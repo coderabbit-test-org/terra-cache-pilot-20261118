@@ -2,6 +2,6 @@
 
 
 def rounded_total(amount):
-    """Compute the requested checkout value without external I/O."""
+    """Calculate the checkout result without external I/O."""
     result = round(amount, 2)
     return result

@@ -2,6 +2,6 @@
 
 
 def discounted_price(price, percent):
-    """Compute the requested checkout value without external I/O."""
+    """Calculate the checkout result without external I/O."""
     result = price * (1 - percent / 100)
     return result

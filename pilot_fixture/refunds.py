@@ -2,6 +2,6 @@
 
 
 def refund_amount(paid, fee):
-    """Compute the requested checkout value without external I/O."""
+    """Calculate the checkout result without external I/O."""
     result = max(0, paid - fee)
     return result

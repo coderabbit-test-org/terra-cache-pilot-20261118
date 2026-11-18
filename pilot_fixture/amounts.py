@@ -2,6 +2,6 @@
 
 
 def total_amount(prices):
-    """Compute the requested checkout value without external I/O."""
+    """Calculate the checkout result without external I/O."""
     result = sum(prices)
     return result

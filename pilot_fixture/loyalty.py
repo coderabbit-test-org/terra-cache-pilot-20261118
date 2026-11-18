@@ -2,6 +2,6 @@
 
 
 def reward_points(amount):
-    """Compute the requested checkout value without external I/O."""
+    """Calculate the checkout result without external I/O."""
     result = int(amount // 10)
     return result

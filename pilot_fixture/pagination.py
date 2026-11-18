@@ -2,6 +2,6 @@
 
 
 def page_offset(page, page_size):
-    """Compute the requested checkout value without external I/O."""
+    """Calculate the checkout result without external I/O."""
     result = (page - 1) * page_size
     return result

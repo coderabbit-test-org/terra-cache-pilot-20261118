@@ -2,6 +2,6 @@
 
 
 def remaining_stock(stock, quantity):
-    """Compute the requested checkout value without external I/O."""
+    """Calculate the checkout result without external I/O."""
     result = stock - quantity
     return result
