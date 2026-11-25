@@ -1,0 +1,30 @@
+# SMG SchemaConfig for genai-data-plane Oracle tables (Flyway-managed)
+#
+# This schema is owned by Flyway, so the gateway must not try to apply its own
+# forward migrations during e2e startup. Pin this to the latest core history
+# migration version that the Flyway-managed schema actually provides. Optional
+# skills/background tables are owned by their feature-specific schema lifecycle.
+version: 4
+auto_migrate: false
+
+conversations:
+  table: CONVERSATIONS
+  columns:
+    id: CONVERSATION_ID
+  extra_columns:
+    EXPIRES_AT:
+      sql_type: "TIMESTAMP WITH TIME ZONE"
+      default_value: "31-DEC-99 11.59.59.000000 PM +00:00"
+
+responses:
+  table: RESPONSES
+  columns:
+    id: RESPONSE_ID
+    input: INPUT_ITEMS
+    raw_response: RESPONSE_OBJECT
+
+conversation_items:
+  table: CONVERSATION_ITEMS
+
+conversation_item_links:
+  table: CONVERSATION_ITEM_LINKS

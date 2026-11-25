@@ -1,0 +1,5302 @@
+//! Anthropic Messages API protocol definitions
+//!
+//! This module provides Rust types for the Anthropic Messages API.
+//! See: <https://docs.anthropic.com/en/api/messages>
+
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    marker::PhantomData,
+    sync::Arc,
+};
+
+use serde::{
+    de::{self, value::SeqAccessDeserializer, SeqAccess, Visitor},
+    Deserialize, Deserializer, Serialize,
+};
+use serde_json::{Map, Value};
+use validator::Validate;
+
+/// The request rules that read the betas of the request beside its body
+/// ([`MessagesBetas`]), applied by the gateway's Messages handler.
+pub use crate::messages_validation::validate_with_betas;
+use crate::{
+    chat::deserialize_reasoning_effort,
+    common::{self, invalid, CachePartition, GenerationRequest},
+    model_card::ModelCard,
+    profile::ProviderProfile,
+    validated::Normalizable,
+};
+
+// ============================================================================
+// Request Types
+// ============================================================================
+
+/// Request to create a message using the Anthropic Messages API.
+///
+/// This is the main request type for `/v1/messages` endpoint.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, Validate, schemars::JsonSchema)]
+#[validate(schema(function = "validate_message_request"))]
+pub struct CreateMessageRequest {
+    /// The model that will complete your prompt.
+    #[validate(length(min = 1, message = "model field is required and cannot be empty"))]
+    pub model: String,
+
+    /// Input messages for the conversation.
+    #[validate(length(min = 1, message = "messages array is required and cannot be empty"))]
+    pub messages: Vec<InputMessage>,
+
+    /// The maximum number of tokens to generate before stopping. `0` is
+    /// accepted as the public API accepts it: the answer is an empty message
+    /// that reports the prompt's token count and generates nothing.
+    pub max_tokens: u32,
+
+    /// An object describing metadata about the request.
+    pub metadata: Option<Metadata>,
+
+    /// Service tier for the request (auto or standard_only).
+    pub service_tier: Option<ServiceTier>,
+
+    /// Custom text sequences that will cause the model to stop generating.
+    pub stop_sequences: Option<Vec<String>>,
+
+    /// Whether to incrementally stream the response using server-sent events.
+    pub stream: Option<bool>,
+
+    /// System prompt for providing context and instructions.
+    pub system: Option<SystemContent>,
+
+    /// Amount of randomness injected into the response (0.0 to 1.0).
+    pub temperature: Option<f64>,
+
+    /// Configuration for extended thinking.
+    pub thinking: Option<ThinkingConfig>,
+
+    /// How the model should use the provided tools.
+    pub tool_choice: Option<ToolChoice>,
+
+    /// Definitions of tools that the model may use.
+    pub tools: Option<Vec<Tool>>,
+
+    /// Only sample from the top K options for each subsequent token.
+    pub top_k: Option<u32>,
+
+    /// Use nucleus sampling.
+    pub top_p: Option<f64>,
+
+    // Beta features
+    /// The container for code execution to reuse (beta): its id, or its
+    /// configuration.
+    pub container: Option<MessagesContainer>,
+
+    /// MCP servers to be utilized in this request (beta).
+    pub mcp_servers: Option<Vec<McpServerConfig>>,
+
+    /// The message thread this request opens or continues (beta): a
+    /// `create` request is a whole conversation whose answer the gateway
+    /// keeps under the answer's `id`; a `continue` request names that id as
+    /// `previous_message_id` and carries the messages since the answer,
+    /// without `system` or `tools` (the thread keeps the create request's).
+    pub thread: Option<MessageThread>,
+
+    /// Request ID forwarded to the backend for log correlation (an engine extension)
+    pub rid: Option<String>,
+
+    /// The effort the response renders with, the format its text must fit,
+    /// and the config's other keys. Boxed, as is `output_format`: few
+    /// requests send either, and the request every call carries (the
+    /// gateway shares it behind an `Arc`) pays a pointer for each instead of
+    /// the config's and the format's own room.
+    pub output_config: Option<Box<OutputConfig>>,
+
+    /// The format the answer's text must fit, under the field's earlier
+    /// top-level name; `output_config.format` is the current one and wins
+    /// when both are sent ([`Self::output_schema`]).
+    pub output_format: Option<Box<OutputFormat>>,
+
+    /// Additional fields not explicitly defined above (e.g. beta features like
+    /// context_management). Captured and forwarded to backends.
+    #[serde(flatten)]
+    pub other: Map<String, Value>,
+}
+
+impl Normalizable for CreateMessageRequest {
+    // Use default no-op implementation
+}
+
+/// The `thread` of a Messages request: the first turn of a thread, or the
+/// next turn of the one whose last answer is `previous_message_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MessageThread {
+    Create,
+    Continue { previous_message_id: String },
+}
+
+/// The betas a Messages request names in its `anthropic-beta` header, read
+/// once per request. The public API names a beta in its dated form,
+/// `name-YYYY-MM-DD`; the header may repeat, and each value may list several
+/// betas, comma separated. The set keeps the two betas the request rules
+/// ([`validate_with_betas`]) read, as flags filled in one pass over the
+/// values (no allocation per request); the request's raw headers reach the
+/// backend unchanged, dates and all, and another name is asked of the raw
+/// values through [`MessagesBetas::values_name`]. A token without the dated
+/// suffix names no beta, and a longer name that begins with a known one is
+/// another beta, not that one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MessagesBetas {
+    /// `interleaved-thinking` is named.
+    interleaved_thinking: bool,
+    /// `message-threads` is named.
+    message_threads: bool,
+}
+
+impl MessagesBetas {
+    /// The beta under which `thinking.budget_tokens` may reach `max_tokens`.
+    pub const INTERLEAVED_THINKING: &'static str = "interleaved-thinking";
+    /// The beta a `thread` field needs.
+    pub const MESSAGE_THREADS: &'static str = "message-threads";
+
+    /// The set named by the header's values, each a comma-separated list.
+    pub fn from_header_values<'a>(values: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut betas = Self::default();
+        for name in dated_beta_names(values) {
+            match name {
+                Self::INTERLEAVED_THINKING => betas.interleaved_thinking = true,
+                Self::MESSAGE_THREADS => betas.message_threads = true,
+                _ => {}
+            }
+        }
+        betas
+    }
+
+    /// Whether the header's values name `name` in its dated form: the
+    /// reading for a name the set does not keep.
+    pub fn values_name<'a>(values: impl IntoIterator<Item = &'a str>, name: &str) -> bool {
+        dated_beta_names(values).any(|named| named == name)
+    }
+
+    /// Whether the interleaved-thinking beta is named.
+    pub fn interleaved_thinking(self) -> bool {
+        self.interleaved_thinking
+    }
+
+    /// Whether the message-threads beta is named.
+    pub fn message_threads(self) -> bool {
+        self.message_threads
+    }
+}
+
+/// `-YYYY-MM-DD`, the suffix a public beta's name ends with.
+const DATED_SUFFIX_LEN: usize = 11;
+
+/// The names of the dated betas in `values`, in their order.
+fn dated_beta_names<'a>(
+    values: impl IntoIterator<Item = &'a str>,
+) -> impl Iterator<Item = &'a str> {
+    values
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .filter_map(|token| dated_beta_name(token.trim()))
+}
+
+/// `token` as `name-YYYY-MM-DD`: its name, or `None` when the token does not
+/// end with the dated suffix (the shape alone, not the calendar).
+fn dated_beta_name(token: &str) -> Option<&str> {
+    let bytes = token.as_bytes();
+    let at = bytes.len().checked_sub(DATED_SUFFIX_LEN)?;
+    let dated = bytes[at..].iter().enumerate().all(|(i, b)| {
+        if i == 0 || i == 5 || i == 8 {
+            *b == b'-'
+        } else {
+            b.is_ascii_digit()
+        }
+    });
+    (dated && at > 0 && token.is_char_boundary(at)).then(|| &token[..at])
+}
+
+/// `output_config`: `effort` is read as a Chat `reasoning_effort` is (a
+/// string, or a number as its text; another type is refused); `format` is
+/// the JSON schema the answer's text must fit; the other keys (beta fields)
+/// ride through.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct OutputConfig {
+    #[serde(default, deserialize_with = "deserialize_reasoning_effort")]
+    pub effort: Option<String>,
+    pub format: Option<OutputFormat>,
+    #[serde(flatten)]
+    pub other: Map<String, Value>,
+}
+
+/// The format a Messages answer's text must fit: a JSON schema, the one
+/// `type` the public API names (`output_config.format`). Another `type` is
+/// refused as an unknown variant; that the schema is an object is checked
+/// with the request's other rules (the crate's `messages_validation`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum OutputFormat {
+    /// `{"type": "json_schema", "schema": {...}}`.
+    JsonSchema {
+        /// The JSON schema of the format.
+        schema: Value,
+    },
+}
+
+impl OutputFormat {
+    /// The JSON schema the format names.
+    pub fn schema(&self) -> &Value {
+        match self {
+            Self::JsonSchema { schema } => schema,
+        }
+    }
+}
+
+/// The thinking preference a prompt is rendered with: the `thinking` block,
+/// else the provider profile's reading of the effort (see
+/// [`crate::chat::ChatCompletionRequest::template_thinking`]).
+fn template_thinking_for(
+    provider: ProviderProfile,
+    thinking: Option<bool>,
+    effort: Option<&str>,
+) -> Option<bool> {
+    thinking.or_else(|| provider.thinking_from_reasoning_effort(effort))
+}
+
+impl CreateMessageRequest {
+    /// Check if the request is for streaming
+    pub fn is_stream(&self) -> bool {
+        self.stream.unwrap_or(false)
+    }
+
+    /// The public API's request rules this request breaks, as the extractor
+    /// states them, or `None`: the field rules and the crate's own
+    /// (`messages_validation`), applied again to a conversation the gateway
+    /// rebuilt from a message thread's stored turns.
+    pub fn contract_violation(&self) -> Option<String> {
+        Validate::validate(self)
+            .err()
+            .map(|errors| errors.to_string())
+    }
+
+    /// Get the model name
+    pub fn get_model(&self) -> &str {
+        &self.model
+    }
+
+    /// Check if the request contains any `mcp_toolset` tool entries.
+    pub fn has_mcp_toolset(&self) -> bool {
+        self.tools
+            .as_ref()
+            .is_some_and(|tools| tools.iter().any(|t| matches!(t, Tool::McpToolset(_))))
+    }
+
+    /// Return MCP server configs if present and non-empty.
+    pub fn mcp_server_configs(&self) -> Option<&[McpServerConfig]> {
+        self.mcp_servers
+            .as_deref()
+            .filter(|servers| !servers.is_empty())
+    }
+
+    /// Whether the request's final message is an assistant prefill the
+    /// response continues (see [`continues_final_assistant`]).
+    pub fn continues_final_assistant(&self) -> bool {
+        continues_final_assistant(&self.messages)
+    }
+
+    /// `output_config.effort`, the request's `reasoning_effort`
+    /// ([`Self::template_reasoning_effort_for`] is the one the template renders).
+    pub fn reasoning_effort(&self) -> Option<&str> {
+        self.output_config.as_ref()?.effort.as_deref()
+    }
+
+    /// The `reasoning_effort` the prompt is rendered with: the effort as the
+    /// model's provider profile hands it to the template
+    /// ([`ProviderProfile::template_reasoning_effort`]), given the thinking
+    /// preference the prompt renders with ([`Self::template_thinking_for`]).
+    pub fn template_reasoning_effort_for(&self, provider: ProviderProfile) -> Option<&str> {
+        provider.template_reasoning_effort(
+            self.reasoning_effort(),
+            self.template_thinking_for(provider),
+        )
+    }
+
+    /// The thinking preference the `thinking` block states, none without one.
+    pub fn thinking_toggle(&self) -> Option<bool> {
+        self.thinking.as_ref().map(ThinkingConfig::enabled)
+    }
+
+    /// The `thinking.display` the `thinking` block states, none without one;
+    /// [`ThinkingDisplay::returns_text`] says what it decides.
+    pub fn thinking_display(&self) -> Option<ThinkingDisplay> {
+        self.thinking.as_ref().and_then(ThinkingConfig::display)
+    }
+
+    /// The thinking preference the prompt is rendered with.
+    pub fn template_thinking(&self) -> Option<bool> {
+        self.template_thinking_for(ProviderProfile::for_model(&self.model))
+    }
+
+    /// [`Self::template_thinking`] with the model's provider profile the caller
+    /// derived already (the gateway's preparation derives it once per request).
+    pub fn template_thinking_for(&self, provider: ProviderProfile) -> Option<bool> {
+        template_thinking_for(provider, self.thinking_toggle(), self.reasoning_effort())
+    }
+
+    /// The JSON schema the answer's text must fit: `output_config.format`'s,
+    /// else the one under the field's earlier top-level name, `output_format`;
+    /// none when neither is sent (or either is `null`).
+    pub fn output_schema(&self) -> Option<&Value> {
+        self.output_config
+            .as_ref()
+            .and_then(|config| config.format.as_ref())
+            .or(self.output_format.as_deref())
+            .map(OutputFormat::schema)
+    }
+
+    /// Whether the request's `tool_choice` turns parallel tool use off.
+    pub fn disables_parallel_tool_use(&self) -> bool {
+        self.tool_choice
+            .as_ref()
+            .is_some_and(ToolChoice::disables_parallel_tool_use)
+    }
+
+    /// The request's custom tools as chat tools, the shape the templates and
+    /// the parsers read (see [`chat_tools`]).
+    pub fn chat_tools(&self) -> Vec<common::Tool> {
+        self.tools.as_deref().map(chat_tools).unwrap_or_default()
+    }
+
+    /// The tool calls the history already holds, across the assistant
+    /// messages: the index the next call continues from.
+    pub fn history_tool_calls_count(&self) -> usize {
+        self.messages
+            .iter()
+            .filter(|message| message.role == Role::Assistant)
+            .flat_map(|message| match &message.content {
+                InputContent::Blocks(blocks) => blocks.as_slice(),
+                InputContent::String(_) => &[],
+            })
+            .filter(|block| matches!(block, InputContentBlock::ToolUse(_)))
+            .count()
+    }
+}
+
+impl GenerationRequest for CreateMessageRequest {
+    fn cache_partition(&self) -> CachePartition<'_> {
+        CachePartition {
+            // Engine extensions in the passthrough map, forwarded to the
+            // backend as-is.
+            cache_salt: self.other.get("cache_salt").and_then(Value::as_str),
+            extra_key: self.other.get("extra_key").and_then(Value::as_str),
+            lora_path: self.other.get("lora_path").and_then(Value::as_str),
+        }
+    }
+
+    fn rid(&self) -> Option<&str> {
+        self.rid.as_deref()
+    }
+
+    fn max_output_tokens(&self) -> Option<u32> {
+        Some(self.max_tokens)
+    }
+
+    fn is_stream(&self) -> bool {
+        self.stream.unwrap_or(false)
+    }
+
+    fn get_model(&self) -> Option<&str> {
+        Some(&self.model)
+    }
+
+    fn extract_text_for_routing(&self) -> String {
+        routing_text(self.system.as_ref(), &self.messages)
+    }
+}
+
+/// The system and message text a Messages request routes on.
+fn routing_text(system: Option<&SystemContent>, messages: &[InputMessage]) -> String {
+    let mut buffer = String::new();
+    let mut has_content = false;
+
+    let push = |s: &str, has_content: &mut bool, buffer: &mut String| {
+        if s.is_empty() {
+            return;
+        }
+        if *has_content {
+            buffer.push(' ');
+        }
+        buffer.push_str(s);
+        *has_content = true;
+    };
+
+    if let Some(system) = system {
+        match system {
+            SystemContent::String(s) => push(s, &mut has_content, &mut buffer),
+            SystemContent::Blocks(blocks) => {
+                for block in blocks {
+                    let SystemContentBlock::Text(text_block) = block;
+                    push(&text_block.text, &mut has_content, &mut buffer);
+                }
+            }
+        }
+    }
+
+    for msg in messages {
+        match &msg.content {
+            InputContent::String(s) => push(s, &mut has_content, &mut buffer),
+            InputContent::Blocks(blocks) => {
+                for block in blocks {
+                    if let InputContentBlock::Text(text_block) = block {
+                        push(&text_block.text, &mut has_content, &mut buffer);
+                    }
+                }
+            }
+        }
+    }
+
+    buffer
+}
+
+impl Tool {
+    fn matches_tool_choice_name(&self, name: &str) -> bool {
+        match self {
+            Self::Custom(tool) => tool.name == name,
+            Self::ToolSearch(tool) => tool.name == name,
+            Self::Bash(tool) => tool.name == name,
+            Self::TextEditor(tool) => tool.name == name,
+            Self::WebSearch(tool) => tool.name == name,
+            Self::McpToolset(toolset) => {
+                let default_enabled = toolset
+                    .default_config
+                    .as_ref()
+                    .and_then(|config| config.enabled)
+                    .unwrap_or(true);
+
+                toolset
+                    .configs
+                    .as_ref()
+                    .and_then(|configs| configs.get(name))
+                    .and_then(|config| config.enabled)
+                    .unwrap_or(default_enabled)
+            }
+        }
+    }
+}
+/// Validate cross-field constraints for Messages API requests.
+fn validate_message_request(req: &CreateMessageRequest) -> Result<(), validator::ValidationError> {
+    crate::messages_validation::validate(req)?;
+
+    if req.has_mcp_toolset() && req.mcp_server_configs().is_none() {
+        return Err(invalid(
+            "mcp_servers_required",
+            "mcp_servers is required when mcp_toolset tools are present",
+        ));
+    }
+
+    let Some(tool_choice) = &req.tool_choice else {
+        return Ok(());
+    };
+
+    // A continue request of a message thread sends no tools: the thread
+    // keeps the create request's, and the choice is judged against them on
+    // the conversation the gateway rebuilds.
+    if matches!(req.thread, Some(MessageThread::Continue { .. })) {
+        return Ok(());
+    }
+
+    let has_tools = req.tools.as_ref().is_some_and(|tools| !tools.is_empty());
+    let requires_tools = !matches!(tool_choice, ToolChoice::None);
+
+    if requires_tools && !has_tools {
+        return Err(invalid(
+            "tool_choice_requires_tools",
+            "Invalid value for 'tool_choice': 'tool_choice' is only allowed when 'tools' are specified.",
+        ));
+    }
+
+    if let ToolChoice::Tool { name, .. } = tool_choice {
+        let tool_exists = req
+            .tools
+            .as_ref()
+            .is_some_and(|tools| tools.iter().any(|tool| tool.matches_tool_choice_name(name)));
+
+        if !tool_exists {
+            return Err(invalid(
+                "tool_choice_tool_not_found",
+                format!("Invalid value for 'tool_choice': tool '{name}' not found in 'tools'."),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Request metadata
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct Metadata {
+    /// An external identifier for the user who is associated with the request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+}
+
+/// Service tier options
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceTier {
+    Auto,
+    StandardOnly,
+}
+
+/// System content can be a string or an array of text blocks
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum SystemContent {
+    String(String),
+    Blocks(Vec<SystemContentBlock>),
+}
+
+impl<'de> Deserialize<'de> for SystemContent {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(
+            match string_or_blocks(deserializer, "a string or an array of text blocks")? {
+                StringOrBlocks::String(text) => Self::String(text),
+                StringOrBlocks::Blocks(blocks) => Self::Blocks(blocks),
+            },
+        )
+    }
+}
+
+/// A content field as the public API shapes it: a string, or an array of
+/// blocks of one kind. Read by hand instead of as an untagged enum, so that
+/// a block that cannot be read is refused with the block's own error (its
+/// position in the array, the unknown `type` and the accepted ones, the
+/// missing field), where an untagged enum reports "data did not match any
+/// variant" and names nothing.
+enum StringOrBlocks<B> {
+    String(String),
+    Blocks(Vec<B>),
+}
+
+/// Reads [`StringOrBlocks`]; `expecting` names the shape in a refusal of
+/// any other JSON type.
+fn string_or_blocks<'de, D, B>(
+    deserializer: D,
+    expecting: &'static str,
+) -> Result<StringOrBlocks<B>, D::Error>
+where
+    D: Deserializer<'de>,
+    B: Deserialize<'de>,
+{
+    struct StringOrBlocksVisitor<B>(&'static str, PhantomData<B>);
+
+    impl<'de, B: Deserialize<'de>> Visitor<'de> for StringOrBlocksVisitor<B> {
+        type Value = StringOrBlocks<B>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(self.0)
+        }
+
+        fn visit_str<E: de::Error>(self, text: &str) -> Result<Self::Value, E> {
+            Ok(StringOrBlocks::String(text.to_owned()))
+        }
+
+        fn visit_string<E: de::Error>(self, text: String) -> Result<Self::Value, E> {
+            Ok(StringOrBlocks::String(text))
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+            Vec::<B>::deserialize(SeqAccessDeserializer::new(seq)).map(StringOrBlocks::Blocks)
+        }
+    }
+
+    deserializer.deserialize_any(StringOrBlocksVisitor(expecting, PhantomData))
+}
+
+/// System content block — wraps TextBlock with the required `type` discriminator
+/// so it round-trips correctly through serialization.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SystemContentBlock {
+    Text(TextBlock),
+}
+
+/// A single input message in a conversation: a role and content, nothing
+/// else (the public API refuses any other field).
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InputMessage {
+    /// The role of the message sender (user or assistant)
+    pub role: Role,
+
+    /// The content of the message
+    pub content: InputContent,
+}
+
+/// Role of a message sender
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    User,
+    Assistant,
+    /// `system` role inside `messages[]`.
+    ///
+    /// The Anthropic Messages API carries the system prompt in the top-level
+    /// `system` field, but some clients (e.g. Claude Code) additionally send a
+    /// `system`-role message *in the array* — often mid-conversation. Accepting
+    /// it (instead of 400ing) lets those requests through; the message is
+    /// forwarded to the chat template **in place**, so backends that render
+    /// `system` inline (e.g. GLM-4.5+/5.x) keep its position, while backends
+    /// that only read a leading system (e.g. MiniMax-M2) handle it per their
+    /// own template. See <https://github.com/smg-project/smg/issues/1795>. A
+    /// renderer whose reference writes no turn for a system message past the
+    /// leading run (`RendererCapabilities::leading_system_only`) gets such a
+    /// message as a user turn at its position instead, set off from the text
+    /// before it rather than glued to it; the leading run is the system
+    /// prompt and stays.
+    System,
+}
+
+/// Input content can be a string or an array of content blocks
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum InputContent {
+    String(String),
+    Blocks(Vec<InputContentBlock>),
+}
+
+impl<'de> Deserialize<'de> for InputContent {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(
+            match string_or_blocks(deserializer, "a string or an array of content blocks")? {
+                StringOrBlocks::String(text) => Self::String(text),
+                StringOrBlocks::Blocks(blocks) => Self::Blocks(blocks),
+            },
+        )
+    }
+}
+
+// ============================================================================
+// Input Content Blocks
+// ============================================================================
+
+/// Input content block types
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum InputContentBlock {
+    /// Text content
+    Text(TextBlock),
+    /// Image content
+    Image(ImageBlock),
+    /// Document content
+    Document(DocumentBlock),
+    /// Tool use block (for assistant messages)
+    ToolUse(ToolUseBlock),
+    /// Tool result block (for user messages)
+    ToolResult(ToolResultBlock),
+    /// Thinking block
+    Thinking(ThinkingBlock),
+    /// Redacted thinking block
+    RedactedThinking(RedactedThinkingBlock),
+    /// Server tool use block
+    ServerToolUse(ServerToolUseBlock),
+    /// Search result block
+    SearchResult(SearchResultBlock),
+    /// Web search tool result block
+    WebSearchToolResult(WebSearchToolResultBlock),
+    /// Tool search tool result block
+    ToolSearchToolResult(ToolSearchToolResultBlock),
+    /// Tool reference block
+    ToolReference(ToolReferenceBlock),
+    /// MCP tool use block (an assistant message of the MCP beta, replayed
+    /// or read back from a stored turn)
+    McpToolUse(McpToolUseBlock),
+    /// MCP tool result block (the same message, beside its use)
+    McpToolResult(McpToolResultBlock),
+    /// Web fetch tool result block (a server tool's result, replayed)
+    WebFetchToolResult(ServerToolResultBlock),
+    /// Code execution tool result block (a server tool's result, replayed)
+    CodeExecutionToolResult(ServerToolResultBlock),
+    /// Bash code execution tool result block (a server tool's result, replayed)
+    BashCodeExecutionToolResult(ServerToolResultBlock),
+    /// Text editor code execution tool result block (a server tool's result,
+    /// replayed)
+    TextEditorCodeExecutionToolResult(ServerToolResultBlock),
+    /// Container upload block: a file the request hands the code execution
+    /// container
+    ContainerUpload(ContainerUploadParam),
+}
+
+/// The result of a server tool the public API ran (web fetch, code execution,
+/// bash, the text editor), replayed in an assistant turn. Its `content` is
+/// kept as written, for the upstream that ran the tool to read.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ServerToolResultBlock {
+    pub tool_use_id: String,
+    pub content: Value,
+    pub cache_control: Option<CacheControl>,
+    /// Who issued the call, when the public API reports it (a web fetch
+    /// result's `caller`).
+    pub caller: Option<ToolUseCaller>,
+}
+
+/// A file the request hands the code execution container
+/// (`container_upload`).
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ContainerUploadParam {
+    pub file_id: String,
+    pub cache_control: Option<CacheControl>,
+}
+
+/// Whether `messages` end with an assistant message that has text and no
+/// tool call: a prefill the response continues rather than a closed turn.
+/// A tool call ends the turn; continuing after the text would drop it, as
+/// transformers' `continue_final_message` cuts the prompt there.
+pub fn continues_final_assistant(messages: &[InputMessage]) -> bool {
+    messages.last().is_some_and(|message| {
+        message.role == Role::Assistant
+            && match &message.content {
+                InputContent::String(_) => true,
+                InputContent::Blocks(blocks) => {
+                    blocks
+                        .iter()
+                        .any(|block| matches!(block, InputContentBlock::Text(_)))
+                        && !blocks
+                            .iter()
+                            .any(|block| matches!(block, InputContentBlock::ToolUse(_)))
+                }
+            }
+    })
+}
+
+/// Text content block
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TextBlock {
+    /// The text content
+    pub text: String,
+
+    /// Cache control for this block
+    pub cache_control: Option<CacheControl>,
+
+    /// Citations for this text block
+    pub citations: Option<Vec<Citation>>,
+}
+
+/// Image content block
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ImageBlock {
+    /// The image source
+    pub source: ImageSource,
+
+    /// Cache control for this block
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
+}
+
+/// Image source (base64, URL, or a file uploaded through the public API's
+/// Files API, by its id)
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ImageSource {
+    /// Base64 text with its media type; the text is shared with the readers
+    /// that decode it, never re-encoded into a data URL.
+    Base64 {
+        media_type: String,
+        data: Arc<String>,
+    },
+    /// A URL or `data:` URL, shared with its readers.
+    Url { url: Arc<String> },
+    /// A file uploaded through the public API's Files API, by its id.
+    File { file_id: String },
+}
+
+/// Document content block
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DocumentBlock {
+    /// The document source
+    pub source: DocumentSource,
+
+    /// Cache control for this block
+    pub cache_control: Option<CacheControl>,
+
+    /// Optional title for the document
+    pub title: Option<String>,
+
+    /// Optional context for the document
+    pub context: Option<String>,
+
+    /// Citations configuration
+    pub citations: Option<CitationsConfig>,
+}
+
+/// Document source (base64, text, URL, content blocks, or a file uploaded
+/// through the public API's Files API, by its id)
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DocumentSource {
+    Base64 { media_type: String, data: String },
+    Text { data: String },
+    Url { url: String },
+    Content { content: DocumentContent },
+    File { file_id: String },
+}
+
+/// A content source's content, as the public API takes it: a string, or an
+/// array of content blocks
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum DocumentContent {
+    String(String),
+    Blocks(Vec<InputContentBlock>),
+}
+
+impl<'de> Deserialize<'de> for DocumentContent {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(
+            match string_or_blocks(deserializer, "a string or an array of content blocks")? {
+                StringOrBlocks::String(text) => Self::String(text),
+                StringOrBlocks::Blocks(blocks) => Self::Blocks(blocks),
+            },
+        )
+    }
+}
+
+/// Tool use block (in assistant messages)
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ToolUseBlock {
+    /// Unique identifier for this tool use
+    pub id: String,
+
+    /// Name of the tool being used
+    pub name: String,
+
+    /// Input arguments for the tool
+    pub input: Value,
+
+    /// Cache control for this block
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
+}
+
+/// Tool result block (in user messages)
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ToolResultBlock {
+    /// The ID of the tool use this is a result for
+    pub tool_use_id: String,
+
+    /// The result content (string or blocks)
+    pub content: Option<ToolResultContent>,
+
+    /// Whether this result indicates an error
+    pub is_error: Option<bool>,
+
+    /// Cache control for this block
+    pub cache_control: Option<CacheControl>,
+}
+
+/// Tool result content (string or blocks)
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum ToolResultContent {
+    String(String),
+    Blocks(Vec<ToolResultContentBlock>),
+}
+
+impl<'de> Deserialize<'de> for ToolResultContent {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(
+            match string_or_blocks(
+                deserializer,
+                "a string or an array of tool result content blocks",
+            )? {
+                StringOrBlocks::String(text) => Self::String(text),
+                StringOrBlocks::Blocks(blocks) => Self::Blocks(blocks),
+            },
+        )
+    }
+}
+
+/// Content blocks allowed in tool results
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolResultContentBlock {
+    Text(TextBlock),
+    Image(ImageBlock),
+    Document(DocumentBlock),
+    SearchResult(SearchResultBlock),
+    /// A tool loaded by tool search (Claude Code's ToolSearch over deferred tools)
+    ToolReference(ToolResultReferenceBlock),
+}
+
+/// `tool_reference` inside a tool result: names a tool the search loaded
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ToolResultReferenceBlock {
+    pub tool_name: String,
+    pub cache_control: Option<CacheControl>,
+}
+
+/// Thinking block
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ThinkingBlock {
+    /// The thinking content
+    pub thinking: String,
+
+    /// Signature for the thinking block; history echoed without one (the
+    /// Anthropic Python SDK sends `null` or drops the field) reads as empty
+    #[serde(default, deserialize_with = "null_as_empty")]
+    pub signature: String,
+}
+
+fn null_as_empty<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
+}
+
+/// Redacted thinking block
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct RedactedThinkingBlock {
+    /// The encrypted/redacted data
+    pub data: String,
+}
+
+/// Server tool use block
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ServerToolUseBlock {
+    /// Unique identifier for this tool use
+    pub id: String,
+
+    /// Name of the server tool
+    pub name: String,
+
+    /// Input arguments for the tool
+    pub input: Value,
+
+    /// Cache control for this block
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
+}
+
+/// A text item of a search result's content. The public API requires its
+/// `type`, so it is written with it; an item read without one, as this build
+/// wrote them before, reads as text.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SearchResultTextBlock {
+    /// Block type (always "text")
+    #[serde(rename = "type", default)]
+    pub block_type: SearchResultTextType,
+
+    #[serde(flatten)]
+    pub text: TextBlock,
+}
+
+/// The `type` of a search result's text item: the public API defines only
+/// `text`, so any other value fails to read.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchResultTextType {
+    #[default]
+    Text,
+}
+
+/// Search result block
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SearchResultBlock {
+    /// Source URL or identifier
+    pub source: String,
+
+    /// Title of the search result
+    pub title: String,
+
+    /// Content of the search result
+    pub content: Vec<SearchResultTextBlock>,
+
+    /// Cache control for this block
+    pub cache_control: Option<CacheControl>,
+
+    /// Citations configuration
+    pub citations: Option<CitationsConfig>,
+}
+
+/// Web search tool result block
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WebSearchToolResultBlock {
+    /// The tool use ID this result is for
+    pub tool_use_id: String,
+
+    /// The search results or error
+    pub content: WebSearchToolResultContent,
+
+    /// Cache control for this block
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
+}
+
+/// Web search tool result content
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum WebSearchToolResultContent {
+    Results(Vec<WebSearchResultBlock>),
+    Error(WebSearchToolResultError),
+}
+
+/// Web search result block
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WebSearchResultBlock {
+    /// Block type (always "web_search_result"). The public API writes it on
+    /// every result and requires it on a replayed one, so a result read
+    /// without it is written with it.
+    #[serde(rename = "type", default = "WebSearchResultBlock::default_type")]
+    pub block_type: String,
+
+    /// Title of the search result
+    pub title: String,
+
+    /// URL of the search result
+    pub url: String,
+
+    /// Encrypted content
+    pub encrypted_content: String,
+
+    /// Page age, null when the search does not know it, as the public API
+    /// writes it
+    #[serde(default)]
+    pub page_age: Option<String>,
+}
+
+impl WebSearchResultBlock {
+    fn default_type() -> String {
+        "web_search_result".to_string()
+    }
+}
+
+/// Web search tool result error
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WebSearchToolResultError {
+    #[serde(rename = "type")]
+    pub error_type: String,
+    pub error_code: WebSearchToolResultErrorCode,
+}
+
+/// Web search tool result error codes
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WebSearchToolResultErrorCode {
+    InvalidToolInput,
+    Unavailable,
+    MaxUsesExceeded,
+    TooManyRequests,
+    QueryTooLong,
+    RequestTooLarge,
+}
+
+/// Cache control configuration
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CacheControl {
+    Ephemeral,
+}
+
+/// Citations configuration
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CitationsConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
+/// Citation types
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "variant names match the OpenAI API citation type discriminators (char_location, page_location, etc.)"
+)]
+pub enum Citation {
+    CharLocation(CharLocationCitation),
+    PageLocation(PageLocationCitation),
+    ContentBlockLocation(ContentBlockLocationCitation),
+    WebSearchResultLocation(WebSearchResultLocationCitation),
+    SearchResultLocation(SearchResultLocationCitation),
+}
+
+/// Character location citation
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CharLocationCitation {
+    pub cited_text: String,
+    pub document_index: u32,
+    pub document_title: Option<String>,
+    pub start_char_index: u32,
+    pub end_char_index: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<String>,
+}
+
+/// Page location citation
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PageLocationCitation {
+    pub cited_text: String,
+    pub document_index: u32,
+    pub document_title: Option<String>,
+    pub start_page_number: u32,
+    pub end_page_number: u32,
+}
+
+/// Content block location citation
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ContentBlockLocationCitation {
+    pub cited_text: String,
+    pub document_index: u32,
+    pub document_title: Option<String>,
+    pub start_block_index: u32,
+    pub end_block_index: u32,
+}
+
+/// Web search result location citation
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WebSearchResultLocationCitation {
+    pub cited_text: String,
+    pub url: String,
+    pub title: Option<String>,
+    pub encrypted_index: String,
+}
+
+/// Search result location citation
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SearchResultLocationCitation {
+    pub cited_text: String,
+    pub search_result_index: u32,
+    pub source: String,
+    pub title: Option<String>,
+    pub start_block_index: u32,
+    pub end_block_index: u32,
+}
+
+// ============================================================================
+// Tool Definitions
+// ============================================================================
+
+/// Tool definition
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "ToolSearch matches Anthropic API naming"
+)]
+#[schemars(rename = "MessagesTool")]
+pub enum Tool {
+    /// MCP toolset definition
+    McpToolset(McpToolset),
+    /// Custom tool definition (must come before ToolSearch: CustomTool requires
+    /// `input_schema` which acts as a discriminator — ToolSearchTool JSON lacks
+    /// it and falls through, while CustomTool JSON with "type" would incorrectly
+    /// match ToolSearchTool's less-restrictive shape if tried first)
+    Custom(CustomTool),
+    /// Tool search tool, and every other Anthropic-defined tool: a tool with a
+    /// `type` and a `name` and no `input_schema` that reads as one reads here,
+    /// its configuration kept in [`ToolSearchTool::extra`].
+    ToolSearch(ToolSearchTool),
+    /// Bash tool (computer use)
+    Bash(BashTool),
+    /// Text editor tool (computer use)
+    TextEditor(TextEditorTool),
+    /// Web search tool
+    WebSearch(WebSearchTool),
+}
+
+/// Custom tool definition
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CustomTool {
+    /// Name of the tool
+    pub name: String,
+
+    /// Optional type (defaults to "custom")
+    #[serde(rename = "type")]
+    pub tool_type: Option<String>,
+
+    /// Description of what this tool does
+    pub description: Option<String>,
+
+    /// JSON schema for the tool's input
+    pub input_schema: InputSchema,
+
+    /// Whether to defer loading this tool
+    pub defer_loading: Option<bool>,
+
+    /// Cache control for this tool
+    pub cache_control: Option<CacheControl>,
+
+    /// The public API's further tool fields (`strict`, `input_examples`, ...),
+    /// forwarded as written; validation refuses any other field.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+// The maps keep the client's key order: the schema is rendered into the
+// prompt, so a reordered schema changes the prompt (and its prefix-cache key)
+// from one request to the next.
+/// JSON Schema for tool input
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct InputSchema {
+    #[serde(rename = "type")]
+    pub schema_type: String,
+
+    pub properties: Option<Map<String, Value>>,
+
+    pub required: Option<Vec<String>>,
+
+    /// Additional properties can be stored here
+    #[serde(flatten)]
+    pub additional: Map<String, Value>,
+}
+
+impl From<InputSchema> for Value {
+    /// The schema as the JSON object a chat tool's `parameters` holds: the
+    /// properties and the additional fields move in, the `type` and the
+    /// `required` names are written as the strings they are.
+    fn from(schema: InputSchema) -> Self {
+        let mut object = Map::new();
+        object.insert("type".to_string(), Value::String(schema.schema_type));
+        if let Some(properties) = schema.properties {
+            object.insert("properties".to_string(), Value::Object(properties));
+        }
+        if let Some(required) = schema.required {
+            object.insert(
+                "required".to_string(),
+                Value::Array(required.into_iter().map(Value::String).collect()),
+            );
+        }
+        object.extend(schema.additional);
+        Value::Object(object)
+    }
+}
+
+impl From<&InputSchema> for Value {
+    /// The same object from a borrowed schema: its fields are copied once, as
+    /// a caller that keeps its schema must.
+    fn from(schema: &InputSchema) -> Self {
+        Self::from(schema.clone())
+    }
+}
+
+impl From<CustomTool> for common::Tool {
+    /// The chat tool a custom tool reads as: a function with the input
+    /// schema as its parameters; the name, the description and the schema
+    /// move in.
+    fn from(tool: CustomTool) -> Self {
+        Self {
+            tool_type: "function".to_string(),
+            function: common::Function {
+                name: tool.name,
+                description: tool.description,
+                parameters: Some(Value::from(tool.input_schema)),
+                strict: None,
+                extra: Default::default(),
+            },
+        }
+    }
+}
+
+impl From<&CustomTool> for common::Tool {
+    /// The same tool from a borrowed custom tool: the name, the description
+    /// and the schema are copied once; the fields a chat tool does not carry
+    /// (`extra`, `cache_control`, ...) are not.
+    fn from(tool: &CustomTool) -> Self {
+        Self::from(CustomTool {
+            name: tool.name.clone(),
+            tool_type: None,
+            description: tool.description.clone(),
+            input_schema: tool.input_schema.clone(),
+            defer_loading: None,
+            cache_control: None,
+            extra: Map::new(),
+        })
+    }
+}
+
+/// The custom tools among `tools` as chat tools, in order; the other kinds
+/// render and parse through their own paths.
+pub fn chat_tools(tools: &[Tool]) -> Vec<common::Tool> {
+    tools
+        .iter()
+        .filter_map(|tool| match tool {
+            Tool::Custom(custom) => Some(common::Tool::from(custom)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The custom tools among the owned `tools` as chat tools, in order: their
+/// names, descriptions and schemas move into the chat tools instead of being
+/// copied; the other kinds are dropped here, as [`chat_tools`] leaves them out.
+pub fn into_chat_tools(tools: Vec<Tool>) -> Vec<common::Tool> {
+    tools
+        .into_iter()
+        .filter_map(|tool| match tool {
+            Tool::Custom(custom) => Some(common::Tool::from(custom)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Bash tool for computer use
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct BashTool {
+    #[serde(rename = "type")]
+    pub tool_type: String, // "bash_20250124"
+
+    pub name: String, // "bash"
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
+}
+
+/// Text editor tool for computer use
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TextEditorTool {
+    #[serde(rename = "type")]
+    pub tool_type: String, // "text_editor_20250124", etc.
+
+    pub name: String, // "str_replace_editor"
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
+}
+
+/// Web search tool
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WebSearchTool {
+    #[serde(rename = "type")]
+    pub tool_type: String, // "web_search_20250305"
+
+    pub name: String, // "web_search"
+
+    pub allowed_domains: Option<Vec<String>>,
+
+    pub blocked_domains: Option<Vec<String>>,
+
+    pub max_uses: Option<u32>,
+
+    pub user_location: Option<UserLocation>,
+
+    pub cache_control: Option<CacheControl>,
+}
+
+/// User location for web search
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct UserLocation {
+    #[serde(rename = "type")]
+    pub location_type: String, // "approximate"
+
+    pub city: Option<String>,
+
+    pub region: Option<String>,
+
+    pub country: Option<String>,
+
+    pub timezone: Option<String>,
+}
+
+// ============================================================================
+// Tool Choice
+// ============================================================================
+
+/// How the model should use the provided tools
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[schemars(rename = "MessagesToolChoice")]
+pub enum ToolChoice {
+    /// The model will automatically decide whether to use tools
+    Auto {
+        disable_parallel_tool_use: Option<bool>,
+    },
+    /// The model will use any available tools
+    Any {
+        disable_parallel_tool_use: Option<bool>,
+    },
+    /// The model will use the specified tool
+    Tool {
+        name: String,
+        disable_parallel_tool_use: Option<bool>,
+    },
+    /// The model will not use tools
+    None,
+}
+
+impl ToolChoice {
+    /// Whether the choice turns parallel tool use off (`disable_parallel_tool_use: true`).
+    pub fn disables_parallel_tool_use(&self) -> bool {
+        matches!(
+            self,
+            Self::Auto {
+                disable_parallel_tool_use: Some(true)
+            } | Self::Any {
+                disable_parallel_tool_use: Some(true)
+            } | Self::Tool {
+                disable_parallel_tool_use: Some(true),
+                ..
+            }
+        )
+    }
+}
+
+impl From<&ToolChoice> for common::ToolChoice {
+    /// The chat tool choice a Messages choice reads as: `auto`, `required` for
+    /// `any`, the named function, `none`.
+    fn from(choice: &ToolChoice) -> Self {
+        match choice {
+            ToolChoice::Auto { .. } => Self::Value(common::ToolChoiceValue::Auto),
+            ToolChoice::Any { .. } => Self::Value(common::ToolChoiceValue::Required),
+            ToolChoice::Tool { name, .. } => Self::Function {
+                tool_type: "function".to_string(),
+                function: common::FunctionChoice { name: name.clone() },
+            },
+            ToolChoice::None => Self::Value(common::ToolChoiceValue::None),
+        }
+    }
+}
+
+// ============================================================================
+// Thinking Configuration
+// ============================================================================
+
+/// Configuration for extended thinking
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ThinkingConfig {
+    /// Enable extended thinking
+    Enabled {
+        /// Budget in tokens for thinking (minimum 1024)
+        budget_tokens: u32,
+        /// How thinking content is returned in the response.
+        display: Option<ThinkingDisplay>,
+    },
+    /// Disable extended thinking
+    Disabled,
+    /// Let the model decide when and how much to think. Required on Opus 4.7.
+    Adaptive {
+        /// How thinking content is returned in the response.
+        /// Defaults vary by model (Opus 4.7 / Mythos default to `Omitted`; others to `Summarized`).
+        display: Option<ThinkingDisplay>,
+    },
+    /// No thinking up front; the model may think between its tool calls.
+    /// The public API takes `type` alone here: the `/v1/messages` request
+    /// validation (`messages_validation`) refuses any other field, which is
+    /// why the variant keeps what else was sent instead of letting the
+    /// reader drop it (`count_tokens` runs no thinking validation, this rule
+    /// and the budget floor alike, and counts the request as read). Where
+    /// the gateway renders the prompt (the gRPC path) the shape reads as
+    /// thinking off; the HTTP relay hands it to the engine's own
+    /// `/v1/messages` as written, for the engine's reading.
+    BetweenTools {
+        /// Every field beside `type`, for the validation to refuse.
+        #[serde(flatten, default, skip_serializing_if = "Map::is_empty")]
+        other: Map<String, Value>,
+    },
+}
+
+impl ThinkingConfig {
+    /// `enabled` and `adaptive` ask for thinking, `disabled` and
+    /// `between_tools` (no thinking up front) turn it off.
+    pub fn enabled(&self) -> bool {
+        matches!(self, Self::Enabled { .. } | Self::Adaptive { .. })
+    }
+
+    /// The `display` the block states, under `enabled` and `adaptive` alike;
+    /// `disabled` and `between_tools` state none.
+    pub fn display(&self) -> Option<ThinkingDisplay> {
+        match self {
+            Self::Enabled { display, .. } | Self::Adaptive { display } => *display,
+            Self::Disabled | Self::BetweenTools { .. } => None,
+        }
+    }
+}
+
+/// How thinking content is returned in API responses: the documented set,
+/// `summarized`, `omitted` and `updates` (the beta value that returns the
+/// model's progress notes between tool calls). What each value returns from
+/// the gateway is [`ThinkingDisplay::returns_text`]'s to say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingDisplay {
+    /// Thinking blocks carry readable reasoning text: a summary where the
+    /// provider writes one, the reasoning itself here
+    Summarized,
+    /// Thinking blocks return an empty text; the block and its signature
+    /// still arrive
+    Omitted,
+    /// As `omitted`, with the model's progress notes between tool calls as
+    /// short thinking blocks (beta `thinking-display-updates-2026-08-18`);
+    /// the reasoning as it arrives here
+    Updates,
+}
+
+impl ThinkingDisplay {
+    /// The documented values by wire name, in the order a refusal lists them.
+    const VALUES: [(&'static str, Self); 3] = [
+        ("summarized", Self::Summarized),
+        ("omitted", Self::Omitted),
+        ("updates", Self::Updates),
+    ];
+
+    /// The set as a refusal lists it.
+    const EXPECTED: &'static str = "one of `summarized`, `omitted`, `updates`";
+
+    /// Whether the thinking blocks of the response carry their text.
+    ///
+    /// `omitted` returns them empty: the block, its `signature` and the
+    /// thinking tokens in `usage` still arrive, the text does not.
+    /// `summarized` and `updates` return the reasoning as the engine wrote
+    /// it, as it arrives: the gateway has no summarizer, and a model served
+    /// through it writes no progress notes apart from its reasoning, so the
+    /// live text is the readable form the one asks for and the update stream
+    /// the other does; returned, the client can send it back, and a template
+    /// that reads the reasoning of the turn's earlier calls then has it.
+    pub fn returns_text(self) -> bool {
+        !matches!(self, Self::Omitted)
+    }
+}
+
+/// A `display` outside the documented set is refused with the field's name:
+/// serde's words for the derived enum would read `thinking: unknown
+/// variant`, the same as for a `thinking.type` outside its own set. The
+/// refusal still opens with serde's words, so the public `code` follows
+/// them (`invalid_value`, `invalid_type`).
+impl<'de> Deserialize<'de> for ThinkingDisplay {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct DisplayVisitor;
+
+        impl Visitor<'_> for DisplayVisitor {
+            type Value = ThinkingDisplay;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(ThinkingDisplay::EXPECTED)
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                ThinkingDisplay::VALUES
+                    .iter()
+                    .find(|(name, _)| *name == value)
+                    .map(|(_, display)| *display)
+                    .ok_or_else(|| {
+                        E::custom(format!(
+                            "unknown variant `{value}` for `thinking.display`, expected {}",
+                            ThinkingDisplay::EXPECTED
+                        ))
+                    })
+            }
+        }
+
+        deserializer.deserialize_str(DisplayVisitor)
+    }
+}
+
+// ============================================================================
+// Response Types
+// ============================================================================
+
+/// Response message from the API
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct Message {
+    /// Unique object identifier
+    pub id: String,
+
+    /// Object type (always "message")
+    #[serde(rename = "type")]
+    pub message_type: String,
+
+    /// Conversational role (always "assistant")
+    pub role: String,
+
+    /// Content generated by the model
+    pub content: Vec<ContentBlock>,
+
+    /// The model that generated the message
+    pub model: String,
+
+    /// The reason the model stopped generating
+    pub stop_reason: Option<StopReason>,
+
+    /// Which custom stop sequence was generated (if any)
+    pub stop_sequence: Option<String>,
+
+    /// Details of the stop when the stop reason carries any; null otherwise
+    /// (the public API always writes the key).
+    pub stop_details: Option<Value>,
+
+    /// Billing and rate-limit usage
+    pub usage: Usage,
+
+    /// The code-execution container of the turn when one ran; null otherwise
+    /// (the public API always writes the key).
+    pub container: Option<Value>,
+}
+
+/// Output content block types
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentBlock {
+    /// Text content
+    Text {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        citations: Option<Vec<Citation>>,
+    },
+    /// Tool use by the model
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+        /// Who issued the call, as the public API reports it on every
+        /// `tool_use` block (the model itself for a call the gateway builds).
+        #[serde(default)]
+        caller: ToolUseCaller,
+    },
+    /// Thinking content
+    Thinking { thinking: String, signature: String },
+    /// Redacted thinking content
+    RedactedThinking { data: String },
+    /// Server tool use
+    ServerToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    /// Web search tool result
+    WebSearchToolResult {
+        tool_use_id: String,
+        content: WebSearchToolResultContent,
+    },
+    /// Tool search tool result
+    ToolSearchToolResult {
+        tool_use_id: String,
+        content: ToolSearchToolResultContent,
+    },
+    /// Tool reference (returned by tool search)
+    ToolReference {
+        tool_name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+    },
+    /// MCP tool use (beta) - model requesting tool execution via MCP
+    McpToolUse {
+        id: String,
+        name: String,
+        server_name: String,
+        input: Value,
+    },
+    /// MCP tool result (beta) - result from MCP tool execution
+    McpToolResult {
+        tool_use_id: String,
+        content: Option<ToolResultContent>,
+        is_error: Option<bool>,
+    },
+    /// A block this build does not read, kept as the upstream sent it: an
+    /// upstream answer must parse whatever block the public API adds (a web
+    /// fetch or code execution result, a container upload, ...), and leave
+    /// with the same object. Only a JSON object reads here, as a content block
+    /// is always one.
+    #[serde(untagged, deserialize_with = "deserialize_block_object")]
+    Other(Value),
+}
+
+/// A content block of a kind this build does not read: any JSON object, and
+/// nothing else.
+fn deserialize_block_object<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Value, D::Error> {
+    let block = Value::deserialize(deserializer)?;
+    if block.is_object() {
+        Ok(block)
+    } else {
+        Err(de::Error::custom("a content block is a JSON object"))
+    }
+}
+
+/// The caller of a `tool_use` block, as the public API reports it: the model
+/// itself (`{"type": "direct"}`) or a server tool that issued the call.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolUseCaller {
+    /// The model issued the call.
+    #[default]
+    Direct,
+    /// A code-execution server tool issued the call.
+    #[serde(rename = "code_execution_20250825")]
+    CodeExecution20250825 { tool_id: String },
+    /// A caller kind this build does not know, kept as the upstream sent it:
+    /// a `tool_use` block of an upstream answer must parse whatever caller the
+    /// public API adds later, and leave with the same object.
+    #[serde(untagged)]
+    Other(Value),
+}
+
+/// Stop reasons
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StopReason {
+    /// The model reached a natural stopping point
+    EndTurn,
+    /// We exceeded the requested max_tokens
+    MaxTokens,
+    /// One of the custom stop_sequences was generated
+    StopSequence,
+    /// The model invoked one or more tools
+    ToolUse,
+    /// We paused a long-running turn
+    PauseTurn,
+    /// Streaming classifiers intervened
+    Refusal,
+    /// The response filled the model's context window before it reached
+    /// `max_tokens`: the client treats it as truncated and does not retry
+    /// with a larger budget
+    ModelContextWindowExceeded,
+}
+
+/// Billing and rate-limit usage.
+///
+/// The public API writes the cache counters, the cache-creation breakdown,
+/// the service tier and the inference geography on every message (zero,
+/// "standard" and "not_available" when nothing else applies), so those keys
+/// are always serialized; `output_tokens_details` comes with thinking and
+/// `server_tool_use` with a server tool, as the public API sends them.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(rename = "MessagesUsage")]
+pub struct Usage {
+    /// The number of input tokens used
+    pub input_tokens: u32,
+
+    /// The number of output tokens used
+    pub output_tokens: u32,
+
+    /// The number of input tokens used to create the cache entry
+    #[serialize_always]
+    pub cache_creation_input_tokens: Option<u32>,
+
+    /// The number of input tokens read from the cache
+    #[serialize_always]
+    pub cache_read_input_tokens: Option<u32>,
+
+    /// Breakdown of cached tokens by TTL
+    #[serialize_always]
+    pub cache_creation: Option<CacheCreation>,
+
+    /// Server tool usage information
+    pub server_tool_use: Option<ServerToolUsage>,
+
+    /// Service tier used for the request
+    #[serialize_always]
+    pub service_tier: Option<String>,
+
+    /// Where the request was served (`not_available` when the deployment
+    /// does not say)
+    #[serialize_always]
+    pub inference_geo: Option<String>,
+
+    /// Breakdown of the output tokens, present when thinking ran
+    pub output_tokens_details: Option<OutputTokensDetails>,
+}
+
+/// Cache creation breakdown by cache lifetime
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CacheCreation {
+    /// Input tokens written to the five-minute cache
+    #[serde(default)]
+    pub ephemeral_5m_input_tokens: u32,
+
+    /// Input tokens written to the one-hour cache
+    #[serde(default)]
+    pub ephemeral_1h_input_tokens: u32,
+}
+
+/// Breakdown of the output tokens
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct OutputTokensDetails {
+    /// Output tokens spent on thinking
+    pub thinking_tokens: u32,
+}
+
+impl Usage {
+    /// The usage of a message served from a deployment of this gateway:
+    /// the counts, the cache counters at zero until
+    /// [`Self::with_cache_read_input_tokens`] writes the engine's prefix-cache
+    /// hit, the standard tier, no geography.
+    pub fn from_counts(input_tokens: u32, output_tokens: u32) -> Self {
+        Self {
+            input_tokens,
+            output_tokens,
+            cache_creation_input_tokens: Some(0),
+            cache_read_input_tokens: Some(0),
+            cache_creation: Some(CacheCreation::default()),
+            server_tool_use: None,
+            service_tier: Some(SERVICE_TIER_STANDARD.to_owned()),
+            inference_geo: Some(INFERENCE_GEO_NOT_AVAILABLE.to_owned()),
+            output_tokens_details: None,
+        }
+    }
+
+    /// Report the thinking tokens of a turn that ran with thinking.
+    pub fn with_thinking_tokens(mut self, thinking_tokens: u32) -> Self {
+        self.output_tokens_details = Some(OutputTokensDetails { thinking_tokens });
+        self
+    }
+
+    /// Report the prompt tokens the engine served from its prefix cache as
+    /// `cache_read_input_tokens`, zero included: the key is always written and
+    /// the count says how much of the prompt was read from the cache.
+    /// `input_tokens` stays what [`Self::from_counts`] was given: on this wire
+    /// it is the input outside the cache and the prompt is the two counts
+    /// together, so a caller holding an engine's whole-prompt count passes the
+    /// prompt less the hit. `cache_creation_input_tokens` and its breakdown
+    /// stay zero: a deployment of this gateway writes no breakpoint-driven
+    /// cache entries of its own, so it measures no cache creation.
+    pub fn with_cache_read_input_tokens(mut self, cache_read_input_tokens: u32) -> Self {
+        self.cache_read_input_tokens = Some(cache_read_input_tokens);
+        self
+    }
+}
+
+/// The service tier of a message nobody prioritized or batched.
+pub const SERVICE_TIER_STANDARD: &str = "standard";
+
+/// The inference geography of a deployment that reports none.
+pub const INFERENCE_GEO_NOT_AVAILABLE: &str = "not_available";
+
+/// Server tool usage information
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ServerToolUsage {
+    pub web_search_requests: u32,
+}
+
+// ============================================================================
+// Streaming Event Types
+// ============================================================================
+
+/// Server-sent event wrapper
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MessageStreamEvent {
+    /// Start of a new message
+    MessageStart { message: Message },
+    /// Update to a message
+    MessageDelta {
+        delta: MessageDelta,
+        usage: MessageDeltaUsage,
+    },
+    /// End of a message
+    MessageStop,
+    /// Start of a content block
+    ContentBlockStart {
+        index: u32,
+        content_block: ContentBlock,
+    },
+    /// Update to a content block
+    ContentBlockDelta {
+        index: u32,
+        delta: ContentBlockDelta,
+    },
+    /// End of a content block
+    ContentBlockStop { index: u32 },
+    /// Ping event (for keep-alive)
+    Ping,
+    /// Error event
+    Error { error: ErrorResponse },
+}
+
+impl MessageStreamEvent {
+    /// The events that close a streamed `thinking` block at `index` as the
+    /// public API closes one: a `signature_delta` just before the
+    /// `content_block_stop`, preceded by one empty `thinking_delta` when the
+    /// block's text was withheld (`thinking.display: omitted`). The gateway
+    /// has no signature to give, so the delta carries the empty string the
+    /// whole answer reports too.
+    pub fn thinking_block_close(index: u32, text_withheld: bool) -> impl Iterator<Item = Self> {
+        text_withheld
+            .then(|| Self::ContentBlockDelta {
+                index,
+                delta: ContentBlockDelta::ThinkingDelta {
+                    thinking: String::new(),
+                },
+            })
+            .into_iter()
+            .chain([
+                Self::ContentBlockDelta {
+                    index,
+                    delta: ContentBlockDelta::SignatureDelta {
+                        signature: String::new(),
+                    },
+                },
+                Self::ContentBlockStop { index },
+            ])
+    }
+}
+
+/// Message delta for streaming updates: the public API writes all four
+/// keys on the final `message_delta`, null where nothing applies.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MessageDelta {
+    pub stop_reason: Option<StopReason>,
+
+    pub stop_sequence: Option<String>,
+
+    #[serde(default)]
+    pub stop_details: Option<Value>,
+
+    #[serde(default)]
+    pub container: Option<Value>,
+}
+
+/// Usage delta for streaming updates. The token counts are always written
+/// (`input_tokens` null until the engine's count is known), `output_tokens_details`
+/// comes with thinking and `server_tool_use` with a server tool.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MessageDeltaUsage {
+    pub output_tokens: u32,
+
+    #[serialize_always]
+    pub input_tokens: Option<u32>,
+
+    #[serialize_always]
+    pub cache_creation_input_tokens: Option<u32>,
+
+    #[serialize_always]
+    pub cache_read_input_tokens: Option<u32>,
+
+    pub server_tool_use: Option<ServerToolUsage>,
+
+    pub output_tokens_details: Option<OutputTokensDetails>,
+}
+
+/// Content block delta for streaming updates
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "variant names match the OpenAI/Anthropic streaming delta type discriminators (text_delta, input_json_delta, etc.)"
+)]
+pub enum ContentBlockDelta {
+    /// Text delta
+    TextDelta { text: String },
+    /// JSON input delta (for tool use)
+    InputJsonDelta { partial_json: String },
+    /// Thinking delta
+    ThinkingDelta { thinking: String },
+    /// Signature delta
+    SignatureDelta { signature: String },
+    /// Citations delta
+    CitationsDelta { citation: Citation },
+}
+
+// ============================================================================
+// Error Types
+// ============================================================================
+
+/// Error response
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(rename = "MessagesErrorResponse")]
+pub struct ErrorResponse {
+    #[serde(rename = "type")]
+    pub error_type: String,
+
+    pub message: String,
+
+    /// The code a client switches on before it retries, with what the
+    /// refusal names; the message-thread errors carry one, the others none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<ErrorDetails>,
+}
+
+impl ErrorResponse {
+    /// An error of `error_type` with `message` and no `details`.
+    pub fn new(error_type: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            error_type: error_type.into(),
+            message: message.into(),
+            details: None,
+        }
+    }
+}
+
+/// The `error.details` of a Messages error: `error_code`, which a client
+/// reads before it retries (a continue refused as `thread_not_found` is
+/// replayed as a new create request, a `thread_fingerprint_mismatch` is
+/// not), and under `unsupported` the request features a refusal names.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(rename = "MessagesErrorDetails")]
+pub struct ErrorDetails {
+    pub error_code: String,
+    pub unsupported: Option<Vec<String>>,
+}
+
+/// The body of an error on the Messages API:
+/// `{"type": "error", "error": {"type", "message"}, "request_id": "..."}`.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(rename = "MessagesErrorEnvelope")]
+pub struct ErrorEnvelope {
+    /// Always `"error"`.
+    #[serde(rename = "type")]
+    pub envelope_type: String,
+
+    pub error: ErrorResponse,
+
+    /// The id of the request the error answers (also the `x-request-id` header).
+    pub request_id: String,
+}
+
+impl ErrorEnvelope {
+    /// Wraps an error with the id of the request it answers.
+    pub fn new(error: ErrorResponse, request_id: impl Into<String>) -> Self {
+        Self {
+            envelope_type: "error".to_string(),
+            error,
+            request_id: request_id.into(),
+        }
+    }
+}
+
+/// API error types
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "variant names match the OpenAI API error type discriminators (invalid_request_error, authentication_error, etc.)"
+)]
+pub enum ApiError {
+    InvalidRequestError { message: String },
+    AuthenticationError { message: String },
+    BillingError { message: String },
+    PermissionError { message: String },
+    NotFoundError { message: String },
+    RateLimitError { message: String },
+    TimeoutError { message: String },
+    ApiError { message: String },
+    OverloadedError { message: String },
+}
+
+// ============================================================================
+// Count Tokens Types
+// ============================================================================
+
+/// Request to count tokens in a message
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, Validate, schemars::JsonSchema)]
+#[validate(schema(function = "validate_count_message_tokens_request"))]
+pub struct CountMessageTokensRequest {
+    /// The model to use for token counting
+    #[validate(length(min = 1, message = "model field is required and cannot be empty"))]
+    pub model: String,
+
+    /// Input messages
+    #[validate(length(min = 1, message = "at least one message is required"))]
+    pub messages: Vec<InputMessage>,
+
+    /// System prompt
+    pub system: Option<SystemContent>,
+
+    /// Thinking configuration
+    pub thinking: Option<ThinkingConfig>,
+
+    /// Tool choice
+    pub tool_choice: Option<ToolChoice>,
+
+    /// Tool definitions
+    pub tools: Option<Vec<Tool>>,
+
+    /// The effort the prompt is rendered with, and the config's other keys
+    /// (boxed as [`CreateMessageRequest::output_config`] is).
+    pub output_config: Option<Box<OutputConfig>>,
+
+    /// The thread of a Messages request, which a count takes none of: the
+    /// count reads the whole conversation, with its `system` and `tools`.
+    pub thread: Option<Value>,
+
+    /// Additional backend-specific token counting options.
+    #[serde(flatten)]
+    pub other: Map<String, Value>,
+}
+
+impl Normalizable for CountMessageTokensRequest {
+    // Use default no-op implementation
+}
+
+/// A count reads the whole conversation: `thread` is refused, as the public
+/// API refuses it, and the client counts what a create request would send.
+fn validate_count_message_tokens_request(
+    req: &CountMessageTokensRequest,
+) -> Result<(), validator::ValidationError> {
+    if req.thread.is_some() {
+        return Err(invalid(
+            "thread_not_counted",
+            "thread: count_tokens takes no thread; count the whole conversation, with its system and tools",
+        ));
+    }
+    Ok(())
+}
+
+impl CountMessageTokensRequest {
+    /// The request's custom tools as chat tools, as [`CreateMessageRequest::chat_tools`].
+    pub fn chat_tools(&self) -> Vec<common::Tool> {
+        self.tools.as_deref().map(chat_tools).unwrap_or_default()
+    }
+
+    /// Whether the request's final message is an assistant prefill the
+    /// response continues (see [`continues_final_assistant`]).
+    pub fn continues_final_assistant(&self) -> bool {
+        continues_final_assistant(&self.messages)
+    }
+
+    /// `output_config.effort`, the request's `reasoning_effort`
+    /// ([`Self::template_reasoning_effort_for`] is the one the template renders).
+    pub fn reasoning_effort(&self) -> Option<&str> {
+        self.output_config.as_ref()?.effort.as_deref()
+    }
+
+    /// The `reasoning_effort` the prompt is rendered with: the effort as the
+    /// model's provider profile hands it to the template
+    /// ([`ProviderProfile::template_reasoning_effort`]), given the thinking
+    /// preference the prompt renders with ([`Self::template_thinking_for`]).
+    pub fn template_reasoning_effort_for(&self, provider: ProviderProfile) -> Option<&str> {
+        provider.template_reasoning_effort(
+            self.reasoning_effort(),
+            self.template_thinking_for(provider),
+        )
+    }
+
+    /// The thinking preference the prompt is rendered with.
+    pub fn template_thinking(&self) -> Option<bool> {
+        self.template_thinking_for(ProviderProfile::for_model(&self.model))
+    }
+
+    /// [`Self::template_thinking`] with the model's provider profile the caller
+    /// derived already.
+    pub fn template_thinking_for(&self, provider: ProviderProfile) -> Option<bool> {
+        let thinking = self.thinking.as_ref().map(ThinkingConfig::enabled);
+        template_thinking_for(provider, thinking, self.reasoning_effort())
+    }
+}
+
+impl GenerationRequest for CountMessageTokensRequest {
+    fn is_stream(&self) -> bool {
+        false
+    }
+
+    fn get_model(&self) -> Option<&str> {
+        Some(&self.model)
+    }
+
+    fn extract_text_for_routing(&self) -> String {
+        routing_text(self.system.as_ref(), &self.messages)
+    }
+}
+
+/// Response from token counting
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CountMessageTokensResponse {
+    pub input_tokens: u32,
+}
+
+// ============================================================================
+// Model Info Types
+// ============================================================================
+
+/// A model entry of the Anthropic-shaped inventory, the public API's
+/// `ModelInfo`: every field of the contract, the ones a served model has no
+/// value for as `null` (the vendor's catalogue fields `capabilities`, `line`,
+/// `deprecated_at`, `retires_at`).
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ModelInfo {
+    /// Object type (always "model")
+    #[serde(rename = "type")]
+    pub model_type: String,
+
+    /// Model ID
+    pub id: String,
+
+    /// Display name
+    pub display_name: String,
+
+    /// When the model was created
+    pub created_at: String,
+
+    /// The model's lifecycle stage, `active`, `deprecated` or `retired`: the
+    /// retirement signal the contract tells clients to read. Every model the
+    /// gateway serves itself is `active`; an upstream's entry keeps the stage
+    /// the upstream says.
+    #[serde(default = "ModelInfo::active")]
+    pub lifecycle: String,
+
+    /// The capability map of the vendor's catalogue; none is known here.
+    #[serde(default)]
+    pub capabilities: Option<Value>,
+
+    /// The model line of the vendor's catalogue; none is known here.
+    #[serde(default)]
+    pub line: Option<String>,
+
+    /// The largest `max_tokens` the model takes: its context length, when the
+    /// card carries one (the gateway caps the output by nothing else).
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+
+    /// The model's context window in tokens, when the card carries one.
+    #[serde(default)]
+    pub max_input_tokens: Option<u32>,
+
+    /// When the model was deprecated; `null` while it is `active`.
+    #[serde(default)]
+    pub deprecated_at: Option<String>,
+
+    /// When the model is scheduled to retire; `null` while it is `active`.
+    #[serde(default)]
+    pub retires_at: Option<String>,
+}
+
+impl ModelInfo {
+    /// The entry a self-hosted model card makes in the Anthropic-shaped
+    /// inventory. The display name falls back to the id; a card carries no
+    /// creation time, so `created_at` is the epoch, the counterpart of the
+    /// OpenAI-shaped list's `created: 0`; the token limits are the card's
+    /// context length.
+    pub fn from_model_card(card: &ModelCard) -> Self {
+        Self {
+            model_type: "model".to_owned(),
+            id: card.id.clone(),
+            display_name: card.display_name.clone().unwrap_or_else(|| card.id.clone()),
+            created_at: UNKNOWN_CREATED_AT.to_owned(),
+            lifecycle: Self::active(),
+            capabilities: None,
+            line: None,
+            max_tokens: card.context_length,
+            max_input_tokens: card.context_length,
+            deprecated_at: None,
+            retires_at: None,
+        }
+    }
+
+    /// The lifecycle stage of every served model.
+    fn active() -> String {
+        "active".to_owned()
+    }
+}
+
+/// `created_at` of a model whose creation time nobody recorded.
+const UNKNOWN_CREATED_AT: &str = "1970-01-01T00:00:00Z";
+
+/// The query of `GET /v1/models` in the Anthropic shape: `limit` (1 to 1000,
+/// 20 by default), one of the cursors `after_id` and `before_id` (the id of
+/// an entry; the page is the one after or before it), and the `lifecycle`
+/// to keep (`active`, `deprecated` or `retired`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ListModelsQuery {
+    pub limit: Option<u32>,
+    pub after_id: Option<String>,
+    pub before_id: Option<String>,
+    pub lifecycle: Option<String>,
+}
+
+impl ListModelsQuery {
+    /// The page size when the query names none.
+    pub const DEFAULT_LIMIT: u32 = 20;
+    /// The largest page the public API serves.
+    pub const MAX_LIMIT: u32 = 1000;
+
+    /// The query of a request's URI (`None` or empty: the defaults); a value
+    /// the contract does not take is the refusal's message, naming the
+    /// parameter. Parameters the contract does not name are ignored.
+    pub fn parse(query: Option<&str>) -> Result<Self, String> {
+        let mut parsed = Self::default();
+        for (key, value) in url::form_urlencoded::parse(query.unwrap_or("").as_bytes()) {
+            match &*key {
+                "limit" => {
+                    let limit = value
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|limit| (1..=Self::MAX_LIMIT).contains(limit))
+                        .ok_or_else(|| {
+                            format!(
+                                "limit: Input should be an integer from 1 to {}, got {value:?}",
+                                Self::MAX_LIMIT
+                            )
+                        })?;
+                    parsed.limit = Some(limit);
+                }
+                "after_id" => parsed.after_id = Some(value.into_owned()),
+                "before_id" => parsed.before_id = Some(value.into_owned()),
+                "lifecycle" => {
+                    if !["active", "deprecated", "retired"].contains(&&*value) {
+                        return Err(format!(
+                            "lifecycle: Input should be 'active', 'deprecated' or 'retired', got {value:?}"
+                        ));
+                    }
+                    parsed.lifecycle = Some(value.into_owned());
+                }
+                _ => {}
+            }
+        }
+        if parsed.after_id.is_some() && parsed.before_id.is_some() {
+            return Err("after_id and before_id: only one cursor can be given".to_owned());
+        }
+        Ok(parsed)
+    }
+
+    /// The page size asked for, or the default.
+    pub fn limit(&self) -> usize {
+        self.limit.unwrap_or(Self::DEFAULT_LIMIT) as usize
+    }
+
+    /// Whether the query narrows the list, by a cursor or a lifecycle: then
+    /// an empty page is the list's answer (nothing past the cursor, nothing
+    /// in that stage), where an empty page of the plain list, under any
+    /// `limit`, is an empty inventory.
+    pub fn narrows(&self) -> bool {
+        self.after_id.is_some() || self.before_id.is_some() || self.lifecycle.is_some()
+    }
+
+    /// The query as a URI carries it, the parameters the contract names and
+    /// the request gave alone (empty for the defaults): what an upstream
+    /// answering a caller's own credential is asked for.
+    pub fn to_query_string(&self) -> String {
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        if let Some(limit) = self.limit {
+            query.append_pair("limit", &limit.to_string());
+        }
+        for (name, value) in [
+            ("after_id", &self.after_id),
+            ("before_id", &self.before_id),
+            ("lifecycle", &self.lifecycle),
+        ] {
+            if let Some(value) = value {
+                query.append_pair(name, value);
+            }
+        }
+        query.finish()
+    }
+}
+
+/// List of models response
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ListModelsResponse {
+    pub data: Vec<ModelInfo>,
+    pub has_more: bool,
+    pub first_id: Option<String>,
+    pub last_id: Option<String>,
+}
+
+impl ListModelsResponse {
+    /// The page `query` asks of the inventory, deduplicated by model id (the
+    /// first card of an id wins) in the order given: the first `limit`
+    /// entries, the ones after the `after_id` entry or the ones just before
+    /// the `before_id` entry, with the page markers the public list carries;
+    /// `has_more` says whether the inventory goes on past the page in the
+    /// direction read. Every served model is `active`, so another
+    /// `lifecycle` keeps nothing. A cursor that names no entry is the
+    /// refusal's message.
+    pub fn from_model_cards(
+        cards: impl IntoIterator<Item = ModelCard>,
+        query: &ListModelsQuery,
+    ) -> Result<Self, String> {
+        let mut seen = HashSet::new();
+        let entries: Vec<ModelInfo> = cards
+            .into_iter()
+            .filter(|card| seen.insert(card.id.clone()))
+            .filter(|_| {
+                query
+                    .lifecycle
+                    .as_deref()
+                    .is_none_or(|stage| stage == "active")
+            })
+            .map(|card| ModelInfo::from_model_card(&card))
+            .collect();
+        let position = |field: &str, id: &str| {
+            entries
+                .iter()
+                .position(|entry| entry.id == id)
+                .ok_or_else(|| format!("{field}: no model {id:?} in the list"))
+        };
+        let limit = query.limit();
+        let (start, end, has_more) = match (&query.after_id, &query.before_id) {
+            (Some(after), _) => {
+                let start = position("after_id", after)? + 1;
+                let end = entries.len().min(start + limit);
+                (start, end, end < entries.len())
+            }
+            (None, Some(before)) => {
+                let end = position("before_id", before)?;
+                let start = end.saturating_sub(limit);
+                (start, end, start > 0)
+            }
+            (None, None) => {
+                let end = entries.len().min(limit);
+                (0, end, end < entries.len())
+            }
+        };
+        let data: Vec<ModelInfo> = entries.into_iter().skip(start).take(end - start).collect();
+        Ok(Self {
+            first_id: data.first().map(|m| m.id.clone()),
+            last_id: data.last().map(|m| m.id.clone()),
+            has_more,
+            data,
+        })
+    }
+}
+
+// ============================================================================
+// Beta Features - Container & MCP Configuration
+// ============================================================================
+
+/// The request's container (beta), in either form the public API takes: the
+/// id of a container to reuse, or its configuration. It is read by hand, as
+/// [`SystemContent`] is, so a malformed container is refused with the error
+/// of the form it took, not an untagged enum's "did not match any variant".
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum MessagesContainer {
+    Id(String),
+    Config(ContainerConfig),
+}
+
+impl<'de> Deserialize<'de> for MessagesContainer {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ContainerVisitor;
+
+        impl<'de> Visitor<'de> for ContainerVisitor {
+            type Value = MessagesContainer;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a container id or a container configuration")
+            }
+
+            fn visit_str<E: de::Error>(self, id: &str) -> Result<Self::Value, E> {
+                Ok(MessagesContainer::Id(id.to_owned()))
+            }
+
+            fn visit_string<E: de::Error>(self, id: String) -> Result<Self::Value, E> {
+                Ok(MessagesContainer::Id(id))
+            }
+
+            fn visit_map<A: de::MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+                ContainerConfig::deserialize(de::value::MapAccessDeserializer::new(map))
+                    .map(MessagesContainer::Config)
+            }
+        }
+
+        deserializer.deserialize_any(ContainerVisitor)
+    }
+}
+
+/// Container configuration for code execution (beta)
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ContainerConfig {
+    /// Container ID for reuse across requests
+    pub id: Option<String>,
+}
+
+/// MCP server configuration (beta)
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct McpServerConfig {
+    /// Server type (always "url")
+    #[serde(rename = "type", default = "McpServerConfig::default_type")]
+    pub server_type: String,
+
+    /// Name of the MCP server
+    pub name: String,
+
+    /// MCP server URL
+    pub url: String,
+
+    /// Authorization token (if required)
+    pub authorization_token: Option<String>,
+
+    /// Tool configuration for this server
+    pub tool_configuration: Option<McpToolConfiguration>,
+}
+
+impl McpServerConfig {
+    fn default_type() -> String {
+        "url".to_string()
+    }
+}
+
+/// MCP tool configuration
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct McpToolConfiguration {
+    /// Whether to allow all tools
+    pub enabled: Option<bool>,
+
+    /// Allowed tool names
+    pub allowed_tools: Option<Vec<String>>,
+}
+
+// ============================================================================
+// Beta Features - MCP Tool Types
+// ============================================================================
+
+/// MCP tool use block (beta) - for assistant messages
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct McpToolUseBlock {
+    /// Unique identifier for this tool use
+    pub id: String,
+
+    /// Name of the tool being used
+    pub name: String,
+
+    /// Name of the MCP server
+    pub server_name: String,
+
+    /// Input arguments for the tool
+    pub input: Value,
+
+    /// Cache control for this block
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
+}
+
+/// MCP tool result block (beta) - for user messages
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct McpToolResultBlock {
+    /// The ID of the tool use this is a result for
+    pub tool_use_id: String,
+
+    /// The result content
+    pub content: Option<ToolResultContent>,
+
+    /// Whether this result indicates an error
+    pub is_error: Option<bool>,
+
+    /// Cache control for this block
+    pub cache_control: Option<CacheControl>,
+}
+
+/// MCP toolset definition (beta)
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct McpToolset {
+    #[serde(rename = "type")]
+    pub toolset_type: String, // "mcp_toolset"
+
+    /// Name of the MCP server to configure tools for
+    pub mcp_server_name: String,
+
+    /// Default configuration applied to all tools from this server
+    pub default_config: Option<McpToolDefaultConfig>,
+
+    /// Configuration overrides for specific tools
+    #[serde(serialize_with = "crate::common::serialize_with_sorted_keys")]
+    pub configs: Option<HashMap<String, McpToolConfig>>,
+
+    /// Cache control for this toolset
+    pub cache_control: Option<CacheControl>,
+}
+
+/// Default configuration for MCP tools
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct McpToolDefaultConfig {
+    /// Whether tools are enabled
+    pub enabled: Option<bool>,
+
+    /// Whether to defer loading
+    pub defer_loading: Option<bool>,
+}
+
+/// Per-tool MCP configuration
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct McpToolConfig {
+    /// Whether this tool is enabled
+    pub enabled: Option<bool>,
+
+    /// Whether to defer loading
+    pub defer_loading: Option<bool>,
+}
+
+// ============================================================================
+// Beta Features - Code Execution Types
+// ============================================================================
+
+/// Code execution tool (beta)
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CodeExecutionTool {
+    #[serde(rename = "type")]
+    pub tool_type: String, // "code_execution_20250522" or "code_execution_20250825"
+
+    pub name: String, // "code_execution"
+
+    /// Allowed callers for this tool
+    pub allowed_callers: Option<Vec<String>>,
+
+    /// Whether to defer loading
+    pub defer_loading: Option<bool>,
+
+    /// Whether to use strict mode
+    pub strict: Option<bool>,
+
+    /// Cache control for this tool
+    pub cache_control: Option<CacheControl>,
+}
+
+/// Code execution result block (beta)
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CodeExecutionResultBlock {
+    /// Stdout output
+    pub stdout: String,
+
+    /// Stderr output
+    pub stderr: String,
+
+    /// Return code
+    pub return_code: i32,
+
+    /// Output files
+    pub content: Vec<CodeExecutionOutputBlock>,
+}
+
+/// Code execution output file reference
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CodeExecutionOutputBlock {
+    #[serde(rename = "type")]
+    pub block_type: String, // "code_execution_output"
+
+    /// File ID
+    pub file_id: String,
+}
+
+/// Code execution tool result block (beta)
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CodeExecutionToolResultBlock {
+    /// The ID of the tool use this is a result for
+    pub tool_use_id: String,
+
+    /// The result content (success or error)
+    pub content: CodeExecutionToolResultContent,
+
+    /// Cache control for this block
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
+}
+
+/// Code execution tool result content
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum CodeExecutionToolResultContent {
+    Success(CodeExecutionResultBlock),
+    Error(CodeExecutionToolResultError),
+}
+
+/// Code execution tool result error
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CodeExecutionToolResultError {
+    #[serde(rename = "type")]
+    pub error_type: String, // "code_execution_tool_result_error"
+
+    pub error_code: CodeExecutionToolResultErrorCode,
+}
+
+/// Code execution error codes
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeExecutionToolResultErrorCode {
+    Unavailable,
+    CodeExecutionExceededTimeout,
+    ContainerExpired,
+    InvalidToolInput,
+}
+
+/// Bash code execution result block (beta)
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct BashCodeExecutionResultBlock {
+    /// Stdout output
+    pub stdout: String,
+
+    /// Stderr output
+    pub stderr: String,
+
+    /// Return code
+    pub return_code: i32,
+
+    /// Output files
+    pub content: Vec<BashCodeExecutionOutputBlock>,
+}
+
+/// Bash code execution output file reference
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct BashCodeExecutionOutputBlock {
+    #[serde(rename = "type")]
+    pub block_type: String, // "bash_code_execution_output"
+
+    /// File ID
+    pub file_id: String,
+}
+
+/// Bash code execution tool result block (beta)
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct BashCodeExecutionToolResultBlock {
+    /// The ID of the tool use this is a result for
+    pub tool_use_id: String,
+
+    /// The result content (success or error)
+    pub content: BashCodeExecutionToolResultContent,
+
+    /// Cache control for this block
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
+}
+
+/// Bash code execution tool result content
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum BashCodeExecutionToolResultContent {
+    Success(BashCodeExecutionResultBlock),
+    Error(BashCodeExecutionToolResultError),
+}
+
+/// Bash code execution tool result error
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct BashCodeExecutionToolResultError {
+    #[serde(rename = "type")]
+    pub error_type: String, // "bash_code_execution_tool_result_error"
+
+    pub error_code: BashCodeExecutionToolResultErrorCode,
+}
+
+/// Bash code execution error codes
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BashCodeExecutionToolResultErrorCode {
+    Unavailable,
+    CodeExecutionExceededTimeout,
+    ContainerExpired,
+    InvalidToolInput,
+}
+
+/// Text editor code execution tool result block (beta)
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TextEditorCodeExecutionToolResultBlock {
+    /// The ID of the tool use this is a result for
+    pub tool_use_id: String,
+
+    /// The result content
+    pub content: TextEditorCodeExecutionToolResultContent,
+
+    /// Cache control for this block
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
+}
+
+/// Text editor code execution result content
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum TextEditorCodeExecutionToolResultContent {
+    CreateResult(TextEditorCodeExecutionCreateResultBlock),
+    StrReplaceResult(TextEditorCodeExecutionStrReplaceResultBlock),
+    ViewResult(TextEditorCodeExecutionViewResultBlock),
+    Error(TextEditorCodeExecutionToolResultError),
+}
+
+/// Text editor create result block
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TextEditorCodeExecutionCreateResultBlock {
+    #[serde(rename = "type")]
+    pub block_type: String, // "text_editor_code_execution_create_result"
+}
+
+/// Text editor str_replace result block
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TextEditorCodeExecutionStrReplaceResultBlock {
+    #[serde(rename = "type")]
+    pub block_type: String, // "text_editor_code_execution_str_replace_result"
+
+    /// Snippet of content around the replacement
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
+}
+
+/// Text editor view result block
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TextEditorCodeExecutionViewResultBlock {
+    #[serde(rename = "type")]
+    pub block_type: String, // "text_editor_code_execution_view_result"
+
+    /// Content of the viewed file
+    pub content: String,
+}
+
+/// Text editor code execution tool result error
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TextEditorCodeExecutionToolResultError {
+    #[serde(rename = "type")]
+    pub error_type: String,
+
+    pub error_code: TextEditorCodeExecutionToolResultErrorCode,
+}
+
+/// Text editor code execution error codes
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TextEditorCodeExecutionToolResultErrorCode {
+    Unavailable,
+    InvalidToolInput,
+    FileNotFound,
+    ContainerExpired,
+}
+
+// ============================================================================
+// Beta Features - Web Fetch Types
+// ============================================================================
+
+/// Web fetch tool (beta)
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WebFetchTool {
+    #[serde(rename = "type")]
+    pub tool_type: String, // "web_fetch_20250305" or similar
+
+    pub name: String, // "web_fetch"
+
+    /// Allowed callers for this tool
+    pub allowed_callers: Option<Vec<String>>,
+
+    /// Maximum number of uses
+    pub max_uses: Option<u32>,
+
+    /// Cache control for this tool
+    pub cache_control: Option<CacheControl>,
+}
+
+/// Web fetch result block (beta)
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WebFetchResultBlock {
+    #[serde(rename = "type")]
+    pub block_type: String, // "web_fetch_result"
+
+    /// The URL that was fetched
+    pub url: String,
+
+    /// The document content
+    pub content: DocumentBlock,
+
+    /// When the content was retrieved
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieved_at: Option<String>,
+}
+
+/// Web fetch tool result block (beta)
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WebFetchToolResultBlock {
+    /// The ID of the tool use this is a result for
+    pub tool_use_id: String,
+
+    /// The result content (success or error)
+    pub content: WebFetchToolResultContent,
+
+    /// Cache control for this block
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
+}
+
+/// Web fetch tool result content
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum WebFetchToolResultContent {
+    Success(WebFetchResultBlock),
+    Error(WebFetchToolResultError),
+}
+
+/// Web fetch tool result error
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WebFetchToolResultError {
+    #[serde(rename = "type")]
+    pub error_type: String, // "web_fetch_tool_result_error"
+
+    pub error_code: WebFetchToolResultErrorCode,
+}
+
+/// Web fetch error codes
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WebFetchToolResultErrorCode {
+    InvalidToolInput,
+    Unavailable,
+    MaxUsesExceeded,
+    TooManyRequests,
+    UrlNotAllowed,
+    FetchFailed,
+    ContentTooLarge,
+}
+
+// ============================================================================
+// Beta Features - Tool Search Types
+// ============================================================================
+
+/// Tool search tool (beta). The untagged [`Tool`] reads every
+/// Anthropic-defined tool (web search, web fetch, computer use, bash, the text
+/// editor, ...) as this one, so the keys those tools take beyond `type` and
+/// `name` ride in [`Self::extra`].
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ToolSearchTool {
+    #[serde(rename = "type")]
+    pub tool_type: String, // "tool_search_tool_regex" or "tool_search_tool_bm25"
+
+    pub name: String,
+
+    /// Allowed callers for this tool
+    pub allowed_callers: Option<Vec<String>>,
+
+    /// Cache control for this tool
+    pub cache_control: Option<CacheControl>,
+
+    /// The tool's other keys (a web search tool's domain filters and use cap,
+    /// a computer tool's display size, `defer_loading`, `strict`, ...),
+    /// forwarded as written.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// Tool reference block (beta) - returned by tool search
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ToolReferenceBlock {
+    #[serde(rename = "type")]
+    pub block_type: String, // "tool_reference"
+
+    /// Tool name
+    pub tool_name: String,
+
+    /// Tool description
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
+    /// Cache control for this reference, which a replayed tool search result
+    /// may set, as a tool result's reference does
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
+}
+
+/// Tool search result content — wraps tool references returned by tool search
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ToolSearchResultContent {
+    #[serde(rename = "type")]
+    pub block_type: String, // "tool_search_tool_search_result"
+
+    /// Tool references found by the search
+    pub tool_references: Vec<ToolReferenceBlock>,
+}
+
+/// A tool search's result: the tool references it found, or the error it
+/// ended with, as the web search's result is
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum ToolSearchToolResultContent {
+    Results(ToolSearchResultContent),
+    Error(ToolSearchToolResultError),
+}
+
+/// Tool search tool result error
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ToolSearchToolResultError {
+    #[serde(rename = "type")]
+    pub error_type: String, // "tool_search_tool_result_error"
+    pub error_code: ToolSearchToolResultErrorCode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+}
+
+/// Tool search tool result error codes
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolSearchToolResultErrorCode {
+    InvalidToolInput,
+    Unavailable,
+    TooManyRequests,
+    ExecutionTimeExceeded,
+}
+
+/// Tool search tool result block (beta)
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ToolSearchToolResultBlock {
+    /// The ID of the tool use this is a result for
+    pub tool_use_id: String,
+
+    /// The search results or error
+    pub content: ToolSearchToolResultContent,
+
+    /// Cache control for this block
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
+}
+
+// ============================================================================
+// Beta Features - Container Upload Types
+// ============================================================================
+
+/// Container upload block (beta)
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ContainerUploadBlock {
+    #[serde(rename = "type")]
+    pub block_type: String, // "container_upload"
+
+    /// File ID
+    pub file_id: String,
+
+    /// File name
+    pub file_name: String,
+
+    /// File path in container
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+}
+
+// ============================================================================
+// Beta Features - Memory Tool Types
+// ============================================================================
+
+/// Memory tool (beta)
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MemoryTool {
+    #[serde(rename = "type")]
+    pub tool_type: String, // "memory_20250818"
+
+    pub name: String, // "memory"
+
+    /// Allowed callers for this tool
+    pub allowed_callers: Option<Vec<String>>,
+
+    /// Whether to defer loading
+    pub defer_loading: Option<bool>,
+
+    /// Whether to use strict mode
+    pub strict: Option<bool>,
+
+    /// Input examples
+    pub input_examples: Option<Vec<Value>>,
+
+    /// Cache control for this tool
+    pub cache_control: Option<CacheControl>,
+}
+
+// ============================================================================
+// Beta Features - Computer Use Tool Types
+// ============================================================================
+
+/// Computer use tool (beta)
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ComputerUseTool {
+    #[serde(rename = "type")]
+    pub tool_type: String, // "computer_20241022" or "computer_20250124"
+
+    pub name: String, // "computer"
+
+    /// Display width
+    pub display_width_px: u32,
+
+    /// Display height
+    pub display_height_px: u32,
+
+    /// Display number (optional)
+    pub display_number: Option<u32>,
+
+    /// Allowed callers for this tool
+    pub allowed_callers: Option<Vec<String>>,
+
+    /// Cache control for this tool
+    pub cache_control: Option<CacheControl>,
+}
+
+// ============================================================================
+// Beta Features - Extended Input Content Block Enum
+// ============================================================================
+
+/// Beta input content block types (extends InputContentBlock)
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BetaInputContentBlock {
+    // Standard types
+    Text(TextBlock),
+    Image(ImageBlock),
+    Document(DocumentBlock),
+    ToolUse(ToolUseBlock),
+    ToolResult(ToolResultBlock),
+    Thinking(ThinkingBlock),
+    RedactedThinking(RedactedThinkingBlock),
+    ServerToolUse(ServerToolUseBlock),
+    SearchResult(SearchResultBlock),
+    WebSearchToolResult(WebSearchToolResultBlock),
+
+    // Beta MCP types
+    McpToolUse(McpToolUseBlock),
+    McpToolResult(McpToolResultBlock),
+
+    // Beta code execution types
+    CodeExecutionToolResult(CodeExecutionToolResultBlock),
+    BashCodeExecutionToolResult(BashCodeExecutionToolResultBlock),
+    TextEditorCodeExecutionToolResult(TextEditorCodeExecutionToolResultBlock),
+
+    // Beta web fetch types
+    WebFetchToolResult(WebFetchToolResultBlock),
+
+    // Beta tool search types
+    ToolSearchToolResult(ToolSearchToolResultBlock),
+    ToolReference(ToolReferenceBlock),
+
+    // Beta container types
+    ContainerUpload(ContainerUploadBlock),
+}
+
+/// Beta output content block types (extends ContentBlock)
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BetaContentBlock {
+    // Standard types
+    Text {
+        text: String,
+        citations: Option<Vec<Citation>>,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    Thinking {
+        thinking: String,
+        signature: String,
+    },
+    RedactedThinking {
+        data: String,
+    },
+    ServerToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    WebSearchToolResult {
+        tool_use_id: String,
+        content: WebSearchToolResultContent,
+    },
+
+    // Beta MCP types
+    McpToolUse {
+        id: String,
+        name: String,
+        server_name: String,
+        input: Value,
+    },
+    McpToolResult {
+        tool_use_id: String,
+        content: Option<ToolResultContent>,
+        is_error: Option<bool>,
+    },
+
+    // Beta code execution types
+    CodeExecutionToolResult {
+        tool_use_id: String,
+        content: CodeExecutionToolResultContent,
+    },
+    BashCodeExecutionToolResult {
+        tool_use_id: String,
+        content: BashCodeExecutionToolResultContent,
+    },
+    TextEditorCodeExecutionToolResult {
+        tool_use_id: String,
+        content: TextEditorCodeExecutionToolResultContent,
+    },
+
+    // Beta web fetch types
+    WebFetchToolResult {
+        tool_use_id: String,
+        content: WebFetchToolResultContent,
+    },
+
+    // Beta tool search types
+    ToolSearchToolResult {
+        tool_use_id: String,
+        content: ToolSearchToolResultContent,
+    },
+    ToolReference {
+        tool_name: String,
+        description: Option<String>,
+    },
+
+    // Beta container types
+    ContainerUpload {
+        file_id: String,
+        file_name: String,
+        file_path: Option<String>,
+    },
+}
+
+/// Beta tool definition (extends Tool)
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum BetaTool {
+    // Standard tools
+    Custom(CustomTool),
+    Bash(BashTool),
+    TextEditor(TextEditorTool),
+    WebSearch(WebSearchTool),
+
+    // Beta tools
+    CodeExecution(CodeExecutionTool),
+    McpToolset(McpToolset),
+    WebFetch(WebFetchTool),
+    ToolSearch(ToolSearchTool),
+    Memory(MemoryTool),
+    ComputerUse(ComputerUseTool),
+}
+
+/// Server tool names for beta features
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BetaServerToolName {
+    WebSearch,
+    WebFetch,
+    CodeExecution,
+    BashCodeExecution,
+    TextEditorCodeExecution,
+    ToolSearchToolRegex,
+    ToolSearchToolBm25,
+}
+
+/// Server tool caller types (beta)
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ServerToolCaller {
+    /// Direct caller (the model itself)
+    Direct,
+    /// Code execution caller
+    #[serde(rename = "code_execution_20250825")]
+    CodeExecution20250825,
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{self, json};
+
+    use super::*;
+
+    /// The usage of a message served here writes both cache counters as
+    /// integers: zero from the counts alone, the engine's prefix-cache hit
+    /// once it is reported beside the input outside the cache (a 945-token
+    /// prompt with 896 read from the cache), while the creation counter and
+    /// its breakdown stay zero either way.
+    #[test]
+    fn the_cache_read_counter_is_the_engines_hit_and_the_creation_counter_stays_zero() {
+        let plain = serde_json::to_value(Usage::from_counts(945, 12)).unwrap();
+        assert_eq!(plain["input_tokens"], 945);
+        assert_eq!(plain["cache_read_input_tokens"], 0);
+        assert_eq!(plain["cache_creation_input_tokens"], 0);
+
+        let hit =
+            serde_json::to_value(Usage::from_counts(49, 12).with_cache_read_input_tokens(896))
+                .unwrap();
+        assert_eq!(hit["input_tokens"], 49);
+        assert_eq!(hit["cache_read_input_tokens"], 896);
+        assert_eq!(hit["cache_creation_input_tokens"], 0);
+        assert_eq!(
+            hit["cache_creation"],
+            json!({"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 0})
+        );
+
+        let miss =
+            serde_json::to_value(Usage::from_counts(945, 12).with_cache_read_input_tokens(0))
+                .unwrap();
+        assert_eq!(
+            miss["cache_read_input_tokens"], 0,
+            "a miss is an integer zero, never null"
+        );
+    }
+
+    /// An assistant message carrying an MCP exchange, as the Messages API
+    /// answers one under the MCP beta, is read as input: a stored MCP turn
+    /// continues and a client's replay of it is accepted.
+    #[test]
+    fn an_mcp_exchange_is_read_as_input() {
+        let message: InputMessage = serde_json::from_value(json!({
+            "role": "assistant",
+            "content": [
+                {"type": "mcp_tool_use", "id": "mcptoolu_1", "name": "lookup", "server_name": "s", "input": {"q": "x"}},
+                {"type": "mcp_tool_result", "tool_use_id": "mcptoolu_1", "content": [{"type": "text", "text": "42"}]},
+                {"type": "text", "text": "it is 42"}
+            ]
+        }))
+        .expect("an MCP exchange is input");
+        let InputContent::Blocks(blocks) = &message.content else {
+            panic!("blocks");
+        };
+        assert!(matches!(
+            &blocks[..],
+            [
+                InputContentBlock::McpToolUse(mcp_use),
+                InputContentBlock::McpToolResult(result),
+                InputContentBlock::Text(_)
+            ] if mcp_use.server_name == "s" && result.tool_use_id == "mcptoolu_1"
+        ));
+        let written = serde_json::to_value(&message).expect("serializes");
+        assert_eq!(written["content"][0]["type"], "mcp_tool_use");
+        assert_eq!(written["content"][1]["type"], "mcp_tool_result");
+    }
+
+    /// A conversation replaying the public API's server tool results (web
+    /// fetch, code execution, bash, the text editor) and a container upload
+    /// reads them as input and writes them back as sent, on a create and on a
+    /// token count alike.
+    #[test]
+    fn a_replayed_server_tool_result_or_container_upload_is_accepted() {
+        let assistant = json!({"role": "assistant", "content": [
+            {"type": "web_fetch_tool_result", "tool_use_id": "srvtoolu_1", "caller": {"type": "direct"},
+             "content": {"type": "web_fetch_result", "url": "https://example.com",
+                         "content": {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "page"}}}},
+            {"type": "code_execution_tool_result", "tool_use_id": "srvtoolu_2",
+             "content": {"type": "code_execution_result", "stdout": "4\n", "stderr": "", "return_code": 0, "content": []}},
+            {"type": "bash_code_execution_tool_result", "tool_use_id": "srvtoolu_3", "cache_control": {"type": "ephemeral"},
+             "content": {"type": "bash_code_execution_result", "stdout": "ok", "stderr": "", "return_code": 0, "content": []}},
+            {"type": "text_editor_code_execution_tool_result", "tool_use_id": "srvtoolu_4",
+             "content": {"type": "text_editor_code_execution_view_result", "file_type": "text", "content": "x = 1",
+                         "num_lines": 1, "start_line": 1, "total_lines": 1}}
+        ]});
+        let user = json!({"role": "user", "content": [
+            {"type": "container_upload", "file_id": "file_1"},
+            {"type": "text", "text": "run it"}
+        ]});
+        for message in [&assistant, &user] {
+            let parsed: InputMessage = serde_json::from_value(message.clone())
+                .unwrap_or_else(|e| panic!("{message}: {e}"));
+            assert_eq!(&serde_json::to_value(&parsed).unwrap(), message);
+        }
+        let count: CountMessageTokensRequest = serde_json::from_value(json!({
+            "model": "m", "messages": [user.clone(), assistant.clone()]
+        }))
+        .expect("a token count with the blocks reads");
+        assert_eq!(count.messages.len(), 2);
+    }
+
+    /// A content field that is neither a string nor an array of blocks, or
+    /// holds a block that cannot be read, is refused with the block's own
+    /// reason: the unknown `type` with the accepted ones, the missing field,
+    /// the wrong JSON type; never "data did not match any variant".
+    #[test]
+    fn an_unreadable_content_block_is_refused_by_its_own_reason() {
+        let refusal = |message: Value| {
+            serde_json::from_value::<InputMessage>(message)
+                .expect_err("refused")
+                .to_string()
+        };
+        let unknown_block = refusal(json!({
+            "role": "user",
+            "content": [{"type": "a_block_kind_of_no_api", "file_id": "file_1"}]
+        }));
+        assert!(
+            unknown_block.starts_with(
+                "unknown variant `a_block_kind_of_no_api`, expected one of `text`, `image`, `document`, `tool_use`, `tool_result`, `thinking`"
+            ),
+            "{unknown_block}"
+        );
+        assert!(
+            unknown_block.contains("`tool_reference`"),
+            "{unknown_block}"
+        );
+        let unknown_source = refusal(json!({
+            "role": "user",
+            "content": [{"type": "image", "source": {"type": "a_source_of_no_api"}}]
+        }));
+        assert!(
+            unknown_source.starts_with(
+                "unknown variant `a_source_of_no_api`, expected one of `base64`, `url`, `file`"
+            ),
+            "{unknown_source}"
+        );
+        let missing_field = refusal(json!({
+            "role": "user",
+            "content": [{"type": "tool_result", "content": "ok"}]
+        }));
+        assert!(
+            missing_field.starts_with("missing field `tool_use_id`"),
+            "{missing_field}"
+        );
+        let untyped = refusal(json!({"role": "user", "content": [{"text": "hi"}]}));
+        assert!(untyped.starts_with("missing field `type`"), "{untyped}");
+        let null = refusal(json!({"role": "user", "content": null}));
+        assert!(
+            null.starts_with("invalid type: null, expected a string or an array of content blocks"),
+            "{null}"
+        );
+        let number = refusal(json!({"role": "user", "content": 5}));
+        assert!(
+            number.starts_with(
+                "invalid type: integer `5`, expected a string or an array of content blocks"
+            ),
+            "{number}"
+        );
+
+        // The same for the system prompt and a tool result's content.
+        let system = serde_json::from_value::<SystemContent>(json!([{"type": "image"}]))
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            system.starts_with("unknown variant `image`, expected `text`"),
+            "{system}"
+        );
+        let system = serde_json::from_value::<SystemContent>(json!({}))
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            system.starts_with("invalid type: map, expected a string or an array of text blocks"),
+            "{system}"
+        );
+        let result = serde_json::from_value::<ToolResultContent>(
+            json!([{"type": "thinking", "thinking": "x"}]),
+        )
+        .expect_err("refused")
+        .to_string();
+        assert!(
+            result.starts_with(
+                "unknown variant `thinking`, expected one of `text`, `image`, `document`, `search_result`, `tool_reference`"
+            ),
+            "{result}"
+        );
+
+        // Both shapes still read, and round-trip as they are written.
+        for content in [json!("hi"), json!([{"type": "text", "text": "hi"}])] {
+            let message: InputMessage =
+                serde_json::from_value(json!({"role": "user", "content": content}))
+                    .expect("accepted");
+            assert_eq!(serde_json::to_value(&message.content).unwrap(), content);
+        }
+        let system: SystemContent = serde_json::from_value(json!("be brief")).expect("accepted");
+        assert!(matches!(system, SystemContent::String(ref s) if s == "be brief"));
+        let result: ToolResultContent =
+            serde_json::from_value(json!([{"type": "text", "text": "ok"}])).expect("accepted");
+        assert!(matches!(result, ToolResultContent::Blocks(ref b) if b.len() == 1));
+    }
+
+    /// History echoed by Claude Code (a ToolSearch result) and by the Anthropic
+    /// Python SDK (thinking without a signature, or with a null one) parses, and
+    /// is forwarded with the reference intact and an empty signature.
+    #[test]
+    fn echoed_tool_reference_and_unsigned_thinking_are_accepted() {
+        let request: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "m", "max_tokens": 8,
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "t"},
+                    {"type": "thinking", "thinking": "u", "signature": null},
+                    {"type": "tool_use", "id": "t1", "name": "ToolSearch", "input": {}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1",
+                    "content": [{"type": "tool_reference", "tool_name": "WebSearch"}]}]}]
+        }))
+        .expect("a Messages request");
+        let forwarded = serde_json::to_value(&request).unwrap();
+        assert_eq!(forwarded["messages"][1]["content"][0]["signature"], "");
+        assert_eq!(forwarded["messages"][1]["content"][1]["signature"], "");
+        assert_eq!(
+            forwarded["messages"][2]["content"][0]["content"][0],
+            json!({"type": "tool_reference", "tool_name": "WebSearch"})
+        );
+    }
+
+    /// A trailing assistant message is continued when it has text and no
+    /// tool call: as a string, as text blocks, with thinking before the
+    /// text. A tool call closes the turn, and so does a trailing user turn.
+    #[test]
+    fn a_trailing_assistant_message_with_text_and_no_tool_call_is_continued() {
+        let request = |last: Value| -> CreateMessageRequest {
+            serde_json::from_value(json!({
+                "model": "m",
+                "max_tokens": 8,
+                "messages": [{"role": "user", "content": "Hello"}, last]
+            }))
+            .expect("a Messages request")
+        };
+        let text = json!({"type": "text", "text": "Sure"});
+        let thinking = json!({"type": "thinking", "thinking": "hm", "signature": "s"});
+        let tool_use = json!({"type": "tool_use", "id": "t1", "name": "lookup", "input": {}});
+        assert!(
+            request(json!({"role": "assistant", "content": "Sure"})).continues_final_assistant()
+        );
+        assert!(
+            request(json!({"role": "assistant", "content": [text]})).continues_final_assistant()
+        );
+        assert!(
+            request(json!({"role": "assistant", "content": [thinking, text]}))
+                .continues_final_assistant()
+        );
+        assert!(
+            !request(json!({"role": "assistant", "content": [text, tool_use]}))
+                .continues_final_assistant()
+        );
+        assert!(
+            !request(json!({"role": "assistant", "content": [tool_use]}))
+                .continues_final_assistant()
+        );
+        assert!(
+            !request(json!({"role": "user", "content": "Hello again"})).continues_final_assistant()
+        );
+
+        let count: CountMessageTokensRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "assistant", "content": "Sure"}]
+        }))
+        .expect("a count_tokens request");
+        assert!(count.continues_final_assistant());
+    }
+
+    /// The effort the template renders is the profile's reading of
+    /// `output_config.effort`, with the `thinking` block's toggle: as sent
+    /// under the default profile; under MiniMax a level the contract names
+    /// only (`minimal` as `low`), and none while thinking is off. The
+    /// count_tokens request reads the same.
+    #[test]
+    fn template_reasoning_effort_follows_the_profile() {
+        let body = |output_config: Value, thinking: Value| {
+            json!({
+                "model": "m", "max_tokens": 8, "output_config": output_config, "thinking": thinking,
+                "messages": [{"role": "user", "content": "Hello"}]
+            })
+        };
+        for (output_config, thinking, minimax, generic) in [
+            (
+                json!({"effort": "high"}),
+                Value::Null,
+                Some("high"),
+                Some("high"),
+            ),
+            (
+                json!({"effort": "max"}),
+                json!({"type": "enabled", "budget_tokens": 1024}),
+                Some("max"),
+                Some("max"),
+            ),
+            (json!({"effort": "none"}), Value::Null, None, Some("none")),
+            (
+                json!({"effort": "minimal"}),
+                Value::Null,
+                Some("low"),
+                Some("minimal"),
+            ),
+            (json!({"effort": "64"}), Value::Null, None, Some("64")),
+            (
+                json!({"effort": "high"}),
+                json!({"type": "disabled"}),
+                None,
+                Some("high"),
+            ),
+            (
+                json!({"effort": "none"}),
+                json!({"type": "enabled", "budget_tokens": 1024}),
+                None,
+                Some("none"),
+            ),
+            (json!({}), Value::Null, None, None),
+        ] {
+            let request: CreateMessageRequest =
+                serde_json::from_value(body(output_config.clone(), thinking.clone()))
+                    .expect("a Messages request");
+            assert_eq!(
+                request.template_reasoning_effort_for(ProviderProfile::Minimax),
+                minimax,
+                "MiniMax {output_config} {thinking}"
+            );
+            assert_eq!(
+                request.template_reasoning_effort_for(ProviderProfile::Generic),
+                generic,
+                "generic {output_config} {thinking}"
+            );
+            let count: CountMessageTokensRequest = serde_json::from_value(json!({
+                "model": "m", "messages": [], "output_config": output_config, "thinking": thinking
+            }))
+            .expect("a count_tokens request");
+            assert_eq!(
+                count.template_reasoning_effort_for(ProviderProfile::Minimax),
+                minimax
+            );
+            assert_eq!(
+                count.template_reasoning_effort_for(ProviderProfile::Generic),
+                generic
+            );
+        }
+    }
+
+    /// `output_config.effort` reads as a Chat `reasoning_effort`: a string
+    /// as given, a number as its text, null or absent as none; another type
+    /// does not parse. The config's other keys stay with it, and a request
+    /// serializes back with the config it came with.
+    #[test]
+    fn output_config_effort_reads_as_a_reasoning_effort() {
+        let body = |output_config: Value| {
+            json!({
+                "model": "m", "max_tokens": 8, "output_config": output_config,
+                "messages": [{"role": "user", "content": "Hello"}]
+            })
+        };
+        for (output_config, effort) in [
+            (json!({"effort": "high"}), Some("high")),
+            (json!({"effort": 64}), Some("64")),
+            (json!({"effort": null}), None),
+            (json!({}), None),
+            (Value::Null, None),
+        ] {
+            let request: CreateMessageRequest =
+                serde_json::from_value(body(output_config.clone())).expect("a Messages request");
+            assert_eq!(request.reasoning_effort(), effort, "{output_config}");
+            let count: CountMessageTokensRequest = serde_json::from_value(
+                json!({"model": "m", "messages": [], "output_config": output_config}),
+            )
+            .expect("a count_tokens request");
+            assert_eq!(count.reasoning_effort(), effort);
+        }
+        assert!(
+            serde_json::from_value::<CreateMessageRequest>(body(json!({"effort": ["low"]})))
+                .is_err()
+        );
+
+        let with_format = body(json!({
+            "effort": "low", "format": {"type": "json_schema", "schema": {"type": "object"}},
+            "beta_key": true
+        }));
+        let request: CreateMessageRequest =
+            serde_json::from_value(with_format.clone()).expect("a Messages request");
+        assert_eq!(
+            request
+                .output_config
+                .as_ref()
+                .and_then(|config| config.format.as_ref()),
+            Some(&OutputFormat::JsonSchema {
+                schema: json!({"type": "object"})
+            })
+        );
+        let back = serde_json::to_value(&request).expect("serializes");
+        assert_eq!(back["output_config"], with_format["output_config"]);
+    }
+
+    /// The output config and the format under its earlier name ride behind
+    /// a pointer each: the request every Messages call carries is 464 bytes
+    /// on 64-bit targets (688 with the two inline, 544 before they were
+    /// typed), and with the `Arc` header the gateway adds it fits the
+    /// allocator's 512-byte class (it had moved up to the 768 one). A field
+    /// that grows it past the class needs its own read of the Messages route.
+    #[test]
+    fn the_output_config_and_the_output_format_ride_behind_a_pointer_each() {
+        let request: CreateMessageRequest =
+            serde_json::from_value(json!({"model": "m", "max_tokens": 8, "messages": []}))
+                .expect("the smallest valid request");
+        assert_eq!(size_of_val(&request.output_config), size_of::<usize>());
+        assert_eq!(size_of_val(&request.output_format), size_of::<usize>());
+        let arc_header = 2 * size_of::<usize>();
+        assert!(
+            size_of::<CreateMessageRequest>() + arc_header <= 512,
+            "the request is {} bytes",
+            size_of::<CreateMessageRequest>()
+        );
+    }
+
+    /// The answer's schema comes from `output_config.format`, else from the
+    /// field's earlier top-level name, `output_format`; `null` under either,
+    /// an `output_config` without `format`, and no field at all name none.
+    /// The format's one `type` is `json_schema`, with its `schema`.
+    #[test]
+    fn the_output_schema_comes_from_output_config_format_else_output_format() {
+        let request = |extra: Value| -> Result<CreateMessageRequest, serde_json::Error> {
+            let mut body = json!({"model": "m", "max_tokens": 8, "messages": []});
+            body.as_object_mut()
+                .expect("an object")
+                .extend(extra.as_object().expect("an object").clone());
+            serde_json::from_value(body)
+        };
+        let schema = json!({"type": "object", "properties": {"a": {"type": "string"}}});
+        let format = json!({"type": "json_schema", "schema": schema});
+        let other = json!({"type": "json_schema", "schema": {"type": "object"}});
+        assert_eq!(
+            request(json!({"output_config": {"format": format}}))
+                .expect("parses")
+                .output_schema(),
+            Some(&schema)
+        );
+        assert_eq!(
+            request(json!({"output_format": format}))
+                .expect("parses")
+                .output_schema(),
+            Some(&schema)
+        );
+        assert_eq!(
+            request(json!({"output_config": {"format": format}, "output_format": other}))
+                .expect("parses")
+                .output_schema(),
+            Some(&schema),
+            "the current field wins"
+        );
+        for extra in [
+            json!({}),
+            json!({"output_format": null}),
+            json!({"output_config": {"format": null}}),
+            json!({"output_config": {"effort": "high"}}),
+        ] {
+            assert_eq!(
+                request(extra.clone()).expect("parses").output_schema(),
+                None,
+                "{extra}"
+            );
+        }
+        for (extra, refused_for) in [
+            (
+                json!({"output_config": {"format": {"type": "xml", "schema": {}}}}),
+                "unknown variant `xml`",
+            ),
+            (
+                json!({"output_format": {"type": "json_schema"}}),
+                "missing field `schema`",
+            ),
+        ] {
+            let error = request(extra.clone()).expect_err("refused").to_string();
+            assert!(error.contains(refused_for), "{extra}: {error}");
+        }
+    }
+
+    #[test]
+    fn tool_use_block_carries_the_caller_the_public_api_reports() {
+        // A block built without a caller (every engine-issued call) leaves
+        // with the model as its caller, as the public API's blocks do.
+        let block: ContentBlock = serde_json::from_value(json!({
+            "type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {"q": "x"}
+        }))
+        .expect("a block without a caller still parses");
+        let value = serde_json::to_value(&block).expect("serialize");
+        assert_eq!(value["caller"], json!({"type": "direct"}), "{value}");
+        assert_eq!(value["input"], json!({"q": "x"}));
+
+        // A caller an upstream reported is kept as it came.
+        let block: ContentBlock = serde_json::from_value(json!({
+            "type": "tool_use", "id": "toolu_2", "name": "lookup", "input": {},
+            "caller": {"type": "code_execution_20250825", "tool_id": "srvtoolu_1"}
+        }))
+        .expect("parse");
+        assert!(matches!(
+            &block,
+            ContentBlock::ToolUse { caller: ToolUseCaller::CodeExecution20250825 { tool_id }, .. }
+                if tool_id == "srvtoolu_1"
+        ));
+        let value = serde_json::to_value(&block).expect("serialize");
+        assert_eq!(value["caller"]["type"], "code_execution_20250825");
+    }
+
+    /// A caller kind this build does not know (one the public API adds later)
+    /// must not fail the parse of an upstream answer: it is kept as sent.
+    #[test]
+    fn an_unknown_caller_kind_of_an_upstream_block_is_kept_as_sent() {
+        let caller =
+            json!({"type": "some_future_tool_20270101", "tool_id": "srvtoolu_9", "extra": 1});
+        let block: ContentBlock = serde_json::from_value(json!({
+            "type": "tool_use", "id": "toolu_3", "name": "lookup", "input": {}, "caller": caller
+        }))
+        .expect("an unknown caller kind still parses");
+        assert!(matches!(
+            &block,
+            ContentBlock::ToolUse {
+                caller: ToolUseCaller::Other(_),
+                ..
+            }
+        ));
+        let value = serde_json::to_value(&block).expect("serialize");
+        assert_eq!(value["caller"], caller, "{value}");
+    }
+
+    #[test]
+    fn test_system_blocks_preserve_type_field() {
+        let input = json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 100,
+            "system": [
+                {"type": "text", "text": "system prompt", "cache_control": {"type": "ephemeral"}}
+            ]
+        });
+
+        let req: CreateMessageRequest = serde_json::from_value(input).expect("should deserialize");
+        let reserialized = serde_json::to_value(&req).expect("should serialize");
+
+        let system_blocks = reserialized.get("system").unwrap().as_array().unwrap();
+        let first_block = &system_blocks[0];
+        assert_eq!(
+            first_block.get("type").and_then(|v| v.as_str()),
+            Some("text"),
+            "system block must retain 'type' field after round-trip: got {first_block:?}",
+        );
+    }
+
+    #[test]
+    fn test_message_content_blocks_preserve_type_field() {
+        let input = json!({
+            "model": "test",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hello", "cache_control": {"type": "ephemeral"}}
+                ]
+            }],
+            "max_tokens": 100
+        });
+
+        let req: CreateMessageRequest = serde_json::from_value(input).expect("should deserialize");
+        let reserialized = serde_json::to_value(&req).expect("should serialize");
+
+        let msg = &reserialized["messages"][0];
+        let content_blocks = msg["content"].as_array().unwrap();
+        let first_block = &content_blocks[0];
+        assert_eq!(
+            first_block.get("type").and_then(|v| v.as_str()),
+            Some("text"),
+            "content block must retain 'type' field: got {first_block:?}",
+        );
+    }
+
+    #[test]
+    fn test_unknown_fields_preserved_via_flatten() {
+        let input = json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 100,
+            "thinking": {"type": "adaptive"},
+            "context_management": {"edits": [{"type": "clear_thinking", "keep": "all"}]},
+            "output_config": {"effort": "high"},
+            "stream": true
+        });
+
+        let req: CreateMessageRequest =
+            serde_json::from_value(input.clone()).expect("should deserialize");
+        assert!(matches!(
+            req.thinking,
+            Some(ThinkingConfig::Adaptive { .. })
+        ));
+
+        let reserialized = serde_json::to_value(&req).expect("should serialize");
+        assert_eq!(
+            reserialized.get("context_management"),
+            input.get("context_management"),
+            "context_management must survive round-trip"
+        );
+        assert_eq!(
+            reserialized.get("output_config"),
+            input.get("output_config"),
+            "output_config must survive round-trip"
+        );
+    }
+
+    fn base_request() -> CreateMessageRequest {
+        CreateMessageRequest {
+            output_config: None,
+            output_format: None,
+            model: "claude-test".to_string(),
+            messages: vec![InputMessage {
+                role: Role::User,
+                content: InputContent::String("hello".to_string()),
+            }],
+            max_tokens: 16,
+            metadata: None,
+            service_tier: None,
+            stop_sequences: None,
+            stream: None,
+            system: None,
+            temperature: None,
+            thinking: None,
+            tool_choice: None,
+            tools: None,
+            top_k: None,
+            top_p: None,
+            container: None,
+            mcp_servers: None,
+            thread: None,
+            rid: None,
+            other: Map::new(),
+        }
+    }
+
+    fn custom_tool(name: &str) -> Tool {
+        Tool::Custom(CustomTool {
+            name: name.to_string(),
+            tool_type: None,
+            description: Some("test tool".to_string()),
+            input_schema: InputSchema {
+                schema_type: "object".to_string(),
+                properties: None,
+                required: None,
+                additional: Map::new(),
+            },
+            defer_loading: None,
+            cache_control: None,
+            extra: Map::new(),
+        })
+    }
+
+    fn mcp_toolset(configs: Option<HashMap<String, McpToolConfig>>) -> Tool {
+        Tool::McpToolset(McpToolset {
+            toolset_type: "mcp_toolset".to_string(),
+            mcp_server_name: "brave".to_string(),
+            default_config: None,
+            configs,
+            cache_control: None,
+        })
+    }
+
+    fn mcp_server_config() -> McpServerConfig {
+        McpServerConfig {
+            server_type: "url".to_string(),
+            name: "brave".to_string(),
+            url: "https://example.com/mcp".to_string(),
+            authorization_token: None,
+            tool_configuration: None,
+        }
+    }
+    #[test]
+    fn test_tool_mcp_toolset_defer_loading_deserialization() {
+        let json = r#"{
+            "type": "mcp_toolset",
+            "mcp_server_name": "brave",
+            "default_config": {"defer_loading": true}
+        }"#;
+
+        let tool: Tool = serde_json::from_str(json).expect("Failed to deserialize McpToolset Tool");
+        match tool {
+            Tool::McpToolset(ts) => {
+                assert_eq!(ts.mcp_server_name, "brave");
+                let default_config = ts.default_config.expect("default_config should be Some");
+                assert_eq!(default_config.defer_loading, Some(true));
+            }
+            other => panic!(
+                "Expected McpToolset, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+    }
+
+    /// An Anthropic-defined tool reads as `ToolSearch` and is written back as
+    /// the client sent it, its configuration included: a web search tool's
+    /// domain filters, use cap and location, a web fetch tool's, a computer
+    /// tool's display size, a text editor's `max_characters`, and a bash
+    /// tool's `defer_loading`, `strict` and `input_examples`.
+    #[test]
+    fn an_anthropic_defined_tool_keeps_its_configuration() {
+        for tool in [
+            json!({
+                "type": "web_search_20250305", "name": "web_search",
+                "allowed_domains": ["example.com"], "max_uses": 3,
+                "user_location": {"type": "approximate", "city": "Paris", "country": "FR"}
+            }),
+            json!({
+                "type": "web_fetch_20250910", "name": "web_fetch",
+                "blocked_domains": ["example.org"], "max_uses": 2,
+                "max_content_tokens": 1000, "citations": {"enabled": true}
+            }),
+            json!({
+                "type": "computer_20250124", "name": "computer",
+                "display_width_px": 1024, "display_height_px": 768, "display_number": 1
+            }),
+            json!({
+                "type": "text_editor_20250728", "name": "str_replace_based_edit_tool",
+                "max_characters": 10000
+            }),
+            json!({
+                "type": "bash_20250124", "name": "bash", "defer_loading": true,
+                "strict": true, "input_examples": [{"command": "ls"}]
+            }),
+        ] {
+            let parsed: Tool =
+                serde_json::from_value(tool.clone()).unwrap_or_else(|e| panic!("{tool}: {e}"));
+            assert!(matches!(parsed, Tool::ToolSearch(_)), "{tool}");
+            assert_eq!(serde_json::to_value(&parsed).unwrap(), tool);
+        }
+    }
+
+    #[test]
+    fn test_tool_search_tool_deserialization() {
+        let json = r#"{
+            "type": "tool_search_tool_regex_20251119",
+            "name": "tool_search_tool_regex"
+        }"#;
+
+        let tool: Tool = serde_json::from_str(json).expect("Failed to deserialize ToolSearch Tool");
+        match tool {
+            Tool::ToolSearch(ts) => {
+                assert_eq!(ts.name, "tool_search_tool_regex");
+                assert_eq!(ts.tool_type, "tool_search_tool_regex_20251119");
+            }
+            other => panic!(
+                "Expected ToolSearch, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+    }
+
+    /// The blocks of the public API's answers this build does not read: the
+    /// web fetch, code execution, bash and text editor results and a
+    /// container upload, in the SDK's shapes.
+    fn blocks_this_build_does_not_read() -> Vec<Value> {
+        vec![
+            json!({
+                "type": "web_fetch_tool_result", "tool_use_id": "srvtoolu_1",
+                "content": {
+                    "type": "web_fetch_result", "url": "https://example.com",
+                    "retrieved_at": "2026-11-13T00:00:00Z",
+                    "content": {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "page"}}
+                }
+            }),
+            json!({
+                "type": "code_execution_tool_result", "tool_use_id": "srvtoolu_2",
+                "content": {"type": "code_execution_result", "stdout": "4\n", "stderr": "", "return_code": 0, "content": []}
+            }),
+            json!({
+                "type": "bash_code_execution_tool_result", "tool_use_id": "srvtoolu_3",
+                "content": {"type": "bash_code_execution_result", "stdout": "ok", "stderr": "", "return_code": 0, "content": []}
+            }),
+            json!({
+                "type": "text_editor_code_execution_tool_result", "tool_use_id": "srvtoolu_4",
+                "content": {"type": "text_editor_code_execution_view_result", "file_type": "text", "content": "x = 1", "num_lines": 1, "start_line": 1, "total_lines": 1}
+            }),
+            json!({"type": "container_upload", "file_id": "file_1"}),
+        ]
+    }
+
+    /// An answer with a block this build does not read parses, the block kept
+    /// as `ContentBlock::Other` and written back as the upstream sent it,
+    /// beside the blocks it reads; a streamed block reads the same way.
+    #[test]
+    fn an_answer_keeps_a_block_this_build_does_not_read() {
+        for block in blocks_this_build_does_not_read() {
+            let answer = json!({
+                "id": "msg_1", "type": "message", "role": "assistant", "model": "m",
+                "content": [{"type": "text", "text": "before"}, block.clone()],
+                "stop_reason": "end_turn", "stop_sequence": null, "stop_details": null,
+                "usage": {"input_tokens": 1, "output_tokens": 1}, "container": null
+            });
+            let message: Message =
+                serde_json::from_value(answer.clone()).unwrap_or_else(|e| panic!("{block}: {e}"));
+            assert!(matches!(message.content[0], ContentBlock::Text { .. }));
+            assert!(matches!(&message.content[1], ContentBlock::Other(kept) if *kept == block));
+            assert_eq!(serde_json::to_value(&message).unwrap()["content"][1], block);
+
+            let start =
+                json!({"type": "content_block_start", "index": 1, "content_block": block.clone()});
+            let event: MessageStreamEvent =
+                serde_json::from_value(start.clone()).unwrap_or_else(|e| panic!("{block}: {e}"));
+            assert_eq!(serde_json::to_value(&event).unwrap(), start);
+        }
+        // A content block is always an object: a value of another JSON type
+        // is no block at all, not one this build does not read.
+        for not_a_block in [json!("text"), json!(1), json!(null), json!([])] {
+            assert!(
+                serde_json::from_value::<ContentBlock>(not_a_block.clone()).is_err(),
+                "{not_a_block}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_content_block_tool_search_tool_result_deserialization() {
+        let json = r#"{
+            "type": "tool_search_tool_result",
+            "tool_use_id": "srvtoolu_015dw5iXvktXLmqwpyzo4Dp2",
+            "content": {
+                "type": "tool_search_tool_search_result",
+                "tool_references": [
+                    {"type": "tool_reference", "tool_name": "get_weather"}
+                ]
+            }
+        }"#;
+
+        let block: ContentBlock = serde_json::from_str(json)
+            .expect("Failed to deserialize tool_search_tool_result ContentBlock");
+        match block {
+            ContentBlock::ToolSearchToolResult {
+                tool_use_id,
+                content,
+            } => {
+                assert_eq!(tool_use_id, "srvtoolu_015dw5iXvktXLmqwpyzo4Dp2");
+                let ToolSearchToolResultContent::Results(content) = content else {
+                    panic!("Expected the search's results");
+                };
+                assert_eq!(content.tool_references.len(), 1);
+                assert_eq!(content.tool_references[0].tool_name, "get_weather");
+            }
+            _ => panic!("Expected ToolSearchToolResult variant"),
+        }
+    }
+
+    /// An image or a document whose source is a file uploaded through the
+    /// public API's Files API reads, and is written back as sent.
+    #[test]
+    fn an_image_or_document_with_a_file_source_is_accepted() {
+        let content = json!([
+            {"type": "image", "source": {"type": "file", "file_id": "file_011CNha8iCJcU1wXNR6q4V8w"}},
+            {"type": "document", "source": {"type": "file", "file_id": "file_011CPMxVD3fHLUhvTqtsQA5w"}},
+            {"type": "text", "text": "Compare the chart with the report."}
+        ]);
+        let request: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "m",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": content}]
+        }))
+        .unwrap();
+        let written = serde_json::to_value(&request).unwrap();
+        assert_eq!(written["messages"][0]["content"], content);
+    }
+
+    /// A search result's text items are written with their `type`, which the
+    /// public API requires of them, whether the block stands in a message or
+    /// in a tool result; an item read without one is written with it.
+    #[test]
+    fn a_search_results_text_items_keep_their_type() {
+        let search_result = json!({
+            "type": "search_result",
+            "source": "https://docs.example.com/install",
+            "title": "Install",
+            "content": [{"type": "text", "text": "Run the installer."}]
+        });
+        let request: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "m",
+            "max_tokens": 16,
+            "messages": [
+                {"role": "user", "content": [search_result.clone()]},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "search", "input": {}}
+                ]},
+                {"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": [search_result.clone()]
+                }]}
+            ]
+        }))
+        .unwrap();
+        let written = serde_json::to_value(&request).unwrap();
+        assert_eq!(written["messages"][0]["content"][0], search_result);
+        assert_eq!(
+            written["messages"][2]["content"][0]["content"][0],
+            search_result
+        );
+
+        let untyped: InputContentBlock = serde_json::from_value(json!({
+            "type": "search_result",
+            "source": "https://docs.example.com/install",
+            "title": "Install",
+            "content": [{"text": "Run the installer."}]
+        }))
+        .unwrap();
+        assert_eq!(serde_json::to_value(&untyped).unwrap(), search_result);
+
+        let other = serde_json::from_value::<InputContentBlock>(json!({
+            "type": "search_result",
+            "source": "https://docs.example.com/install",
+            "title": "Install",
+            "content": [{"type": "image", "text": "Run the installer."}]
+        }));
+        assert!(other.is_err(), "an item of a type the API does not define");
+    }
+
+    /// A web search's results and errors read and write as the public API
+    /// writes them: each result with its `type` and its null `page_age`, and
+    /// the `request_too_large` error. A result read without its `type` is
+    /// written with it, which the public API requires of a replayed one.
+    #[test]
+    fn a_web_search_result_reads_and_writes_as_the_public_api_writes_it() {
+        let results = json!({
+            "type": "web_search_tool_result",
+            "tool_use_id": "srvtoolu_1",
+            "content": [{
+                "type": "web_search_result",
+                "title": "Claude Shannon",
+                "url": "https://en.wikipedia.org/wiki/Claude_Shannon",
+                "encrypted_content": "EqgfCioIARgBIiQ3",
+                "page_age": null
+            }]
+        });
+        let block: ContentBlock = serde_json::from_value(results.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&block).unwrap(), results);
+
+        let error = json!({
+            "type": "web_search_tool_result",
+            "tool_use_id": "srvtoolu_2",
+            "content": {"type": "web_search_tool_result_error", "error_code": "request_too_large"}
+        });
+        let block: ContentBlock = serde_json::from_value(error.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&block).unwrap(), error);
+
+        let request: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "m",
+            "max_tokens": 16,
+            "messages": [
+                {"role": "user", "content": "Who was Claude Shannon?"},
+                {"role": "assistant", "content": [{
+                    "type": "web_search_tool_result",
+                    "tool_use_id": "srvtoolu_1",
+                    "content": [{
+                        "title": "Claude Shannon",
+                        "url": "https://en.wikipedia.org/wiki/Claude_Shannon",
+                        "encrypted_content": "EqgfCioIARgBIiQ3"
+                    }]
+                }]}
+            ]
+        }))
+        .unwrap();
+        let written = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            written["messages"][1]["content"][0]["content"],
+            results["content"]
+        );
+    }
+
+    /// A tool search that ended with an error reads and writes as the public
+    /// API writes it, in an answer and replayed in a request.
+    #[test]
+    fn a_tool_search_error_reads_and_writes_as_the_public_api_writes_it() {
+        let error = json!({
+            "type": "tool_search_tool_result",
+            "tool_use_id": "srvtoolu_1",
+            "content": {
+                "type": "tool_search_tool_result_error",
+                "error_code": "execution_time_exceeded",
+                "error_message": "The tool search took too long."
+            }
+        });
+        let block: ContentBlock = serde_json::from_value(error.clone()).unwrap();
+        let ContentBlock::ToolSearchToolResult {
+            content: ToolSearchToolResultContent::Error(ref reason),
+            ..
+        } = block
+        else {
+            panic!("Expected the search's error, got {block:?}");
+        };
+        assert!(matches!(
+            reason.error_code,
+            ToolSearchToolResultErrorCode::ExecutionTimeExceeded
+        ));
+        assert_eq!(serde_json::to_value(&block).unwrap(), error);
+
+        let replayed: InputContentBlock = serde_json::from_value(error.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&replayed).unwrap(), error);
+    }
+
+    /// A tool reference in a replayed tool search result keeps its cache
+    /// breakpoint, as the public API takes it.
+    #[test]
+    fn a_replayed_tool_reference_keeps_its_cache_breakpoint() {
+        let references = json!({
+            "type": "tool_search_tool_result",
+            "tool_use_id": "srvtoolu_1",
+            "content": {
+                "type": "tool_search_tool_search_result",
+                "tool_references": [{
+                    "type": "tool_reference",
+                    "tool_name": "get_weather",
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }
+        });
+        let replayed: InputContentBlock = serde_json::from_value(references.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&replayed).unwrap(), references);
+    }
+
+    /// A document's content source and the request's container take the
+    /// string form the public API allows beside their other form, and each
+    /// form is written back as sent.
+    #[test]
+    fn a_content_source_and_a_container_take_their_string_forms() {
+        for content in [
+            json!("The document's text."),
+            json!([{"type": "text", "text": "The document's text."}]),
+        ] {
+            let request: CreateMessageRequest = serde_json::from_value(json!({
+                "model": "m",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": [{
+                    "type": "document",
+                    "source": {"type": "content", "content": content}
+                }]}]
+            }))
+            .unwrap();
+            let written = serde_json::to_value(&request).unwrap();
+            assert_eq!(
+                written["messages"][0]["content"][0]["source"]["content"],
+                content
+            );
+        }
+
+        for container in [json!("container_011CZ"), json!({"id": "container_011CZ"})] {
+            let request: CreateMessageRequest = serde_json::from_value(json!({
+                "model": "m",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "Run the script again."}],
+                "container": container
+            }))
+            .unwrap();
+            let written = serde_json::to_value(&request).unwrap();
+            assert_eq!(written["container"], container);
+        }
+
+        // a malformed container is refused with the error of the form it took
+        for (container, expected) in [
+            (
+                json!(5),
+                "invalid type: integer `5`, expected a container id",
+            ),
+            (
+                json!({"id": 5}),
+                "invalid type: integer `5`, expected a string",
+            ),
+        ] {
+            let refused = serde_json::from_value::<CreateMessageRequest>(json!({
+                "model": "m",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "Run the script again."}],
+                "container": container
+            }))
+            .expect_err("a malformed container")
+            .to_string();
+            assert!(refused.contains(expected), "{refused}");
+        }
+    }
+
+    #[test]
+    fn test_content_block_server_tool_use_deserialization() {
+        let json = r#"{
+            "type": "server_tool_use",
+            "id": "srvtoolu_015dw5iXvktXLmqwpyzo4Dp2",
+            "name": "tool_search_tool_regex",
+            "input": {"query": "weather"}
+        }"#;
+
+        let block: ContentBlock =
+            serde_json::from_str(json).expect("Failed to deserialize server_tool_use ContentBlock");
+        match block {
+            ContentBlock::ServerToolUse { id, name, input: _ } => {
+                assert_eq!(id, "srvtoolu_015dw5iXvktXLmqwpyzo4Dp2");
+                assert_eq!(name, "tool_search_tool_regex");
+            }
+            _ => panic!("Expected ServerToolUse variant"),
+        }
+    }
+
+    #[test]
+    fn test_content_block_tool_reference_deserialization() {
+        let json = r#"{
+            "type": "tool_reference",
+            "tool_name": "get_weather",
+            "description": "Get the weather for a location"
+        }"#;
+
+        let block: ContentBlock =
+            serde_json::from_str(json).expect("Failed to deserialize tool_reference ContentBlock");
+        match block {
+            ContentBlock::ToolReference {
+                tool_name,
+                description,
+            } => {
+                assert_eq!(tool_name, "get_weather");
+                assert_eq!(description.unwrap(), "Get the weather for a location");
+            }
+            _ => panic!("Expected ToolReference variant"),
+        }
+    }
+
+    #[test]
+    fn test_tool_choice_auto_requires_tools() {
+        let mut request = base_request();
+        request.tool_choice = Some(ToolChoice::Auto {
+            disable_parallel_tool_use: None,
+        });
+
+        assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn test_tool_choice_any_requires_tools() {
+        let mut request = base_request();
+        request.tool_choice = Some(ToolChoice::Any {
+            disable_parallel_tool_use: None,
+        });
+
+        assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn test_tool_choice_auto_with_tools_is_valid() {
+        let mut request = base_request();
+        request.tool_choice = Some(ToolChoice::Auto {
+            disable_parallel_tool_use: None,
+        });
+        request.tools = Some(vec![custom_tool("get_weather")]);
+
+        assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn test_tool_choice_any_with_tools_is_valid() {
+        let mut request = base_request();
+        request.tool_choice = Some(ToolChoice::Any {
+            disable_parallel_tool_use: None,
+        });
+        request.tools = Some(vec![custom_tool("get_weather")]);
+
+        assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn test_tool_choice_specific_tool_requires_tools() {
+        let mut request = base_request();
+        request.tool_choice = Some(ToolChoice::Tool {
+            name: "get_weather".to_string(),
+            disable_parallel_tool_use: None,
+        });
+
+        assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn test_tool_choice_specific_tool_must_exist() {
+        let mut request = base_request();
+        request.tool_choice = Some(ToolChoice::Tool {
+            name: "get_weather".to_string(),
+            disable_parallel_tool_use: None,
+        });
+        request.tools = Some(vec![custom_tool("search_web")]);
+
+        assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn test_tool_choice_none_without_tools_is_valid() {
+        let mut request = base_request();
+        request.tool_choice = Some(ToolChoice::None);
+
+        assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn test_tool_choice_specific_tool_is_valid_when_declared() {
+        let mut request = base_request();
+        request.tool_choice = Some(ToolChoice::Tool {
+            name: "get_weather".to_string(),
+            disable_parallel_tool_use: None,
+        });
+        request.tools = Some(vec![custom_tool("get_weather")]);
+
+        assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn test_tool_choice_specific_tool_is_valid_with_mcp_toolset() {
+        let mut request = base_request();
+        request.tool_choice = Some(ToolChoice::Tool {
+            name: "get_weather".to_string(),
+            disable_parallel_tool_use: None,
+        });
+        request.tools = Some(vec![mcp_toolset(None)]);
+        request.mcp_servers = Some(vec![mcp_server_config()]);
+
+        assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn test_tool_choice_specific_tool_uses_mcp_toolset_default_when_override_missing() {
+        let mut request = base_request();
+        request.tool_choice = Some(ToolChoice::Tool {
+            name: "get_weather".to_string(),
+            disable_parallel_tool_use: None,
+        });
+        request.tools = Some(vec![mcp_toolset(Some(HashMap::from([(
+            "search_web".to_string(),
+            McpToolConfig {
+                enabled: Some(false),
+                defer_loading: None,
+            },
+        )])))]);
+        request.mcp_servers = Some(vec![mcp_server_config()]);
+
+        assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn test_tool_choice_specific_tool_must_be_enabled_in_mcp_toolset_configs() {
+        let mut request = base_request();
+        request.tool_choice = Some(ToolChoice::Tool {
+            name: "get_weather".to_string(),
+            disable_parallel_tool_use: None,
+        });
+        request.tools = Some(vec![mcp_toolset(Some(HashMap::from([(
+            "get_weather".to_string(),
+            McpToolConfig {
+                enabled: Some(false),
+                defer_loading: None,
+            },
+        )])))]);
+        request.mcp_servers = Some(vec![mcp_server_config()]);
+
+        assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn test_thinking_config_adaptive_minimal() {
+        let cfg: ThinkingConfig = serde_json::from_str(r#"{"type":"adaptive"}"#).unwrap();
+        match cfg {
+            ThinkingConfig::Adaptive { display } => assert_eq!(display, None),
+            other => panic!("expected Adaptive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_thinking_config_adaptive_with_display() {
+        let cfg: ThinkingConfig =
+            serde_json::from_str(r#"{"type":"adaptive","display":"omitted"}"#).unwrap();
+        match cfg {
+            ThinkingConfig::Adaptive { display } => {
+                assert_eq!(display, Some(ThinkingDisplay::Omitted));
+            }
+            other => panic!("expected Adaptive, got {other:?}"),
+        }
+
+        let cfg: ThinkingConfig =
+            serde_json::from_str(r#"{"type":"adaptive","display":"summarized"}"#).unwrap();
+        match cfg {
+            ThinkingConfig::Adaptive { display } => {
+                assert_eq!(display, Some(ThinkingDisplay::Summarized));
+            }
+            other => panic!("expected Adaptive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_thinking_config_adaptive_round_trip_omits_null_display() {
+        let cfg = ThinkingConfig::Adaptive { display: None };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert_eq!(json, r#"{"type":"adaptive"}"#);
+    }
+
+    #[test]
+    fn test_thinking_config_existing_variants_still_work() {
+        let cfg: ThinkingConfig =
+            serde_json::from_str(r#"{"type":"enabled","budget_tokens":1024}"#).unwrap();
+        assert!(matches!(
+            cfg,
+            ThinkingConfig::Enabled {
+                budget_tokens: 1024,
+                display: None
+            }
+        ));
+
+        let cfg: ThinkingConfig = serde_json::from_str(r#"{"type":"disabled"}"#).unwrap();
+        assert!(matches!(cfg, ThinkingConfig::Disabled));
+    }
+
+    #[test]
+    fn test_thinking_config_enabled_with_display() {
+        let cfg: ThinkingConfig = serde_json::from_str(
+            r#"{"type":"enabled","budget_tokens":2048,"display":"summarized"}"#,
+        )
+        .unwrap();
+        match cfg {
+            ThinkingConfig::Enabled {
+                budget_tokens,
+                display,
+            } => {
+                assert_eq!(budget_tokens, 2048);
+                assert_eq!(display, Some(ThinkingDisplay::Summarized));
+            }
+            other => panic!("expected Enabled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_thinking_config_enabled_round_trip_omits_null_display() {
+        let cfg = ThinkingConfig::Enabled {
+            budget_tokens: 1024,
+            display: None,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert_eq!(json, r#"{"type":"enabled","budget_tokens":1024}"#);
+    }
+
+    /// `display` takes every documented value under `adaptive` and
+    /// `enabled` alike, and each comes back out as it went in.
+    #[test]
+    fn thinking_display_takes_every_documented_value() {
+        for (name, display) in ThinkingDisplay::VALUES {
+            for input in [
+                json!({"type": "adaptive", "display": name}),
+                json!({"type": "enabled", "budget_tokens": 1024, "display": name}),
+            ] {
+                let cfg: ThinkingConfig = serde_json::from_value(input.clone()).expect(name);
+                let parsed = match &cfg {
+                    ThinkingConfig::Adaptive { display }
+                    | ThinkingConfig::Enabled { display, .. } => *display,
+                    ThinkingConfig::Disabled | ThinkingConfig::BetweenTools { .. } => None,
+                };
+                assert_eq!(parsed, Some(display), "{input}");
+                assert_eq!(serde_json::to_value(&cfg).unwrap(), input);
+            }
+        }
+        assert_eq!(
+            ThinkingDisplay::EXPECTED,
+            format!(
+                "one of {}",
+                ThinkingDisplay::VALUES
+                    .iter()
+                    .map(|(name, _)| format!("`{name}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        );
+    }
+
+    /// A `display` outside the set is refused with the field's name and the
+    /// set, a wrong type the same way; `null` is no display. The words open
+    /// with serde's own, so the public `code` follows them.
+    #[test]
+    fn thinking_display_outside_the_documented_set_is_refused_by_name() {
+        let refusal = |input: Value| -> String {
+            serde_json::from_value::<ThinkingConfig>(input.clone())
+                .expect_err(&input.to_string())
+                .to_string()
+        };
+        assert_eq!(
+            refusal(json!({"type": "adaptive", "display": "full"})),
+            "unknown variant `full` for `thinking.display`, expected one of `summarized`, `omitted`, `updates`"
+        );
+        assert_eq!(
+            refusal(json!({"type": "enabled", "budget_tokens": 1024, "display": "Updates"})),
+            "unknown variant `Updates` for `thinking.display`, expected one of `summarized`, `omitted`, `updates`"
+        );
+        assert_eq!(
+            refusal(json!({"type": "adaptive", "display": 1})),
+            "invalid type: integer `1`, expected one of `summarized`, `omitted`, `updates`"
+        );
+        let cfg: ThinkingConfig =
+            serde_json::from_value(json!({"type": "adaptive", "display": null})).unwrap();
+        assert!(matches!(cfg, ThinkingConfig::Adaptive { display: None }));
+    }
+
+    /// `omitted` is the one value that returns the thinking blocks without
+    /// their text; the request states the display under `adaptive` and
+    /// `enabled` alike, and none under `disabled` or without `thinking`.
+    #[test]
+    fn thinking_display_decides_whether_the_thinking_text_is_returned() {
+        assert!(ThinkingDisplay::Summarized.returns_text());
+        assert!(ThinkingDisplay::Updates.returns_text());
+        assert!(!ThinkingDisplay::Omitted.returns_text());
+        let display = |thinking: Value| -> Option<ThinkingDisplay> {
+            let request: CreateMessageRequest = serde_json::from_value(json!({
+                "model": "m", "max_tokens": 16, "messages": [], "thinking": thinking
+            }))
+            .expect("the request deserializes");
+            request.thinking_display()
+        };
+        assert_eq!(
+            display(json!({"type": "adaptive", "display": "omitted"})),
+            Some(ThinkingDisplay::Omitted)
+        );
+        assert_eq!(
+            display(json!({"type": "enabled", "budget_tokens": 1024, "display": "updates"})),
+            Some(ThinkingDisplay::Updates)
+        );
+        assert_eq!(
+            display(json!({"type": "enabled", "budget_tokens": 1024, "display": "summarized"})),
+            Some(ThinkingDisplay::Summarized)
+        );
+        assert_eq!(display(json!({"type": "adaptive"})), None);
+        assert_eq!(display(json!({"type": "disabled"})), None);
+        assert_eq!(display(json!({"type": "between_tools"})), None);
+        assert_eq!(display(Value::Null), None);
+    }
+
+    /// `between_tools` is the public API's fourth thinking shape: no thinking
+    /// up front, so the request's toggle reads off as under `disabled`, no
+    /// display; it writes back as `type` alone, and what else was sent with
+    /// it is kept for the validation to refuse.
+    #[test]
+    fn between_tools_is_thinking_off_up_front() {
+        let cfg: ThinkingConfig = serde_json::from_value(json!({"type": "between_tools"})).unwrap();
+        assert!(matches!(cfg, ThinkingConfig::BetweenTools { ref other } if other.is_empty()));
+        assert!(!cfg.enabled());
+        assert_eq!(cfg.display(), None);
+        assert_eq!(
+            serde_json::to_value(&cfg).unwrap(),
+            json!({"type": "between_tools"})
+        );
+        let request: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "m", "max_tokens": 16, "messages": [], "thinking": {"type": "between_tools"}
+        }))
+        .unwrap();
+        assert_eq!(request.thinking_toggle(), Some(false));
+        let cfg: ThinkingConfig =
+            serde_json::from_value(json!({"type": "between_tools", "display": "omitted"})).unwrap();
+        assert!(
+            matches!(cfg, ThinkingConfig::BetweenTools { ref other } if other.contains_key("display"))
+        );
+    }
+
+    /// The first request of a coding agent: an adaptive thinking with
+    /// `display` `updates`, the effort under `output_config`, a context
+    /// management edit and a safeguards list (beta fields that ride in
+    /// `other`), a JSON string as `metadata.user_id`, a system-role entry in
+    /// `messages`, cache-controlled system blocks and custom tools. Nothing
+    /// in it is refused.
+    #[test]
+    fn a_coding_agents_first_request_deserializes_whole() {
+        let request: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "List the files."}]},
+                {"role": "system", "content": [{"type": "text", "text": "Workspace notes."}]}
+            ],
+            "system": [
+                {"type": "text", "text": "You are a coding agent."},
+                {"type": "text", "text": "Tool rules.", "cache_control": {"type": "ephemeral"}}
+            ],
+            "tools": [{
+                "name": "Bash",
+                "description": "Runs a command.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"]
+                }
+            }],
+            "metadata": {"user_id": "{\"device_id\":\"d\",\"session_id\":\"s\"}"},
+            "max_tokens": 32000,
+            "thinking": {"type": "adaptive", "display": "updates"},
+            "context_management": {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]},
+            "safeguards": [{"type": "dangerous_tool_use", "classifier_context": {"v": 1}}],
+            "output_config": {"effort": "high"},
+            "stream": true
+        }))
+        .expect("the request deserializes");
+        assert!(matches!(
+            request.thinking,
+            Some(ThinkingConfig::Adaptive {
+                display: Some(ThinkingDisplay::Updates)
+            })
+        ));
+        assert_eq!(request.reasoning_effort(), Some("high"));
+        assert!(request.other.contains_key("context_management"));
+        assert!(request.other.contains_key("safeguards"));
+        request.validate().expect("the request validates");
+    }
+
+    #[test]
+    fn test_full_message_with_tool_search_flow_deserialization() {
+        // Simulates the full response from Anthropic API with tool search flow
+        let json = r#"{
+            "id": "msg_01TEST",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4-5-20250929",
+            "content": [
+                {
+                    "type": "server_tool_use",
+                    "id": "srvtoolu_015dw5iXvktXLmqwpyzo4Dp2",
+                    "name": "tool_search_tool_regex",
+                    "input": {"query": "weather"}
+                },
+                {
+                    "type": "tool_search_tool_result",
+                    "tool_use_id": "srvtoolu_015dw5iXvktXLmqwpyzo4Dp2",
+                    "content": {
+                        "type": "tool_search_tool_search_result",
+                        "tool_references": [
+                            {"type": "tool_reference", "tool_name": "get_weather"}
+                        ]
+                    }
+                },
+                {
+                    "type": "tool_use",
+                    "id": "toolu_01ABC",
+                    "name": "get_weather",
+                    "input": {"location": "San Francisco"}
+                }
+            ],
+            "stop_reason": "tool_use",
+            "stop_sequence": null,
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 50
+            }
+        }"#;
+
+        let msg: Message = serde_json::from_str(json)
+            .expect("Failed to deserialize Message with tool search flow");
+        assert_eq!(msg.content.len(), 3);
+        assert!(matches!(msg.content[0], ContentBlock::ServerToolUse { .. }));
+        assert!(matches!(
+            msg.content[1],
+            ContentBlock::ToolSearchToolResult { .. }
+        ));
+        assert!(matches!(msg.content[2], ContentBlock::ToolUse { .. }));
+    }
+
+    #[test]
+    fn test_system_role_in_messages_is_accepted_and_preserved() {
+        // Claude Code sends a `system`-role message in `messages[]` (in addition
+        // to the top-level `system`). It must parse (not 400) and stay in place
+        // so inline-`system` templates render it where it was sent.
+        let body = json!({
+            "model": "m",
+            "max_tokens": 16,
+            "system": "main prompt",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "mid-conversation system"}
+            ]
+        });
+        let req: CreateMessageRequest = serde_json::from_value(body).unwrap();
+        assert_eq!(req.messages.len(), 2);
+        assert_eq!(req.messages[0].role, Role::User);
+        assert_eq!(req.messages[1].role, Role::System); // preserved in place
+    }
+
+    #[test]
+    fn tool_input_schema_keeps_the_clients_key_order() {
+        // More keys than a hash map would keep in order by chance.
+        let names = [
+            "zeta", "alpha", "mu", "beta", "omega", "delta", "kappa", "gamma",
+        ];
+        let properties: Map<String, Value> = names
+            .iter()
+            .map(|name| (name.to_string(), json!({"type": "string"})))
+            .collect();
+        let schema = json!({
+            "type": "object",
+            "properties": properties,
+            "required": ["mu", "alpha"],
+            "title": "Lookup",
+            "additionalProperties": false,
+            "$defs": {}
+        });
+        let body = json!({
+            "model": "m",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "lookup", "input_schema": schema}]
+        });
+        let req: CreateMessageRequest = serde_json::from_value(body).unwrap();
+        let Some(Tool::Custom(tool)) = req.tools.as_ref().and_then(|tools| tools.first()) else {
+            panic!("expected a custom tool");
+        };
+        let keys: Vec<&str> = tool
+            .input_schema
+            .properties
+            .as_ref()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, names);
+        // Serialized again, as for a passthrough upstream, the schema is the
+        // client's, byte for byte.
+        assert_eq!(
+            serde_json::to_string(&tool.input_schema).unwrap(),
+            serde_json::to_string(&schema).unwrap()
+        );
+    }
+
+    #[test]
+    fn cache_partition_reads_passthrough_fields() {
+        use crate::common::GenerationRequest;
+
+        let request: CreateMessageRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+            "cache_salt": "tenant-a"
+        }))
+        .unwrap();
+        let partition = request.cache_partition();
+        assert_eq!(partition.cache_salt, Some("tenant-a"));
+        assert!(partition.extra_key.is_none());
+        assert!(partition.lora_path.is_none());
+    }
+
+    #[test]
+    fn max_tokens_zero_validates_as_the_public_api_accepts_it() {
+        let zero: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "m",
+            "max_tokens": 0,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        assert!(zero.validate().is_ok());
+    }
+
+    #[test]
+    fn count_tokens_request_is_validated_like_a_message_request() {
+        let empty: CountMessageTokensRequest =
+            serde_json::from_value(json!({"model": "m", "messages": []})).unwrap();
+        let err = empty.validate().unwrap_err().to_string();
+        assert!(err.contains("at least one message"), "{err}");
+
+        let ok: CountMessageTokensRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn anthropic_model_list_is_built_from_model_cards() {
+        let mut named = ModelCard::new("m1");
+        named.display_name = Some("Model One".to_owned());
+        let list = ListModelsResponse::from_model_cards(
+            vec![named, ModelCard::new("m2"), ModelCard::new("m1")],
+            &ListModelsQuery::default(),
+        )
+        .expect("a page");
+        let v = serde_json::to_value(&list).unwrap();
+        assert_eq!(v["has_more"], false);
+        assert_eq!(v["first_id"], "m1");
+        assert_eq!(v["last_id"], "m2");
+        assert_eq!(
+            v["data"].as_array().unwrap().len(),
+            2,
+            "duplicates collapse"
+        );
+        assert_eq!(
+            v["data"][0],
+            json!({
+                "type": "model",
+                "id": "m1",
+                "display_name": "Model One",
+                "created_at": "1970-01-01T00:00:00Z",
+                "lifecycle": "active",
+                "capabilities": null,
+                "line": null,
+                "max_tokens": null,
+                "max_input_tokens": null,
+                "deprecated_at": null,
+                "retires_at": null
+            })
+        );
+        assert_eq!(
+            v["data"][1]["display_name"], "m2",
+            "the id stands in for a missing name"
+        );
+    }
+
+    /// `disable_parallel_tool_use: true` turns parallel use off under
+    /// `auto`, `any` and a named tool; unset, `false`, `none` and no
+    /// `tool_choice` leave it on.
+    #[test]
+    fn a_tool_choice_says_whether_it_disables_parallel_tool_use() {
+        let request = |tool_choice: Value| -> CreateMessageRequest {
+            let mut body = json!({"model": "m", "max_tokens": 8, "messages": []});
+            if !tool_choice.is_null() {
+                body["tool_choice"] = tool_choice;
+            }
+            serde_json::from_value(body).expect("a Messages request")
+        };
+        for choice in [
+            json!({"type": "auto", "disable_parallel_tool_use": true}),
+            json!({"type": "any", "disable_parallel_tool_use": true}),
+            json!({"type": "tool", "name": "lookup", "disable_parallel_tool_use": true}),
+        ] {
+            assert!(
+                request(choice.clone()).disables_parallel_tool_use(),
+                "{choice}"
+            );
+        }
+        for choice in [
+            json!({"type": "any"}),
+            json!({"type": "any", "disable_parallel_tool_use": false}),
+            json!({"type": "none"}),
+            Value::Null,
+        ] {
+            assert!(
+                !request(choice.clone()).disables_parallel_tool_use(),
+                "{choice}"
+            );
+        }
+    }
+
+    /// A Messages tool choice reads as the chat choice the templates and
+    /// parsers know: `auto`, `required` for `any`, the named function, `none`.
+    #[test]
+    fn a_tool_choice_reads_as_a_chat_tool_choice() {
+        let choice = |body: Value| -> common::ToolChoice {
+            let choice: ToolChoice = serde_json::from_value(body).expect("a tool choice");
+            common::ToolChoice::from(&choice)
+        };
+        assert!(matches!(
+            choice(json!({"type": "auto"})),
+            common::ToolChoice::Value(common::ToolChoiceValue::Auto)
+        ));
+        assert!(matches!(
+            choice(json!({"type": "any"})),
+            common::ToolChoice::Value(common::ToolChoiceValue::Required)
+        ));
+        assert!(matches!(
+            choice(json!({"type": "none"})),
+            common::ToolChoice::Value(common::ToolChoiceValue::None)
+        ));
+        match choice(json!({"type": "tool", "name": "calc"})) {
+            common::ToolChoice::Function {
+                tool_type,
+                function,
+            } => {
+                assert_eq!(tool_type, "function");
+                assert_eq!(function.name, "calc");
+            }
+            other => panic!("a named tool reads as a function choice, not {other:?}"),
+        }
+    }
+
+    /// A custom tool reads as a function tool whose parameters are the input
+    /// schema, keys in the order the client wrote them; the other tool kinds
+    /// are left out of the chat tools.
+    #[test]
+    fn custom_tools_read_as_chat_tools_in_order() {
+        let request: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "m", "max_tokens": 8, "messages": [],
+            "tools": [
+                {"name": "weather", "description": "Get weather", "input_schema": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                    "additionalProperties": false
+                }},
+                {"type": "web_search_20250305", "name": "web_search"},
+                {"name": "calc", "input_schema": {"type": "object"}}
+            ]
+        }))
+        .expect("a Messages request");
+        let tools = request.chat_tools();
+        let names: Vec<&str> = tools
+            .iter()
+            .map(|tool| tool.function.name.as_str())
+            .collect();
+        assert_eq!(names, ["weather", "calc"]);
+        let weather = &tools[0];
+        assert_eq!(weather.tool_type, "function");
+        assert_eq!(weather.function.description.as_deref(), Some("Get weather"));
+        let keys: Vec<&str> = weather.function.parameters_schema()["properties"]
+            .as_object()
+            .expect("properties")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["city"]);
+        let keys: Vec<&str> = weather
+            .function
+            .parameters_schema()
+            .as_object()
+            .expect("an object schema")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            ["type", "properties", "required", "additionalProperties"]
+        );
+        assert_eq!(
+            tools[1].function.parameters_schema(),
+            &json!({"type": "object"})
+        );
+        let none: CreateMessageRequest =
+            serde_json::from_value(json!({"model": "m", "max_tokens": 8, "messages": []}))
+                .expect("a Messages request");
+        assert!(none.chat_tools().is_empty());
+    }
+
+    /// The history's tool calls are the `tool_use` blocks of the assistant
+    /// turns; user turns and text blocks do not count.
+    #[test]
+    fn the_history_counts_the_assistant_tool_uses() {
+        let request = |messages: Value| -> CreateMessageRequest {
+            serde_json::from_value(json!({"model": "m", "max_tokens": 8, "messages": messages}))
+                .expect("a Messages request")
+        };
+        assert_eq!(
+            request(json!([{"role": "user", "content": "Hello"}])).history_tool_calls_count(),
+            0
+        );
+        let history = json!([
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "Let me check."},
+                {"type": "tool_use", "id": "tu_1", "name": "calc", "input": {"x": 1}},
+                {"type": "tool_use", "id": "tu_2", "name": "search", "input": {"q": "t"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "tu_1", "content": "2"}
+            ]},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "tu_3", "name": "calc", "input": {}}
+            ]}
+        ]);
+        assert_eq!(request(history).history_tool_calls_count(), 3);
+    }
+
+    /// The query an upstream is asked for is the request's, the contract's
+    /// parameters alone, in the URI's form; the defaults ask for nothing.
+    #[test]
+    fn the_model_list_query_is_rewritten_for_an_upstream_as_the_contract_names_it() {
+        let query = ListModelsQuery::parse(Some("foo=bar&limit=5&after_id=a%20b&lifecycle=active"))
+            .expect("parses");
+        assert_eq!(
+            query.to_query_string(),
+            "limit=5&after_id=a+b&lifecycle=active"
+        );
+        assert!(query.narrows());
+        assert_eq!(ListModelsQuery::default().to_query_string(), "");
+        assert!(!ListModelsQuery::default().narrows());
+        assert!(!ListModelsQuery::parse(Some("limit=5"))
+            .expect("parses")
+            .narrows());
+        assert_eq!(
+            ListModelsQuery::parse(Some("before_id=m1"))
+                .expect("parses")
+                .to_query_string(),
+            "before_id=m1"
+        );
+    }
+
+    /// The Messages-shaped list pages over the deduplicated inventory as its
+    /// query asks: `limit` entries from the start, after a cursor or just
+    /// before one, `has_more` for the rest; every served model is `active`,
+    /// so another lifecycle keeps nothing. A limit outside 1 to 1000, both
+    /// cursors, an unknown lifecycle or a cursor naming no entry are refused
+    /// naming the parameter. The entry carries every field of the contract,
+    /// the card's context length as both token limits.
+    #[test]
+    fn the_model_list_pages_as_its_query_asks() {
+        let cards = || {
+            ["a", "b", "c", "d", "b"].into_iter().map(|id| {
+                let mut card = ModelCard::new(id);
+                card.context_length = Some(8192);
+                card
+            })
+        };
+        let ids = |list: &ListModelsResponse| {
+            list.data
+                .iter()
+                .map(|entry| entry.id.clone())
+                .collect::<Vec<_>>()
+        };
+        let page = |query: &str| {
+            ListModelsResponse::from_model_cards(
+                cards(),
+                &ListModelsQuery::parse(Some(query)).expect("a query the contract takes"),
+            )
+            .expect("a page")
+        };
+
+        let whole = page("");
+        assert_eq!(ids(&whole), ["a", "b", "c", "d"]);
+        assert!(!whole.has_more);
+        assert_eq!(
+            (whole.first_id.as_deref(), whole.last_id.as_deref()),
+            (Some("a"), Some("d"))
+        );
+        assert_eq!(
+            serde_json::to_value(&whole.data[0]).expect("serializes"),
+            json!({
+                "type": "model", "id": "a", "display_name": "a",
+                "created_at": "1970-01-01T00:00:00Z", "lifecycle": "active",
+                "capabilities": null, "line": null,
+                "max_tokens": 8192, "max_input_tokens": 8192,
+                "deprecated_at": null, "retires_at": null
+            })
+        );
+
+        let first = page("limit=2");
+        assert_eq!(ids(&first), ["a", "b"]);
+        assert!(first.has_more);
+        let next = page("after_id=b&limit=2");
+        assert_eq!(ids(&next), ["c", "d"]);
+        assert!(!next.has_more);
+        let back = page("before_id=d&limit=2");
+        assert_eq!(ids(&back), ["b", "c"]);
+        assert!(back.has_more);
+        let start = page("before_id=b&limit=5");
+        assert_eq!(ids(&start), ["a"]);
+        assert!(!start.has_more);
+        let none = page("lifecycle=retired");
+        assert!(none.data.is_empty() && !none.has_more && none.first_id.is_none());
+        assert_eq!(
+            ListModelsQuery::parse(Some("foo=bar&limit=1000"))
+                .expect("parses")
+                .limit(),
+            1000
+        );
+
+        for query in [
+            "limit=0",
+            "limit=1001",
+            "limit=x",
+            "lifecycle=bogus",
+            "after_id=a&before_id=b",
+        ] {
+            assert!(ListModelsQuery::parse(Some(query)).is_err(), "{query}");
+        }
+        let unknown = ListModelsQuery::parse(Some("after_id=nope")).expect("parses");
+        assert_eq!(
+            ListModelsResponse::from_model_cards(cards(), &unknown)
+                .expect_err("no such entry")
+                .as_str(),
+            "after_id: no model \"nope\" in the list"
+        );
+    }
+
+    /// The owned conversion and the borrowed one read the same chat tools: the
+    /// custom tools in order, each a function whose parameters are the input
+    /// schema with the client's keys in their order, the other kinds left out.
+    #[test]
+    fn into_chat_tools_moves_what_chat_tools_copies() {
+        let tools: Vec<Tool> = serde_json::from_value(json!([
+            {"name": "weather", "description": "Get weather", "input_schema": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}, "unit": {"type": "string"}},
+                "required": ["city"],
+                "additionalProperties": false
+            }},
+            {"type": "web_search_20250305", "name": "web_search"},
+            {"name": "calc", "input_schema": {"type": "object"}}
+        ]))
+        .expect("the tools deserialize");
+        let borrowed = serde_json::to_value(chat_tools(&tools)).unwrap();
+        let owned = serde_json::to_value(into_chat_tools(tools)).unwrap();
+        assert_eq!(owned, borrowed);
+        assert_eq!(
+            owned.as_array().map(Vec::len),
+            Some(2),
+            "the server tool is left out"
+        );
+        let keys: Vec<&str> = owned[0]["function"]["parameters"]["properties"]
+            .as_object()
+            .expect("properties")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["city", "unit"], "the client's key order is kept");
+        assert_eq!(
+            owned[0]["function"]["parameters"]["additionalProperties"],
+            json!(false)
+        );
+    }
+}

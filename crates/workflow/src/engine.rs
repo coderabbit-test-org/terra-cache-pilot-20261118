@@ -1,0 +1,1874 @@
+//! Workflow execution engine
+//!
+//! Supports DAG-based parallel execution of workflow steps.
+//! Steps with no dependencies run in parallel, steps with dependencies
+//! wait for all dependencies to complete successfully.
+
+use std::{
+    any::Any,
+    collections::{HashMap, HashSet, VecDeque},
+    future::Future,
+    panic::{catch_unwind, AssertUnwindSafe},
+    pin::{pin, Pin},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    task::{self, Poll},
+    time::Duration,
+};
+
+use backoff::{backoff::Backoff, ExponentialBackoffBuilder};
+use chrono::Utc;
+use parking_lot::RwLock;
+use tokio::{
+    sync::{mpsc, watch},
+    time::timeout,
+};
+
+use crate::{
+    definition::{StepDefinition, WorkflowDefinition},
+    event::{EventBus, WorkflowEvent},
+    state::{InMemoryStore, StateStore},
+    types::*,
+};
+
+/// How often a step waiting out its backoff reads its workflow's cancellation.
+const CANCELLATION_READ_INTERVAL: Duration = Duration::from_millis(250);
+/// The error text of a step that failed without an error of its own: a plain
+/// `Failure` result, or a panic whose message goes to the log only.
+const PLAIN_FAILURE: &str = "Step failed";
+
+#[derive(Default)]
+struct StepTracker {
+    completed: HashSet<StepId>,
+    failed: HashSet<StepId>,
+    /// The first step to fail: the step a failed run is named by.
+    first_failed: Option<StepId>,
+    skipped: HashSet<StepId>,
+    running: HashSet<StepId>,
+    /// Steps waiting for delay/scheduled_at: maps step INDEX to ready time
+    /// Using index instead of StepId for O(w) iteration in the main loop
+    waiting_until: HashMap<usize, std::time::Instant>,
+}
+
+/// What the scheduler reads off the tracker at the top of an iteration.
+struct ReadyScan {
+    /// Steps whose wait is over.
+    wait_ready: Vec<usize>,
+    /// Steps whose dependencies are satisfied, from the pending checks.
+    deps_ready: Vec<usize>,
+    total_processed: usize,
+    running: usize,
+    waiting: usize,
+}
+
+/// Phase 1: the steps ready to run or wait, and the counts the blocked verdict
+/// reads, under one read of the tracker.
+fn scan_ready<D: WorkflowData>(
+    t: &StepTracker,
+    definition: &WorkflowDefinition<D>,
+    pending_check: &mut VecDeque<usize>,
+) -> ReadyScan {
+    // O(w) iteration over waiting_until keys instead of O(n) over all steps
+    let wait_ready: Vec<usize> = t.get_ready_waiting_indices();
+
+    // Check pending_check for dependency-satisfied steps
+    let deps_ready: Vec<usize> = pending_check
+        .drain(..)
+        .filter(|&idx| {
+            let step = &definition.steps[idx];
+            t.is_step_processable(&step.id, idx)
+                && t.are_dependencies_satisfied(&step.depends_on)
+                && t.is_any_dependency_satisfied(&step.depends_on_any)
+                && !t.has_failed_dependency(&step.depends_on)
+                && !t.have_all_any_deps_failed(&step.depends_on_any)
+        })
+        .collect();
+
+    ReadyScan {
+        wait_ready,
+        deps_ready,
+        total_processed: t.total_processed(),
+        running: t.running.len(),
+        waiting: t.waiting_until.len(),
+    }
+}
+
+/// Take every completion the channel holds and put up for a check what each
+/// one unblocks. Whether anything came.
+fn drain_completions<D: WorkflowData>(
+    rx: &mut mpsc::Receiver<(StepId, StepResult)>,
+    definition: &WorkflowDefinition<D>,
+    pending_check: &mut VecDeque<usize>,
+    when: &'static str,
+) -> bool {
+    let mut drained = false;
+    while let Ok((step_id, result)) = rx.try_recv() {
+        drained = true;
+        tracing::debug!(
+            step_id = %step_id,
+            result = ?result,
+            when,
+            "Step completed"
+        );
+        enqueue_dependents(definition, &step_id, result, pending_check);
+    }
+    drained
+}
+
+/// A step that succeeded or was skipped puts its dependents up for a check; a
+/// failed one leaves them where they are. The one rule for a completion,
+/// whichever way it arrived.
+fn enqueue_dependents<D: WorkflowData>(
+    definition: &WorkflowDefinition<D>,
+    step_id: &StepId,
+    result: StepResult,
+    pending_check: &mut VecDeque<usize>,
+) {
+    if matches!(result, StepResult::Success | StepResult::Skip) {
+        for &dep_idx in definition.get_dependent_indices(step_id) {
+            pending_check.push_back(dep_idx);
+        }
+    }
+}
+
+/// How long until the soonest waiting step is ready; a short tick when every
+/// wait is already over.
+fn time_to_next_wait(t: &StepTracker) -> Duration {
+    let now = std::time::Instant::now();
+    t.waiting_until
+        .values()
+        .filter_map(|&ready_at| {
+            if ready_at > now {
+                Some(ready_at - now)
+            } else {
+                None
+            }
+        })
+        .min()
+        .unwrap_or(Duration::from_millis(10))
+}
+
+impl StepTracker {
+    fn total_processed(&self) -> usize {
+        self.completed.len() + self.failed.len() + self.skipped.len()
+    }
+
+    fn is_step_processable(&self, step_id: &StepId, step_idx: usize) -> bool {
+        !self.completed.contains(step_id)
+            && !self.failed.contains(step_id)
+            && !self.skipped.contains(step_id)
+            && !self.running.contains(step_id)
+            && !self.waiting_until.contains_key(&step_idx)
+    }
+
+    /// Get indices of waiting steps that are now ready to run - O(w) where w = waiting count
+    fn get_ready_waiting_indices(&self) -> Vec<usize> {
+        let now = std::time::Instant::now();
+        self.waiting_until
+            .iter()
+            .filter(|(_, &ready_at)| now >= ready_at)
+            .map(|(&idx, _)| idx)
+            .collect()
+    }
+
+    /// Mark a step as waiting until a specific time (by index)
+    fn set_waiting(&mut self, step_idx: usize, ready_at: std::time::Instant) {
+        self.waiting_until.insert(step_idx, ready_at);
+    }
+
+    /// Clear waiting status for a step (it's now ready to run)
+    fn clear_waiting(&mut self, step_idx: usize) {
+        self.waiting_until.remove(&step_idx);
+    }
+
+    /// Check if ALL dependencies are satisfied (completed or skipped)
+    fn are_dependencies_satisfied(&self, depends_on: &[StepId]) -> bool {
+        depends_on
+            .iter()
+            .all(|dep| self.completed.contains(dep) || self.skipped.contains(dep))
+    }
+
+    /// Check if ANY dependency is satisfied (completed or skipped)
+    /// Returns true if the list is empty (no "any" dependencies)
+    fn is_any_dependency_satisfied(&self, depends_on_any: &[StepId]) -> bool {
+        depends_on_any.is_empty()
+            || depends_on_any
+                .iter()
+                .any(|dep| self.completed.contains(dep) || self.skipped.contains(dep))
+    }
+
+    /// Check if ANY dependency has failed (for depends_on - blocks if any fail)
+    fn has_failed_dependency(&self, depends_on: &[StepId]) -> bool {
+        depends_on.iter().any(|dep| self.failed.contains(dep))
+    }
+
+    /// Check if ALL dependencies have failed (for depends_on_any - blocks only if all fail)
+    fn have_all_any_deps_failed(&self, depends_on_any: &[StepId]) -> bool {
+        !depends_on_any.is_empty() && depends_on_any.iter().all(|dep| self.failed.contains(dep))
+    }
+}
+
+/// The verdict of a step's `run_if` condition, read before the step runs.
+enum Gate {
+    /// No condition, or the condition held.
+    Run,
+    /// The condition did not hold.
+    Skip,
+    /// The context the condition reads could not be loaded; the step fails
+    /// with this text rather than proceeding blindly.
+    Fail(String),
+    /// The condition panicked, with the same fixed failure text used when a
+    /// step's `execute` panics. The step fails by its failure action.
+    Panic(String),
+}
+
+/// How a finished step reports itself: the signal its dependents get (which
+/// names the tracker set it lands in), and the step state to store before
+/// they are told, on the paths that owe one: a step the gate skipped or
+/// failed before it ran, and a `ContinueNextStep` failure, whose `Failed`
+/// state is overwritten as `Skipped`.
+struct Completion {
+    signal: StepResult,
+    state: Option<(StepStatus, Option<String>)>,
+}
+
+impl Completion {
+    /// The step's own result folded with its failure action: a failure under
+    /// `ContinueNextStep` signals as a skip so the dependents get scheduled,
+    /// and is recorded as skipped.
+    fn of(result: WorkflowResult<StepResult>, on_failure: FailureAction) -> Self {
+        match result {
+            Ok(StepResult::Success) => Self {
+                signal: StepResult::Success,
+                state: None,
+            },
+            // A skip in the attempt is recorded as a gate's skip is: the attempt
+            // began the step as running, and nothing else writes its end.
+            Ok(StepResult::Skip) => Self {
+                signal: StepResult::Skip,
+                state: Some((StepStatus::Skipped, None)),
+            },
+            // Cancelled between attempts: the step's record says so, where
+            // its last attempt left it running or retrying. A waiter reading
+            // the cancelled workflow sees no step still on its task then.
+            Err(WorkflowError::Cancelled(_)) => Self {
+                signal: StepResult::Failure,
+                state: Some((StepStatus::Cancelled, None)),
+            },
+            Ok(StepResult::Failure) | Err(_) => match on_failure {
+                FailureAction::FailWorkflow | FailureAction::RetryIndefinitely => Self {
+                    signal: StepResult::Failure,
+                    state: None,
+                },
+                FailureAction::ContinueNextStep => Self {
+                    signal: StepResult::Skip,
+                    state: Some((StepStatus::Skipped, None)),
+                },
+            },
+        }
+    }
+
+    /// A step its `run_if` condition skipped before it ran.
+    fn skipped() -> Self {
+        Self {
+            signal: StepResult::Skip,
+            state: Some((StepStatus::Skipped, None)),
+        }
+    }
+
+    /// A step that failed before it ran, with the reason for its state.
+    fn failed(error: String) -> Self {
+        Self {
+            signal: StepResult::Failure,
+            state: Some((StepStatus::Failed, Some(error))),
+        }
+    }
+
+    /// A step whose condition panicked, folded with its failure action: under
+    /// `ContinueNextStep` it signals as a skip and is recorded as skipped,
+    /// with the failure text kept.
+    fn panicked(error: String, on_failure: FailureAction) -> Self {
+        match on_failure {
+            FailureAction::FailWorkflow | FailureAction::RetryIndefinitely => Self::failed(error),
+            FailureAction::ContinueNextStep => Self {
+                signal: StepResult::Skip,
+                state: Some((StepStatus::Skipped, Some(error))),
+            },
+        }
+    }
+}
+
+/// One run of a step's executor: what came of it, the context it ran on
+/// (the hooks read it), and how long it took.
+struct Attempt<D: WorkflowData> {
+    outcome: Outcome,
+    context: WorkflowContext<D>,
+    duration: Duration,
+}
+
+/// What one attempt came to, in the terms the retry rule reads.
+enum Outcome {
+    Success,
+    Skip,
+    /// The error text for the step's state and events, and whether another
+    /// attempt is allowed: the executor's word for its own errors, always
+    /// for a timeout, never for a plain `Failure` result or a panic.
+    Failed {
+        error: String,
+        retryable: bool,
+    },
+}
+
+/// A future of a step author's code that ends with its panic, when it panics,
+/// where it would unwind its task. Its caller says what the panic means: a
+/// failed attempt for `execute`, a logged line for an end hook. Left to
+/// unwind, the step would read as running for ever and its run would never
+/// end, so every wait on that run would last its whole timeout.
+///
+/// The guarded future makes the author's call itself, so a method that
+/// panics before it returns its future is caught too.
+struct CatchPanic<F>(F);
+
+impl<F: Future + Unpin> Future for CatchPanic<F> {
+    type Output = Result<F::Output, Box<dyn Any + Send>>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
+        let inner = Pin::new(&mut self.0);
+        match catch_unwind(AssertUnwindSafe(|| inner.poll(cx))) {
+            Ok(Poll::Ready(output)) => Poll::Ready(Ok(output)),
+            Ok(Poll::Pending) => Poll::Pending,
+            Err(panic) => Poll::Ready(Err(panic)),
+        }
+    }
+}
+
+/// The words a panic carried, when it carried words.
+fn panic_words(panic: &(dyn Any + Send)) -> &str {
+    panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("no message")
+}
+
+/// Logs how a step's hook ended when it failed or panicked. Neither changes
+/// what the step came to.
+fn log_hook_end<E: std::fmt::Debug>(
+    step_id: &StepId,
+    hook: &'static str,
+    end: Result<Result<(), E>, Box<dyn Any + Send>>,
+) {
+    match end {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(step_id = %step_id, error = ?error, "{hook} hook failed"),
+        Err(panic) => tracing::warn!(
+            step_id = %step_id,
+            panic = panic_words(panic.as_ref()),
+            "{hook} hook panicked"
+        ),
+    }
+}
+
+/// Fixed backoff that returns the same delay every time
+struct FixedBackoff(Duration);
+
+impl Backoff for FixedBackoff {
+    fn reset(&mut self) {}
+
+    fn next_backoff(&mut self) -> Option<Duration> {
+        Some(self.0)
+    }
+}
+
+/// Linear backoff that increases delay by a fixed amount each retry
+struct LinearBackoff {
+    current: Duration,
+    increment: Duration,
+    max: Duration,
+}
+
+impl LinearBackoff {
+    fn new(increment: Duration, max: Duration) -> Self {
+        Self {
+            current: increment,
+            increment,
+            max,
+        }
+    }
+}
+
+impl Backoff for LinearBackoff {
+    fn reset(&mut self) {
+        self.current = self.increment;
+    }
+
+    fn next_backoff(&mut self) -> Option<Duration> {
+        let next = self.current;
+        self.current = (self.current + self.increment).min(self.max);
+        Some(next)
+    }
+}
+
+/// Enum-based backoff implementation to avoid heap allocation
+enum BackoffImpl {
+    Fixed(FixedBackoff),
+    Exponential(backoff::ExponentialBackoff),
+    Linear(LinearBackoff),
+}
+
+impl BackoffImpl {
+    fn next_backoff(&mut self) -> Option<Duration> {
+        match self {
+            BackoffImpl::Fixed(b) => b.next_backoff(),
+            BackoffImpl::Exponential(b) => b.next_backoff(),
+            BackoffImpl::Linear(b) => b.next_backoff(),
+        }
+    }
+}
+
+/// Main workflow execution engine
+///
+/// # Type Parameters
+///
+/// * `D` - The workflow data type that implements `WorkflowData`
+/// * `S` - The state store implementation (defaults to `InMemoryStore<D>`)
+///
+/// # Graceful Shutdown
+///
+/// The engine supports graceful shutdown via [`shutdown()`](Self::shutdown):
+///
+/// ```ignore
+/// // Trigger shutdown - stops accepting new workflows
+/// engine.shutdown();
+///
+/// // Wait for all running workflows to complete (with timeout)
+/// if !engine.wait_for_shutdown(Duration::from_secs(30)).await {
+///     // Force cancel remaining workflows
+///     engine.force_cancel_all().await;
+/// }
+/// ```
+pub struct WorkflowEngine<D: WorkflowData, S: StateStore<D> = InMemoryStore<D>> {
+    definitions: Arc<RwLock<HashMap<WorkflowId, Arc<WorkflowDefinition<D>>>>>,
+    state_store: S,
+    event_bus: Arc<EventBus>,
+    /// Shutdown signal sender - when true, engine is shutting down.
+    /// Also used to derive receivers via `subscribe()` and check state via `borrow()`.
+    shutdown_tx: Arc<watch::Sender<bool>>,
+    /// Count of active workflow executions
+    active_workflows: Arc<AtomicUsize>,
+}
+
+impl<D: WorkflowData> WorkflowEngine<D, InMemoryStore<D>> {
+    pub fn new() -> Self {
+        Self::with_store(InMemoryStore::new())
+    }
+}
+
+impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
+    /// Create a new workflow engine with a custom state store
+    pub fn with_store(state_store: S) -> Self {
+        let (shutdown_tx, _) = watch::channel(false);
+        Self {
+            definitions: Arc::new(RwLock::new(HashMap::new())),
+            state_store,
+            event_bus: Arc::new(EventBus::new()),
+            shutdown_tx: Arc::new(shutdown_tx),
+            active_workflows: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Check if the engine is shutting down
+    pub fn is_shutting_down(&self) -> bool {
+        *self.shutdown_tx.borrow()
+    }
+
+    /// Initiate graceful shutdown
+    ///
+    /// This will:
+    /// - Stop accepting new workflows (start_workflow will return an error)
+    /// - Stop the cleanup task
+    /// - Allow running workflows to complete
+    ///
+    /// Use [`wait_for_shutdown`](Self::wait_for_shutdown) to wait for completion.
+    pub fn shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
+        tracing::info!("Workflow engine shutdown initiated");
+    }
+
+    /// Wait for all active workflows to complete
+    ///
+    /// Returns `true` if all workflows completed within the timeout,
+    /// `false` if the timeout was reached with workflows still running.
+    ///
+    /// Uses simple polling - appropriate for shutdown which happens once per process.
+    pub async fn wait_for_shutdown(&self, timeout_duration: Duration) -> bool {
+        let start = tokio::time::Instant::now();
+
+        loop {
+            let active = self.active_workflows.load(Ordering::Acquire);
+            if active == 0 {
+                tracing::info!("All workflows completed, shutdown complete");
+                return true;
+            }
+
+            if start.elapsed() >= timeout_duration {
+                tracing::warn!(
+                    remaining_workflows = active,
+                    "Shutdown timeout reached with workflows still running"
+                );
+                return false;
+            }
+
+            tracing::debug!(
+                active_workflows = active,
+                "Waiting for workflows to complete"
+            );
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Force cancel all running workflows
+    ///
+    /// This should be called after `wait_for_shutdown` times out if you need
+    /// to ensure all workflows are stopped. Note that this cancels workflows
+    /// at the state level; running steps may still complete.
+    pub async fn force_cancel_all(&self) -> usize {
+        let active_states = match self.state_store.list_active().await {
+            Ok(states) => states,
+            Err(e) => {
+                tracing::error!(error = ?e, "Failed to list active workflows for force cancel");
+                return 0;
+            }
+        };
+
+        let mut cancelled = 0;
+        for state in active_states {
+            if let Err(e) = self.cancel_workflow(state.instance_id).await {
+                tracing::warn!(
+                    instance_id = %state.instance_id,
+                    error = ?e,
+                    "Failed to cancel workflow during force shutdown"
+                );
+            } else {
+                cancelled += 1;
+            }
+        }
+
+        tracing::info!(cancelled_count = cancelled, "Force cancelled workflows");
+        cancelled
+    }
+
+    /// Get the number of currently active workflow executions
+    pub fn active_workflow_count(&self) -> usize {
+        self.active_workflows.load(Ordering::Acquire)
+    }
+
+    /// Decrement active workflow count
+    fn workflow_finished(&self) {
+        self.active_workflows.fetch_sub(1, Ordering::Release);
+    }
+
+    /// Calculate how long a step needs to wait based on delay and/or scheduled_at.
+    /// Returns None if no waiting is needed.
+    fn calculate_wait_duration(step: &StepDefinition<D>) -> Option<Duration> {
+        let now = Utc::now();
+
+        // Calculate wait time for scheduled_at
+        let schedule_wait = step.scheduled_at.and_then(|scheduled_time| {
+            if now < scheduled_time {
+                (scheduled_time - now).to_std().ok()
+            } else {
+                // Scheduled time is in the past
+                tracing::debug!(
+                    step_id = %step.id,
+                    scheduled_time = %scheduled_time,
+                    "Step scheduled_at is in the past, proceeding immediately"
+                );
+                None
+            }
+        });
+
+        // Combine delay and schedule_wait (both apply if both are set)
+        match (step.delay, schedule_wait) {
+            (Some(delay), Some(schedule)) => Some(delay + schedule),
+            (Some(delay), None) => Some(delay),
+            (None, Some(schedule)) => Some(schedule),
+            (None, None) => None,
+        }
+    }
+
+    /// Create a guard that decrements active_workflows on drop.
+    /// This ensures the count is decremented even if a task panics.
+    fn active_workflow_guard(&self) -> ActiveWorkflowGuard {
+        ActiveWorkflowGuard {
+            active_workflows: Arc::clone(&self.active_workflows),
+        }
+    }
+
+    /// Start a background task to periodically clean up old workflow states
+    ///
+    /// This prevents unbounded memory growth by removing completed/failed workflows
+    /// that are older than the specified TTL.
+    ///
+    /// The task will automatically stop when [`shutdown()`](Self::shutdown) is called.
+    ///
+    /// # Arguments
+    ///
+    /// * `ttl` - Time-to-live for terminal workflows (default: 1 hour)
+    /// * `interval` - How often to run cleanup (default: 5 minutes)
+    ///
+    /// # Returns
+    ///
+    /// A join handle for the cleanup task that can be used to stop it.
+    pub fn start_cleanup_task(
+        &self,
+        ttl: Option<Duration>,
+        interval: Option<Duration>,
+    ) -> tokio::task::JoinHandle<()> {
+        let state_store = self.state_store.clone();
+        let ttl = ttl.unwrap_or(Duration::from_secs(3600)); // 1 hour default
+        let interval = interval.unwrap_or(Duration::from_secs(300)); // 5 minutes default
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "periodic cleanup task with bounded lifetime via shutdown signal"
+        )]
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        state_store.cleanup_old_workflows(ttl).await;
+                    }
+                    _ = shutdown_rx.changed() => {
+                        tracing::info!("Cleanup task stopping due to shutdown");
+                        break;
+                    }
+                }
+            }
+        })
+    }
+
+    /// Register a workflow definition
+    #[must_use = "registration result should be checked"]
+    pub fn register_workflow(
+        &self,
+        mut definition: WorkflowDefinition<D>,
+    ) -> Result<(), super::definition::ValidationError> {
+        // Validate DAG and build dependency graph once at registration
+        definition.validate()?;
+
+        let id = definition.id.clone();
+        self.definitions.write().insert(id, Arc::new(definition));
+        Ok(())
+    }
+
+    /// Get the event bus for subscribing to workflow events
+    pub fn event_bus(&self) -> Arc<EventBus> {
+        Arc::clone(&self.event_bus)
+    }
+
+    /// Get the state store
+    pub fn state_store(&self) -> &S {
+        &self.state_store
+    }
+
+    /// Start a new workflow instance
+    ///
+    /// Returns `Err(WorkflowError::ShuttingDown)` if the engine is shutting down.
+    #[must_use = "workflow instance ID should be stored or awaited"]
+    pub async fn start_workflow(
+        &self,
+        definition_id: WorkflowId,
+        data: D,
+    ) -> WorkflowResult<WorkflowInstanceId> {
+        // Guard increments counter and decrements on drop unless committed.
+        // This handles all error paths automatically.
+        let guard = StartGuard::new(self);
+
+        if self.is_shutting_down() {
+            return Err(WorkflowError::ShuttingDown);
+        }
+
+        let definition = self
+            .definitions
+            .read()
+            .get(&definition_id)
+            .cloned()
+            .ok_or_else(|| WorkflowError::DefinitionNotFound(definition_id.clone()))?;
+
+        let instance_id = WorkflowInstanceId::new();
+        let mut state = WorkflowState::new(instance_id, definition_id.clone(), data);
+        state.status = WorkflowStatus::Running;
+
+        state.step_states.reserve(definition.steps.len());
+        for step in &definition.steps {
+            state
+                .step_states
+                .insert(step.id.clone(), StepState::default());
+        }
+
+        self.state_store.save(state).await?;
+
+        self.event_bus
+            .publish(WorkflowEvent::WorkflowStarted {
+                instance_id,
+                definition_id,
+            })
+            .await;
+
+        // Commit the guard - from here the spawned task takes ownership of the count
+        guard.commit();
+
+        let engine = self.clone_for_execution();
+        let def = Arc::clone(&definition);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "detached workflow execution; caller receives instance_id to track progress via state store"
+        )]
+        tokio::spawn(async move {
+            let _guard = engine.active_workflow_guard();
+            let result = engine.execute_workflow(instance_id, def).await;
+            if let Err(e) = result {
+                tracing::error!(instance_id = %instance_id, error = ?e, "Workflow execution failed");
+            }
+        });
+
+        Ok(instance_id)
+    }
+
+    /// Execute a workflow with DAG-based parallel execution
+    ///
+    /// Uses event-driven readiness: instead of scanning all steps each iteration,
+    /// we only check steps whose dependencies just completed.
+    async fn execute_workflow(
+        &self,
+        instance_id: WorkflowInstanceId,
+        definition: Arc<WorkflowDefinition<D>>,
+    ) -> WorkflowResult<()> {
+        let start_time = std::time::Instant::now();
+        let step_count = definition.steps.len();
+
+        let tracker: Arc<RwLock<StepTracker>> = Arc::new(RwLock::new(StepTracker::default()));
+        let (tx, mut rx) = mpsc::channel::<(StepId, StepResult)>(step_count.max(1));
+
+        // Initialize with steps that have no dependencies (O(1) lookup)
+        let mut pending_check: VecDeque<usize> = definition
+            .get_initial_step_indices()
+            .iter()
+            .copied()
+            .collect();
+
+        loop {
+            if self.state_store.is_cancelled(instance_id).await? {
+                self.event_bus
+                    .publish(WorkflowEvent::WorkflowCancelled { instance_id })
+                    .await;
+                return Ok(());
+            }
+
+            // Phase 0: Drain any pending completion signals to ensure dependents are added
+            drain_completions(&mut rx, &definition, &mut pending_check, "startup drain");
+
+            // Phase 1: Check waiting steps + deps-ready steps + blocked detection
+            let scan = scan_ready(&tracker.read(), &definition, &mut pending_check);
+            // Phase 2: Process waiting and deps-ready steps, update waiting_until
+            let (ready_to_launch, steps_added_to_waiting) =
+                Self::schedule_ready(&mut tracker.write(), &definition, &scan);
+            let (total_processed, current_running, current_waiting) =
+                (scan.total_processed, scan.running, scan.waiting);
+
+            if total_processed == step_count {
+                break;
+            }
+
+            // Handle blocked workflow (no ready steps, none running/waiting, but work remains).
+            // current_waiting is from Phase 1, so add the steps Phase 2 just put into waiting.
+            let effective_waiting = current_waiting + steps_added_to_waiting;
+            if ready_to_launch.is_empty()
+                && current_running == 0
+                && effective_waiting == 0
+                && pending_check.is_empty()
+            {
+                // A step can finish in the gap between Phase 0's drain and Phase 1's
+                // tracker read: it removes itself from `running` and sends its
+                // completion in one lock scope, so Phase 1 sees running == 0 while
+                // the message is still queued in `rx` and its dependents were never
+                // added to `pending_check`. Re-drain before declaring deadlock;
+                // instant-completing steps (e.g. ZMQ connection detection) hit this
+                // window routinely.
+                if drain_completions(
+                    &mut rx,
+                    &definition,
+                    &mut pending_check,
+                    "deadlock-check drain",
+                ) {
+                    continue;
+                }
+
+                return self.fail_blocked(instance_id, &tracker).await;
+            }
+
+            let tasks_launched = ready_to_launch.len();
+            if tasks_launched > 0 {
+                let mut t = tracker.write();
+                for &idx in &ready_to_launch {
+                    t.running.insert(definition.steps[idx].id.clone());
+                }
+            }
+
+            for step_idx in ready_to_launch {
+                let engine = self.clone_for_execution();
+                let def = Arc::clone(&definition);
+                let tx = tx.clone();
+                let tracker = Arc::clone(&tracker);
+
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "parallel step execution; results sent back via channel tx"
+                )]
+                tokio::spawn(async move {
+                    engine
+                        .run_step(def, step_idx, instance_id, tx, tracker)
+                        .await;
+                });
+            }
+
+            let (has_running, has_waiting) = {
+                let t = tracker.read();
+                (
+                    tasks_launched > 0 || !t.running.is_empty(),
+                    !t.waiting_until.is_empty(),
+                )
+            };
+
+            if has_running {
+                if let Some((completed_step_id, result)) = rx.recv().await {
+                    tracing::debug!(
+                        step_id = %completed_step_id,
+                        result = ?result,
+                        "Step completed"
+                    );
+                    enqueue_dependents(&definition, &completed_step_id, result, &mut pending_check);
+                }
+            } else if has_waiting {
+                // No running tasks, but some steps are waiting for their delay/schedule
+                // Calculate how long to sleep based on the soonest waiting step
+                let sleep_duration = time_to_next_wait(&tracker.read());
+
+                // Sleep until the next step is ready (with a cap to allow cancellation checks)
+                let capped_sleep = sleep_duration.min(Duration::from_millis(100));
+                tokio::time::sleep(capped_sleep).await;
+            }
+        }
+
+        self.finish(instance_id, &tracker, start_time).await
+    }
+
+    /// The blocked verdict: no step ready, none running or waiting, work left.
+    /// The first step to fail is the cause when there is one, a deadlock
+    /// otherwise.
+    async fn fail_blocked(
+        &self,
+        instance_id: WorkflowInstanceId,
+        tracker: &Arc<RwLock<StepTracker>>,
+    ) -> WorkflowResult<()> {
+        let failed_step = tracker.read().first_failed.clone();
+        // Use &'static str to avoid allocation in common error paths
+        let error_message: &'static str = if failed_step.is_some() {
+            "Workflow failed due to step dependency failure"
+        } else {
+            "Workflow deadlocked: no steps ready and none running"
+        };
+
+        self.mark_failed(instance_id, failed_step.as_ref()).await?;
+        self.event_bus
+            .publish(WorkflowEvent::WorkflowFailed {
+                instance_id,
+                failed_step: failed_step.unwrap_or_else(|| StepId::new("internal_scheduler")),
+                error: error_message.to_string(),
+            })
+            .await;
+        Ok(())
+    }
+
+    /// Mark the run failed. Its current step becomes the first step that
+    /// failed, where one did: an attempt of another branch that began later
+    /// does not name the run's failure. A deadlock with no failed step keeps
+    /// the last step an attempt named.
+    async fn mark_failed(
+        &self,
+        instance_id: WorkflowInstanceId,
+        failed_step: Option<&StepId>,
+    ) -> WorkflowResult<()> {
+        self.state_store
+            .update(instance_id, |s| {
+                s.status = WorkflowStatus::Failed;
+                if let Some(step) = failed_step {
+                    s.current_step = Some(step.clone());
+                }
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// One launched step, on its own task: the `run_if` gate, the step with
+    /// its retries, and the completion into the tracker and the channel.
+    async fn run_step(
+        self,
+        def: Arc<WorkflowDefinition<D>>,
+        step_idx: usize,
+        instance_id: WorkflowInstanceId,
+        tx: mpsc::Sender<(StepId, StepResult)>,
+        tracker: Arc<RwLock<StepTracker>>,
+    ) {
+        let engine = self;
+        let step = &def.steps[step_idx];
+        let step_id = step.id.clone();
+
+        let completion = match engine.run_if_gate(instance_id, step).await {
+            Gate::Run => {
+                let result = engine
+                    .execute_step_with_retry(instance_id, step, &def)
+                    .await;
+                Completion::of(result, step.on_failure)
+            }
+            Gate::Skip => Completion::skipped(),
+            Gate::Fail(error) => Completion::failed(error),
+            Gate::Panic(error) => Completion::panicked(error, step.on_failure),
+        };
+
+        // The step's end is stored before its dependents are told, so a
+        // reader of the ended run finds the step's status and its error.
+        if let Some((status, last_error)) = completion.state {
+            engine
+                .record_step_status(instance_id, &step_id, status, last_error)
+                .await;
+        }
+
+        Self::settle(&tracker, &tx, &step_id, completion.signal);
+    }
+
+    /// The `run_if` verdict: a step without a condition runs; one whose
+    /// condition does not hold is skipped; one whose context cannot be read
+    /// fails rather than proceeding blindly; one whose condition panics fails
+    /// by its failure action.
+    async fn run_if_gate(&self, instance_id: WorkflowInstanceId, step: &StepDefinition<D>) -> Gate {
+        let Some(condition) = step.run_if.as_ref() else {
+            return Gate::Run;
+        };
+        match self.state_store.get_context(instance_id).await {
+            // The condition is the step author's code: its panic fails the
+            // step as a panic in `execute` does.
+            Ok(ctx) => match catch_unwind(AssertUnwindSafe(|| condition(&ctx))) {
+                Ok(true) => Gate::Run,
+                Ok(false) => {
+                    tracing::debug!(
+                        step_id = %step.id,
+                        "Step skipped due to run_if condition"
+                    );
+                    Gate::Skip
+                }
+                Err(panic) => {
+                    tracing::error!(
+                        instance_id = %instance_id,
+                        step_id = %step.id,
+                        panic = panic_words(panic.as_ref()),
+                        "run_if panicked"
+                    );
+                    Gate::Panic(PLAIN_FAILURE.to_string())
+                }
+            },
+            Err(e) => {
+                tracing::error!(
+                    step_id = %step.id,
+                    error = ?e,
+                    "Failed to get context for run_if evaluation, failing step"
+                );
+                Gate::Fail(format!("run_if context error: {e}"))
+            }
+        }
+    }
+
+    /// The step leaves `running` for the set its signal names and its
+    /// dependents are told, in one lock scope: the deadlock re-drain never
+    /// sees running == 0 with the completion still unsent.
+    fn settle(
+        tracker: &RwLock<StepTracker>,
+        tx: &mpsc::Sender<(StepId, StepResult)>,
+        step_id: &StepId,
+        signal: StepResult,
+    ) {
+        let mut t = tracker.write();
+        t.running.remove(step_id);
+        match signal {
+            StepResult::Success => t.completed.insert(step_id.clone()),
+            StepResult::Skip => t.skipped.insert(step_id.clone()),
+            StepResult::Failure => {
+                t.first_failed.get_or_insert_with(|| step_id.clone());
+                t.failed.insert(step_id.clone())
+            }
+        };
+
+        if let Err(e) = tx.try_send((step_id.clone(), signal)) {
+            use mpsc::error::TrySendError;
+            match e {
+                TrySendError::Full(_) => {
+                    tracing::error!(
+                        step_id = %step_id,
+                        "Channel full when sending step completion - this is a bug"
+                    );
+                }
+                TrySendError::Closed(_) => {
+                    tracing::debug!(
+                        step_id = %step_id,
+                        "Channel closed, workflow likely cancelled"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The step state a completion owes: the status, and the error text when
+    /// the step failed before it ran. Such a step is the run's failing step.
+    async fn record_step_status(
+        &self,
+        instance_id: WorkflowInstanceId,
+        step_id: &StepId,
+        status: StepStatus,
+        last_error: Option<String>,
+    ) {
+        if let Err(e) = self
+            .state_store
+            .update(instance_id, |s| {
+                // A step that failed before an attempt is the run's failing
+                // step: no attempt named it as the current one.
+                if status == StepStatus::Failed {
+                    s.current_step = Some(step_id.clone());
+                }
+                if let Some(step_state) = s.step_states.get_mut(step_id) {
+                    step_state.status = status;
+                    if last_error.is_some() {
+                        step_state.last_error = last_error;
+                    }
+                }
+            })
+            .await
+        {
+            tracing::warn!(
+                step_id = %step_id,
+                error = ?e,
+                "Failed to update step state to {status:?}"
+            );
+        }
+    }
+
+    /// Phase 2: the steps that launch now, and how many went to wait for their
+    /// delay or schedule instead; a `depends_on_any` step appears once however
+    /// many of its dependencies were satisfied.
+    fn schedule_ready(
+        t: &mut StepTracker,
+        definition: &WorkflowDefinition<D>,
+        scan: &ReadyScan,
+    ) -> (Vec<usize>, usize) {
+        let now = std::time::Instant::now();
+        let mut added_to_waiting = 0usize;
+
+        // Clear waiting status for ready steps
+        for &idx in &scan.wait_ready {
+            t.clear_waiting(idx);
+        }
+
+        // Deduplicate: a depends_on_any step can appear once per satisfied
+        // dependency but must only launch once.
+        let mut seen = HashSet::new();
+        let mut ready: Vec<usize> = Vec::new();
+        for &idx in &scan.wait_ready {
+            if seen.insert(idx) {
+                ready.push(idx);
+            }
+        }
+
+        for &idx in &scan.deps_ready {
+            let step = &definition.steps[idx];
+            let wait_duration = Self::calculate_wait_duration(step);
+
+            if let Some(duration) = wait_duration {
+                if duration > Duration::ZERO {
+                    // Step needs to wait - add to waiting_until
+                    let ready_at = now + duration;
+                    tracing::debug!(
+                        step_id = %step.id,
+                        wait_ms = duration.as_millis(),
+                        "Step waiting for delay/schedule"
+                    );
+                    t.set_waiting(idx, ready_at);
+                    added_to_waiting += 1;
+                    continue;
+                }
+            }
+            if seen.insert(idx) {
+                ready.push(idx);
+            }
+        }
+
+        (ready, added_to_waiting)
+    }
+
+    /// The end of the workflow: failed when a step failed, completed otherwise,
+    /// each with its event. A failed run is named by the first step to fail.
+    async fn finish(
+        &self,
+        instance_id: WorkflowInstanceId,
+        tracker: &Arc<RwLock<StepTracker>>,
+        start_time: std::time::Instant,
+    ) -> WorkflowResult<()> {
+        let failed_step = tracker.read().first_failed.clone();
+
+        if let Some(ref step) = failed_step {
+            self.mark_failed(instance_id, Some(step)).await?;
+            self.event_bus
+                .publish(WorkflowEvent::WorkflowFailed {
+                    instance_id,
+                    failed_step: step.clone(),
+                    error: "One or more steps failed".into(),
+                })
+                .await;
+        } else {
+            self.state_store
+                .update(instance_id, |s| {
+                    s.status = WorkflowStatus::Completed;
+                })
+                .await?;
+
+            let duration = start_time.elapsed();
+            self.event_bus
+                .publish(WorkflowEvent::WorkflowCompleted {
+                    instance_id,
+                    duration,
+                })
+                .await;
+        }
+
+        Ok(())
+    }
+
+    /// Execute a step with retry logic: each attempt is begun (state and
+    /// event), run under the step timeout with its context written back, and
+    /// ends the step or waits out the backoff for the next attempt.
+    async fn execute_step_with_retry(
+        &self,
+        instance_id: WorkflowInstanceId,
+        step: &StepDefinition<D>,
+        definition: &WorkflowDefinition<D>,
+    ) -> WorkflowResult<StepResult> {
+        let retry_policy = definition.get_retry_policy(step);
+        let step_timeout = definition.get_timeout(step);
+
+        let mut attempt = 1;
+        let max_attempts = if matches!(step.on_failure, FailureAction::RetryIndefinitely) {
+            u32::MAX
+        } else {
+            retry_policy.max_attempts
+        };
+
+        let mut backoff = Self::create_backoff(&retry_policy.backoff);
+
+        loop {
+            if self.state_store.is_cancelled(instance_id).await? {
+                return Err(WorkflowError::Cancelled(instance_id));
+            }
+
+            self.begin_attempt(instance_id, step, attempt).await?;
+            let Attempt {
+                outcome,
+                context,
+                duration,
+            } = self.run_once(instance_id, step, step_timeout).await?;
+
+            match outcome {
+                Outcome::Success => {
+                    self.succeed(instance_id, step, &context, duration).await?;
+                    return Ok(StepResult::Success);
+                }
+                Outcome::Skip => return Ok(StepResult::Skip),
+                Outcome::Failed { error, retryable } => {
+                    let will_retry = retryable && attempt < max_attempts;
+                    self.record_failure(instance_id, step, &error, will_retry)
+                        .await?;
+                    if !will_retry {
+                        self.give_up(step, &context, error).await;
+                        return Ok(StepResult::Failure);
+                    }
+                    self.wait_before_retry(instance_id, step, &mut backoff, attempt)
+                        .await;
+                    attempt += 1;
+                }
+            }
+        }
+    }
+
+    /// The attempt's start: the step state (running, or retrying from the
+    /// second attempt on) and the started event. A workflow cancelled by
+    /// then starts no attempt.
+    async fn begin_attempt(
+        &self,
+        instance_id: WorkflowInstanceId,
+        step: &StepDefinition<D>,
+        attempt: u32,
+    ) -> WorkflowResult<()> {
+        // The cancel read and the attempt's start are one store update: a
+        // step never moves to running once the cancel is written, so a
+        // waiter's snapshot after the cancel sees every step on its task
+        // (the `is_cancelled` read before this is the fast path).
+        let mut cancelled = false;
+        self.state_store
+            .update(instance_id, |s| {
+                if s.status == WorkflowStatus::Cancelled {
+                    cancelled = true;
+                    return;
+                }
+                s.current_step = Some(step.id.clone());
+                if let Some(step_state) = s.step_states.get_mut(&step.id) {
+                    step_state.status = if attempt == 1 {
+                        StepStatus::Running
+                    } else {
+                        StepStatus::Retrying
+                    };
+                    step_state.attempt = attempt;
+                    step_state.started_at = Some(Utc::now());
+                }
+            })
+            .await?;
+        if cancelled {
+            return Err(WorkflowError::Cancelled(instance_id));
+        }
+
+        self.event_bus
+            .publish(WorkflowEvent::StepStarted {
+                instance_id,
+                step_id: step.id.clone(),
+                attempt,
+            })
+            .await;
+        Ok(())
+    }
+
+    /// One attempt: the executor runs on a copy of the shared context under
+    /// the step timeout, and the copy is written back — but not for a Skip.
+    /// A Skip is a pre-mutation early return (the step ran no logic), so
+    /// `context` is just the stale full-copy read at step start; writing it
+    /// back would clobber a concurrent parallel-branch step under
+    /// last-writer-wins. Concretely: an instantly-skipping external branch
+    /// step would erase the `connection_mode` a just-finished local branch
+    /// step committed, because the whole context is snapshotted and rewritten
+    /// wholesale rather than field-merged.
+    async fn run_once(
+        &self,
+        instance_id: WorkflowInstanceId,
+        step: &StepDefinition<D>,
+        step_timeout: Duration,
+    ) -> WorkflowResult<Attempt<D>> {
+        let mut context = self.state_store.get_context(instance_id).await?;
+
+        let step_start = std::time::Instant::now();
+        let result = {
+            let attempt = pin!(async { step.executor.execute(&mut context).await });
+            timeout(step_timeout, CatchPanic(attempt)).await
+        };
+        let duration = step_start.elapsed();
+
+        let outcome = match result {
+            Ok(Ok(Ok(StepResult::Success))) => Outcome::Success,
+            Ok(Ok(Ok(StepResult::Skip))) => Outcome::Skip,
+            Ok(Ok(Ok(StepResult::Failure))) => Outcome::Failed {
+                error: PLAIN_FAILURE.to_string(),
+                retryable: false,
+            },
+            Ok(Ok(Err(e))) => Outcome::Failed {
+                error: format!("{e}"),
+                // The executor's word, and no further attempt when it panics.
+                retryable: catch_unwind(AssertUnwindSafe(|| step.executor.is_retryable(&e)))
+                    .unwrap_or_else(|panic| {
+                        tracing::warn!(
+                            step_id = %step.id,
+                            panic = panic_words(panic.as_ref()),
+                            "is_retryable panicked, no further attempt"
+                        );
+                        false
+                    }),
+            },
+            // A panic fails the attempt, and no further attempt is made.
+            Ok(Err(panic)) => {
+                tracing::error!(
+                    instance_id = %instance_id,
+                    step_id = %step.id,
+                    panic = panic_words(panic.as_ref()),
+                    "Step panicked"
+                );
+                Outcome::Failed {
+                    error: PLAIN_FAILURE.to_string(),
+                    retryable: false,
+                }
+            }
+            Err(_) => Outcome::Failed {
+                error: format!("Step timeout after {step_timeout:?}"),
+                // Timeouts are retryable
+                retryable: true,
+            },
+        };
+
+        if !matches!(outcome, Outcome::Skip) {
+            self.state_store
+                .update(instance_id, |s| {
+                    s.context = context.clone();
+                })
+                .await?;
+        }
+
+        Ok(Attempt {
+            outcome,
+            context,
+            duration,
+        })
+    }
+
+    /// A successful attempt: the step state, the succeeded event and the
+    /// executor's `on_success` hook (its failure is logged, not propagated).
+    async fn succeed(
+        &self,
+        instance_id: WorkflowInstanceId,
+        step: &StepDefinition<D>,
+        context: &WorkflowContext<D>,
+        duration: Duration,
+    ) -> WorkflowResult<()> {
+        self.state_store
+            .update(instance_id, |s| {
+                if let Some(step_state) = s.step_states.get_mut(&step.id) {
+                    step_state.status = StepStatus::Succeeded;
+                    step_state.completed_at = Some(Utc::now());
+                }
+            })
+            .await?;
+
+        self.event_bus
+            .publish(WorkflowEvent::StepSucceeded {
+                instance_id,
+                step_id: step.id.clone(),
+                duration,
+            })
+            .await;
+
+        let hook = pin!(async { step.executor.on_success(context).await });
+        log_hook_end(&step.id, "on_success", CatchPanic(hook).await);
+        Ok(())
+    }
+
+    /// A failed attempt: the step state (retrying, or failed with its
+    /// completion time) and the failed event.
+    async fn record_failure(
+        &self,
+        instance_id: WorkflowInstanceId,
+        step: &StepDefinition<D>,
+        error: &str,
+        will_retry: bool,
+    ) -> WorkflowResult<()> {
+        self.state_store
+            .update(instance_id, |s| {
+                if let Some(step_state) = s.step_states.get_mut(&step.id) {
+                    step_state.status = if will_retry {
+                        StepStatus::Retrying
+                    } else {
+                        StepStatus::Failed
+                    };
+                    step_state.last_error = Some(error.to_string());
+                    if !will_retry {
+                        step_state.completed_at = Some(Utc::now());
+                    }
+                }
+            })
+            .await?;
+
+        self.event_bus
+            .publish(WorkflowEvent::StepFailed {
+                instance_id,
+                step_id: step.id.clone(),
+                error: error.to_string(),
+                will_retry,
+            })
+            .await;
+        Ok(())
+    }
+
+    /// Between attempts: the backoff's next delay (a second when it has none
+    /// left), the retrying event, and the wait, which ends early when the
+    /// workflow is cancelled.
+    async fn wait_before_retry(
+        &self,
+        instance_id: WorkflowInstanceId,
+        step: &StepDefinition<D>,
+        backoff: &mut BackoffImpl,
+        attempt: u32,
+    ) {
+        let delay = backoff
+            .next_backoff()
+            .unwrap_or_else(|| Duration::from_secs(1));
+
+        self.event_bus
+            .publish(WorkflowEvent::StepRetrying {
+                instance_id,
+                step_id: step.id.clone(),
+                attempt: attempt + 1,
+                delay,
+            })
+            .await;
+
+        // The cancellation is read between slices of the sleep: a step that
+        // polls a starting engine sleeps minutes between attempts, and the
+        // read before the next attempt would otherwise come after the whole
+        // sleep. A state the store no longer holds ends the wait as well; the
+        // next attempt's read reports it.
+        let deadline = tokio::time::Instant::now() + delay;
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return;
+            }
+            tokio::time::sleep((deadline - now).min(CANCELLATION_READ_INTERVAL)).await;
+            if self
+                .state_store
+                .is_cancelled(instance_id)
+                .await
+                .unwrap_or(true)
+            {
+                return;
+            }
+        }
+    }
+
+    /// The last failure: the executor's `on_failure` hook with the step's
+    /// error (its own failure is logged, not propagated).
+    async fn give_up(&self, step: &StepDefinition<D>, context: &WorkflowContext<D>, error: String) {
+        let hook_error = WorkflowError::StepFailed {
+            step_id: step.id.clone(),
+            message: error,
+        };
+        let hook = pin!(async { step.executor.on_failure(context, &hook_error).await });
+        log_hook_end(&step.id, "on_failure", CatchPanic(hook).await);
+    }
+
+    fn create_backoff(strategy: &BackoffStrategy) -> BackoffImpl {
+        match strategy {
+            BackoffStrategy::Fixed(duration) => BackoffImpl::Fixed(FixedBackoff(*duration)),
+            BackoffStrategy::Exponential { base, max } => {
+                let backoff = ExponentialBackoffBuilder::new()
+                    .with_initial_interval(*base)
+                    .with_max_interval(*max)
+                    .with_max_elapsed_time(None)
+                    .build();
+                BackoffImpl::Exponential(backoff)
+            }
+            BackoffStrategy::Linear { increment, max } => {
+                BackoffImpl::Linear(LinearBackoff::new(*increment, *max))
+            }
+        }
+    }
+
+    /// Cancel a running workflow
+    pub async fn cancel_workflow(&self, instance_id: WorkflowInstanceId) -> WorkflowResult<()> {
+        self.state_store
+            .update(instance_id, |s| {
+                s.status = WorkflowStatus::Cancelled;
+            })
+            .await?;
+
+        self.event_bus
+            .publish(WorkflowEvent::WorkflowCancelled { instance_id })
+            .await;
+
+        Ok(())
+    }
+
+    /// Get workflow status
+    pub async fn get_status(
+        &self,
+        instance_id: WorkflowInstanceId,
+    ) -> WorkflowResult<WorkflowState<D>> {
+        self.state_store.load(instance_id).await
+    }
+
+    /// Wait for a workflow to complete with adaptive polling
+    ///
+    /// Returns Ok with success message on completion, Err on failure/timeout/cancellation.
+    /// Automatically cleans up terminal workflow states.
+    pub async fn wait_for_completion(
+        &self,
+        instance_id: WorkflowInstanceId,
+        label: &str,
+        timeout_duration: Duration,
+    ) -> Result<String, String> {
+        let state = self
+            .wait_for_terminal_state(instance_id, label, timeout_duration)
+            .await?;
+        completion_outcome(&state, label)
+    }
+
+    /// Waits for the workflow to reach a terminal status and returns that
+    /// state, its step states included, read before the terminal cleanup. A
+    /// cancellation is written at once while a step past its cancel read is
+    /// still on its task, so a cancelled workflow is terminal here only once
+    /// no step reads running or retrying: that step's own end is in the
+    /// state (succeeded or failed), and a step cancelled before its next
+    /// attempt reads cancelled. The timeout is an error and leaves a
+    /// still-running workflow to the periodic cleanup.
+    pub async fn wait_for_terminal_state(
+        &self,
+        instance_id: WorkflowInstanceId,
+        label: &str,
+        timeout_duration: Duration,
+    ) -> Result<WorkflowState<D>, String> {
+        // The runtime's clock, which a step's own timeout reads too.
+        let start = tokio::time::Instant::now();
+        let mut poll_interval = Duration::from_millis(100);
+        let max_poll_interval = Duration::from_millis(2000);
+        let poll_backoff = Duration::from_millis(200);
+        loop {
+            if start.elapsed() > timeout_duration {
+                // Only removes already-terminal state; a still-running
+                // workflow stays readable and is reclaimed by the periodic
+                // cleanup task once it terminates.
+                self.state_store.cleanup_if_terminal(instance_id).await;
+                return Err(format!(
+                    "Workflow timeout after {}s for {}",
+                    timeout_duration.as_secs(),
+                    label
+                ));
+            }
+            let state = self
+                .get_status(instance_id)
+                .await
+                .map_err(|e| format!("Failed to get workflow status: {e:?}"))?;
+            let step_on_its_task = state
+                .step_states
+                .values()
+                .any(|step| matches!(step.status, StepStatus::Running | StepStatus::Retrying));
+            match state.status {
+                WorkflowStatus::Cancelled if step_on_its_task => {
+                    tokio::time::sleep(poll_interval).await;
+                    poll_interval = (poll_interval + poll_backoff).min(max_poll_interval);
+                }
+                WorkflowStatus::Completed | WorkflowStatus::Failed | WorkflowStatus::Cancelled => {
+                    self.state_store.cleanup_if_terminal(instance_id).await;
+                    return Ok(state);
+                }
+                WorkflowStatus::Pending | WorkflowStatus::Paused | WorkflowStatus::Running => {
+                    tokio::time::sleep(poll_interval).await;
+                    poll_interval = (poll_interval + poll_backoff).min(max_poll_interval);
+                }
+            }
+        }
+    }
+
+    /// Clone engine for async execution
+    fn clone_for_execution(&self) -> Self {
+        Self {
+            definitions: Arc::clone(&self.definitions),
+            state_store: self.state_store.clone(),
+            event_bus: Arc::clone(&self.event_bus),
+            shutdown_tx: Arc::clone(&self.shutdown_tx),
+            active_workflows: Arc::clone(&self.active_workflows),
+        }
+    }
+}
+
+/// RAII guard that decrements active_workflows count on drop.
+/// Ensures proper cleanup even if a workflow task panics.
+struct ActiveWorkflowGuard {
+    active_workflows: Arc<AtomicUsize>,
+}
+
+impl Drop for ActiveWorkflowGuard {
+    fn drop(&mut self) {
+        self.active_workflows.fetch_sub(1, Ordering::Release);
+    }
+}
+
+/// RAII guard for start_workflow that increments on creation and decrements on drop
+/// unless commit() is called. Handles all error paths automatically.
+struct StartGuard<'a, D: WorkflowData, S: StateStore<D> + 'static> {
+    engine: &'a WorkflowEngine<D, S>,
+    committed: bool,
+}
+
+impl<'a, D: WorkflowData, S: StateStore<D> + 'static> StartGuard<'a, D, S> {
+    fn new(engine: &'a WorkflowEngine<D, S>) -> Self {
+        engine.active_workflows.fetch_add(1, Ordering::AcqRel);
+        Self {
+            engine,
+            committed: false,
+        }
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl<D: WorkflowData, S: StateStore<D> + 'static> Drop for StartGuard<'_, D, S> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.engine.workflow_finished();
+        }
+    }
+}
+
+/// Shallow clone: shares all Arc-held state; used for spawning execution tasks.
+impl<D: WorkflowData, S: StateStore<D> + 'static> Clone for WorkflowEngine<D, S> {
+    fn clone(&self) -> Self {
+        self.clone_for_execution()
+    }
+}
+
+impl<D: WorkflowData> Default for WorkflowEngine<D, InMemoryStore<D>> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<D: WorkflowData, S: StateStore<D> + 'static> std::fmt::Debug for WorkflowEngine<D, S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkflowEngine")
+            .field("definitions_count", &self.definitions.read().len())
+            .finish()
+    }
+}
+
+/// The outcome a terminal state reads as: the completion line, the
+/// failing step's error, or the cancellation.
+pub fn completion_outcome<D: WorkflowData>(
+    state: &WorkflowState<D>,
+    label: &str,
+) -> Result<String, String> {
+    match state.status {
+        WorkflowStatus::Completed => Ok(format!("{label} completed successfully via workflow")),
+        WorkflowStatus::Failed => {
+            let current_step = state.current_step.as_ref();
+            let step_name = current_step
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            let error_msg = current_step
+                .and_then(|step_id| state.step_states.get(step_id))
+                .and_then(|s| s.last_error.as_deref())
+                .unwrap_or("Unknown error");
+            Err(format!("Workflow failed at step {step_name}: {error_msg}"))
+        }
+        WorkflowStatus::Cancelled => Err(format!("Workflow cancelled for {label}")),
+        WorkflowStatus::Pending | WorkflowStatus::Paused | WorkflowStatus::Running => {
+            Err(format!("Workflow still running for {label}"))
+        }
+    }
+}
+
+#[cfg(test)]
+mod scheduler_tests {
+    //! The scheduler's phases over a three-step definition: `a`, `b` after
+    //! `a`, and `c` after either of them.
+
+    use serde::{Deserialize, Serialize};
+
+    use super::*;
+    use crate::executor::StepExecutor;
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    struct Data;
+
+    impl WorkflowData for Data {
+        fn workflow_type() -> &'static str {
+            "scheduler-test"
+        }
+    }
+
+    struct Noop;
+
+    #[async_trait::async_trait]
+    impl StepExecutor<Data> for Noop {
+        async fn execute(
+            &self,
+            _context: &mut WorkflowContext<Data>,
+        ) -> WorkflowResult<StepResult> {
+            Ok(StepResult::Success)
+        }
+    }
+
+    fn step(id: &str) -> StepDefinition<Data> {
+        StepDefinition::new(id, id, Arc::new(Noop))
+    }
+
+    /// `a`; `b` after `a`; `c` after `a` or `b`; `c` delayed when `delay_c`.
+    fn three_steps(delay_c: Option<Duration>) -> WorkflowDefinition<Data> {
+        let mut c = step("c").depends_on_any(&["a", "b"]);
+        if let Some(delay) = delay_c {
+            c = c.with_delay(delay);
+        }
+        let mut definition = WorkflowDefinition::new("wf", "wf")
+            .add_step(step("a"))
+            .add_step(step("b").depends_on(&["a"]))
+            .add_step(c);
+        definition.validate().expect("a valid definition");
+        definition
+    }
+
+    #[test]
+    fn the_drain_puts_the_dependents_of_a_finished_step_up_for_a_check_and_says_whether_any_came() {
+        let definition = three_steps(None);
+        let (tx, mut rx) = mpsc::channel::<(StepId, StepResult)>(8);
+        let mut pending = VecDeque::new();
+
+        assert!(!drain_completions(&mut rx, &definition, &mut pending, "t"));
+        assert!(pending.is_empty());
+
+        tx.try_send((StepId::new("a"), StepResult::Success))
+            .unwrap();
+        assert!(drain_completions(&mut rx, &definition, &mut pending, "t"));
+        assert_eq!(
+            pending.iter().copied().collect::<Vec<_>>(),
+            [1, 2],
+            "b and c follow a"
+        );
+
+        pending.clear();
+        tx.try_send((StepId::new("b"), StepResult::Failure))
+            .unwrap();
+        tx.try_send((StepId::new("a"), StepResult::Skip)).unwrap();
+        assert!(drain_completions(&mut rx, &definition, &mut pending, "t"));
+        assert_eq!(
+            pending.iter().copied().collect::<Vec<_>>(),
+            [1, 2],
+            "a failed step's dependents are not put up; a skipped step's are"
+        );
+    }
+
+    #[test]
+    fn a_completion_puts_dependents_up_for_a_check_only_when_its_step_succeeded_or_was_skipped() {
+        let definition = three_steps(None);
+        let a = StepId::new("a");
+        let dependents_of_a: Vec<usize> = definition.get_dependent_indices(&a).to_vec();
+        assert!(
+            !dependents_of_a.is_empty(),
+            "the fixture gives `a` a dependent"
+        );
+
+        let mut pending = VecDeque::new();
+        enqueue_dependents(&definition, &a, StepResult::Failure, &mut pending);
+        assert!(pending.is_empty(), "a failed step unblocks nothing");
+
+        enqueue_dependents(&definition, &a, StepResult::Skip, &mut pending);
+        assert_eq!(Vec::from(pending.clone()), dependents_of_a);
+
+        pending.clear();
+        enqueue_dependents(&definition, &a, StepResult::Success, &mut pending);
+        assert_eq!(Vec::from(pending), dependents_of_a);
+    }
+
+    #[test]
+    fn the_scan_finds_the_steps_whose_dependencies_are_satisfied() {
+        let definition = three_steps(None);
+        let mut tracker = StepTracker::default();
+        tracker.completed.insert(StepId::new("a"));
+        let mut pending: VecDeque<usize> = [1, 2].into_iter().collect();
+
+        let scan = scan_ready(&tracker, &definition, &mut pending);
+        assert_eq!(scan.deps_ready, [1, 2], "b after a, c after any of a or b");
+        assert!(scan.wait_ready.is_empty());
+        assert_eq!(
+            (scan.total_processed, scan.running, scan.waiting),
+            (1, 0, 0)
+        );
+        assert!(pending.is_empty(), "the checks are consumed");
+    }
+
+    #[test]
+    fn scheduling_launches_an_any_step_once_and_defers_a_delayed_step_to_its_wait() {
+        let scan = |deps_ready: Vec<usize>| ReadyScan {
+            wait_ready: Vec::new(),
+            deps_ready,
+            total_processed: 1,
+            running: 0,
+            waiting: 0,
+        };
+        type Engine = WorkflowEngine<Data, InMemoryStore<Data>>;
+
+        // c satisfied twice (by a and by b) launches once.
+        let definition = three_steps(None);
+        let mut tracker = StepTracker::default();
+        let (ready, waiting) =
+            Engine::schedule_ready(&mut tracker, &definition, &scan(vec![1, 2, 2]));
+        assert_eq!((ready, waiting), (vec![1, 2], 0));
+
+        // A delayed c goes to wait instead, and a wait that is over launches.
+        let definition = three_steps(Some(Duration::from_secs(60)));
+        let mut tracker = StepTracker::default();
+        let (ready, waiting) = Engine::schedule_ready(&mut tracker, &definition, &scan(vec![1, 2]));
+        assert_eq!((ready, waiting), (vec![1], 1));
+        assert!(tracker.waiting_until.contains_key(&2));
+        let over = ReadyScan {
+            wait_ready: vec![2],
+            deps_ready: Vec::new(),
+            total_processed: 2,
+            running: 0,
+            waiting: 1,
+        };
+        let (ready, waiting) = Engine::schedule_ready(&mut tracker, &definition, &over);
+        assert_eq!((ready, waiting), (vec![2], 0));
+        assert!(!tracker.waiting_until.contains_key(&2));
+    }
+
+    #[test]
+    fn the_wait_is_until_the_soonest_delayed_step_and_a_short_tick_once_every_wait_is_over() {
+        let now = std::time::Instant::now();
+        let mut tracker = StepTracker::default();
+        tracker.set_waiting(1, now + Duration::from_secs(50));
+        tracker.set_waiting(2, now + Duration::from_secs(5));
+        let wait = time_to_next_wait(&tracker);
+        assert!(
+            wait > Duration::from_secs(4) && wait <= Duration::from_secs(5),
+            "{wait:?}"
+        );
+
+        let mut tracker = StepTracker::default();
+        tracker.set_waiting(1, now - Duration::from_secs(1));
+        assert_eq!(time_to_next_wait(&tracker), Duration::from_millis(10));
+    }
+
+    #[tokio::test]
+    async fn a_deadlock_with_no_failed_step_keeps_the_last_attempts_step() {
+        let engine: WorkflowEngine<Data> = WorkflowEngine::new();
+        let id = WorkflowInstanceId::new();
+        let last = StepId::new("last_attempt");
+        let mut state = WorkflowState::new(id, WorkflowId::new("deadlock"), Data);
+        state.status = WorkflowStatus::Running;
+        state.current_step = Some(last.clone());
+        engine
+            .state_store()
+            .save(state)
+            .await
+            .expect("the state is saved");
+
+        // No step failed, so the blocked verdict is a deadlock.
+        let tracker = Arc::new(RwLock::new(StepTracker::default()));
+        engine
+            .fail_blocked(id, &tracker)
+            .await
+            .expect("the verdict is written");
+
+        let state = engine.get_status(id).await.expect("the run's state");
+        assert_eq!(state.status, WorkflowStatus::Failed);
+        assert_eq!(state.current_step, Some(last));
+    }
+}

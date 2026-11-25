@@ -1,0 +1,961 @@
+"""
+Unit tests for router configuration validation and setup.
+
+These tests focus on testing the router configuration logic in isolation,
+including validation of configuration parameters and their interactions.
+"""
+
+import inspect
+import re
+import subprocess
+import sys
+from textwrap import dedent
+from unittest.mock import MagicMock, patch
+
+import pytest
+from smg.launch_router import RouterArgs, launch_router, parse_router_args
+from smg.router import Router, build_control_plane_auth_config, policy_from_str
+from smg.router_args import DOCUMENT_REPLACES
+from smg.smg_rs import PolicyType
+from smg.smg_rs import Router as _Router
+
+
+class TestRouterConfigValidation:
+    """Test router configuration validation logic."""
+
+    def test_valid_basic_config(self):
+        """Test that a valid basic configuration passes validation."""
+        args = RouterArgs(
+            host="127.0.0.1",
+            port=30000,
+            worker_urls=["http://worker1:8000", "http://worker2:8000"],
+            policy="cache_aware",
+        )
+
+        # Should not raise any exceptions
+        assert args.host == "127.0.0.1"
+        assert args.port == 30000
+        assert args.worker_urls == ["http://worker1:8000", "http://worker2:8000"]
+        assert args.policy == "cache_aware"
+
+    def test_valid_pd_config(self):
+        """Test that a valid PD configuration passes validation."""
+        args = RouterArgs(
+            host="127.0.0.1",
+            port=30000,
+            pd_disaggregation=True,
+            prefill_urls=[
+                ("http://prefill1:8000", 9000),
+                ("http://prefill2:8000", None),
+            ],
+            decode_urls=["http://decode1:8001", "http://decode2:8001"],
+            policy="cache_aware",
+        )
+
+        assert args.pd_disaggregation is True
+        assert args.prefill_urls == [
+            ("http://prefill1:8000", 9000),
+            ("http://prefill2:8000", None),
+        ]
+        assert args.decode_urls == ["http://decode1:8001", "http://decode2:8001"]
+        assert args.policy == "cache_aware"
+
+    def test_pd_config_without_urls_allowed(self):
+        """Test that PD mode without URLs is now allowed (URLs are optional)."""
+        args = RouterArgs(
+            pd_disaggregation=True,
+            prefill_urls=[],
+            decode_urls=[],
+            service_discovery=False,
+        )
+
+        # Should not raise validation error - URLs are now optional
+        with patch("smg.launch_router.Router") as router_mod:
+            mock_router_instance = MagicMock()
+            router_mod.from_args = MagicMock(return_value=mock_router_instance)
+
+            # This should succeed without raising an error
+            launch_router(args)
+            router_mod.from_args.assert_called_once()
+
+    def test_pd_config_with_service_discovery_allows_empty_urls(self):
+        """Test that PD mode with service discovery allows empty URLs."""
+        args = RouterArgs(
+            pd_disaggregation=True,
+            prefill_urls=[],
+            decode_urls=[],
+            service_discovery=True,
+        )
+
+        # Should not raise validation error when service discovery is enabled
+        with patch("smg.launch_router.Router") as router_mod:
+            mock_router_instance = MagicMock()
+            router_mod.from_args = MagicMock(return_value=mock_router_instance)
+
+            launch_router(args)
+
+            # Should create router instance via from_args
+            router_mod.from_args.assert_called_once()
+
+    def test_regular_mode_without_workers_allows_empty_urls(self):
+        """Test that regular mode allows empty worker URLs."""
+        args = RouterArgs(worker_urls=[], service_discovery=False)
+
+        # Should not raise validation error
+        with patch("smg.launch_router.Router") as router_mod:
+            mock_router_instance = MagicMock()
+            router_mod.from_args = MagicMock(return_value=mock_router_instance)
+
+            launch_router(args)
+
+            # Should create router instance via from_args
+            router_mod.from_args.assert_called_once()
+
+    def test_cache_threshold_validation(self):
+        """Test cache threshold validation."""
+        # Valid cache threshold
+        args = RouterArgs(cache_threshold=0.5)
+        assert args.cache_threshold == 0.5
+
+        # Edge cases
+        args = RouterArgs(cache_threshold=0.0)
+        assert args.cache_threshold == 0.0
+
+        args = RouterArgs(cache_threshold=1.0)
+        assert args.cache_threshold == 1.0
+
+    def test_a_line_with_no_policy_builds_cache_aware(self, tmp_path):
+        args = parse_router_args(["--cache-threshold", "2"])
+        args.storage_hook_wasm_path = str(tmp_path / "missing.wasm")
+        with pytest.raises(ValueError, match="cache_threshold"):
+            Router.from_args(args).start()
+        with pytest.raises(ValueError, match="cache_threshold"):
+            _Router(
+                worker_urls=[],
+                cache_threshold=2,
+                storage_hook_wasm_path=args.storage_hook_wasm_path,
+            ).start()
+
+    def test_balance_threshold_validation(self):
+        """Test load balancing threshold validation."""
+        # Valid thresholds
+        args = RouterArgs(balance_abs_threshold=64, balance_rel_threshold=1.5)
+        assert args.balance_abs_threshold == 64
+        assert args.balance_rel_threshold == 1.5
+
+        # Edge cases
+        args = RouterArgs(balance_abs_threshold=0, balance_rel_threshold=1.0)
+        assert args.balance_abs_threshold == 0
+        assert args.balance_rel_threshold == 1.0
+
+    def test_timeout_validation(self):
+        """Test timeout parameter validation."""
+        # Valid timeouts
+        args = RouterArgs(
+            worker_startup_timeout_secs=600,
+            worker_startup_check_interval=30,
+            request_timeout_secs=1800,
+            queue_timeout_secs=60,
+        )
+        assert args.worker_startup_timeout_secs == 600
+        assert args.worker_startup_check_interval == 30
+        assert args.request_timeout_secs == 1800
+        assert args.queue_timeout_secs == 60
+
+    def test_grpc_request_timeout_is_opt_in(self):
+        """The bound on a request to a gRPC worker is off (0) unless set."""
+        assert RouterArgs().grpc_request_timeout_secs == 0
+        args = RouterArgs(request_timeout_secs=1800, grpc_request_timeout_secs=30)
+        assert args.request_timeout_secs == 1800
+        assert args.grpc_request_timeout_secs == 30
+
+    def test_retry_config_validation(self):
+        """Test retry configuration validation."""
+        # Valid retry config
+        args = RouterArgs(
+            retry_max_retries=5,
+            retry_initial_backoff_ms=50,
+            retry_max_backoff_ms=30000,
+            retry_backoff_multiplier=1.5,
+            retry_jitter_factor=0.2,
+            disable_retries=False,
+        )
+        assert args.retry_max_retries == 5
+        assert args.retry_initial_backoff_ms == 50
+        assert args.retry_max_backoff_ms == 30000
+        assert args.retry_backoff_multiplier == 1.5
+        assert args.retry_jitter_factor == 0.2
+        assert args.disable_retries is False
+
+    def test_circuit_breaker_config_validation(self):
+        """Test circuit breaker configuration validation."""
+        # Valid circuit breaker config
+        args = RouterArgs(
+            cb_failure_threshold=10,
+            cb_success_threshold=3,
+            cb_timeout_duration_secs=60,
+            cb_window_duration_secs=120,
+            disable_circuit_breaker=False,
+        )
+        assert args.cb_failure_threshold == 10
+        assert args.cb_success_threshold == 3
+        assert args.cb_timeout_duration_secs == 60
+        assert args.cb_window_duration_secs == 120
+        assert args.disable_circuit_breaker is False
+
+    def test_health_check_config_validation(self):
+        """Test health check configuration validation."""
+        # Valid health check config
+        args = RouterArgs(
+            health_failure_threshold=3,
+            health_success_threshold=2,
+            health_check_timeout_secs=5,
+            health_check_interval_secs=60,
+            health_check_endpoint="/health",
+        )
+        assert args.health_failure_threshold == 3
+        assert args.health_success_threshold == 2
+        assert args.health_check_timeout_secs == 5
+        assert args.health_check_interval_secs == 60
+        assert args.health_check_endpoint == "/health"
+
+    def test_rate_limiting_config_validation(self):
+        """Test rate limiting configuration validation."""
+        # Valid rate limiting config
+        args = RouterArgs(
+            max_concurrent_requests=256,
+            queue_size=100,
+            queue_timeout_secs=60,
+            rate_limit_tokens_per_second=100,
+        )
+        assert args.max_concurrent_requests == 256
+        assert args.queue_size == 100
+        assert args.queue_timeout_secs == 60
+        assert args.rate_limit_tokens_per_second == 100
+
+    def test_service_discovery_config_validation(self):
+        """Test service discovery configuration validation."""
+        # Valid service discovery config
+        args = RouterArgs(
+            service_discovery=True,
+            selector={"app": "worker", "env": "prod"},
+            service_discovery_port=8080,
+            service_discovery_namespace="default",
+        )
+        assert args.service_discovery is True
+        assert args.selector == {"app": "worker", "env": "prod"}
+        assert args.service_discovery_port == 8080
+        assert args.service_discovery_namespace == "default"
+
+    def test_pd_service_discovery_config_validation(self):
+        """Test PD service discovery configuration validation."""
+        # Valid PD service discovery config
+        args = RouterArgs(
+            pd_disaggregation=True,
+            service_discovery=True,
+            prefill_selector={"app": "prefill"},
+            decode_selector={"app": "decode"},
+            bootstrap_port_annotation="sglang.ai/bootstrap-port",
+        )
+        assert args.pd_disaggregation is True
+        assert args.service_discovery is True
+        assert args.prefill_selector == {"app": "prefill"}
+        assert args.decode_selector == {"app": "decode"}
+        assert args.bootstrap_port_annotation == "sglang.ai/bootstrap-port"
+        assert args.worker_ports_annotation == "smg.ai/worker-ports"
+        assert args.kv_connector_annotation == "smg.ai/kv-connector"
+        assert args.kv_engine_id_annotation == "smg.ai/kv-engine-id"
+        assert args.pairing_protocol_label == "smg.ai/pairing-protocol"
+
+    def test_prometheus_config_validation(self):
+        """Test Prometheus configuration validation."""
+        # Valid Prometheus config
+        args = RouterArgs(prometheus_port=29000, prometheus_host="127.0.0.1")
+        assert args.prometheus_port == 29000
+        assert args.prometheus_host == "127.0.0.1"
+
+    def test_cors_config_validation(self):
+        """Test CORS configuration validation."""
+        # Valid CORS config
+        args = RouterArgs(cors_allowed_origins=["http://localhost:3000", "https://example.com"])
+        assert args.cors_allowed_origins == [
+            "http://localhost:3000",
+            "https://example.com",
+        ]
+
+    def test_tokenizer_config_validation(self):
+        """Test tokenizer configuration validation."""
+        # Note: model_path and tokenizer_path are not available in current RouterArgs
+        pytest.skip("Tokenizer configuration not available in current implementation")
+
+    def test_dp_aware_config_validation(self):
+        """Test data parallelism aware configuration validation."""
+        # Valid DP aware config
+        args = RouterArgs(dp_aware=True, api_key="test-api-key")
+        assert args.dp_aware is True
+        assert args.api_key == "test-api-key"
+
+    def test_request_id_headers_validation(self):
+        """Test request ID headers configuration validation."""
+        # Valid request ID headers config
+        args = RouterArgs(request_id_headers=["x-request-id", "x-trace-id", "x-correlation-id"])
+        assert args.request_id_headers == [
+            "x-request-id",
+            "x-trace-id",
+            "x-correlation-id",
+        ]
+
+    def test_storage_context_headers_validation(self):
+        """Test storage context header mapping validation."""
+        args = RouterArgs(
+            storage_context_headers={
+                "x-tenant-id": "tenant_id",
+                "x-user-id": "user_id",
+            }
+        )
+        assert args.storage_context_headers == {
+            "x-tenant-id": "tenant_id",
+            "x-user-id": "user_id",
+        }
+
+    def test_policy_consistency_validation(self):
+        """Test policy consistency validation in PD mode."""
+        # Test with both prefill and decode policies specified
+        args = RouterArgs(
+            pd_disaggregation=True,
+            prefill_urls=[("http://prefill1:8000", None)],
+            decode_urls=["http://decode1:8001"],
+            policy="cache_aware",
+            prefill_policy="power_of_two",
+            decode_policy="round_robin",
+        )
+
+        # Should not raise validation error
+        with patch("smg.launch_router.Router") as router_mod:
+            mock_router_instance = MagicMock()
+            router_mod.from_args = MagicMock(return_value=mock_router_instance)
+
+            launch_router(args)
+
+            # Should create router instance via from_args
+            router_mod.from_args.assert_called_once()
+
+    def test_policy_fallback_validation(self):
+        """Test policy fallback validation in PD mode."""
+        # Test with only prefill policy specified
+        args = RouterArgs(
+            pd_disaggregation=True,
+            prefill_urls=[("http://prefill1:8000", None)],
+            decode_urls=["http://decode1:8001"],
+            policy="cache_aware",
+            prefill_policy="power_of_two",
+            decode_policy=None,
+        )
+
+        # Should not raise validation error
+        with patch("smg.launch_router.Router") as router_mod:
+            mock_router_instance = MagicMock()
+            router_mod.from_args = MagicMock(return_value=mock_router_instance)
+
+            launch_router(args)
+
+            # Should create router instance via from_args
+            router_mod.from_args.assert_called_once()
+
+    def test_policy_enum_conversion(self):
+        """Test policy string to enum conversion."""
+        # Test all valid policy conversions
+        assert policy_from_str("random") == PolicyType.Random
+        assert policy_from_str("round_robin") == PolicyType.RoundRobin
+        assert policy_from_str("cache_aware") == PolicyType.CacheAware
+        assert policy_from_str("power_of_two") == PolicyType.PowerOfTwo
+        assert policy_from_str("least_load") == PolicyType.LeastLoad
+
+    def test_invalid_policy_enum_conversion(self):
+        """Test invalid policy string to enum conversion."""
+        with pytest.raises(KeyError):
+            policy_from_str("invalid_policy")
+
+    def test_config_immutability(self):
+        """Test that configuration objects are properly immutable."""
+        args = RouterArgs(host="127.0.0.1", port=30000, worker_urls=["http://worker1:8000"])
+
+        # Test that we can't modify the configuration after creation
+        # (This is more of a design test - dataclasses are mutable by default)
+        original_host = args.host
+        args.host = "0.0.0.0"
+        assert args.host == "0.0.0.0"  # Dataclasses are mutable
+        assert args.host != original_host
+
+    def test_config_defaults_consistency(self):
+        """Test that configuration defaults are consistent."""
+        args1 = RouterArgs()
+        args2 = RouterArgs()
+
+        # Both instances should have the same defaults
+        assert args1.host == args2.host
+        assert args1.port == args2.port
+        assert args1.policy == args2.policy
+        assert args1.worker_urls == args2.worker_urls
+        assert args1.pd_disaggregation == args2.pd_disaggregation
+
+    def test_config_serialization(self):
+        """Test that configuration can be serialized/deserialized."""
+        args = RouterArgs(
+            host="127.0.0.1",
+            port=30000,
+            worker_urls=["http://worker1:8000"],
+            policy="cache_aware",
+            cache_threshold=0.5,
+        )
+
+        # Test that we can access all attributes
+        assert hasattr(args, "host")
+        assert hasattr(args, "port")
+        assert hasattr(args, "worker_urls")
+        assert hasattr(args, "policy")
+        assert hasattr(args, "cache_threshold")
+
+    def test_config_with_none_values(self):
+        """Test configuration with None values."""
+        args = RouterArgs(
+            api_key=None,
+            log_dir=None,
+            log_level=None,
+            prometheus_port=None,
+            prometheus_host=None,
+            request_id_headers=None,
+            storage_context_headers={},
+            rate_limit_tokens_per_second=None,
+            service_discovery_namespace=None,
+        )
+
+        # All None values should be preserved
+        assert args.api_key is None
+        assert args.log_dir is None
+        assert args.log_level is None
+        assert args.prometheus_port is None
+        assert args.prometheus_host is None
+        assert args.request_id_headers is None
+        assert args.storage_context_headers == {}
+        assert args.rate_limit_tokens_per_second is None
+        assert args.service_discovery_namespace is None
+
+    def test_config_with_empty_lists(self):
+        """Test configuration with empty lists."""
+        args = RouterArgs(worker_urls=[], prefill_urls=[], decode_urls=[], cors_allowed_origins=[])
+
+        # All empty lists should be preserved
+        assert args.worker_urls == []
+        assert args.prefill_urls == []
+        assert args.decode_urls == []
+        assert args.cors_allowed_origins == []
+
+    def test_config_with_empty_dicts(self):
+        """Test configuration with empty dictionaries."""
+        args = RouterArgs(
+            selector={}, prefill_selector={}, decode_selector={}, storage_context_headers={}
+        )
+
+        # All empty dictionaries should be preserved
+        assert args.selector == {}
+        assert args.prefill_selector == {}
+        assert args.decode_selector == {}
+        assert args.storage_context_headers == {}
+
+
+class TestDiscoveryMapping:
+    """The binding's keyword-only `discovery` mapping."""
+
+    @staticmethod
+    def kubernetes_fields():
+        return {
+            "port": 8000,
+            "check_interval_secs": 60,
+            "selector": {"app": "worker"},
+            "prefill_selector": {},
+            "decode_selector": {},
+            "bootstrap_port_annotation": "sglang.ai/bootstrap-port",
+        }
+
+    def test_tagged_kubernetes_mapping_is_accepted(self):
+        _Router(worker_urls=[], discovery={"provider": "kubernetes", **self.kubernetes_fields()})
+
+    def test_untagged_mapping_reads_as_kubernetes(self):
+        _Router(worker_urls=[], discovery=self.kubernetes_fields())
+
+    def test_file_mapping_is_accepted(self):
+        _Router(
+            worker_urls=[],
+            discovery={"provider": "file", "path": "/run/smg/workers.json"},
+        )
+
+    def test_file_mapping_needs_a_path(self):
+        with pytest.raises(ValueError, match="path"):
+            _Router(worker_urls=[], discovery={"provider": "file"})
+
+    def test_kubernetes_interval_is_accepted_with_service_discovery(self):
+        _Router(
+            worker_urls=[],
+            service_discovery=True,
+            selector={"app": "worker"},
+            discovery_check_interval_secs=15,
+        )
+
+    def test_kubernetes_interval_needs_service_discovery(self):
+        with pytest.raises(ValueError, match="check_interval_secs"):
+            _Router(worker_urls=[], discovery_check_interval_secs=15)
+        with pytest.raises(ValueError, match="check_interval_secs"):
+            _Router(
+                worker_urls=[],
+                discovery={"provider": "file", "path": "/run/smg/workers.json"},
+                discovery_check_interval_secs=15,
+            )
+
+    def test_slurm_mapping_is_accepted(self):
+        _Router(
+            worker_urls=[],
+            discovery={"provider": "slurm", "job_names": ["smg-worker"], "port": 8000},
+        )
+
+    def test_slurm_mapping_needs_a_port(self):
+        with pytest.raises(ValueError, match="port"):
+            _Router(worker_urls=[], discovery={"provider": "slurm", "job_names": ["w"]})
+
+    def test_consul_mapping_is_accepted(self):
+        _Router(
+            worker_urls=[],
+            discovery={
+                "provider": "consul",
+                "service": "smg-worker",
+                "address": "http://consul.internal:8500",
+            },
+        )
+
+    def test_consul_mapping_needs_a_service(self):
+        with pytest.raises(ValueError, match="service"):
+            _Router(worker_urls=[], discovery={"provider": "consul"})
+
+    def test_mapping_and_service_discovery_conflict(self):
+        with pytest.raises(ValueError, match="not both"):
+            _Router(
+                worker_urls=[],
+                service_discovery=True,
+                discovery=self.kubernetes_fields(),
+            )
+
+    def test_unknown_provider_is_rejected(self):
+        with pytest.raises(ValueError, match="Invalid discovery mapping"):
+            _Router(worker_urls=[], discovery={"provider": "zookeeper"})
+
+
+def out_of_place(names: list[str]) -> str:
+    """Which name breaks the alphabetical order, and where it belongs."""
+    expected = sorted(names)
+    for i, (seen, wanted) in enumerate(zip(names, expected)):
+        if seen != wanted:
+            before = names[i - 1] if i else "the start"
+            return (
+                f"{wanted} is out of alphabetical order: it belongs after {before}, before {seen}"
+            )
+    return "in order"
+
+
+class TestRouterConstructorSignature:
+    """``_Router`` binds four parameters by position (worker_urls, policy, host,
+    port) and every other one by keyword, with a default, so the prefix's order is
+    the only one a caller can depend on. The keyword-only parameters are kept in
+    alphabetical order: a new parameter goes at its place in the signature, never
+    at the tail, so two additions do not touch the same lines."""
+
+    POSITIONAL_PREFIX = ["worker_urls", "policy", "host", "port"]
+
+    @staticmethod
+    def parameters() -> list[inspect.Parameter]:
+        return list(inspect.signature(_Router).parameters.values())
+
+    def test_the_positional_prefix_is_frozen(self):
+        positional = [
+            p.name for p in self.parameters() if p.kind is not inspect.Parameter.KEYWORD_ONLY
+        ]
+        assert positional == self.POSITIONAL_PREFIX
+
+    def test_every_other_parameter_is_keyword_only_with_a_default(self):
+        tail = self.parameters()[len(self.POSITIONAL_PREFIX) :]
+        assert all(p.kind is inspect.Parameter.KEYWORD_ONLY for p in tail)
+        assert all(p.default is not inspect.Parameter.empty for p in tail)
+        with pytest.raises(TypeError):
+            _Router(["http://w:8000"], PolicyType.RoundRobin, "0.0.0.0", 3001, 600)
+
+    def test_the_keyword_only_parameters_are_in_alphabetical_order(self):
+        tail = [p.name for p in self.parameters()[len(self.POSITIONAL_PREFIX) :]]
+        assert tail == sorted(tail), out_of_place(tail)
+
+
+class TestRouterParserChoice:
+    """The launcher reads with Symphony unless ``--parser legacy`` is given: ``RouterArgs.parser``
+    is what ``Router.from_args`` hands to ``_Router(...)``, by name, so the binding's own
+    signature default never decides for a launcher-started router. The binding stores the
+    name and checks it, like every other name, when the router starts."""
+
+    @staticmethod
+    def parser_handed_to_the_binding(args: RouterArgs) -> str:
+        with patch("smg.router._Router") as binding:
+            Router.from_args(args)
+        binding.assert_called_once()
+        return binding.call_args.kwargs["parser"]
+
+    def test_the_launcher_hands_its_default_symphony_to_the_binding(self):
+        assert RouterArgs().parser == "symphony"
+        assert self.parser_handed_to_the_binding(RouterArgs()) == "symphony"
+
+    def test_legacy_is_handed_to_the_binding_as_spelled(self):
+        assert self.parser_handed_to_the_binding(RouterArgs(parser="legacy")) == "legacy"
+
+
+class TestControlPlaneAuthHalfJwt:
+    """An issuer without an audience (or the reverse) is refused, not a silently open control plane."""
+
+    def test_half_jwt_configuration_is_refused(self):
+        with pytest.raises(ValueError, match="jwt-audience"):
+            build_control_plane_auth_config({"jwt_issuer": "https://issuer.example"})
+        with pytest.raises(ValueError, match="jwt-issuer"):
+            build_control_plane_auth_config({"jwt_audience": "aud"})
+        assert build_control_plane_auth_config({}) is None
+
+
+@pytest.fixture
+def policy_document(tmp_path):
+    def write(policy, *, kind=None):
+        path = tmp_path / "routing.yaml"
+        yaml = (
+            "apiVersion: smg.policy/v1\n"
+            "generation: 1\n"
+            "profiles:\n"
+            f"  {policy}:\n"
+            "    filter: [healthy, not-overloaded, not-tried]\n"
+            f"    pick: {policy.replace('_', '-')}\n"
+            "bindings:\n"
+            "  - match: {model: '*'}\n"
+            f"    profile: {policy}\n"
+        )
+        if kind is not None:
+            yaml += f"kind: {kind}\n"
+        path.write_text(yaml)
+        return path
+
+    return write
+
+
+class TestPolicyDocument:
+    """The plain start runs the policy document it was given, and a routing option
+    beside a document is refused by its name."""
+
+    @staticmethod
+    def assert_start_refusal(path, named, *flags):
+        # Each start installs a process-wide metrics recorder, so each runs in a
+        # process of its own. A storage hook that is not there stops a start that
+        # accepted its document before anything binds.
+        code = dedent("""
+            import sys
+            from pathlib import Path
+
+            from smg.launch_router import parse_router_args
+            from smg.router import Router
+
+            path = Path(sys.argv[1])
+            args = parse_router_args(
+                ["--policy-controller", "on", "--policy-spec", str(path), *sys.argv[2:]]
+            )
+            args.storage_hook_wasm_path = str(path.with_name("missing.wasm"))
+            Router.from_args(args).start()
+            """)
+        result = subprocess.run(
+            [sys.executable, "-c", code, str(path), *flags],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 1, result.stderr
+        # The start ends in the policy controller's refusal of the document, which
+        # names what the document wrote. The words between are the policy crate's,
+        # and no case here holds them.
+        refusals = [
+            line for line in result.stderr.splitlines() if line.startswith("RuntimeError: ")
+        ]
+        assert len(refusals) == 1, result.stderr
+        assert refusals[0].startswith("RuntimeError: policy controller: "), result.stderr
+        assert named in refusals[0], result.stderr
+
+    @pytest.mark.parametrize(
+        "mode",
+        [(), ("--pd-disaggregation",), ("--epd-disaggregation",)],
+        ids=["regular", "pd", "epd"],
+    )
+    def test_the_plain_start_takes_the_document(self, policy_document, mode):
+        path = policy_document("round_robin", kind="PolicySpec")
+        self.assert_start_refusal(path, '"PolicySpec"', *mode)
+
+    @pytest.mark.parametrize(
+        ("flags", "named"),
+        [
+            (["--policy", "round_robin"], "policy='round_robin'"),
+            (["--cache-threshold", "0.7"], "cache_threshold=0.7"),
+            (["--pd-disaggregation", "--prefill-policy", "random"], "prefill_policy='random'"),
+            (["--disable-worker-overload-protection"], "worker_overload_protection=False"),
+        ],
+    )
+    def test_a_routing_option_set_beside_a_document_is_refused_by_name(
+        self, policy_document, flags, named
+    ):
+        path = policy_document("round_robin")
+        args = parse_router_args(["--policy-controller", "on", "--policy-spec", str(path), *flags])
+        with pytest.raises(ValueError) as refusal:
+            Router.from_args(args)
+        assert str(refusal.value) == (
+            f"A policy document replaces the routing settings, and these are set beside it: {named}"
+        )
+
+    def test_the_constructor_names_every_setting_in_one_refusal(self, tmp_path):
+        # A policy name and a tuning value together: one list, in the launcher's order.
+        named = "these are set beside it: policy, cache_threshold, prefill_policy$"
+        with pytest.raises(ValueError, match=named):
+            _Router(
+                worker_urls=[],
+                policy_controller="on",
+                policy_spec=str(tmp_path / "routing.yaml"),
+                policy=PolicyType.Random,
+                prefill_policy=PolicyType.Random,
+                cache_threshold=0.5,
+            ).start()
+
+    @staticmethod
+    def moved(name):
+        """A value of ``name`` that is not the launcher's default."""
+        default = getattr(RouterArgs(), name)
+        if name in ("policy", "prefill_policy", "decode_policy", "encode_policy"):
+            return PolicyType.Random
+        if isinstance(default, bool):
+            return not default
+        if isinstance(default, (int, float)):
+            return default + 1
+        if isinstance(default, str):
+            return default + "-moved"
+        if isinstance(default, (list, tuple)):
+            return [*default, 1]
+        return "moved" if "str" in str(RouterArgs.__annotations__[name]) else 1
+
+    @pytest.mark.parametrize("name", DOCUMENT_REPLACES)
+    def test_the_constructor_refuses_each_setting_a_document_replaces(self, tmp_path, name):
+        # The launcher refuses these by its own defaults. A host that builds
+        # the router itself meets the same refusal, before anything starts.
+        router = _Router(
+            worker_urls=[],
+            policy_controller="on",
+            policy_spec=str(tmp_path / "routing.yaml"),
+            **{name: self.moved(name)},
+        )
+        with pytest.raises(ValueError, match=f"these are set beside it: {name}$"):
+            router.start()
+
+    def test_the_overload_thresholds_stand_beside_a_document(self, policy_document):
+        # No document names an overload threshold: the gateway builds its
+        # worker objects with the two, so both stand beside a document.
+        flags = ["--worker-overload-waiting-requests", "32", "--worker-overload-token-usage", "0.9"]
+        path = policy_document("round_robin")
+        args = parse_router_args(["--policy-controller", "on", "--policy-spec", str(path), *flags])
+        assert args.options_a_document_replaces() == []
+        assert args.worker_overload_waiting_requests == 32
+        assert args.worker_overload_token_usage == pytest.approx(0.9)
+        Router.from_args(args)
+        # The native start refuses by its own copy of the list. With the two
+        # beside it the start reads the document: it ends in the document's
+        # own refusal.
+        refused = policy_document("round_robin", kind="PolicySpec")
+        self.assert_start_refusal(refused, '"PolicySpec"', *flags)
+
+    def test_the_routing_options_at_their_defaults_stand_beside_a_document(self, policy_document):
+        # The chart's line carries these six at their defaults on every render.
+        line = [
+            "--cache-threshold=0.3",
+            "--balance-abs-threshold=64",
+            "--balance-rel-threshold=1.5",
+            "--eviction-interval-secs=120",
+            "--max-tree-size=67108864",
+            "--block-size=16",
+        ]
+        path = policy_document("round_robin")
+        args = parse_router_args(["--policy-controller", "on", "--policy-spec", str(path), *line])
+        assert args.options_a_document_replaces() == []
+        Router.from_args(args)
+
+
+class TestKeywordOnlyParametersOfTheCliFlags:
+    """The parameters behind the CLI's --engine-metrics, --grouped-dp-sticky,
+    --pd-pairing-mode, --policy-controller, --policy-spec, --runtime-worker-threads, --webrtc-bind-addr and
+    --webrtc-stun-server are keyword-only (no positional slot to keep) with the
+    CLI's defaults, and a value the CLI refuses is refused before anything starts."""
+
+    def test_keyword_only_with_the_cli_defaults(self):
+        import inspect
+
+        params = inspect.signature(_Router).parameters
+        for name in (
+            "engine_metrics",
+            "grouped_dp_sticky",
+            "pd_pairing_mode",
+            "policy_controller",
+            "policy_spec",
+            "runtime_worker_threads",
+            "webrtc_bind_addr",
+            "webrtc_stun_server",
+        ):
+            assert params[name].kind is inspect.Parameter.KEYWORD_ONLY, name
+        assert params["engine_metrics"].default is False
+        assert params["policy_spec"].default is None
+        assert params["runtime_worker_threads"].default is None
+        assert params["webrtc_bind_addr"].default is None
+        assert params["webrtc_stun_server"].default is None
+
+    def test_an_unknown_pairing_mode_is_refused(self):
+        with pytest.raises(ValueError, match="pd_pairing_mode"):
+            _Router(worker_urls=["http://w:8000"], pd_pairing_mode="sideways").start()
+
+    def test_an_unknown_grouped_dp_pinning_is_refused(self):
+        with pytest.raises(ValueError, match="grouped_dp_sticky"):
+            _Router(worker_urls=["http://w:8000"], grouped_dp_sticky="round_robin").start()
+
+    def test_an_unknown_policy_controller_value_is_refused(self):
+        with pytest.raises(ValueError, match=r"policy_controller.*other.*expected 'on' or 'off'"):
+            _Router(worker_urls=["http://w:8000"], policy_controller="other").start()
+
+    def test_a_document_path_reaches_the_configuration(self, tmp_path):
+        path = tmp_path / "routing.yaml"
+        path.write_text("apiVersion: smg.policy/v1\nprofiles: {default: {pick: random}}\n")
+        options = {
+            "worker_urls": ["http://w:8000"],
+            "policy_spec": str(path),
+            "retry_initial_backoff_ms": 0,
+        }
+        with pytest.raises(ValueError, match=r"policy_spec.*" + re.escape(str(path))):
+            _Router(**options).start()
+        with pytest.raises(ValueError, match=r"retry\.initial_backoff_ms"):
+            _Router(**options, policy_controller="on").start()
+
+    def test_zero_runtime_threads_is_refused(self):
+        with pytest.raises(ValueError, match="runtime_worker_threads"):
+            _Router(worker_urls=["http://w:8000"], runtime_worker_threads=0).start()
+
+    def test_a_bind_address_that_is_not_an_ip_is_refused(self):
+        with pytest.raises(ValueError, match="webrtc_bind_addr"):
+            _Router(worker_urls=["http://w:8000"], webrtc_bind_addr="not-an-ip").start()
+
+
+class TestJwtConfigRoleClaim:
+    """The JWT configuration carries the role claim's name (default roles, as the
+    CLI's --jwt-role-claim); appended last, so positional callers bind as before."""
+
+    def test_default_and_positional_value(self):
+        from smg.smg_rs import PyJwtConfig
+
+        assert PyJwtConfig("https://issuer.example", "aud").role_claim == "roles"
+        assert (
+            PyJwtConfig("https://issuer.example", "aud", None, {}, "groups").role_claim == "groups"
+        )
+
+    def test_build_passes_it_on(self):
+        issuer = {"jwt_issuer": "https://issuer.example", "jwt_audience": "aud"}
+        assert build_control_plane_auth_config(issuer).jwt.role_claim == "roles"
+        auth = build_control_plane_auth_config({**issuer, "jwt_role_claim": "groups"})
+        assert auth.jwt.role_claim == "groups"
+
+
+class TestTheRouterRefusesWhatTheCliRefuses:
+    """The binary refuses these flag shapes at parse time; the Router refuses
+    the same values from ``start()`` with the same words, before anything binds."""
+
+    @staticmethod
+    def router(**kwargs) -> _Router:
+        return _Router(worker_urls=["http://worker:8000"], **kwargs)
+
+    def test_a_bucket_list_that_does_not_ascend_is_refused(self):
+        with pytest.raises(ValueError, match="bucket bounds must ascend strictly"):
+            self.router(prometheus_duration_buckets=[1.0, 0.5]).start()
+
+    @pytest.mark.parametrize("bound", [float("nan"), float("inf"), 0.0, -1.0])
+    def test_a_bucket_bound_that_is_not_a_finite_number_above_zero_is_refused(self, bound):
+        with pytest.raises(ValueError, match="every bucket bound must be a finite number above 0"):
+            self.router(prometheus_duration_buckets=[0.5, bound]).start()
+
+    def test_a_role_mapping_to_an_unknown_gateway_role_is_refused(self):
+        from smg.smg_rs import PyControlPlaneAuthConfig, PyJwtConfig
+
+        jwt = PyJwtConfig("https://issuer.example", "aud", None, {"Gateway.Admin": "administrator"})
+        with pytest.raises(ValueError, match="the gateway role must be 'admin' or 'user'"):
+            self.router(control_plane_auth=PyControlPlaneAuthConfig(jwt=jwt)).start()
+
+    def test_a_role_mapping_from_an_empty_idp_role_is_refused(self):
+        from smg.smg_rs import PyControlPlaneAuthConfig, PyJwtConfig
+
+        jwt = PyJwtConfig("https://issuer.example", "aud", None, {"": "admin"})
+        with pytest.raises(ValueError, match="the IdP role must not be empty"):
+            self.router(control_plane_auth=PyControlPlaneAuthConfig(jwt=jwt)).start()
+
+    # The encode side takes the three names the CLI's --encode-policy takes;
+    # the other seven policies are refused with those names in the message.
+    ENCODE_ACCEPTED = {
+        "random": PolicyType.Random,
+        "round_robin": PolicyType.RoundRobin,
+        "consistent_hashing": PolicyType.ConsistentHashing,
+    }
+    ENCODE_REFUSED = {
+        "passthrough": PolicyType.Passthrough,
+        "cache_aware": PolicyType.CacheAware,
+        "power_of_two": PolicyType.PowerOfTwo,
+        "least_load": PolicyType.LeastLoad,
+        "bucket": PolicyType.Bucket,
+        "manual": PolicyType.Manual,
+        "prefix_hash": PolicyType.PrefixHash,
+    }
+
+    @staticmethod
+    def epd_router(**kwargs) -> _Router:
+        return _Router(
+            worker_urls=[],
+            epd_disaggregation=True,
+            encode_urls=[("http://encode:8000", None)],
+            prefill_urls=[("http://prefill:8000", None)],
+            decode_urls=["http://decode:8000"],
+            **kwargs,
+        )
+
+    @pytest.mark.parametrize("name", sorted(ENCODE_REFUSED))
+    def test_an_encode_policy_the_cli_refuses_is_refused(self, name):
+        refusal = (
+            f"Invalid value for field 'encode_policy': {name}"
+            " - expected random, round_robin or consistent_hashing"
+        )
+        with pytest.raises(ValueError, match=re.escape(refusal)):
+            self.epd_router(encode_policy=self.ENCODE_REFUSED[name]).start()
+
+    @pytest.mark.parametrize("name", sorted(ENCODE_ACCEPTED))
+    def test_an_encode_policy_the_cli_takes_passes(self, name):
+        # `port=0` is refused by the shared validator after the encode policy
+        # is read: the refusal that arrives shows the policy passed and that
+        # nothing bound.
+        with pytest.raises(ValueError, match=re.escape("Invalid value for field 'port'")) as info:
+            self.epd_router(encode_policy=self.ENCODE_ACCEPTED[name], port=0).start()
+        assert "encode_policy" not in str(info.value)
+
+    def test_an_unsupported_encode_policy_outside_epd_is_refused(self):
+        # The shared validator reads the encode policy in EPD mode only; the
+        # binding asks it before anything binds, so the refusal reads the same
+        # without `epd_disaggregation`. `port=0` is the refusal that would
+        # arrive instead if the encode policy passed, so nothing binds either way.
+        refusal = (
+            "Invalid value for field 'encode_policy': cache_aware"
+            " - expected random, round_robin or consistent_hashing"
+        )
+        with pytest.raises(ValueError, match=re.escape(refusal)):
+            self.router(encode_policy=PolicyType.CacheAware, port=0).start()

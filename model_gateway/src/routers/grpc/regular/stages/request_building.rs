@@ -1,0 +1,69 @@
+//! Request building stage for chat and generate endpoints
+
+use async_trait::async_trait;
+use axum::response::Response;
+use tracing::error;
+
+use super::{chat::ChatRequestBuildingStage, generate::GenerateRequestBuildingStage};
+use crate::routers::{
+    error as grpc_error,
+    grpc::{
+        common::stages::BuildStage,
+        context::{BuildOutput, PlanSettings, RequestContext, RequestType},
+    },
+};
+
+/// Request building stage for chat and generate pipelines
+///
+/// These two request types share a single pipeline instance and are dispatched
+/// here, through the inner stages' inherent futures: the stage call boxes once
+/// (this stage's `async_trait` future), not once more for the inner stage. All
+/// other request types have dedicated pipelines and wire their own request
+/// building stages directly.
+pub(crate) struct ChatGenerateRequestBuildingStage {
+    chat_stage: ChatRequestBuildingStage,
+    generate_stage: GenerateRequestBuildingStage,
+}
+
+impl ChatGenerateRequestBuildingStage {
+    pub fn new(settings: PlanSettings) -> Self {
+        Self {
+            chat_stage: ChatRequestBuildingStage::new(settings),
+            generate_stage: GenerateRequestBuildingStage::new(settings),
+        }
+    }
+}
+
+#[async_trait]
+impl BuildStage for ChatGenerateRequestBuildingStage {
+    async fn build(&self, ctx: &mut RequestContext) -> Result<BuildOutput, Response> {
+        match &ctx.input.request_type {
+            RequestType::Chat(_) => self.chat_stage.build_plan(ctx).await,
+            RequestType::Generate(_) => self.generate_stage.build_plan(ctx),
+            request_type => {
+                error!(
+                    function = "ChatGenerateRequestBuildingStage::build",
+                    request_type = %request_type,
+                    "{request_type} should not reach this stage"
+                );
+                Err(grpc_error::internal_error(
+                    "wrong_pipeline",
+                    format!("{request_type} should use its dedicated pipeline"),
+                ))
+            }
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "ChatGenerateRequestBuilding"
+    }
+
+    #[cfg(test)]
+    fn signature(&self) -> String {
+        format!(
+            "ChatGenerateRequestBuildingStage({}, {})",
+            self.chat_stage.signature(),
+            self.generate_stage.signature()
+        )
+    }
+}

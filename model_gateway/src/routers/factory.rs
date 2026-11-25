@@ -1,0 +1,387 @@
+//! Factory for creating router instances
+
+use std::sync::Arc;
+
+use smg_external_router::{builtin_routers, spec_for_backend};
+use smg_worker::identity::basic::ConnectionMode;
+
+use super::{
+    external::ExternalRouterAdapter,
+    grpc::{
+        mode::{grpc_mode, Mode},
+        router::GrpcRouter,
+    },
+    http::{pd_router::PDRouter, router::Router},
+    RouterTrait,
+};
+use crate::{
+    app_context::AppContext,
+    config::{PolicyConfig, RoutingMode},
+    policies::{DPRankLoadPolicy, MinimumTokensPolicy, Side},
+};
+
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+pub struct RouterId(&'static str);
+
+impl RouterId {
+    pub const fn new(id: &'static str) -> Self {
+        Self(id)
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0
+    }
+}
+
+/// Static router ID constants to avoid heap allocations in hot paths
+pub mod router_ids {
+    use smg_external_router::ids as external_ids;
+
+    use super::RouterId;
+
+    pub const HTTP_REGULAR: RouterId = RouterId::new("http-regular");
+    pub const HTTP_PD: RouterId = RouterId::new("http-pd");
+    pub const HTTP_OPENAI: RouterId = RouterId::new(external_ids::OPENAI);
+    pub const HTTP_ANTHROPIC: RouterId = RouterId::new(external_ids::ANTHROPIC);
+    pub const HTTP_GEMINI: RouterId = RouterId::new(external_ids::GEMINI);
+    pub const GRPC_REGULAR: RouterId = RouterId::new("grpc-regular");
+    pub const GRPC_PD: RouterId = RouterId::new("grpc-pd");
+    pub const GRPC_EPD: RouterId = RouterId::new("grpc-epd");
+}
+
+/// One IGW registration: the router id, its label, and the constructed
+/// router or the reason it could not be built.
+type IgwRouterEntry = (RouterId, &'static str, Result<Box<dyn RouterTrait>, String>);
+
+/// Factory for creating router instances based on configuration
+pub struct RouterFactory;
+
+impl RouterFactory {
+    /// Create a router instance from application context
+    pub async fn create_router(ctx: &Arc<AppContext>) -> Result<Box<dyn RouterTrait>, String> {
+        match ctx.router_config.connection_mode {
+            ConnectionMode::Grpc | ConnectionMode::Zmq => {
+                // Register the per-role policies each disaggregation mode needs,
+                // then build the mode-parameterized gRPC router.
+                match &ctx.router_config.mode {
+                    RoutingMode::Regular { .. } => {}
+                    RoutingMode::PrefillDecode {
+                        prefill_policy,
+                        decode_policy,
+                        ..
+                    } => Self::set_pd_policies(
+                        prefill_policy.as_ref(),
+                        decode_policy.as_ref(),
+                        &ctx.router_config.policy,
+                        ctx,
+                    ),
+                    RoutingMode::EncodePrefillDecode {
+                        encode_policy,
+                        prefill_policy,
+                        decode_policy,
+                        ..
+                    } => Self::set_epd_policies(
+                        encode_policy.as_ref(),
+                        prefill_policy.as_ref(),
+                        decode_policy.as_ref(),
+                        &ctx.router_config.policy,
+                        ctx,
+                    ),
+                    RoutingMode::OpenAI { .. } => {
+                        return Err("OpenAI mode requires HTTP connection_mode".to_string())
+                    }
+                    RoutingMode::Anthropic { .. } => {
+                        return Err("Anthropic mode requires HTTP connection_mode".to_string())
+                    }
+                    RoutingMode::Gemini { .. } => {
+                        return Err("Gemini mode requires HTTP connection_mode".to_string())
+                    }
+                }
+                let mode = grpc_mode(&ctx.router_config).ok_or_else(|| {
+                    "gRPC connection mode requires a gRPC routing mode".to_string()
+                })?;
+                Self::create_grpc_router(ctx, mode)
+            }
+            ConnectionMode::Http => match &ctx.router_config.mode {
+                RoutingMode::Regular { .. } => Self::create_regular_router(ctx).await,
+                RoutingMode::PrefillDecode {
+                    prefill_policy,
+                    decode_policy,
+                    ..
+                } => {
+                    Self::create_pd_router(
+                        prefill_policy.as_ref(),
+                        decode_policy.as_ref(),
+                        &ctx.router_config.policy,
+                        ctx,
+                    )
+                    .await
+                }
+                RoutingMode::EncodePrefillDecode { .. } => {
+                    Err("EPD mode requires gRPC connection_mode and TokenSpeed".to_string())
+                }
+                RoutingMode::OpenAI { .. } => Self::create_external_router("openai", ctx).await,
+                RoutingMode::Anthropic { .. } => {
+                    Self::create_external_router("anthropic", ctx).await
+                }
+                RoutingMode::Gemini { .. } => Self::create_external_router("gemini", ctx).await,
+            },
+        }
+    }
+
+    /// Create a regular router
+    pub async fn create_regular_router(
+        ctx: &Arc<AppContext>,
+    ) -> Result<Box<dyn RouterTrait>, String> {
+        let router = Router::new(ctx).await?;
+
+        Ok(Box::new(router))
+    }
+
+    /// Create a PD router with injected policy
+    pub async fn create_pd_router(
+        prefill_policy_config: Option<&PolicyConfig>,
+        decode_policy_config: Option<&PolicyConfig>,
+        main_policy_config: &PolicyConfig,
+        ctx: &Arc<AppContext>,
+    ) -> Result<Box<dyn RouterTrait>, String> {
+        Self::set_pd_policies(
+            prefill_policy_config,
+            decode_policy_config,
+            main_policy_config,
+            ctx,
+        );
+
+        let config = ctx.router_config.clone();
+        // The rank policy is a classic policy object: none is built for a
+        // registry made for the policy engine.
+        if config.dp_minimum_tokens_scheduler && ctx.policy_registry.keeps_classic_policies() {
+            let mini_tokens_policy = MinimumTokensPolicy::new(
+                ctx.worker_monitor
+                    .as_ref()
+                    .map(|monitor| monitor.worker_load_manager.clone()),
+            );
+            let dp_rank_policy: Arc<dyn DPRankLoadPolicy> = Arc::new(mini_tokens_policy);
+            ctx.policy_registry.set_dp_rank_policy(dp_rank_policy);
+        }
+        let router = PDRouter::new(ctx).await?;
+
+        Ok(Box::new(router))
+    }
+
+    /// Create a gRPC router for the given disaggregation `mode`.
+    ///
+    /// For PD/EPD modes the caller must register the prefill/decode (and encode)
+    /// policies first via [`Self::set_pd_policies`] / [`Self::set_epd_policies`].
+    fn create_grpc_router(
+        ctx: &Arc<AppContext>,
+        mode: Mode,
+    ) -> Result<Box<dyn RouterTrait>, String> {
+        let router = GrpcRouter::new(ctx, mode)?;
+
+        Ok(Box::new(router))
+    }
+
+    /// Register the prefill/decode policies (HTTP PD, gRPC PD and gRPC EPD),
+    /// each from its own config or, when unset, the main policy.
+    fn set_pd_policies(
+        prefill_policy_config: Option<&PolicyConfig>,
+        decode_policy_config: Option<&PolicyConfig>,
+        main_policy_config: &PolicyConfig,
+        ctx: &Arc<AppContext>,
+    ) {
+        let registry = &ctx.policy_registry;
+        registry.set_side_policy(
+            Side::Prefill,
+            prefill_policy_config.unwrap_or(main_policy_config),
+        );
+        registry.set_side_policy(
+            Side::Decode,
+            decode_policy_config.unwrap_or(main_policy_config),
+        );
+    }
+
+    /// Register the encode/prefill/decode policies for a gRPC EPD deployment.
+    /// Encode defaults to consistent hashing over each item's content hash;
+    /// prefill/decode default to the main policy when unset.
+    fn set_epd_policies(
+        encode_policy_config: Option<&PolicyConfig>,
+        prefill_policy_config: Option<&PolicyConfig>,
+        decode_policy_config: Option<&PolicyConfig>,
+        main_policy_config: &PolicyConfig,
+        ctx: &Arc<AppContext>,
+    ) {
+        let default_encode_policy = PolicyConfig::ConsistentHashing;
+        ctx.policy_registry.set_side_policy(
+            Side::Encode,
+            encode_policy_config.unwrap_or(&default_encode_policy),
+        );
+        Self::set_pd_policies(
+            prefill_policy_config,
+            decode_policy_config,
+            main_policy_config,
+            ctx,
+        );
+    }
+
+    /// Mount the external router that `backend` names, or say which Cargo
+    /// feature would compile it in.
+    pub async fn create_external_router(
+        backend: &str,
+        ctx: &Arc<AppContext>,
+    ) -> Result<Box<dyn RouterTrait>, String> {
+        match spec_for_backend(backend) {
+            Some(spec) if spec.compiled => ExternalRouterAdapter::mount(spec, ctx).await,
+            Some(spec) => Err(spec.not_compiled()),
+            None => Err(format!(
+                "{backend} is not an external router this gateway knows"
+            )),
+        }
+    }
+
+    /// Create all routers for IGW (multi-router) mode.
+    ///
+    /// Returns a list of (router_id, label, creation_result) tuples.
+    /// Adding a new router to IGW mode only requires adding a line here.
+    pub async fn create_igw_routers(
+        policy: &PolicyConfig,
+        ctx: &Arc<AppContext>,
+    ) -> Vec<IgwRouterEntry> {
+        let (encode_policy, prefill_policy, decode_policy) = match &ctx.router_config.mode {
+            RoutingMode::PrefillDecode {
+                prefill_policy,
+                decode_policy,
+                ..
+            } => (None, prefill_policy.as_ref(), decode_policy.as_ref()),
+            RoutingMode::EncodePrefillDecode {
+                encode_policy,
+                prefill_policy,
+                decode_policy,
+                ..
+            } => (
+                encode_policy.as_ref(),
+                prefill_policy.as_ref(),
+                decode_policy.as_ref(),
+            ),
+            _ => (None, None, None),
+        };
+
+        let mut routers = vec![
+            (
+                router_ids::HTTP_REGULAR,
+                "HTTP Regular",
+                Self::create_regular_router(ctx).await,
+            ),
+            (
+                router_ids::GRPC_REGULAR,
+                "gRPC Regular",
+                Self::create_grpc_router(ctx, Mode::Regular),
+            ),
+            (
+                router_ids::HTTP_PD,
+                "HTTP PD",
+                Self::create_pd_router(prefill_policy, decode_policy, policy, ctx).await,
+            ),
+            (router_ids::GRPC_PD, "gRPC PD", {
+                Self::set_pd_policies(prefill_policy, decode_policy, policy, ctx);
+                Self::create_grpc_router(ctx, Mode::PrefillDecode)
+            }),
+            (router_ids::GRPC_EPD, "gRPC EPD", {
+                Self::set_epd_policies(encode_policy, prefill_policy, decode_policy, policy, ctx);
+                Self::create_grpc_router(ctx, Mode::EncodePrefillDecode)
+            }),
+        ];
+
+        // Every provider router this build carries. They proxy to third-party
+        // APIs and forward the caller's credentials upstream, so a build that
+        // should never do that simply leaves the features out.
+        for spec in builtin_routers() {
+            routers.push((
+                RouterId::new(spec.router_id),
+                spec.label,
+                ExternalRouterAdapter::mount(spec, ctx).await,
+            ));
+        }
+
+        routers
+    }
+}
+
+#[cfg(test)]
+mod grpc_router_type_tests {
+    use super::*;
+    use crate::routers::grpc::testing::grpc_ctx;
+
+    #[tokio::test]
+    async fn grpc_router_type_reflects_disaggregation_mode() {
+        let cases = [
+            (
+                RoutingMode::Regular {
+                    worker_urls: vec![],
+                },
+                "grpc",
+            ),
+            (
+                RoutingMode::PrefillDecode {
+                    prefill_urls: vec![],
+                    decode_urls: vec![],
+                    prefill_policy: None,
+                    decode_policy: None,
+                },
+                "grpc_pd",
+            ),
+            (
+                RoutingMode::EncodePrefillDecode {
+                    encode_urls: vec![],
+                    prefill_urls: vec![],
+                    decode_urls: vec![],
+                    encode_policy: None,
+                    prefill_policy: None,
+                    decode_policy: None,
+                },
+                "grpc_epd",
+            ),
+        ];
+
+        for (mode, expected) in cases {
+            let ctx = grpc_ctx(mode).await;
+            let router = RouterFactory::create_router(&ctx)
+                .await
+                .expect("router creation");
+            assert_eq!(router.router_type(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn igw_routers_preserve_disaggregated_role_policies() {
+        for mode in [
+            RoutingMode::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: Some(PolicyConfig::RoundRobin),
+                decode_policy: Some(PolicyConfig::Passthrough),
+            },
+            RoutingMode::EncodePrefillDecode {
+                encode_urls: vec![],
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                encode_policy: Some(PolicyConfig::PowerOfTwo {
+                    load_metric: Default::default(),
+                }),
+                prefill_policy: Some(PolicyConfig::RoundRobin),
+                decode_policy: Some(PolicyConfig::Passthrough),
+            },
+        ] {
+            let expected_encode_policy = mode
+                .get_encode_policy(&PolicyConfig::ConsistentHashing)
+                .name();
+            let ctx = grpc_ctx(mode).await;
+            RouterFactory::create_igw_routers(&ctx.router_config.policy, &ctx).await;
+
+            let policies = &ctx.policy_registry;
+            assert_eq!(policies.get_encode_policy().name(), expected_encode_policy);
+            assert_eq!(policies.get_prefill_policy().name(), "round_robin");
+            assert_eq!(policies.get_decode_policy().name(), "passthrough");
+        }
+    }
+}

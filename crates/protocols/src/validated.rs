@@ -1,0 +1,2864 @@
+// Validated JSON extractor for automatic request validation
+//
+// This module provides a ValidatedJson extractor that automatically validates
+// requests using the validator crate's Validate trait.
+
+/// Trait for request types that need post-deserialization normalization
+pub trait Normalizable {
+    /// Normalize the request by applying defaults and transformations
+    fn normalize(&mut self) {
+        // Default: no-op
+    }
+}
+
+#[cfg(feature = "axum")]
+use std::borrow::Cow;
+
+#[cfg(feature = "axum")]
+use axum::{
+    body::Bytes,
+    extract::{
+        path::ErrorKind,
+        rejection::{
+            BytesRejection, FailedToBufferBody, JsonRejection, PathRejection, QueryRejection,
+        },
+        FromRequest, FromRequestParts, Path, Query, Request,
+    },
+    http::{
+        header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE},
+        request::Parts,
+        HeaderValue, StatusCode,
+    },
+    response::{IntoResponse, Response},
+    Json,
+};
+#[cfg(feature = "axum")]
+use serde::de::{DeserializeOwned, MapAccess, SeqAccess, Visitor};
+#[cfg(feature = "axum")]
+use serde_json::{json, Value};
+#[cfg(feature = "axum")]
+use validator::{Validate, ValidationError, ValidationErrors, ValidationErrorsKind};
+
+#[cfg(feature = "axum")]
+use crate::{
+    common::FIELD_PARAM,
+    strict_value::{entries_with, StrictValue},
+};
+
+/// A JSON extractor that automatically validates and normalizes the request body
+///
+/// This extractor deserializes the request body and automatically calls `.validate()`
+/// on types that implement the `Validate` trait. If validation fails, it returns
+/// a 400 Bad Request with detailed error information.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// async fn create_chat(
+///     ValidatedJson(request): ValidatedJson<ChatCompletionRequest>,
+/// ) -> Response {
+///     // request is guaranteed to be valid here
+///     process_request(request).await
+/// }
+/// ```
+#[cfg(feature = "axum")]
+pub struct ValidatedJson<T>(pub T);
+
+/// A body a route reads as a JSON value and checks itself (the Conversations
+/// routes): it rides the validated extractor for the envelope its refusals
+/// take, with nothing to validate or normalize before the handler sees it.
+/// A repeated key is refused as a typed body's is, at the body's own keys
+/// and at any depth below them; the keys of `metadata` keep the last value,
+/// as that map's do in a typed body.
+#[cfg(feature = "axum")]
+#[derive(Debug)]
+pub struct ValueBody(pub Value);
+
+#[cfg(feature = "axum")]
+impl<'de> serde::Deserialize<'de> for ValueBody {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(BodyVisitor).map(ValueBody)
+    }
+}
+
+/// [`ValueBody`]'s reader. The `metadata` member of the body's own object is
+/// left to [`Value`]'s own reader, as a typed body's `metadata` map is read:
+/// a repeated key of that map answers the same on every route.
+#[cfg(feature = "axum")]
+struct BodyVisitor;
+
+#[cfg(feature = "axum")]
+impl<'de> Visitor<'de> for BodyVisitor {
+    type Value = Value;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        StrictValue.expecting(formatter)
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Value, E> {
+        StrictValue.visit_bool(value)
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Value, E> {
+        StrictValue.visit_i64(value)
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Value, E> {
+        StrictValue.visit_u64(value)
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Value, E> {
+        StrictValue.visit_f64(value)
+    }
+
+    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Value, E> {
+        StrictValue.visit_str(value)
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Value, E> {
+        StrictValue.visit_unit()
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, elements: A) -> Result<Value, A::Error> {
+        StrictValue.visit_seq(elements)
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut entries: A) -> Result<Value, A::Error> {
+        entries_with(&mut entries, |key, entries| {
+            if key == "metadata" {
+                entries.next_value()
+            } else {
+                entries.next_value_seed(StrictValue)
+            }
+        })
+        .map(Value::Object)
+    }
+}
+
+#[cfg(feature = "axum")]
+impl Validate for ValueBody {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "axum")]
+impl Normalizable for ValueBody {}
+
+/// The `error.code` of a body this extractor refused, carried as a response
+/// extension: the gateway's HTTP metrics read it when a response did not come
+/// from the gateway's own error builder, so the `error_code` label records the
+/// code the client sees (`json_parse_error`, `integer_below_min_value`, ...).
+/// The codes are the extractor's own fixed set, never client input.
+#[cfg(feature = "axum")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RejectionCode(pub String);
+
+/// The gateway's JSON error envelope for a rejected request body: the public
+/// API's shape (`message`, `type`, `param`, `code`), `code` a string and
+/// `param` the offending field when one is known; the code also rides on the
+/// response as a [`RejectionCode`] extension.
+#[cfg(feature = "axum")]
+pub(crate) fn rejection(
+    status: StatusCode,
+    code: &str,
+    param: Option<String>,
+    message: String,
+) -> Response {
+    let mut response = (
+        status,
+        Json(json!({
+            "error": {
+                "message": message,
+                "type": "invalid_request_error",
+                "param": param,
+                "code": code
+            }
+        })),
+    )
+        .into_response();
+    response
+        .extensions_mut()
+        .insert(RejectionCode(code.to_string()));
+    response
+}
+
+/// The axum prefix of a body that deserialized into the wrong shape; the rest
+/// is serde's message, with the path to the offending value in front when the
+/// value is nested (`messages[0].content: invalid type ...`).
+#[cfg(feature = "axum")]
+const DESERIALIZE_PREFIX: &str = "Failed to deserialize the JSON body into the target type: ";
+
+/// The words serde opens a reason with, in the order the public API's `code`
+/// is read from them (the longer `invalid value: integer `-` before `invalid
+/// value`): `missing_required_parameter` for a field that is not there,
+/// `unknown_parameter` for one the type does not know, `invalid_value` for a
+/// value outside an enumeration, `integer_below_min_value` for a negative
+/// integer where the field cannot be negative, `invalid_type` for a value of
+/// the wrong shape (a body that is not an object included; a JSON array
+/// where an object was expected is a wrong type too, whether serde reports
+/// the type or the length of the sequence).
+#[cfg(feature = "axum")]
+const SERDE_REASONS: &[(&str, &str)] = &[
+    ("missing field `", "missing_required_parameter"),
+    ("unknown field `", "unknown_parameter"),
+    ("unknown variant `", "invalid_value"),
+    ("invalid value: integer `-", "integer_below_min_value"),
+    ("invalid value", "invalid_value"),
+    ("invalid type", "invalid_type"),
+    ("invalid length", "invalid_type"),
+    ("data did not match any variant", "invalid_type"),
+];
+
+/// Whether `text` opens with one of serde's reasons.
+#[cfg(feature = "axum")]
+fn opens_a_reason(text: &str) -> bool {
+    SERDE_REASONS
+        .iter()
+        .any(|(words, _)| text.starts_with(words))
+}
+
+/// Serde's message without axum's prefix (split at the prefix's first copy:
+/// axum's comes before serde's text, a client's value after it), as the path
+/// serde puts in front of a nested value (`messages[0].content`) and the
+/// reason. The path is the first `: ` split's head when that head reads as a
+/// path (field names and indexes); the reason is the rest, serde's own words
+/// or a custom error's, and a value a custom error repeats cannot move the
+/// split, whatever it says. A key that is no plain path (a space, a colon, a
+/// letter outside ASCII) is a path all the same: the reason is then found by
+/// serde's own words, at the first split whose remainder opens with one
+/// (serde quotes the value it refused after its words, never before). This
+/// order cuts a key with a colon and a space in it at the colon and folds
+/// its parts into a path (`a: b` reads as `a.b`); serde's words then name
+/// the key whole and the param reads it back from them. One case it reads
+/// wrong: a key that is no plain path, in front of a custom error, keeps no
+/// path.
+#[cfg(feature = "axum")]
+fn deserialize_detail(message: &str) -> (Option<Cow<'_, str>>, &str) {
+    let detail = message
+        .split_once(DESERIALIZE_PREFIX)
+        .map_or(message, |(_, detail)| detail);
+    if opens_a_reason(detail) {
+        return (None, detail);
+    }
+    let mut splits = detail
+        .match_indices(": ")
+        .map(|(at, _)| (&detail[..at], &detail[at + 2..]));
+    let is_path = |head: &str| {
+        !head.is_empty()
+            && head
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '[' | ']' | '-'))
+    };
+    match splits.next() {
+        Some((head, mut reason)) if is_path(head) => {
+            // A reader that read a buffered value itself (an item's message,
+            // a message's part) puts the path it tracked in front of the
+            // reason, under serde's: the two fold into one path.
+            let mut path = Cow::Borrowed(head);
+            while !opens_a_reason(reason) {
+                match reason.split_once(": ") {
+                    Some((inner, rest)) if is_path(inner) => {
+                        path = Cow::Owned(format!("{path}.{inner}"));
+                        reason = rest;
+                    }
+                    _ => break,
+                }
+            }
+            (Some(path), reason)
+        }
+        Some(first) => std::iter::once(first)
+            .chain(splits)
+            .find(|(_, reason)| opens_a_reason(reason))
+            .map_or((None, detail), |(head, reason)| {
+                (Some(Cow::Borrowed(head)), reason)
+            }),
+        None => (None, detail),
+    }
+}
+
+/// The public API's `code` for a body the deserializer refused: the code of
+/// the first of [`SERDE_REASONS`] its reason opens with (see
+/// [`deserialize_detail`]), `json_parse_error` for anything else.
+#[cfg(feature = "axum")]
+fn deserialize_code(message: &str) -> &'static str {
+    let (_, reason) = deserialize_detail(message);
+    SERDE_REASONS
+        .iter()
+        .find(|(words, _)| reason.starts_with(words))
+        .map_or("json_parse_error", |(_, code)| code)
+}
+
+/// The field a deserialization error is about, as the public API's `param`:
+/// the path serde recorded, the field a `missing field` / `unknown field`
+/// reason names, or both (`items[0].role`); None for a syntax error.
+#[cfg(feature = "axum")]
+fn param_from_deserialize_message(message: &str) -> Option<String> {
+    let (path, reason) = deserialize_detail(message);
+    let field = ["missing field `", "unknown field `"]
+        .iter()
+        .find_map(|marker| reason.strip_prefix(marker))
+        .and_then(|rest| rest.split_once('`'))
+        .map(|(field, _)| field);
+    match (path.as_deref(), field) {
+        // A refused unknown key is already the last segment of serde's path.
+        (Some(path), Some(field)) if path == field || path.ends_with(&format!(".{field}")) => {
+            Some(path.to_string())
+        }
+        // A key with a colon and a space in it folded into the path; serde's
+        // words name it whole.
+        (Some(path), Some(field)) if field.contains(": ") && path == field.replace(": ", ".") => {
+            Some(field.to_string())
+        }
+        (Some(path), Some(field)) => Some(format!("{path}.{field}")),
+        (Some(path), None) => Some(path.to_string()),
+        (None, Some(field)) => Some(field.to_string()),
+        (None, None) => None,
+    }
+}
+
+/// The key the validator crate files a rule over the whole request under
+/// (and a rule over one nested value, under that value's path). It is the
+/// crate's own and names no field of the public API: it is never printed
+/// and never a `param`.
+#[cfg(feature = "axum")]
+const WHOLE_REQUEST_KEY: &str = "__all__";
+
+/// `key` under `prefix`: the key alone at the top, else `prefix.key`.
+#[cfg(feature = "axum")]
+fn join(prefix: &str, key: &str) -> String {
+    if prefix.is_empty() {
+        key.to_string()
+    } else {
+        format!("{prefix}.{key}")
+    }
+}
+
+/// The path of a report entry: a field's key under its prefix; the prefix
+/// itself for a rule over the whole value.
+#[cfg(feature = "axum")]
+fn path_of(prefix: &str, key: &str) -> String {
+    if key == WHOLE_REQUEST_KEY {
+        prefix.to_string()
+    } else {
+        join(prefix, key)
+    }
+}
+
+/// The report's entries in sorted key order, so that the same report always
+/// reads the same way.
+#[cfg(feature = "axum")]
+fn sorted_entries(errors: &ValidationErrors) -> Vec<(&Cow<'static, str>, &ValidationErrorsKind)> {
+    let mut entries: Vec<_> = errors.errors().iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    entries
+}
+
+/// The first violation of a validation report, as the public API's
+/// (`param`, `code`): the path of the field (`items[1].role`; the field a
+/// rule checked across fields names for itself, `FIELD_PARAM`; None for a
+/// rule over the whole request that names none) and the code of the rule,
+/// validator's built-in rules named the way the public API names them. Keys
+/// are visited in sorted order, so the same report always yields the same
+/// pair.
+#[cfg(feature = "axum")]
+fn first_violation(errors: &ValidationErrors) -> (Option<String>, String) {
+    fn walk(errors: &ValidationErrors, prefix: &str) -> Option<(Option<String>, String)> {
+        for (key, kind) in sorted_entries(errors) {
+            let path = path_of(prefix, key);
+            match kind {
+                ValidationErrorsKind::Field(field_errors) => {
+                    if let Some(error) = field_errors.first() {
+                        let param = match error.params.get(FIELD_PARAM).and_then(Value::as_str) {
+                            Some(field) => Some(join(&path, field)),
+                            None => (!path.is_empty()).then_some(path),
+                        };
+                        return Some((param, public_code(error)));
+                    }
+                }
+                ValidationErrorsKind::Struct(inner) => {
+                    if let Some(found) = walk(inner, &path) {
+                        return Some(found);
+                    }
+                }
+                ValidationErrorsKind::List(items) => {
+                    for (index, inner) in items {
+                        if let Some(found) = walk(inner, &format!("{path}[{index}]")) {
+                            return Some(found);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+    walk(errors, "").unwrap_or_else(|| (None, "invalid_value".to_string()))
+}
+
+/// The refusal's message for a validation report: the violations each on a
+/// line of their own, in the order [`first_violation`] visits them (the
+/// first line is the violation whose `param` and `code` the envelope
+/// carries); `field: message` for a field's rule with a message of its own,
+/// a nested field by its path (`items[1].role: ...`), the sentence alone for
+/// a built-in rule without one (it names the field itself, [`sentence_of`]),
+/// and the message alone for a rule over the whole
+/// request, whose key in the report is the validator crate's own
+/// (`WHOLE_REQUEST_KEY`) and no field of the public API.
+#[cfg(feature = "axum")]
+fn message_of(errors: &ValidationErrors) -> String {
+    fn walk(out: &mut String, errors: &ValidationErrors, prefix: &str) {
+        for (key, kind) in sorted_entries(errors) {
+            let path = path_of(prefix, key);
+            match kind {
+                ValidationErrorsKind::Field(field_errors) => {
+                    if !out.is_empty() {
+                        out.push('\n');
+                    }
+                    // A built-in rule's sentence names the field itself; a
+                    // message of a rule's own (or the library's rendering of
+                    // a rule the sentence cannot read) stands under the path.
+                    let sentences: Vec<Option<String>> = field_errors
+                        .iter()
+                        .map(|error| sentence_of(&path, error))
+                        .collect();
+                    if !path.is_empty() && sentences.iter().any(Option::is_none) {
+                        out.push_str(&path);
+                        out.push_str(": ");
+                    }
+                    for (index, (error, sentence)) in field_errors.iter().zip(sentences).enumerate()
+                    {
+                        if index > 0 {
+                            out.push_str(", ");
+                        }
+                        match sentence {
+                            Some(sentence) => out.push_str(&sentence),
+                            None => out.push_str(&error.to_string()),
+                        }
+                    }
+                }
+                ValidationErrorsKind::Struct(inner) => walk(out, inner, &path),
+                ValidationErrorsKind::List(items) => {
+                    for (index, inner) in items {
+                        walk(out, inner, &format!("{path}[{index}]"));
+                    }
+                }
+            }
+        }
+    }
+    let mut out = String::new();
+    walk(&mut out, errors, "");
+    out
+}
+
+/// The sentence for a built-in `range` or `length` rule that carries no
+/// message of its own, in the form the routes' own rules use (`Invalid
+/// 'top_p': decimal above maximum value. Expected a value <= 1, but got 2
+/// instead.`) instead of the validator crate's rendering of the rule's name
+/// and parameters (`Validation error: range [{"min": Number(1), "value":
+/// Number(0)}]`); `None` for a rule with a message of its own, or one whose
+/// value or bound the report does not carry, which print as before.
+#[cfg(feature = "axum")]
+fn sentence_of(path: &str, error: &ValidationError) -> Option<String> {
+    if error.message.is_some() {
+        return None;
+    }
+    let field = if path.is_empty() { "value" } else { path };
+    let value = error.params.get("value");
+    match error.code.as_ref() {
+        "range" => {
+            let code = range_code(error);
+            let (what, got) = match value {
+                Some(v) if v.is_i64() || v.is_u64() => ("an integer", v.to_string()),
+                Some(v) => match v.as_f64() {
+                    // A decimal field (an `f32` throughout the crate) reaches
+                    // the report widened to `f64` (`2.1` as
+                    // `2.0999999046325684`): a value that round-trips through
+                    // `f32` prints as one.
+                    Some(f) if f64::from(f as f32) == f => ("a value", (f as f32).to_string()),
+                    Some(f) => ("a value", f.to_string()),
+                    None => return None,
+                },
+                None => return None,
+            };
+            let (sign, limit) = if code.ends_with("_below_min_value") {
+                bound(error, "min")
+                    .map(|min| (">=", min))
+                    .or_else(|| bound(error, "exclusive_min").map(|min| (">", min)))
+            } else if code.ends_with("_above_max_value") {
+                bound(error, "max")
+                    .map(|max| ("<=", max))
+                    .or_else(|| bound(error, "exclusive_max").map(|max| ("<", max)))
+            } else {
+                None
+            }
+            .unzip();
+            let (Some(sign), Some(limit)) = (sign, limit) else {
+                return None;
+            };
+            let words = code
+                .replace("_min_", " minimum ")
+                .replace("_max_", " maximum ")
+                .replace('_', " ");
+            Some(format!("Invalid '{field}': {words}. Expected {what} {sign} {limit}, but got {got} instead."))
+        }
+        "length" => {
+            let code = length_code(error);
+            let (kind, what, len) = match value {
+                Some(Value::String(text)) => ("string", "a string", text.chars().count()),
+                Some(Value::Array(items)) => ("array", "an array", items.len()),
+                Some(Value::Object(members)) => ("object", "an object", members.len()),
+                _ => return None,
+            };
+            let below = code == "empty_array" || code.contains("_below_min_");
+            let limit = bound(error, if below { "min" } else { "max" })?;
+            let (bound_word, words) = if below {
+                ("minimum", "too short")
+            } else {
+                ("maximum", "too long")
+            };
+            Some(if kind == "object" {
+                // The routes' form for a property count.
+                let words = if below { "too few" } else { "too many" };
+                let noun = if len == 1 { "property" } else { "properties" };
+                format!("Invalid '{field}': {words} properties. The object has {len} {noun}, but the {bound_word} is {limit}.")
+            } else if below && len == 0 {
+                format!("Invalid '{field}': empty {kind}. Expected {what} with minimum length {limit}, but got an empty {kind} instead.")
+            } else {
+                format!("Invalid '{field}': {kind} {words}. Expected {what} with {bound_word} length {limit}, but got {what} with length {len} instead.")
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The public API's code for a validation error: a custom rule's own code
+/// passes through (`tool_choice_requires_tools`), validator's built-in rules
+/// get the public API's names for the same conditions.
+#[cfg(feature = "axum")]
+fn public_code(error: &ValidationError) -> String {
+    match error.code.as_ref() {
+        "range" => range_code(error),
+        "length" => length_code(error),
+        "required" => "missing_required_parameter".to_string(),
+        "email"
+        | "url"
+        | "regex"
+        | "contains"
+        | "does_not_contain"
+        | "must_match"
+        | "ip"
+        | "credit_card"
+        | "phone"
+        | "non_control_character" => "invalid_value".to_string(),
+        // A rule whose "code" is a sentence ("query cannot be empty") has
+        // its text in the message already; the code stays an identifier.
+        code if code.contains(char::is_whitespace) => "invalid_value".to_string(),
+        code => code.to_string(),
+    }
+}
+
+#[cfg(feature = "axum")]
+fn bound(error: &ValidationError, name: &str) -> Option<f64> {
+    error.params.get(name).and_then(Value::as_f64)
+}
+
+/// `integer_below_min_value`, `decimal_above_max_value`, ...: the kind of the
+/// value and the bound it crossed.
+#[cfg(feature = "axum")]
+fn range_code(error: &ValidationError) -> String {
+    let value = error.params.get("value");
+    let kind = match value {
+        Some(value) if value.is_i64() || value.is_u64() => "integer",
+        _ => "decimal",
+    };
+    match value.and_then(Value::as_f64) {
+        Some(v)
+            if bound(error, "min").is_some_and(|min| v < min)
+                || bound(error, "exclusive_min").is_some_and(|min| v <= min) =>
+        {
+            format!("{kind}_below_min_value")
+        }
+        Some(v)
+            if bound(error, "max").is_some_and(|max| v > max)
+                || bound(error, "exclusive_max").is_some_and(|max| v >= max) =>
+        {
+            format!("{kind}_above_max_value")
+        }
+        _ => "invalid_value".to_string(),
+    }
+}
+
+/// `string_above_max_length`, `empty_array`, `object_above_max_properties`,
+/// ...: the kind of the value and the bound its length crossed.
+#[cfg(feature = "axum")]
+fn length_code(error: &ValidationError) -> String {
+    let (kind, unit, len) = match error.params.get("value") {
+        Some(Value::String(s)) => ("string", "length", Some(s.chars().count())),
+        Some(Value::Array(a)) => ("array", "length", Some(a.len())),
+        Some(Value::Object(o)) => ("object", "properties", Some(o.len())),
+        _ => ("value", "length", None),
+    };
+    let min = bound(error, "min");
+    let max = bound(error, "max");
+    match len {
+        Some(0) if kind == "array" && min.is_some_and(|min| min >= 1.0) => {
+            "empty_array".to_string()
+        }
+        Some(len) if min.is_some_and(|min| (len as f64) < min) => {
+            format!("{kind}_below_min_{unit}")
+        }
+        Some(len) if max.is_some_and(|max| (len as f64) > max) => {
+            format!("{kind}_above_max_{unit}")
+        }
+        _ => "invalid_value".to_string(),
+    }
+}
+
+/// Whether the request declares the plain `application/json` content type,
+/// bare or with well-formed `name=value` parameters (a token name; a token
+/// or a non-empty quoted string as the value; a parameter may follow its `;`
+/// after spaces, nothing else): a strict subset of what axum's extractor
+/// accepts, parsed directly. A `+json` suffix, a parameter the check doubts,
+/// whitespace where the MIME grammar has none, or anything else is left to
+/// axum's extractor, which decides as before.
+#[cfg(feature = "axum")]
+fn has_plain_json_content_type(req: &Request) -> bool {
+    let Some(value) = req
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let mut parts = value.split(';');
+    let mime = parts.next().unwrap_or("");
+    mime.eq_ignore_ascii_case("application/json") && parts.all(is_mime_parameter)
+}
+
+/// `name=value` after the spaces that may follow the `;`: a token name and a
+/// token or non-empty quoted-string value, with no whitespace of its own.
+#[cfg(feature = "axum")]
+fn is_mime_parameter(part: &str) -> bool {
+    fn is_token(text: &str) -> bool {
+        !text.is_empty()
+            && text
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
+    }
+    let Some((name, value)) = part.trim_start_matches(' ').split_once('=') else {
+        return false;
+    };
+    // A quoted value: non-empty, printable ASCII and spaces only (no tab, no
+    // control character, no inner quote, no backslash escape), the part of
+    // the grammar axum's parser and this check read alike.
+    let quoted = value.len() >= 3
+        && value.starts_with('"')
+        && value.ends_with('"')
+        && value[1..value.len() - 1]
+            .bytes()
+            .all(|byte| (b' '..=b'~').contains(&byte) && byte != b'"' && byte != b'\\');
+    is_token(name) && (is_token(value) || quoted)
+}
+
+/// The `Content-Encoding` of a request whose body a JSON extractor cannot
+/// read: any but `identity`, in whichever field of a repeated header or
+/// position of a comma-separated list it stands (a list is read coding by
+/// coding, as a combined field is one; the first coding the gateway does
+/// not decode is the one named). The gateway decodes no content encoding,
+/// so a compressed body would be parsed as JSON and refused as one; the
+/// header is answered first, as 415, by both JSON extractors.
+#[cfg(feature = "axum")]
+pub fn undecodable_content_encoding(req: &Request) -> Option<String> {
+    req.headers()
+        .get_all(CONTENT_ENCODING)
+        .iter()
+        .flat_map(|value| {
+            String::from_utf8_lossy(value.as_bytes())
+                .split(',')
+                .map(|coding| coding.trim().to_string())
+                .collect::<Vec<_>>()
+        })
+        .find(|encoding| !encoding.is_empty() && !encoding.eq_ignore_ascii_case("identity"))
+}
+
+/// The most of a client's header value a refusal's message echoes: the
+/// value is the client's own text, cut here so that the message stays one
+/// line.
+#[cfg(feature = "axum")]
+const HEADER_ECHO_CHARS: usize = 64;
+
+/// A header value as a refusal's message echoes it: a value longer than the
+/// echo bound, counted in characters, is cut there and the cut marked.
+#[cfg(feature = "axum")]
+pub fn header_echo(value: &str) -> String {
+    let mut chars = value.chars();
+    let mut shown: String = chars.by_ref().take(HEADER_ECHO_CHARS).collect();
+    if chars.next().is_some() {
+        shown.push_str("...");
+    }
+    shown
+}
+
+/// The message of the 415 a JSON body under an encoding the gateway does
+/// not decode is answered with; the coding is echoed as [`header_echo`]
+/// shows it.
+#[cfg(feature = "axum")]
+pub fn content_encoding_message(encoding: &str) -> String {
+    let echo = header_echo(encoding);
+    format!("Content-Encoding `{echo}` is not decoded: send the JSON body unencoded")
+}
+
+/// The 415 with its `Accept-Encoding: identity`, the header by which a
+/// client that compresses its requests tells an encoding refusal from a
+/// media-type one (RFC 9110, sections 12.5.3 and 15.5.16).
+#[cfg(feature = "axum")]
+pub fn with_accept_encoding_identity(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+    response
+}
+
+/// The gateway's answer to a body axum's extractor refused.
+#[cfg(feature = "axum")]
+fn json_rejection(err: JsonRejection) -> Response {
+    // A body that crosses the payload limit is a size error,
+    // not a client JSON error: a declared Content-Length over
+    // the limit is already refused with 413 before the body,
+    // and a chunked upload must get the same answer the moment
+    // it crosses the limit (reading stops there; the frames
+    // after it are never pulled in).
+    if let JsonRejection::BytesRejection(BytesRejection::FailedToBufferBody(
+        FailedToBufferBody::LengthLimitError(_),
+    )) = &err
+    {
+        return rejection(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_body_too_large",
+            None,
+            "Request body exceeded the payload limit (max_payload_size)".to_string(),
+        );
+    }
+    let (code, error_message) = match err {
+        JsonRejection::JsonDataError(e) => {
+            let mut message = format!("Invalid JSON data: {e}");
+            // A path a reader tracked under serde's reads as one path.
+            if let (Some(Cow::Owned(path)), reason) = deserialize_detail(&message) {
+                message = format!("Invalid JSON data: {DESERIALIZE_PREFIX}{path}: {reason}");
+            }
+            (deserialize_code(&message), message)
+        }
+        JsonRejection::JsonSyntaxError(e) => ("invalid_json", format!("JSON syntax error: {e}")),
+        JsonRejection::MissingJsonContentType(_) => (
+            "json_parse_error",
+            "Missing Content-Type: application/json header".to_string(),
+        ),
+        _ => ("json_parse_error", format!("Failed to parse JSON: {err}")),
+    };
+    let param = param_from_deserialize_message(&error_message);
+    rejection(StatusCode::BAD_REQUEST, code, param, error_message)
+}
+
+#[cfg(feature = "axum")]
+impl<S, T> FromRequest<S> for ValidatedJson<T>
+where
+    T: DeserializeOwned + Validate + Normalizable + Send + 'static,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        if let Some(encoding) = undecodable_content_encoding(&req) {
+            return Err(with_accept_encoding_identity(rejection(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "json_parse_error",
+                None,
+                content_encoding_message(&encoding),
+            )));
+        }
+        // A body under the plain `application/json` content type is read and
+        // parsed once, directly; axum's extractor parses it a second time only
+        // when that fails, so that the rejection names the path of the failing
+        // field as before. (axum's extractor always parses with path tracking,
+        // a chain of allocations per nested value: 118 of a tool-heavy chat
+        // request's 2,652 allocation calls, measured 2026-10-21.) Any other
+        // content type goes to axum's extractor as a whole, which decides what
+        // it accepts and how it refuses.
+        let Json(mut data) = if has_plain_json_content_type(&req) {
+            let bytes = Bytes::from_request(req, state)
+                .await
+                .map_err(|err| json_rejection(JsonRejection::from(err)))?;
+            // The body is checked as text once, as a whole: a parse from bytes
+            // checks every key and every string on its own.
+            let direct = std::str::from_utf8(&bytes).ok().and_then(|text| {
+                crate::kind_read::direct::<T, _>(|| serde_json::from_str::<T>(text)).ok()
+            });
+            match direct {
+                Some(data) => Json(data),
+                None => Json::<T>::from_bytes(&bytes).map_err(json_rejection)?,
+            }
+        } else {
+            Json::<T>::from_request(req, state)
+                .await
+                .map_err(json_rejection)?
+        };
+
+        // Normalize the request (apply defaults based on other fields)
+        data.normalize();
+
+        // Then, automatically validate the data
+        data.validate().map_err(|validation_errors| {
+            let (param, code) = first_violation(&validation_errors);
+            rejection(
+                StatusCode::BAD_REQUEST,
+                &code,
+                param,
+                message_of(&validation_errors),
+            )
+        })?;
+
+        Ok(ValidatedJson(data))
+    }
+}
+
+// Implement Deref to allow transparent access to the inner value
+#[cfg(feature = "axum")]
+impl<T> std::ops::Deref for ValidatedJson<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[cfg(feature = "axum")]
+impl<T> std::ops::DerefMut for ValidatedJson<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+/// A query string a route reads as `T` (the Conversations list route, the
+/// realtime routes): a value the type does not take is refused in the
+/// envelope, with the code the body extractor gives the same serde reason
+/// (`unknown_parameter`, `invalid_type`, ...) and `invalid_value` for a
+/// value that does not parse, where the framework answers text/plain.
+#[cfg(feature = "axum")]
+pub struct ValidatedQuery<T>(pub T);
+
+#[cfg(feature = "axum")]
+impl<S, T> FromRequestParts<S> for ValidatedQuery<T>
+where
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        match Query::<T>::from_request_parts(parts, state).await {
+            Ok(Query(value)) => Ok(Self(value)),
+            Err(err) => Err(query_rejection(&err)),
+        }
+    }
+}
+
+/// A path segment a route reads as `T` (`/v1/models/{*id}`, the
+/// Conversations and Responses ids): a segment that is not UTF-8 or does not
+/// parse as the type is refused in the envelope as `invalid_value`, `param`
+/// the segment's name, where the framework answers text/plain. A rejection
+/// the route itself causes (no such parameter, a shape the extractor cannot
+/// fill) keeps the framework's answer: a 500 of the route's making, never a
+/// client's.
+#[cfg(feature = "axum")]
+pub struct ValidatedPath<T>(pub T);
+
+#[cfg(feature = "axum")]
+impl<S, T> FromRequestParts<S> for ValidatedPath<T>
+where
+    T: DeserializeOwned + Send,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        match Path::<T>::from_request_parts(parts, state).await {
+            Ok(Path(value)) => Ok(Self(value)),
+            Err(err) => Err(path_rejection(err)),
+        }
+    }
+}
+
+/// The framework's prefix on a query string the type did not take.
+#[cfg(feature = "axum")]
+const QUERY_PREFIX: &str = "Failed to deserialize query string: ";
+
+#[cfg(feature = "axum")]
+fn query_rejection(err: &QueryRejection) -> Response {
+    let message = err.body_text();
+    let reason = message.strip_prefix(QUERY_PREFIX).unwrap_or(&message);
+    // The body extractor's code for the same serde reason; its fallback
+    // names JSON parsing, which a query string never had: a value that does
+    // not parse is `invalid_value`.
+    let code = match deserialize_code(reason) {
+        "json_parse_error" => "invalid_value",
+        code => code,
+    };
+    let param = param_from_deserialize_message(reason);
+    rejection(StatusCode::BAD_REQUEST, code, param, message)
+}
+
+#[cfg(feature = "axum")]
+fn path_rejection(err: PathRejection) -> Response {
+    match err {
+        PathRejection::FailedToDeserializePathParams(failed)
+            if failed.status() == StatusCode::BAD_REQUEST =>
+        {
+            let param = match failed.kind() {
+                ErrorKind::InvalidUtf8InPathParam { key }
+                | ErrorKind::ParseErrorAtKey { key, .. }
+                | ErrorKind::DeserializeError { key, .. } => Some(key.clone()),
+                _ => None,
+            };
+            rejection(
+                StatusCode::BAD_REQUEST,
+                "invalid_value",
+                param,
+                failed.body_text(),
+            )
+        }
+        other => other.into_response(),
+    }
+}
+
+#[cfg(all(test, feature = "axum"))]
+mod tests {
+    use axum::body::Body;
+    use serde::{Deserialize, Serialize};
+    use validator::Validate;
+
+    use super::*;
+    use crate::{
+        chat::{ChatCompletionRequest, ChatMessage},
+        common::{invalid, invalid_at},
+        responses::ResponsesRequest,
+    };
+
+    #[derive(Debug, Deserialize, Serialize, Validate)]
+    struct TestRequest {
+        #[validate(range(min = 0.0, max = 1.0))]
+        value: f32,
+        #[validate(length(min = 1))]
+        name: String,
+    }
+
+    impl Normalizable for TestRequest {
+        // Use default no-op implementation
+    }
+
+    #[tokio::test]
+    async fn test_validated_json_valid() {
+        // This test is conceptual - actual testing would require Axum test harness
+        let request = TestRequest {
+            value: 0.5,
+            name: "test".to_string(),
+        };
+        assert!(request.validate().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_validated_json_invalid_range() {
+        let request = TestRequest {
+            value: 1.5, // Out of range
+            name: "test".to_string(),
+        };
+        assert!(request.validate().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_validated_json_invalid_length() {
+        let request = TestRequest {
+            value: 0.5,
+            name: String::new(), // Empty name
+        };
+        assert!(request.validate().is_err());
+    }
+
+    // The envelope of a rejected body, through the extractor itself.
+
+    #[derive(Debug, Deserialize, Serialize, Validate)]
+    struct Item {
+        #[validate(length(min = 1))]
+        role: String,
+    }
+
+    /// A plain field whose type refuses unknown keys: serde's path to such a
+    /// key already ends with it, so the param must not repeat it.
+    #[derive(Debug, Deserialize, Serialize, Validate)]
+    #[serde(deny_unknown_fields)]
+    struct Dependency {
+        #[validate(length(min = 1))]
+        version: String,
+    }
+
+    fn not_vip(tier: &str) -> Result<(), ValidationError> {
+        if tier == "vip" {
+            return Err(ValidationError::new("unsupported_value"));
+        }
+        if tier == "gold" {
+            return Err(ValidationError::new("tier must not be gold"));
+        }
+        Ok(())
+    }
+
+    fn not_both(request: &BodyRequest) -> Result<(), ValidationError> {
+        if request.both {
+            return Err(ValidationError::new("mutually_exclusive_parameters"));
+        }
+        Ok(())
+    }
+
+    #[derive(Debug, Deserialize, Serialize, Validate)]
+    #[validate(schema(function = "not_both"))]
+    struct BodyRequest {
+        #[validate(range(min = 0.0, max = 1.0))]
+        value: f32,
+        #[validate(length(min = 1, max = 8))]
+        name: String,
+        #[serde(default)]
+        #[validate(range(min = 1, max = 20))]
+        count: Option<u32>,
+        #[serde(default)]
+        #[validate(length(min = 1))]
+        tags: Option<Vec<String>>,
+        #[serde(default)]
+        #[validate(length(max = 2))]
+        metadata: Option<std::collections::HashMap<String, String>>,
+        #[serde(default)]
+        #[validate(nested)]
+        items: Vec<Item>,
+        #[serde(default)]
+        #[validate(nested)]
+        dependency: Option<Dependency>,
+        #[serde(default)]
+        #[validate(custom(function = "not_vip"))]
+        tier: Option<String>,
+        #[serde(default)]
+        both: bool,
+        #[serde(default)]
+        kind: Option<Kind>,
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum Kind {
+        Plain,
+        Fancy,
+    }
+
+    impl Normalizable for BodyRequest {}
+
+    /// The status and body of a rejected body; an accepted body shows up as
+    /// a 200 with a null body (and fails the caller's assertions).
+    async fn reject(body: &str) -> (StatusCode, Value) {
+        rejected::<BodyRequest>(body).await
+    }
+
+    /// The body of a request under `content_type`, through the extractor.
+    async fn extract(
+        content_type: &str,
+        body: impl AsRef<[u8]>,
+    ) -> Result<BodyRequest, (StatusCode, Value)> {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("content-type", content_type)
+            .body(Body::from(body.as_ref().to_vec()))
+            .unwrap_or_default();
+        match ValidatedJson::<BodyRequest>::from_request(request, &()).await {
+            Ok(ValidatedJson(body)) => Ok(body),
+            Err(response) => {
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap_or_default();
+                Err((
+                    status,
+                    serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+                ))
+            }
+        }
+    }
+
+    /// A good body under `application/json` is parsed once, directly; one that
+    /// fails is parsed again by axum's extractor, whose rejection names the
+    /// failing field as before; a content type that is not the plain one goes
+    /// to axum's extractor as a whole. A byte that is not UTF-8 inside a string
+    /// the type skips refuses no body under either.
+    #[tokio::test]
+    async fn bodies_parse_once_and_a_failure_keeps_its_named_path() {
+        let good = r#"{"value":0.5,"name":"x"}"#;
+        assert!(extract("application/json", good).await.is_ok());
+        assert!(
+            extract("application/json; charset=utf-8", good)
+                .await
+                .is_ok(),
+            "parameters do not change the content type"
+        );
+        for malformed in [
+            "application/json; charset",
+            "application/json;;",
+            "application/json; a=b=c\"",
+            "application/json ;charset=utf-8",
+            "application/json;\tcharset=utf-8",
+            "application/json; charset=utf-8 ; x=y",
+            "application/json; foo=\"\"",
+            "application/json; foo=\"a\tb\"",
+            "application/json; foo=\"a\\\"b\"",
+        ] {
+            let (status, body) = extract(malformed, good).await.unwrap_err();
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{malformed}");
+            assert!(
+                body.to_string().contains("Missing Content-Type"),
+                "a parameter the check doubts goes to axum's extractor, which refuses it as before: {malformed}: {body}"
+            );
+        }
+        assert!(
+            extract("application/vnd.api+json", good).await.is_ok(),
+            "a +json type is accepted through axum's extractor"
+        );
+        let (status, body) = extract("text/plain", good).await.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.to_string().contains("Missing Content-Type"), "{body}");
+        let (status, body) = extract("application/json", r#"{"value":"half","name":"x"}"#)
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let text = body.to_string();
+        assert!(
+            text.contains("value") && text.contains("invalid type"),
+            "the second parse names the failing field: {text}"
+        );
+        let (status, body) = extract("application/json", r#"{"value":0.5,"name":"#)
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.to_string().contains("syntax"), "{body}");
+        let skipped = b"{\"value\":0.5,\"name\":\"x\",\"extra\":\"\xff\"}";
+        for content_type in ["application/json", "application/vnd.api+json"] {
+            assert!(
+                extract(content_type, skipped).await.is_ok(),
+                "a byte that is not UTF-8 inside a string the type skips does not refuse the body: {content_type}"
+            );
+        }
+    }
+
+    /// A body under a `Content-Encoding` the gateway does not decode is a
+    /// 415 in the envelope (`json_parse_error`, the header in the message,
+    /// `Accept-Encoding: identity` on the answer) before the body is read, in
+    /// whichever field of a repeated header or position of a comma-separated
+    /// list the encoding stands (the first undecoded coding is the one named);
+    /// `identity`, the one encoding that is none, alone or repeated in a list,
+    /// is read as the plain body it is.
+    #[tokio::test]
+    async fn a_content_encoding_the_gateway_does_not_decode_is_a_415_before_the_body_is_read() {
+        for (fields, accepted, named) in [
+            (&["gzip"][..], false, "gzip"),
+            (&["br, gzip"][..], false, "br"),
+            (&["identity", "gzip"][..], false, "gzip"),
+            (&["identity, gzip"][..], false, "gzip"),
+            (&["identity"][..], true, ""),
+            (&["identity, identity"][..], true, ""),
+            (&["Identity , identity"][..], true, ""),
+        ] {
+            let encoding = fields.join(" + ");
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/")
+                .header("content-type", "application/json");
+            for field in fields {
+                request = request.header("content-encoding", *field);
+            }
+            let request = request
+                .body(Body::from(r#"{"value":0.5,"name":"x"}"#))
+                .unwrap_or_default();
+            let result = ValidatedJson::<BodyRequest>::from_request(request, &()).await;
+            if accepted {
+                assert!(result.is_ok(), "{encoding}: read as the plain body it is");
+                continue;
+            }
+            let response = result.err().expect("refused");
+            assert_eq!(
+                response.status(),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "{encoding}"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(ACCEPT_ENCODING)
+                    .map(HeaderValue::as_bytes),
+                Some(&b"identity"[..]),
+                "{encoding}: the 415 names the one encoding it takes"
+            );
+            assert_eq!(
+                response.extensions().get::<RejectionCode>(),
+                Some(&RejectionCode("json_parse_error".to_string())),
+                "{encoding}"
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap_or_default();
+            let body: Value = serde_json::from_slice(&bytes).unwrap_or_default();
+            assert_eq!(
+                body["error"]["code"], "json_parse_error",
+                "{encoding}: {body}"
+            );
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains(named),
+                "{encoding}: {body}"
+            );
+        }
+    }
+
+    /// The 415 message echoes at most the echo bound of a refused coding,
+    /// counted in characters, and marks the cut: a header value is the
+    /// client's text, not the message's.
+    #[test]
+    fn the_415_message_cuts_a_long_coding() {
+        assert_eq!(
+            content_encoding_message("gzip"),
+            "Content-Encoding `gzip` is not decoded: send the JSON body unencoded"
+        );
+        let at_the_bound = "y".repeat(HEADER_ECHO_CHARS);
+        assert!(
+            content_encoding_message(&at_the_bound).contains(&format!("`{at_the_bound}`")),
+            "a coding at the bound is echoed whole"
+        );
+        let long = "x".repeat(HEADER_ECHO_CHARS + 1);
+        assert_eq!(
+            content_encoding_message(&long),
+            format!(
+                "Content-Encoding `{}...` is not decoded: send the JSON body unencoded",
+                "x".repeat(HEADER_ECHO_CHARS)
+            )
+        );
+        // The bound counts characters, not bytes: an obs-text byte of the header
+        // reaches the helper as the three-byte replacement character.
+        let accented = "é".repeat(HEADER_ECHO_CHARS + 1);
+        assert_eq!(
+            content_encoding_message(&accented),
+            format!(
+                "Content-Encoding `{}...` is not decoded: send the JSON body unencoded",
+                "é".repeat(HEADER_ECHO_CHARS)
+            ),
+            "the cut is counted in characters"
+        );
+    }
+
+    /// A rejection carries its code as the `RejectionCode` extension (the
+    /// gateway's metrics read it), the same code the envelope shows.
+    #[tokio::test]
+    async fn rejections_carry_their_code_as_an_extension() {
+        for (body, code) in [
+            (r#"{"value":0.5,"name":"x","tier":"vi"#, "invalid_json"),
+            (r#"{"value":1.5,"name":"x"}"#, "decimal_above_max_value"),
+        ] {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap_or_default();
+            let response = ValidatedJson::<BodyRequest>::from_request(request, &())
+                .await
+                .err()
+                .expect("rejected");
+            assert_eq!(
+                response.extensions().get::<RejectionCode>(),
+                Some(&RejectionCode(code.to_string())),
+                "{body}"
+            );
+        }
+    }
+
+    /// A Messages body whose `thinking.display` is outside the documented
+    /// set is refused in place: `code` `invalid_value`, `param` the path
+    /// serde recorded, a message that names the field and lists the set.
+    /// One with a documented value goes through.
+    #[tokio::test]
+    async fn a_thinking_display_outside_its_set_is_refused_by_name() {
+        use crate::messages::{CreateMessageRequest, ThinkingConfig, ThinkingDisplay};
+
+        let extract = |display: &str| {
+            let body = json!({
+                "model": "m", "max_tokens": 64,
+                "thinking": {"type": "adaptive", "display": display},
+                "messages": [{"role": "user", "content": "hi"}]
+            })
+            .to_string();
+            let request = Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap_or_default();
+            ValidatedJson::<CreateMessageRequest>::from_request(request, &())
+        };
+        let Ok(ValidatedJson(accepted)) = extract("updates").await else {
+            panic!("`updates` is refused");
+        };
+        assert!(matches!(
+            accepted.thinking,
+            Some(ThinkingConfig::Adaptive {
+                display: Some(ThinkingDisplay::Updates)
+            })
+        ));
+        let Err(refused) = extract("full").await else {
+            panic!("`full` is accepted");
+        };
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(refused.into_body(), usize::MAX)
+            .await
+            .unwrap_or_default();
+        let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        assert_eq!(json["error"]["code"], "invalid_value", "{json}");
+        assert_eq!(json["error"]["param"], "thinking", "{json}");
+        let message = json["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(
+                "thinking: unknown variant `full` for `thinking.display`, expected one of `summarized`, `omitted`, `updates`"
+            ),
+            "{message}"
+        );
+    }
+
+    /// (status, type, code, param) of a rejection; `code` must be a string
+    /// and `param` present (a string or null), as in the public API. A
+    /// field of the wrong shape is reported in place, so the assertion that
+    /// follows names it.
+    async fn envelope(body: &str) -> (StatusCode, String, String, Option<String>) {
+        let (status, json) = reject(body).await;
+        let error = json["error"].as_object().cloned().unwrap_or_default();
+        let code = match error.get("code") {
+            Some(Value::String(code)) => code.clone(),
+            other => format!("<code must be a string, got {other:?}>"),
+        };
+        let param = match error.get("param") {
+            Some(Value::Null) => None,
+            Some(Value::String(param)) => Some(param.clone()),
+            other => Some(format!(
+                "<param must be present as a string or null, got {other:?}>"
+            )),
+        };
+        let kind = error
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("<type must be a string>")
+            .to_string();
+        assert!(
+            error
+                .get("message")
+                .and_then(Value::as_str)
+                .is_some_and(|m| !m.is_empty()),
+            "{json}"
+        );
+        (status, kind, code, param)
+    }
+
+    #[tokio::test]
+    async fn range_violations_name_the_field_and_the_bound_crossed() {
+        for (body, code, param) in [
+            (
+                r#"{"value": 1.5, "name": "x"}"#,
+                "decimal_above_max_value",
+                "value",
+            ),
+            (
+                r#"{"value": -0.5, "name": "x"}"#,
+                "decimal_below_min_value",
+                "value",
+            ),
+            (
+                r#"{"value": 0.5, "name": "x", "count": 0}"#,
+                "integer_below_min_value",
+                "count",
+            ),
+            (
+                r#"{"value": 0.5, "name": "x", "count": 25}"#,
+                "integer_above_max_value",
+                "count",
+            ),
+        ] {
+            assert_eq!(
+                envelope(body).await,
+                (
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error".to_string(),
+                    code.to_string(),
+                    Some(param.to_string())
+                ),
+                "{body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn length_violations_name_the_kind_of_value() {
+        for (body, code, param) in [
+            (
+                r#"{"value": 0.5, "name": ""}"#,
+                "string_below_min_length",
+                "name",
+            ),
+            (
+                r#"{"value": 0.5, "name": "far too long"}"#,
+                "string_above_max_length",
+                "name",
+            ),
+            (
+                r#"{"value": 0.5, "name": "x", "tags": []}"#,
+                "empty_array",
+                "tags",
+            ),
+            (
+                r#"{"value": 0.5, "name": "x", "metadata": {"a": "1", "b": "2", "c": "3"}}"#,
+                "object_above_max_properties",
+                "metadata",
+            ),
+        ] {
+            let (_, _, got_code, got_param) = envelope(body).await;
+            assert_eq!(
+                (got_code.as_str(), got_param.as_deref()),
+                (code, Some(param)),
+                "{body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_violations_carry_the_full_path() {
+        let body = r#"{"value": 0.5, "name": "x", "items": [{"role": "user"}, {"role": ""}]}"#;
+        let (_, _, code, param) = envelope(body).await;
+        assert_eq!(code, "string_below_min_length");
+        assert_eq!(param.as_deref(), Some("items[1].role"));
+    }
+
+    #[tokio::test]
+    async fn custom_rule_codes_pass_through_unless_they_are_sentences() {
+        let body = r#"{"value": 0.5, "name": "x", "tier": "vip"}"#;
+        let (_, _, code, param) = envelope(body).await;
+        assert_eq!(code, "unsupported_value");
+        assert_eq!(param.as_deref(), Some("tier"));
+
+        let body = r#"{"value": 0.5, "name": "x", "tier": "gold"}"#;
+        let (_, _, code, param) = envelope(body).await;
+        assert_eq!(code, "invalid_value");
+        assert_eq!(param.as_deref(), Some("tier"));
+    }
+
+    #[tokio::test]
+    async fn rules_over_the_whole_request_have_no_param() {
+        let body = r#"{"value": 0.5, "name": "x", "both": true}"#;
+        let (_, _, code, param) = envelope(body).await;
+        assert_eq!(code, "mutually_exclusive_parameters");
+        assert_eq!(param, None);
+    }
+
+    #[tokio::test]
+    async fn deserialization_errors_name_the_offending_field() {
+        for (body, code, param) in [
+            (r#"{"value": 0.5}"#, "missing_required_parameter", "name"),
+            (r#"{"value": "high", "name": "x"}"#, "invalid_type", "value"),
+            (
+                r#"{"value": 0.5, "name": "x", "items": [{"nope": 1}]}"#,
+                "missing_required_parameter",
+                "items[0].role",
+            ),
+        ] {
+            let (status, kind, got_code, got_param) = envelope(body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(kind, "invalid_request_error", "{body}");
+            assert_eq!(got_code, code, "{body}");
+            assert_eq!(got_param.as_deref(), Some(param), "{body}");
+        }
+    }
+
+    /// The code names the deserializer's reason, as the public API's does:
+    /// a wrong type, a value outside an enumeration, a negative integer
+    /// where the field cannot be negative, a body that is not an object.
+    #[tokio::test]
+    async fn deserialization_errors_carry_the_public_api_code() {
+        for (body, code, param) in [
+            (
+                r#"{"value": 0.5, "name": "x", "kind": "odd"}"#,
+                "invalid_value",
+                Some("kind"),
+            ),
+            (
+                r#"{"value": 0.5, "name": "x", "count": -1}"#,
+                "integer_below_min_value",
+                Some("count"),
+            ),
+            (
+                r#"{"value": 0.5, "name": "x", "tags": "a"}"#,
+                "invalid_type",
+                Some("tags"),
+            ),
+            ("[]", "invalid_type", None),
+        ] {
+            let (status, kind, got_code, got_param) = envelope(body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(kind, "invalid_request_error", "{body}");
+            assert_eq!(got_code, code, "{body}");
+            assert_eq!(got_param.as_deref(), param, "{body}");
+        }
+    }
+
+    /// `Dependency` refuses unknown keys, and serde's path to such a key
+    /// already ends with it (`dependency.nope`): the param names it once.
+    #[tokio::test]
+    async fn an_unknown_key_of_a_nested_object_is_named_once() {
+        let body = r#"{"value": 0.5, "name": "x", "dependency": {"version": "1", "nope": true}}"#;
+        let (status, kind, code, param) = envelope(body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(kind, "invalid_request_error");
+        assert_eq!(code, "unknown_parameter");
+        assert_eq!(param.as_deref(), Some("dependency.nope"));
+    }
+
+    /// A Messages content block the gateway cannot read is refused by its
+    /// position and its own reason, which the envelope's `param` and `code`
+    /// follow: the `param` is serde's path, ending in the tag's key or the
+    /// missing field, as the module names fields (the unknown `type` is a
+    /// value, not a shape).
+    #[tokio::test]
+    async fn an_unreadable_messages_block_is_named_by_position() {
+        use crate::messages::CreateMessageRequest;
+
+        let refusal = |body: String| async move {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap_or_default();
+            let Err(refused) =
+                ValidatedJson::<CreateMessageRequest>::from_request(request, &()).await
+            else {
+                panic!("accepted");
+            };
+            assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+            let bytes = axum::body::to_bytes(refused.into_body(), usize::MAX)
+                .await
+                .unwrap_or_default();
+            serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null)
+        };
+        let json = refusal(
+            json!({
+                "model": "m", "max_tokens": 8,
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "user", "content": [{"type": "a_block_kind_of_no_api", "file_id": "file_1"}]}
+                ]
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(json["error"]["code"], "invalid_value", "{json}");
+        assert_eq!(
+            json["error"]["param"], "messages[1].content[0].type",
+            "{json}"
+        );
+        let message = json["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.starts_with(
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: messages[1].content[0].type: unknown variant `a_block_kind_of_no_api`, expected one of `text`, `image`"
+            ),
+            "{message}"
+        );
+        let json = refusal(
+            json!({
+                "model": "m", "max_tokens": 8,
+                "messages": [{"role": "user", "content": [{"type": "tool_result", "content": "ok"}]}]
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(
+            json["error"]["code"], "missing_required_parameter",
+            "{json}"
+        );
+        assert_eq!(
+            json["error"]["param"], "messages[0].content[0].tool_use_id",
+            "{json}"
+        );
+        let message = json["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("messages[0].content[0]: missing field `tool_use_id`"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn syntax_errors_have_no_param() {
+        let (status, json) = reject(r#"{"value": "#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"]["code"], "invalid_json");
+        assert!(json["error"]["param"].is_null(), "{json}");
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("JSON syntax error")),
+            "{json}"
+        );
+    }
+
+    /// A request whose rule checked across fields names its field
+    /// (`invalid_at`), and one whose rule over the whole request names none.
+    #[derive(Debug, Deserialize, Serialize, Validate)]
+    #[validate(schema(function = "crossed"))]
+    struct CrossRequest {
+        #[serde(default)]
+        base: bool,
+        #[serde(default)]
+        top: bool,
+        #[serde(default)]
+        whole: bool,
+        #[serde(default)]
+        #[validate(range(min = 1, max = 3))]
+        level: Option<u32>,
+    }
+
+    impl Normalizable for CrossRequest {}
+
+    fn crossed(request: &CrossRequest) -> Result<(), ValidationError> {
+        if request.top && !request.base {
+            return Err(invalid_at(
+                "top",
+                "top_requires_base",
+                "top is only allowed when base is set",
+            ));
+        }
+        if request.whole {
+            return Err(invalid(
+                "whole_request_refused",
+                "the request as a whole is refused",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The status and body of a rejected body of type `T`.
+    async fn rejected<T>(body: &str) -> (StatusCode, Value)
+    where
+        T: DeserializeOwned + Validate + Normalizable + Send + 'static,
+    {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap_or_default();
+        let response = match ValidatedJson::<T>::from_request(request, &()).await {
+            Ok(_) => return (StatusCode::OK, Value::Null),
+            Err(response) => response,
+        };
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap_or_default();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    /// A rule checked across fields names its field, which the envelope
+    /// reports as `param`; a rule over the whole request that names none
+    /// keeps `param` null; neither prints the key the validator crate files
+    /// them under. A field's rule with a message of its own prints
+    /// `field: message` as before, a nested one by its path, a built-in rule's
+    /// sentence names the field itself; several violations each on a line in
+    /// key order.
+    #[tokio::test]
+    async fn request_level_refusals_name_their_field_and_print_no_internal_key() {
+        let (status, json) = rejected::<CrossRequest>(r#"{"top": true}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"]["code"], "top_requires_base", "{json}");
+        assert_eq!(json["error"]["param"], "top", "{json}");
+        assert_eq!(
+            json["error"]["message"], "top is only allowed when base is set",
+            "{json}"
+        );
+
+        let (status, json) = rejected::<CrossRequest>(r#"{"whole": true}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"]["code"], "whole_request_refused", "{json}");
+        assert!(json["error"]["param"].is_null(), "{json}");
+        assert_eq!(
+            json["error"]["message"], "the request as a whole is refused",
+            "{json}"
+        );
+
+        let (_, json) = rejected::<CrossRequest>(r#"{"level": 9}"#).await;
+        let message = json["error"]["message"].as_str().unwrap_or_default();
+        assert_eq!(
+            message,
+            "Invalid 'level': integer above maximum value. Expected an integer <= 3, but got 9 instead.",
+            "{json}"
+        );
+        assert_eq!(json["error"]["param"], "level", "{json}");
+
+        let (_, json) = reject(r#"{"value": 0.5, "name": "x", "items": [{"role": ""}]}"#).await;
+        let message = json["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.starts_with("Invalid 'items[0].role': "), "{json}");
+
+        let (_, json) = reject(r#"{"value": 1.5, "name": ""}"#).await;
+        let message = json["error"]["message"].as_str().unwrap_or_default();
+        let lines: Vec<&str> = message.lines().collect();
+        assert_eq!(lines.len(), 2, "{json}");
+        assert!(lines[0].starts_with("Invalid 'name': "), "{json}");
+        assert!(lines[1].starts_with("Invalid 'value': "), "{json}");
+        assert_eq!(json["error"]["param"], "name", "{json}");
+    }
+
+    /// A content part whose `type` the gateway knows but whose body does not
+    /// fit it is refused at serde's reason for the field: the code is the
+    /// reason's, the param the message serde's path stops at, with the part's
+    /// place and the missing field under it when a field is the one missing;
+    /// never the gRPC routes' `unsupported_content_part`.
+    #[tokio::test]
+    async fn a_malformed_known_content_part_is_refused_at_its_field() {
+        use crate::chat::ChatCompletionRequest;
+
+        for (part, code, param) in [
+            (
+                r#"{"type":"image_url","image_url":{"url":"data:image/png;base64,AA==","max_long_side_pixel":-1}}"#,
+                "integer_below_min_value",
+                "messages[0]",
+            ),
+            (
+                r#"{"type":"video_url","video_url":{"url":"data:video/mp4;base64,AA==","fps":"1"}}"#,
+                "invalid_type",
+                "messages[0]",
+            ),
+            (
+                r#"{"type":"image_url","image_url":{"detail":"high"}}"#,
+                "missing_required_parameter",
+                "messages[0].content[1].image_url.url",
+            ),
+            (
+                r#"{"type":"image_url"}"#,
+                "missing_required_parameter",
+                "messages[0].content[1].image_url",
+            ),
+        ] {
+            let body = format!(
+                r#"{{"model":"m","messages":[{{"role":"user","content":[{{"type":"text","text":"hi"}},{part}]}}]}}"#
+            );
+            let (status, json) = rejected::<ChatCompletionRequest>(&body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(json["error"]["code"], code, "{json}");
+            assert_eq!(json["error"]["param"], param, "{json}");
+        }
+    }
+
+    /// A key repeated inside a chat content part is refused with serde's
+    /// words: the param is the message serde's path stops at and the part's
+    /// place is in the words, as for any part refusal that is no missing
+    /// field; the legacy `function_call` object answers at its own path. The
+    /// code is `json_parse_error`: the reason table names no duplicate field.
+    #[tokio::test]
+    async fn a_repeated_key_inside_a_chat_content_part_is_refused() {
+        use crate::chat::ChatCompletionRequest;
+
+        for (body, param, message) in [
+            (
+                r#"{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"a","text":"b"}]}]}"#,
+                "messages[0]",
+                "messages[0]: duplicate field `text`, in `content[0]`",
+            ),
+            (
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"},{"role":"tool","tool_call_id":"call_1","content":[{"type":"text","text":"a"},{"type":"text","text":"a","text":"b"}]}]}"#,
+                "messages[1]",
+                "messages[1]: duplicate field `text`, in `content[1]`",
+            ),
+            (
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"function_call":{"name":"f","name":"g"}}"#,
+                "function_call",
+                "function_call: duplicate field `name`",
+            ),
+        ] {
+            let (status, json) = rejected::<ChatCompletionRequest>(body).await;
+            let text = json["error"]["message"].as_str().unwrap_or_default();
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(json["error"]["code"], "json_parse_error", "{json}");
+            assert_eq!(json["error"]["param"], param, "{json}");
+            assert!(
+                text.starts_with(&format!("Invalid JSON data: {DESERIALIZE_PREFIX}{message}")),
+                "{text}"
+            );
+        }
+    }
+
+    /// A repeated key below an input item's own keys is refused at its
+    /// place: serde's words, the path the extractor's tracker recorded
+    /// through the nested read; the item's own keys answer `input[0]`. The
+    /// code is `json_parse_error`: the reason table names no duplicate field.
+    #[tokio::test]
+    async fn a_repeated_key_below_an_input_items_own_keys_is_refused_at_its_place() {
+        for (body, param, message) in [
+            (
+                r#"{"model":"m","input":[{"role":"user","content":[{"type":"input_text","text":"a","text":"b"}]}],"max_output_tokens":2}"#,
+                "input[0].content[0]",
+                "input[0].content[0]: duplicate field `text`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"t","annotations":[{"type":"file_citation","file_id":"f","filename":"n","index":0,"index":1}]}]}],"max_output_tokens":2}"#,
+                "input[0].content[0].annotations[0]",
+                "input[0].content[0].annotations[0]: duplicate field `index`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"apply_patch_call","id":"ap_1","call_id":"c","operation":{"type":"create_file","path":"a","diff":"d","path":"b"},"status":"completed"}],"max_output_tokens":2}"#,
+                "input[0].operation",
+                "input[0].operation: duplicate field `path`",
+            ),
+            (
+                r#"{"model":"m","input":[{"role":"user","content":"hi","role":"system"}],"max_output_tokens":2}"#,
+                "input[0]",
+                "input[0]: duplicate field `role`",
+            ),
+        ] {
+            let (status, json) = rejected::<ResponsesRequest>(body).await;
+            let text = json["error"]["message"].as_str().unwrap_or_default();
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(json["error"]["code"], "json_parse_error", "{json}");
+            assert_eq!(json["error"]["param"], param, "{json}");
+            assert!(
+                text.starts_with(&format!("Invalid JSON data: {DESERIALIZE_PREFIX}{message}")),
+                "{text}"
+            );
+        }
+    }
+
+    /// A Conversations body refuses a repeated key as the Responses door
+    /// refuses one: at the body's own keys (no place to name, as for a typed
+    /// body's own), at an item's keys and at any depth below them (the place
+    /// the extractor's tracker recorded). The keys of `metadata` keep the
+    /// last value, as that map's do on every door, and a body that is no
+    /// object is read whole for the handler to refuse.
+    #[tokio::test]
+    async fn a_value_body_refuses_a_repeated_key_outside_metadata_at_its_place() {
+        for (body, param, message) in [
+            (
+                r#"{"metadata":{"a":"1"},"metadata":{"a":"2"}}"#,
+                Value::Null,
+                "duplicate field `metadata`",
+            ),
+            (
+                r#"{"items":[{"type":"message","role":"user","content":"hi","role":"system"}]}"#,
+                json!("items[0]"),
+                "items[0]: duplicate field `role`",
+            ),
+            (
+                r#"{"items":[{"type":"message","role":"user","content":[{"type":"input_text","text":"a","text":"b"}]}]}"#,
+                json!("items[0].content[0]"),
+                "items[0].content[0]: duplicate field `text`",
+            ),
+        ] {
+            let (status, json) = rejected::<ValueBody>(body).await;
+            let text = json["error"]["message"].as_str().unwrap_or_default();
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(json["error"]["code"], "json_parse_error", "{json}");
+            assert_eq!(json["error"]["param"], param, "{json}");
+            assert!(
+                text.starts_with(&format!("Invalid JSON data: {DESERIALIZE_PREFIX}{message}")),
+                "{text}"
+            );
+        }
+        for (body, read) in [
+            (
+                r#"{"metadata":{"a":"1","a":"2"}}"#,
+                json!({"metadata": {"a": "2"}}),
+            ),
+            ("[1]", json!([1])),
+        ] {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap_or_default();
+            let accepted = ValidatedJson::<ValueBody>::from_request(request, &()).await;
+            assert!(
+                matches!(&accepted, Ok(ValidatedJson(ValueBody(value))) if *value == read),
+                "{body}"
+            );
+        }
+    }
+
+    /// The Chat Completions rules checked across fields name their field;
+    /// a provider profile's rule keeps its code and message with nothing in
+    /// front; the Messages rules print the public API's words alone.
+    #[tokio::test]
+    async fn the_public_requests_refusals_name_the_field_without_the_internal_key() {
+        use crate::{
+            chat::ChatCompletionRequest, interactions::InteractionsRequest,
+            messages::CreateMessageRequest, responses::ResponsesRequest,
+        };
+
+        for (body, code, param, message) in [
+            (
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"top_logprobs":2}"#,
+                "top_logprobs_requires_logprobs",
+                "top_logprobs",
+                "top_logprobs is only allowed when logprobs is enabled",
+            ),
+            (
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"stream_options":{"include_usage":true}}"#,
+                "stream_options_requires_stream",
+                "stream_options",
+                "The 'stream_options' parameter is only allowed when 'stream' is enabled",
+            ),
+            (
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"tool_choice":"required"}"#,
+                "tool_choice_requires_tools",
+                "tool_choice",
+                "Invalid value for 'tool_choice': 'tool_choice' is only allowed when 'tools' are specified.",
+            ),
+            (
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}],"tool_choice":{"type":"function","function":{"name":"nope"}}}"#,
+                "tool_choice_function_not_found",
+                "tool_choice",
+                "Invalid value for 'tool_choice': function 'nope' not found in 'tools'.",
+            ),
+            (
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f","parameters":[]}}]}"#,
+                "invalid_type",
+                "tools[0].function.parameters",
+                "Invalid 'tools[0].function.parameters': expected an object, but got an array instead",
+            ),
+            (
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f"}},{"type":"function","function":{"name":""}}]}"#,
+                "empty_string",
+                "tools[1].function.name",
+                "Invalid 'tools[1].function.name': empty string. Expected a string with minimum length 1, but got an empty string instead.",
+            ),
+            // The deprecated `functions` list is judged where its migration put it.
+            (
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"functions":[{"name":""}]}"#,
+                "empty_string",
+                "tools[0].function.name",
+                "Invalid 'tools[0].function.name': empty string. Expected a string with minimum length 1, but got an empty string instead.",
+            ),
+            (
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"regex":"a+","ebnf":"root ::= \"a\""}"#,
+                "multiple_constraints",
+                "ebnf",
+                "only one structured output constraint (regex, ebnf, or json_schema) can be active at a time",
+            ),
+            (
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"regex":"a+","response_format":{"type":"structural_tag","structures":[],"triggers":[]}}"#,
+                "regex_conflicts_with_json",
+                "regex",
+                "cannot use regex constraint with a JSON or structural_tag response format",
+            ),
+            (
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"ebnf":"root ::= \"a\"","response_format":{"type":"structural_tag","structures":[],"triggers":[]}}"#,
+                "ebnf_conflicts_with_json",
+                "ebnf",
+                "cannot use EBNF constraint with a JSON or structural_tag response format",
+            ),
+        ] {
+            let (status, json) = rejected::<ChatCompletionRequest>(body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(json["error"]["code"], code, "{json}");
+            assert_eq!(json["error"]["param"], param, "{json}");
+            assert_eq!(json["error"]["message"], message, "{json}");
+        }
+
+        let body = r#"{"model":"kimi-k2","messages":[{"role":"root","content":"hi"}]}"#;
+        let (status, json) = rejected::<ChatCompletionRequest>(body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(json["error"]["code"], "invalid_role", "{json}");
+        assert_eq!(json["error"]["message"], "invalid role: root", "{json}");
+        assert!(json["error"]["param"].is_null(), "{json}");
+
+        let body = r#"{"model":"m","max_tokens":8,"temperature":1.5,"messages":[{"role":"user","content":"hi"}]}"#;
+        let (status, json) = rejected::<CreateMessageRequest>(body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(json["error"]["code"], "value_out_of_range", "{json}");
+        assert_eq!(
+            json["error"]["message"], "temperature: range: 0..1",
+            "{json}"
+        );
+
+        // A function declared with an empty name on the two surfaces that name it flat: the
+        // refusal is the `tools` field's, and its message says which tool.
+        let body = r#"{"model":"m","input":"hi","tools":[{"type":"function","name":"f"},{"type":"function","name":""}]}"#;
+        for (surface, (status, json)) in [
+            ("responses", rejected::<ResponsesRequest>(body).await),
+            ("interactions", rejected::<InteractionsRequest>(body).await),
+        ] {
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{surface}: {json}");
+            assert_eq!(json["error"]["code"], "empty_string", "{surface}: {json}");
+            assert_eq!(json["error"]["param"], "tools", "{surface}: {json}");
+            let message = json["error"]["message"].as_str().unwrap_or_default();
+            assert!(
+                message.contains("Invalid 'tools[1].name': empty string."),
+                "{surface}: {json}"
+            );
+        }
+
+        // A namespace member whose parameters are no object, on Responses: the refusal is the
+        // `tools` field's, and its message says which member.
+        let body = r#"{"model":"m","input":"hi","tools":[{"type":"namespace","name":"ns","description":"d","tools":[{"type":"function","name":"f","parameters":[]}]}]}"#;
+        let (status, json) = rejected::<ResponsesRequest>(body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(json["error"]["code"], "invalid_type", "{json}");
+        assert_eq!(json["error"]["param"], "tools", "{json}");
+        let message = json["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(
+                "Invalid type for 'tools[0].tools[0].parameters': expected an object, but got an array instead."
+            ),
+            "{json}"
+        );
+    }
+
+    /// A refusal inside a Responses `input` item names the item, the part
+    /// and the field under the route's own code, as every other field's
+    /// refusal on this door does: a message with or without its `type` or
+    /// its `id`, a part inside a typed item, a field inside a part's own
+    /// array, a typed item's own field or the element of one of its arrays,
+    /// a field sent an array it does not take (the field, not the array's
+    /// first element), the kind of a typed item; the accepted shapes are
+    /// unchanged.
+    #[tokio::test]
+    async fn a_responses_input_part_refusal_names_the_part_and_its_field() {
+        let image = |part: &str| {
+            format!(
+                r#"{{"model":"m","input":[{{"role":"user","content":[{{"type":"input_text","text":"describe"}},{{"type":"input_image","image_url":"data:image/png;base64,AQ==",{part}}}]}}],"max_output_tokens":2}}"#
+            )
+        };
+        for (body, code, param, message) in [
+            (
+                image(r#""detail":"LOW""#),
+                "invalid_value",
+                "input[0].content[1].detail",
+                "input[0].content[1].detail: unknown variant `LOW`, expected one of `low`, `high`, `auto`, `original`",
+            ),
+            (
+                image(r#""detail":"bogus""#),
+                "invalid_value",
+                "input[0].content[1].detail",
+                "input[0].content[1].detail: unknown variant `bogus`, expected one of `low`, `high`, `auto`, `original`",
+            ),
+            (
+                r#"{"model":"m","input":[{"role":"user","content":[{"type":"input_text","text":"describe"},{"type":"input_image","image_url":{"url":"data:image/png;base64,AQ=="}}]}],"max_output_tokens":2}"#.to_string(),
+                "invalid_type",
+                "input[0].content[1].image_url",
+                "input[0].content[1].image_url: invalid type: map, expected a string",
+            ),
+            // A part's field that takes no array, sent one, is refused
+            // itself, not at the array's first element.
+            (
+                r#"{"model":"m","input":[{"role":"user","content":[{"type":"input_text","text":["describe"]}]}],"max_output_tokens":2}"#.to_string(),
+                "invalid_type",
+                "input[0].content[0].text",
+                "input[0].content[0].text: invalid type: sequence, expected a string",
+            ),
+            (
+                r#"{"model":"m","input":[{"role":"user","content":[{"type":"input_text","text":"describe"},{"type":"input_video","video_url":"http://127.0.0.1/clip.mp4"}]}],"max_output_tokens":2}"#.to_string(),
+                "invalid_value",
+                "input[0].content[1].type",
+                "input[0].content[1].type: unknown variant `input_video`, expected one of `output_text`, `input_text`, `input_image`, `input_file`, `refusal`",
+            ),
+            (
+                r#"{"model":"m","input":[{"role":"user","content":[{"type":"input_text"}]}],"max_output_tokens":2}"#.to_string(),
+                "missing_required_parameter",
+                "input[0].content[0].text",
+                "input[0].content[0]: missing field `text`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"describe"},{"type":"input_image","image_url":"data:image/png;base64,AQ==","detail":"LOW"}]}],"max_output_tokens":2}"#.to_string(),
+                "invalid_value",
+                "input[0].content[1].detail",
+                "input[0].content[1].detail: unknown variant `LOW`, expected one of `low`, `high`, `auto`, `original`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"message","id":"msg_1","role":"user","content":[{"type":"input_text","text":"describe"},{"type":"input_image","image_url":"data:image/png;base64,AQ==","detail":"LOW"}]}],"max_output_tokens":2}"#.to_string(),
+                "invalid_value",
+                "input[0].content[1].detail",
+                "input[0].content[1].detail: unknown variant `LOW`, expected one of `low`, `high`, `auto`, `original`",
+            ),
+            (
+                r#"{"model":"m","input":[{"role":"user","content":[{"type":7,"text":"hi"}]}],"max_output_tokens":2}"#.to_string(),
+                "invalid_type",
+                "input[0].content[0].type",
+                "input[0].content[0].type: invalid type: integer `7`, expected variant identifier",
+            ),
+            (
+                r#"{"model":"m","input":[{"role":"user","content":[{"type":"output_text","text":"hi","annotations":[{"type":"file_citation","index":0}]}]}],"max_output_tokens":2}"#.to_string(),
+                "missing_required_parameter",
+                "input[0].content[0].annotations[0].file_id",
+                "input[0].content[0].annotations[0]: missing field `file_id`",
+            ),
+            (
+                r#"{"model":"m","input":[{"role":"user","content":[{"type":"output_text","text":"hi","annotations":[{"type":"url_citation","url":5}]}]}],"max_output_tokens":2}"#.to_string(),
+                "invalid_type",
+                "input[0].content[0].annotations[0]",
+                "input[0].content[0].annotations[0]: invalid type: integer `5`, expected a string",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"function_call_output","call_id":"call_1","output":[{"type":"input_text"}]}],"max_output_tokens":2}"#.to_string(),
+                "missing_required_parameter",
+                "input[0].output[0].text",
+                "input[0].output[0]: missing field `text`",
+            ),
+            // A typed item's own field: a missing one by serde's words at the
+            // item, an invalid one at the field, a kind the door has no
+            // variant for at `type`, a field inside one of the item's arrays
+            // at the element.
+            (
+                r#"{"model":"m","input":[{"type":"function_call","id":"fc_1","name":"lookup","arguments":"{}"}],"max_output_tokens":2}"#.to_string(),
+                "missing_required_parameter",
+                "input[0].call_id",
+                "input[0]: missing field `call_id`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"function_call","call_id":"call_1","name":"lookup","arguments":7}],"max_output_tokens":2}"#.to_string(),
+                "invalid_type",
+                "input[0].arguments",
+                "input[0].arguments: invalid type: integer `7`, expected a string",
+            ),
+            // The same for an item's field: `arguments` takes a string, so
+            // an array there is the field's refusal.
+            (
+                r#"{"model":"m","input":[{"type":"function_call","call_id":"call_1","name":"lookup","arguments":["{}"]}],"max_output_tokens":2}"#.to_string(),
+                "invalid_type",
+                "input[0].arguments",
+                "input[0].arguments: invalid type: sequence, expected a string",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"message","id":"msg_1","role":7,"content":[{"type":"input_text","text":"hi"}]}],"max_output_tokens":2}"#.to_string(),
+                "invalid_type",
+                "input[0].role",
+                "input[0].role: invalid type: integer `7`, expected a string",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"web_search_results","id":"ws_1"}],"max_output_tokens":2}"#.to_string(),
+                "invalid_value",
+                "input[0].type",
+                "input[0].type: unknown variant `web_search_results`, expected one of `message`, `reasoning`, `function_call`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"mcp_list_tools","id":"mcpl_1","server_label":"docs","tools":[{"name":"search"}]}],"max_output_tokens":2}"#.to_string(),
+                "missing_required_parameter",
+                "input[0].tools[0].input_schema",
+                "input[0].tools[0]: missing field `input_schema`",
+            ),
+            // A field missing inside an array element whose name is an
+            // optional field of the item too (the safety check's `id`, the
+            // output's own `id`) is named at the element.
+            (
+                r#"{"model":"m","input":[{"type":"computer_call_output","call_id":"call_1","output":{"type":"computer_screenshot"},"acknowledged_safety_checks":[{}]}],"max_output_tokens":2}"#.to_string(),
+                "missing_required_parameter",
+                "input[0].acknowledged_safety_checks[0].id",
+                "input[0].acknowledged_safety_checks[0]: missing field `id`",
+            ),
+            // An item reference is refused for its `id` alone, never for its
+            // kind, which the door takes.
+            (
+                r#"{"model":"m","input":[{"type":"item_reference"}],"max_output_tokens":2}"#.to_string(),
+                "missing_required_parameter",
+                "input[0].id",
+                "input[0]: missing field `id`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"item_reference","id":7}],"max_output_tokens":2}"#.to_string(),
+                "invalid_type",
+                "input[0].id",
+                "input[0].id: invalid type: integer `7`, expected a string",
+            ),
+            // A `message` with an `id` and a string `content` is the untagged
+            // shape (the `id` dropped); a refused field beside them is named,
+            // not the `content` the shape takes.
+            (
+                r#"{"model":"m","input":[{"type":"message","id":"msg_1","content":"hi","role":7}],"max_output_tokens":2}"#.to_string(),
+                "invalid_type",
+                "input[0].role",
+                "input[0].role: invalid type: integer `7`, expected a string",
+            ),
+            (
+                r#"{"model":"m","input":[{"content":"hi"}],"max_output_tokens":2}"#.to_string(),
+                "missing_required_parameter",
+                "input[0].role",
+                "input[0]: missing field `role`",
+            ),
+            (
+                r#"{"model":"m","input":7,"max_output_tokens":2}"#.to_string(),
+                "invalid_type",
+                "input",
+                "input: invalid type: integer `7`, expected a string or an array of input items",
+            ),
+        ] {
+            let (status, json) = rejected::<ResponsesRequest>(&body).await;
+            let text = json["error"]["message"].as_str().unwrap_or_default();
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(json["error"]["code"], code, "{json}");
+            assert_eq!(json["error"]["param"], param, "{json}");
+            assert!(
+                text.starts_with(&format!("Invalid JSON data: {DESERIALIZE_PREFIX}{message}")),
+                "{text}"
+            );
+        }
+        for body in [
+            image(r#""detail":"low""#),
+            r#"{"model":"m","input":"hi","max_output_tokens":2}"#.to_string(),
+            r#"{"model":"m","input":[{"role":"user","content":"hi"}],"max_output_tokens":2}"#.to_string(),
+            r#"{"model":"m","input":[{"type":"message","role":"user","content":"hi"}],"max_output_tokens":2}"#.to_string(),
+            r#"{"model":"m","input":[{"type":"message","id":"msg_1","role":"user","content":[{"type":"input_text","text":"hi"}]}],"max_output_tokens":2}"#.to_string(),
+            r#"{"model":"m","input":[{"id":"msg_1"}],"max_output_tokens":2}"#.to_string(),
+            r#"{"model":"m","input":[{"id":"msg_1","content":"hi"}],"max_output_tokens":2}"#.to_string(),
+            r#"{"model":"m","input":[{"id":"msg_1","type":"item_reference"}],"max_output_tokens":2}"#.to_string(),
+            r#"{"model":"m","input":[{"type":"message","id":"msg_1","role":"user","content":"hi"}],"max_output_tokens":2}"#.to_string(),
+            r#"{"model":"m","input":[{"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"},{"type":"function_call_output","call_id":"call_1","output":"found"}],"max_output_tokens":2}"#.to_string(),
+        ] {
+            let (status, json) = rejected::<ResponsesRequest>(&body).await;
+            assert_eq!(status, StatusCode::OK, "{body}: {json}");
+        }
+    }
+
+    #[test]
+    fn deserialize_code_follows_the_reason_in_the_message() {
+        for (message, code) in [
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: missing field `model` at line 1 column 14",
+                "missing_required_parameter",
+            ),
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: frobnicate: unknown field `frobnicate`, expected one of `include`, `input` at line 1 column 44",
+                "unknown_parameter",
+            ),
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: include[0]: unknown variant `bogus.field`, expected one of `code_interpreter_call.outputs` at line 1 column 60",
+                "invalid_value",
+            ),
+            // A custom error that opens with serde's words takes their code:
+            // a `thinking.display` outside its set is refused as a value.
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: thinking: unknown variant `full` for `thinking.display`, expected one of `summarized`, `omitted`, `updates` at line 1 column 71",
+                "invalid_value",
+            ),
+            // Both reasoning keys with different text are refused as a value too.
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: messages[1]: invalid value: `reasoning_content` and `reasoning` disagree; send one of them, or the same text in both at line 1 column 312",
+                "invalid_value",
+            ),
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: max_output_tokens: invalid value: integer `-1`, expected u32 at line 1 column 49",
+                "integer_below_min_value",
+            ),
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: messages: invalid type: string \"hi\", expected a sequence at line 1 column 29",
+                "invalid_type",
+            ),
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: input: data did not match any variant of untagged enum ResponseInput at line 1 column 71",
+                "invalid_type",
+            ),
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: invalid type: sequence, expected struct ChatCompletionRequest at line 1 column 0",
+                "invalid_type",
+            ),
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: invalid length 0, expected struct BodyRequest with 11 elements at line 1 column 2",
+                "invalid_type",
+            ),
+            ("Missing Content-Type: application/json header", "json_parse_error"),
+            // A value that repeats serde's words does not steer the code: the
+            // reason is read at its start, after the path.
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: reasoning_effort: unknown variant `missing field `x`, expected one of `low`, `medium`, `high` at line 1 column 60",
+                "invalid_value",
+            ),
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: messages: invalid type: string \"an invalid value\", expected a sequence at line 1 column 42",
+                "invalid_type",
+            ),
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: invalid type: string \"unknown field `x`\", expected struct ChatCompletionRequest at line 1 column 20",
+                "invalid_type",
+            ),
+            // Nor does a value that repeats axum's prefix: the prefix is split
+            // at its first copy.
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: truncation: unknown variant `Failed to deserialize the JSON body into the target type: missing field `x``, expected `auto` or `disabled` at line 1 column 110",
+                "invalid_value",
+            ),
+            // A key with a space, a colon or a letter outside ASCII is a path
+            // like any other: the reason is found by serde's words.
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: max tokens: unknown field `max tokens`, expected one of `model`, `input` at line 1 column 19",
+                "unknown_parameter",
+            ),
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: températur: unknown field `températur`, expected one of `model`, `input` at line 1 column 15",
+                "unknown_parameter",
+            ),
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: metadata.user id: invalid type: integer `5`, expected a string at line 1 column 40",
+                "invalid_type",
+            ),
+            // A custom error opens with none of serde's words: no code of
+            // the table, as before.
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: reasoning_effort: reasoning_effort must be a string, number, or null at line 1 column 42",
+                "json_parse_error",
+            ),
+            // A custom error that repeats the client's value does not hand
+            // the value the code: the reason starts after the path.
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: function_call: unknown function_call value: \"x: invalid type\" at line 1 column 44",
+                "json_parse_error",
+            ),
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: function_call: unknown function_call value: \"x: missing field `y`\" at line 1 column 48",
+                "json_parse_error",
+            ),
+            // A key with a colon and a space in it is cut at the colon and its
+            // parts fold into the path; serde's words after them keep their code.
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: a: b: unknown field `a: b`, expected one of `model`, `input` at line 1 column 12",
+                "unknown_parameter",
+            ),
+        ] {
+            assert_eq!(deserialize_code(message), code, "{message}");
+        }
+    }
+
+    #[test]
+    fn param_is_read_from_serde_paths_and_field_names() {
+        for (message, param) in [
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: missing field `messages` at line 1 column 15",
+                Some("messages"),
+            ),
+            (
+                "Failed to deserialize the JSON body into the target type: messages[0]: unknown field `foo`, expected one of `role`, `content` at line 1 column 40",
+                Some("messages[0].foo"),
+            ),
+            (
+                "Failed to deserialize the JSON body into the target type: dependency.nope: unknown field `nope`, expected `version` at line 1 column 58",
+                Some("dependency.nope"),
+            ),
+            (
+                "Failed to deserialize the JSON body into the target type: frobnicate: unknown field `frobnicate`, expected one of `model`, `input` at line 1 column 44",
+                Some("frobnicate"),
+            ),
+            (
+                "Failed to deserialize the JSON body into the target type: messages[0].content: data did not match any variant of untagged enum Content at line 1 column 60",
+                Some("messages[0].content"),
+            ),
+            // A field inside a tagged enum keeps the enum's path: the message
+            // names the field, the param is the path serde recorded.
+            (
+                "Failed to deserialize the JSON body into the target type: thinking: unknown variant `full` for `thinking.display`, expected one of `summarized`, `omitted`, `updates` at line 1 column 71",
+                Some("thinking"),
+            ),
+            // A custom error inside a message keeps the message's path as the param.
+            (
+                "Failed to deserialize the JSON body into the target type: messages[1]: invalid value: `reasoning_content` and `reasoning` disagree; send one of them, or the same text in both at line 1 column 312",
+                Some("messages[1]"),
+            ),
+            (
+                "Failed to deserialize the JSON body into the target type: invalid type: integer `5`, expected a string at line 1 column 10",
+                None,
+            ),
+            // A value that repeats a field marker does not steer the param.
+            (
+                "Failed to deserialize the JSON body into the target type: reasoning_effort: unknown variant `missing field `x`, expected one of `low`, `medium`, `high` at line 1 column 60",
+                Some("reasoning_effort"),
+            ),
+            // Nor one that repeats axum's prefix.
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: truncation: unknown variant `Failed to deserialize the JSON body into the target type: missing field `x``, expected `auto` or `disabled` at line 1 column 110",
+                Some("truncation"),
+            ),
+            // Keys with a space, a colon or a letter outside ASCII.
+            (
+                "Failed to deserialize the JSON body into the target type: max tokens: unknown field `max tokens`, expected one of `model`, `input` at line 1 column 19",
+                Some("max tokens"),
+            ),
+            (
+                "Failed to deserialize the JSON body into the target type: températur: unknown field `températur`, expected one of `model`, `input` at line 1 column 15",
+                Some("températur"),
+            ),
+            (
+                "Failed to deserialize the JSON body into the target type: metadata.user id: invalid type: integer `5`, expected a string at line 1 column 40",
+                Some("metadata.user id"),
+            ),
+            // A custom error keeps its path, and a value it repeats cannot
+            // move the split that reads the path.
+            (
+                "Failed to deserialize the JSON body into the target type: reasoning_effort: reasoning_effort must be a string, number, or null at line 1 column 42",
+                Some("reasoning_effort"),
+            ),
+            (
+                "Failed to deserialize the JSON body into the target type: function_call: unknown function_call value: \"x: invalid type\" at line 1 column 44",
+                Some("function_call"),
+            ),
+            (
+                "Failed to deserialize the JSON body into the target type: function_call: unknown function_call value: \"x: missing field `y`\" at line 1 column 48",
+                Some("function_call"),
+            ),
+            // A key with a colon and a space in it is cut at the colon and folds
+            // into the path; serde's words name it whole, and the param reads it
+            // back from them.
+            (
+                "Failed to deserialize the JSON body into the target type: a: b: unknown field `a: b`, expected one of `model`, `input` at line 1 column 12",
+                Some("a: b"),
+            ),
+            ("JSON syntax error: expected value at line 1 column 1", None),
+            ("Missing Content-Type: application/json header", None),
+        ] {
+            assert_eq!(param_from_deserialize_message(message).as_deref(), param, "{message}");
+        }
+    }
+
+    /// The request of issue #5092: an agent client's second request, with the
+    /// model's reasoning under both keys.
+    fn replayed_turn(reasoning: &str) -> String {
+        json!({
+            "model": "zai-org/GLM-5.3",
+            "max_tokens": 8,
+            "messages": [
+                {"role": "user", "content": "list files"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning": reasoning,
+                    "reasoning_content": "I should run ls.",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "terminal", "arguments": "{\"command\":\"ls\"}"}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "file.txt"}
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "terminal",
+                    "parameters": {"type": "object", "properties": {"command": {"type": "string"}}}
+                }
+            }]
+        })
+        .to_string()
+    }
+
+    /// Reads a chat completion body through the extractor, as the gateway does.
+    async fn chat_request(body: &str) -> Result<ChatCompletionRequest, (StatusCode, Value)> {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap_or_default();
+        match ValidatedJson::<ChatCompletionRequest>::from_request(request, &()).await {
+            Ok(ValidatedJson(body)) => Ok(body),
+            Err(response) => {
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap_or_default();
+                Err((
+                    status,
+                    serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+                ))
+            }
+        }
+    }
+
+    /// Omitted, null and true all keep Flash's sampling defaults and explicit values.
+    #[tokio::test]
+    async fn glm_flash_sampling_defaults_and_explicit_values() {
+        for do_sample in [None, Some(Value::Null), Some(json!(true))] {
+            let mut body = json!({
+                "model": "zai-org/GLM-5.3-Flash",
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            if let Some(do_sample) = do_sample {
+                body["do_sample"] = do_sample;
+            }
+            let req = chat_request(&body.to_string()).await.unwrap();
+            assert_eq!(
+                (req.temperature, req.top_p, req.top_k),
+                (Some(1.0), Some(0.95), None)
+            );
+
+            body["temperature"] = json!(0.7);
+            body["top_p"] = json!(0.8);
+            body["top_k"] = json!(20);
+            let req = chat_request(&body.to_string()).await.unwrap();
+            assert_eq!(
+                (req.temperature, req.top_p, req.top_k),
+                (Some(0.7), Some(0.8), Some(20))
+            );
+
+            body["top_p"] = json!(0);
+            let req = chat_request(&body.to_string()).await.unwrap();
+            assert_eq!(
+                (req.temperature, req.top_p, req.top_k),
+                (Some(0.7), Some(1.0), Some(1))
+            );
+        }
+    }
+
+    /// A registered Flash alias takes the same greedy override and validation as its model.
+    #[tokio::test]
+    async fn glm_flash_sampling_validates_effective_values_for_the_model_and_its_alias() {
+        use crate::profile::ProviderProfile;
+
+        const ALIAS: &str = "flash-sampling-chat-alias";
+        const CHECKPOINT: &str = "flash-sampling-chat-checkpoint";
+        ProviderProfile::register_model_aliases([
+            (ALIAS, "zai-org/GLM-5.3-Flash"),
+            ("glm-5.3-flash-sampling-checkpoint-alias", CHECKPOINT),
+        ]);
+        for model in [
+            "zai-org/GLM-5.3-Flash",
+            "GLM5.3-FLASH-FP8",
+            ALIAS,
+            CHECKPOINT,
+        ] {
+            let mut body = json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hi"}],
+                "do_sample": false, "temperature": 99, "top_p": -1, "top_k": 0
+            });
+            let req = chat_request(&body.to_string()).await.unwrap();
+            assert_eq!(
+                (req.temperature, req.top_p, req.top_k),
+                (Some(0.0), Some(1.0), Some(1))
+            );
+
+            body["top_k"] = json!(20);
+            body["top_p"] = json!(0.9);
+            body["do_sample"] = json!(true);
+            body["temperature"] = json!(1.01);
+            let (status, error) = chat_request(&body.to_string()).await.unwrap_err();
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(error["error"]["param"], "temperature");
+
+            body["temperature"] = json!(-0.01);
+            assert!(chat_request(&body.to_string()).await.is_err());
+            for temperature in [0.0, 1.0] {
+                body["temperature"] = json!(temperature);
+                assert!(chat_request(&body.to_string()).await.is_ok());
+            }
+            for invalid in [json!(0), json!("false"), json!([]), json!({})] {
+                body["do_sample"] = invalid;
+                let (status, error) = chat_request(&body.to_string()).await.unwrap_err();
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                assert_eq!(error["error"]["param"], "do_sample");
+            }
+        }
+    }
+
+    /// Flash-specific sampling rules leave neighboring models and their extensions alone.
+    #[tokio::test]
+    async fn glm_flash_sampling_rules_do_not_reach_other_models() {
+        for model in [
+            "glm-5.3-air",
+            "glm-5.3-flashlight",
+            "glm53flash2",
+            "local-model",
+        ] {
+            let mut body = json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hi"}],
+                "do_sample": false, "temperature": 1.5, "top_p": 0.7, "top_k": 20
+            });
+            let req = chat_request(&body.to_string()).await.unwrap();
+            assert_eq!(
+                (req.temperature, req.top_p, req.top_k),
+                (Some(1.5), Some(0.7), Some(20))
+            );
+            assert_eq!(req.other["do_sample"], false);
+            body["do_sample"] = json!("false");
+            let req = chat_request(&body.to_string()).await.unwrap();
+            assert_eq!(req.other["do_sample"], "false");
+            body["top_p"] = json!(0);
+            let (status, _) = chat_request(&body.to_string()).await.unwrap_err();
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+    }
+
+    /// The Chat Completions extractor applies the Flash budget to model names
+    /// and registered aliases, preserving both wire fields and their precedence.
+    #[tokio::test]
+    async fn glm53_flash_chat_output_budget() {
+        use serde_json::json;
+
+        use crate::profile::ProviderProfile;
+
+        const ALIAS: &str = "opaque-glm-flash-budget-test";
+        ProviderProfile::register_model_aliases([(ALIAS, "zai-org/GLM-5.3-Flash")]);
+
+        for (model, flash) in [
+            ("glm-5.3-flash", true),
+            ("zai-org/GLM-5.3-Flash-FP8", true),
+            ("glm53flash", false),
+            (ALIAS, true),
+            ("glm-5.3", false),
+            ("glm-5.2", false),
+            ("glm-5.3-flashlight", false),
+            ("glm-5.3-flash2", false),
+            ("local-model", false),
+        ] {
+            let mut body = json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hello"}]
+            });
+            let request = chat_request(&body.to_string()).await.unwrap();
+            assert_eq!(request.output_token_cap(), None, "{model}");
+            if !flash {
+                body["max_completion_tokens"] = json!(163_840);
+                let request = chat_request(&body.to_string()).await.unwrap();
+                assert_eq!(request.output_token_cap(), Some(163_840), "{model}");
+                continue;
+            }
+
+            body["max_tokens"] = Value::Null;
+            body["max_completion_tokens"] = Value::Null;
+            assert_eq!(
+                chat_request(&body.to_string())
+                    .await
+                    .unwrap()
+                    .output_token_cap(),
+                None
+            );
+
+            let mut minimum_only = body.clone();
+            minimum_only["min_tokens"] = json!(65_537);
+            assert!(chat_request(&minimum_only.to_string()).await.is_ok());
+
+            for fields in [
+                json!({"max_tokens": 1}),
+                json!({"max_tokens": 131_072}),
+                json!({"max_completion_tokens": 1}),
+                json!({"max_completion_tokens": 131_072}),
+                json!({"max_tokens": 131_072, "max_completion_tokens": 1}),
+                json!({"max_tokens": 1, "max_completion_tokens": 131_072}),
+            ] {
+                let mut input = body.clone();
+                input
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(fields.as_object().unwrap().clone());
+                let request = chat_request(&input.to_string()).await.unwrap();
+                assert_eq!(
+                    request.output_token_cap().map(u64::from),
+                    fields["max_completion_tokens"]
+                        .as_u64()
+                        .or_else(|| fields["max_tokens"].as_u64()),
+                    "{input}"
+                );
+                let serialized = serde_json::to_value(request).unwrap();
+                assert_eq!(serialized["max_tokens"], fields["max_tokens"], "{input}");
+                assert_eq!(
+                    serialized["max_completion_tokens"], fields["max_completion_tokens"],
+                    "{input}"
+                );
+            }
+
+            for (value, code) in [
+                (0, "integer_below_min_value"),
+                (131_073, "max_tokens_out_of_range"),
+            ] {
+                for (field, other) in [
+                    ("max_tokens", "max_completion_tokens"),
+                    ("max_completion_tokens", "max_tokens"),
+                ] {
+                    for other_value in [Value::Null, json!(1)] {
+                        body[field] = json!(value);
+                        body[other] = other_value;
+                        let (status, error) = chat_request(&body.to_string()).await.unwrap_err();
+                        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+                        assert_eq!(error["error"]["code"], code, "{body}: {error}");
+                        assert_eq!(error["error"]["param"], field, "{body}: {error}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Both keys with the same text make a request, as before the alias. Both
+    /// keys with different text are refused as a value, and the param names
+    /// the message.
+    #[tokio::test]
+    async fn an_assistant_turn_spelling_its_reasoning_both_ways_is_a_request() {
+        let request = chat_request(&replayed_turn("I should run ls."))
+            .await
+            .unwrap();
+        let ChatMessage::Assistant { reasoning, .. } = &request.messages[1] else {
+            panic!("{:?}: not an assistant message", request.messages[1]);
+        };
+        assert_eq!(reasoning.text.as_deref(), Some("I should run ls."));
+
+        let (status, json) = chat_request(&replayed_turn("I should run pwd."))
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"]["type"], "invalid_request_error", "{json}");
+        assert_eq!(json["error"]["code"], "invalid_value", "{json}");
+        assert_eq!(json["error"]["param"], "messages[1]", "{json}");
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("`reasoning_content` and `reasoning` disagree")),
+            "{json}"
+        );
+    }
+
+    /// A built-in `range` or `length` rule without a message of its own
+    /// answers a sentence in the routes' form, naming the field itself (no
+    /// `field: ` prefix), the code and param as before; a rule with its own
+    /// message keeps it under the field's path.
+    #[tokio::test]
+    async fn a_built_in_rule_without_a_message_answers_a_sentence() {
+        for (body, code, param, sentence) in [
+            (
+                r#"{"value": 1.5, "name": "x"}"#,
+                "decimal_above_max_value",
+                "value",
+                "Invalid 'value': decimal above maximum value. Expected a value <= 1, but got 1.5 instead.",
+            ),
+            (
+                r#"{"value": 1.1, "name": "x"}"#,
+                "decimal_above_max_value",
+                "value",
+                "Invalid 'value': decimal above maximum value. Expected a value <= 1, but got 1.1 instead.",
+            ),
+            (
+                r#"{"value": 0.5, "name": "x", "count": 0}"#,
+                "integer_below_min_value",
+                "count",
+                "Invalid 'count': integer below minimum value. Expected an integer >= 1, but got 0 instead.",
+            ),
+            (
+                r#"{"value": 0.5, "name": "toolongname"}"#,
+                "string_above_max_length",
+                "name",
+                "Invalid 'name': string too long. Expected a string with maximum length 8, but got a string with length 11 instead.",
+            ),
+            (
+                r#"{"value": 0.5, "name": ""}"#,
+                "string_below_min_length",
+                "name",
+                "Invalid 'name': empty string. Expected a string with minimum length 1, but got an empty string instead.",
+            ),
+            (
+                r#"{"value": 0.5, "name": "x", "metadata": {"a": "1", "b": "2", "c": "3"}}"#,
+                "object_above_max_properties",
+                "metadata",
+                "Invalid 'metadata': too many properties. The object has 3 properties, but the maximum is 2.",
+            ),
+            (
+                r#"{"value": 0.5, "name": "x", "tags": []}"#,
+                "empty_array",
+                "tags",
+                "Invalid 'tags': empty array. Expected an array with minimum length 1, but got an empty array instead.",
+            ),
+        ] {
+            let (status, json) = reject(body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(json["error"]["code"], code, "{body}: {json}");
+            assert_eq!(json["error"]["param"], param, "{body}: {json}");
+            assert_eq!(json["error"]["message"], sentence, "{body}: {json}");
+        }
+    }
+}
+
+#[cfg(all(test, feature = "axum"))]
+mod query_tests {
+    use serde::Deserialize;
+
+    use super::*;
+
+    #[derive(Debug, Deserialize)]
+    struct Page {
+        limit: Option<usize>,
+    }
+
+    /// The limit the extractor read from `uri`, or the status and the body of
+    /// its refusal.
+    async fn extract(uri: &str) -> Result<Option<usize>, (StatusCode, Value)> {
+        let request = Request::builder().uri(uri).body(()).unwrap_or_default();
+        let (mut parts, ()) = request.into_parts();
+        match ValidatedQuery::<Page>::from_request_parts(&mut parts, &()).await {
+            Ok(ValidatedQuery(page)) => Ok(page.limit),
+            Err(response) => {
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap_or_default();
+                Err((status, serde_json::from_slice(&bytes).unwrap_or_default()))
+            }
+        }
+    }
+
+    /// A query string the type takes reaches the handler; a value the type
+    /// does not take is a 400 in the envelope, `invalid_value`, with the
+    /// framework's message.
+    #[tokio::test]
+    async fn a_query_string_the_type_does_not_take_is_refused_in_the_envelope() {
+        assert_eq!(extract("/list?limit=5").await, Ok(Some(5)));
+        assert_eq!(extract("/list").await, Ok(None));
+        let (status, body) = extract("/list?limit=-1").await.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["type"], "invalid_request_error", "{body}");
+        assert_eq!(body["error"]["code"], "invalid_value", "{body}");
+        assert_eq!(body["error"]["param"], "limit", "{body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with(QUERY_PREFIX),
+            "{body}"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "axum"))]
+mod path_tests {
+    use super::*;
+
+    /// A path parameter the route did not declare is a rejection of the
+    /// route's own making: the framework's answer (a 500, text/plain)
+    /// reaches the client as it is, not as a 400 in the envelope.
+    #[tokio::test]
+    async fn a_rejection_of_the_routes_own_making_keeps_the_frameworks_answer() {
+        let request = Request::builder()
+            .uri("/items/7")
+            .body(())
+            .unwrap_or_default();
+        let (mut parts, ()) = request.into_parts();
+        let Err(response) = ValidatedPath::<u32>::from_request_parts(&mut parts, &()).await else {
+            panic!("a request no route matched carries no path parameters");
+        };
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        assert!(content_type.starts_with("text/plain"), "{content_type}");
+    }
+}

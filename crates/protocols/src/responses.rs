@@ -1,0 +1,6852 @@
+// OpenAI Responses API types
+// https://platform.openai.com/docs/api-reference/responses
+
+use std::collections::{HashMap, HashSet};
+
+use serde::{
+    de::value::{MapAccessDeserializer, MapDeserializer},
+    ser::SerializeMap,
+    Deserialize, Serialize,
+};
+use serde_json::Value;
+use validator::{Validate, ValidationError};
+
+use super::{
+    common::{
+        default_true, deserialize_null_as_empty_vec, empty_tool_name, json_type_name,
+        strict_schema_missing_additional_properties, validate_json_schema_shape, validate_stop,
+        ChatLogProbs, ContextManagementEntry, ConversationRef, Detail, Function, FunctionChoice,
+        GenerationRequest, PromptCacheRetention, PromptTokenUsageInfo, ResponsePrompt,
+        StreamOptions, StringOrArray, ToolChoice as ChatToolChoice,
+        ToolChoiceValue as ChatToolChoiceValue, ToolReference, Usage, UsageInfo,
+    },
+    sampling_params::{validate_top_k_value, validate_top_p_value},
+};
+use crate::{
+    builders::ResponsesResponseBuilder,
+    common::{deserialize_null_as_empty_map, invalid},
+    profile::is_openai_vendor_model,
+    validated::Normalizable,
+};
+
+// ============================================================================
+// Responses API Tool Choice
+// ============================================================================
+
+/// Simple tool-choice option strings supported by the Responses API.
+///
+/// Spec: `tool_choice` may be the bare string `"none"`, `"auto"`, or `"required"`.
+/// Shared chat/responses semantics but the Responses type owns its own enum so
+/// chat-path validators cannot accept unknown Responses variants by accident.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolChoiceOptions {
+    None,
+    Auto,
+    Required,
+}
+
+/// Single-value tag used to force the `"type": "function"` discriminator on the
+/// flat function-selection variant so the untagged outer enum can distinguish
+/// `Function` from `AllowedTools` / `Mcp` / `Custom` / `Types`.
+///
+/// Responses spec: `{"type": "function", "name": "..."}` — note the **flat**
+/// shape (no nested `function` object). This differs from Chat Completions
+/// which wraps the name in `{"function": {"name": "..."}}`.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
+pub enum FunctionToolChoiceTag {
+    #[serde(rename = "function")]
+    Function,
+}
+
+/// Tag enum forcing the `"type": "allowed_tools"` discriminator.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
+pub enum AllowedToolsToolChoiceTag {
+    #[serde(rename = "allowed_tools")]
+    AllowedTools,
+}
+
+/// Tag enum forcing the `"type": "mcp"` discriminator.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
+pub enum McpToolChoiceTag {
+    #[serde(rename = "mcp")]
+    Mcp,
+}
+
+/// Tag enum forcing the `"type": "custom"` discriminator.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
+pub enum CustomToolChoiceTag {
+    #[serde(rename = "custom")]
+    Custom,
+}
+
+/// Tag enum forcing the `"type": "apply_patch"` discriminator.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
+pub enum ApplyPatchToolChoiceTag {
+    #[serde(rename = "apply_patch")]
+    ApplyPatch,
+}
+
+/// Tag enum forcing the `"type": "shell"` discriminator.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
+pub enum ShellToolChoiceTag {
+    #[serde(rename = "shell")]
+    Shell,
+}
+
+/// Built-in (hosted) tool types that can be referenced directly by
+/// `tool_choice: {"type": "..."}` in the Responses API.
+///
+/// Each variant is a distinct string per the spec — we keep multiple
+/// `web_search_preview*` forms because the spec enumerates them separately
+/// and older clients may still send the versioned aliases.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BuiltInToolChoiceType {
+    FileSearch,
+    WebSearch,
+    WebSearchPreview,
+    #[serde(rename = "web_search_preview_2025_03_11")]
+    WebSearchPreview20250311,
+    ImageGeneration,
+    /// The GA computer tool; `computer_use` names it too, and
+    /// `computer_use_preview` the preview tool.
+    Computer,
+    ComputerUsePreview,
+    ComputerUse,
+    CodeInterpreter,
+}
+
+/// Canonical payload for the Responses API `Function` tool-choice variant.
+///
+/// Serializes as the spec-flat shape `{"type": "function", "name": "..."}`.
+///
+/// Deserialization accepts **both** wire shapes for backward compatibility
+/// with smg clients written against the pre-split shared `ToolChoice` type
+/// (which used the Chat-style nested `{"function": {"name": "..."}}` layout
+/// on the Responses endpoint):
+///
+/// * Canonical flat: `{"type": "function", "name": "..."}`
+/// * Legacy nested:  `{"type": "function", "function": {"name": "..."}}`
+///
+/// Either shape normalizes to `name: String` at deserialize time so the rest
+/// of the gateway only ever sees the canonical form.
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct ResponsesFunctionToolChoice {
+    #[serde(rename = "type")]
+    pub tool_type: FunctionToolChoiceTag,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for ResponsesFunctionToolChoice {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Accept either the spec-flat `{type, name}` or the legacy
+        // Chat-nested `{type, function: {name}}` shape. The helper lets
+        // both fields be absent so serde can bind whichever wire form
+        // the caller sent; we then pick one and fail loudly if neither
+        // provides a function name.
+        #[derive(Deserialize)]
+        struct Helper {
+            #[serde(rename = "type")]
+            tool_type: FunctionToolChoiceTag,
+            #[serde(default)]
+            name: Option<String>,
+            #[serde(default)]
+            function: Option<FunctionChoice>,
+            #[serde(default)]
+            namespace: Option<String>,
+        }
+
+        let helper = Helper::deserialize(deserializer)?;
+        let name = helper
+            .name
+            .or_else(|| helper.function.map(|f| f.name))
+            .ok_or_else(|| {
+                serde::de::Error::custom(
+                    "tool_choice function requires a `name` field or a `function.name` field",
+                )
+            })?;
+        Ok(Self {
+            tool_type: helper.tool_type,
+            name,
+            namespace: helper.namespace,
+        })
+    }
+}
+
+/// `tool_choice` accepted on the Responses API (`POST /v1/responses`).
+///
+/// The Responses spec enumerates eight concrete wire shapes, each with a
+/// distinct discriminator — see `ResponsesToolChoice` variants below.
+/// Deserialised via `#[serde(untagged)]` because the outermost JSON is
+/// either a bare string (`Options`) or an object whose `"type"` picks
+/// the variant.
+///
+/// Each object variant pins the discriminator through a single-value tag
+/// enum (`FunctionToolChoiceTag`, etc.) so serde cannot match a payload
+/// whose `type` does not belong to that variant. Without the tag pinning,
+/// the `#[serde(untagged)]` enum would accept any object shape that
+/// happened to fit the field set of an earlier variant.
+///
+/// This type deliberately does NOT live in `common.rs`: Chat Completions
+/// has its own `ToolChoice` with a different `Function` wire shape
+/// (nested `{"function": {"name": ...}}`) and does not accept the
+/// `Types` / `Mcp` / `Custom` / `ApplyPatch` / `Shell` variants at all.
+/// Sharing one enum across both APIs would silently accept spec-invalid
+/// payloads on `/v1/chat/completions`.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum ResponsesToolChoice {
+    /// `"none"` | `"auto"` | `"required"`.
+    Options(ToolChoiceOptions),
+
+    /// `{"type": "<hosted tool>"}`, a type [`BuiltInToolChoiceType`] names:
+    /// select a built-in hosted tool by type alone (no additional payload).
+    Types {
+        #[serde(rename = "type")]
+        tool_type: BuiltInToolChoiceType,
+    },
+
+    /// `{"type": "function", "name": "..."}` — Responses spec flat shape.
+    ///
+    /// Accepts both the spec-canonical flat wire shape and the legacy
+    /// Chat-style nested shape (`{"type": "function", "function": {"name": "..."}}`)
+    /// on deserialize to preserve backward compatibility with smg clients
+    /// written against the pre-split shared `ToolChoice` type. Always
+    /// serializes as the canonical flat shape per the OpenAI Responses spec
+    /// — Postel's law: liberal on input, conservative on output.
+    ///
+    /// The nested legacy shape is gated behind a custom `Deserialize` impl on
+    /// `ResponsesFunctionToolChoice`; the untagged outer enum still pins the
+    /// `"type": "function"` discriminator via `FunctionToolChoiceTag` so
+    /// payloads without that tag cannot reach this variant.
+    Function(ResponsesFunctionToolChoice),
+
+    /// `{"type": "allowed_tools", "mode": "auto"|"required", "tools": [...]}`.
+    ///
+    /// `tools` is an array of `ToolReference` items — the same type reused
+    /// from Chat's Allowed Tools payload because the Responses spec also
+    /// allows function / mcp / file_search / web_search_preview /
+    /// computer_use_preview / code_interpreter / image_generation entries.
+    AllowedTools {
+        #[serde(rename = "type")]
+        tool_type: AllowedToolsToolChoiceTag,
+        /// `"auto"` or `"required"`. Validated at request-normalisation time
+        /// (see `validate_tool_choice_with_tools`).
+        mode: String,
+        tools: Vec<ToolReference>,
+    },
+
+    /// `{"type": "mcp", "server_label": "...", "name"?: "..."}` — force
+    /// routing to a specific MCP server, optionally pinning a tool name.
+    Mcp {
+        #[serde(rename = "type")]
+        tool_type: McpToolChoiceTag,
+        server_label: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+
+    /// `{"type": "custom", "name": "..."}` — pin a user-registered
+    /// custom tool by name.
+    Custom {
+        #[serde(rename = "type")]
+        tool_type: CustomToolChoiceTag,
+        name: String,
+    },
+
+    /// `{"type": "apply_patch"}` — force the built-in `apply_patch` tool.
+    ApplyPatch {
+        #[serde(rename = "type")]
+        tool_type: ApplyPatchToolChoiceTag,
+    },
+
+    /// `{"type": "shell"}` — force the built-in `shell` tool.
+    Shell {
+        #[serde(rename = "type")]
+        tool_type: ShellToolChoiceTag,
+    },
+}
+
+impl Default for ResponsesToolChoice {
+    fn default() -> Self {
+        Self::Options(ToolChoiceOptions::Auto)
+    }
+}
+
+impl ResponsesToolChoice {
+    /// Return the pinned function name for the `Function` variant, regardless
+    /// of which wire shape (spec-flat `name` or legacy nested `function.name`)
+    /// was used at deserialize time. `None` for any non-`Function` variant.
+    ///
+    /// Consumers that need to project / validate the function name should go
+    /// through this accessor rather than pattern-matching so future wire
+    /// shapes can be added without touching call sites.
+    pub fn function_name(&self) -> Option<&str> {
+        match self {
+            Self::Function(payload) => Some(payload.name.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Project the Responses-level tool_choice onto a Chat Completions
+    /// tool_choice when a Responses request is being routed through the
+    /// Chat Completions gRPC pipeline.
+    ///
+    /// Mapping rules:
+    /// - `Options(None|Auto|Required)` → `ChatToolChoice::Value(...)` — shared
+    ///   semantics.
+    /// - `Function { name }` → `ChatToolChoice::Function { nested name }` —
+    ///   shape translation (flat Responses → nested Chat wire form).
+    /// - `AllowedTools { mode, tools }` → `ChatToolChoice::AllowedTools {...}`.
+    /// - Hosted / custom / apply_patch / shell / mcp — Chat Completions has no
+    ///   equivalent spec variant; fall back to `Auto` so the downstream chat
+    ///   backend still runs with tool-calling enabled.
+    pub fn to_chat_tool_choice(&self) -> ChatToolChoice {
+        match self {
+            Self::Options(ToolChoiceOptions::None) => {
+                ChatToolChoice::Value(ChatToolChoiceValue::None)
+            }
+            Self::Options(ToolChoiceOptions::Auto) => {
+                ChatToolChoice::Value(ChatToolChoiceValue::Auto)
+            }
+            Self::Options(ToolChoiceOptions::Required) => {
+                ChatToolChoice::Value(ChatToolChoiceValue::Required)
+            }
+            Self::Function(payload) => ChatToolChoice::Function {
+                tool_type: "function".to_string(),
+                function: FunctionChoice {
+                    name: match &payload.namespace {
+                        Some(namespace) => format!("{namespace}.{}", payload.name),
+                        None => payload.name.clone(),
+                    },
+                },
+            },
+            Self::AllowedTools { mode, tools, .. } => ChatToolChoice::AllowedTools {
+                tool_type: "allowed_tools".to_string(),
+                mode: mode.clone(),
+                tools: tools.clone(),
+            },
+            // The regular router downgrades custom tools to function tools
+            // (single `input` string parameter), so pinning the chat
+            // tool_choice by name preserves the forcing semantics.
+            Self::Custom { name, .. } => ChatToolChoice::Function {
+                tool_type: "function".to_string(),
+                function: FunctionChoice { name: name.clone() },
+            },
+            // No matching Chat spec variant — fall through to `auto` so
+            // downstream Chat backends still see tool-calling enabled.
+            Self::Types { .. }
+            | Self::Mcp { .. }
+            | Self::ApplyPatch { .. }
+            | Self::Shell { .. } => ChatToolChoice::Value(ChatToolChoiceValue::Auto),
+        }
+    }
+}
+
+// ============================================================================
+// Response Tools (MCP and others)
+// ============================================================================
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type")]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseTool {
+    /// Function tool.
+    #[serde(rename = "function")]
+    Function(FunctionTool),
+
+    /// Built-in preview web search tool. The public API also names it by its
+    /// dated type, `web_search_preview_2025_03_11`, which reads as this tool
+    /// and is written under the canonical `web_search_preview`.
+    #[serde(rename = "web_search_preview", alias = "web_search_preview_2025_03_11")]
+    WebSearchPreview(WebSearchPreviewTool),
+
+    /// Built-in non-preview hosted web search tool.
+    ///
+    /// Spec: `{ type: "web_search" | "web_search_2025_08_26", filters? { allowed_domains? },
+    /// search_context_size?: "low"|"medium"|"high", user_location? }`. Distinct from
+    /// `web_search_preview` — non-preview adds `filters.allowed_domains` and constrains
+    /// `search_context_size` to a typed enum.
+    #[serde(rename = "web_search", alias = "web_search_2025_08_26")]
+    WebSearch(WebSearchTool),
+
+    /// Built-in tool.
+    #[serde(rename = "code_interpreter")]
+    CodeInterpreter(CodeInterpreterTool),
+
+    /// MCP server tool.
+    #[serde(rename = "mcp")]
+    Mcp(McpTool),
+
+    /// Built-in file search tool over vector stores.
+    #[serde(rename = "file_search")]
+    FileSearch(FileSearchTool),
+
+    /// Built-in image generation tool. Spec:
+    /// `{ type: "image_generation", action?, background?, input_fidelity?,
+    ///    input_image_mask?, model?, moderation?, output_compression?,
+    ///    output_format?, partial_images?, quality?, size? }`.
+    #[serde(rename = "image_generation")]
+    ImageGeneration(ImageGenerationTool),
+
+    /// Generic computer tool — `{ type: "computer" }`.
+    ///
+    /// Spec (openai-responses-api-spec.md §tools): `Computer { type: "computer" }`.
+    /// Carries no payload; the model is told that a computer-control surface is
+    /// available without committing to display dimensions or environment.
+    #[serde(rename = "computer")]
+    Computer,
+
+    /// Computer-use preview tool — `{ type: "computer_use_preview",
+    /// display_height, display_width, environment }`.
+    ///
+    /// Spec (openai-responses-api-spec.md §tools): `ComputerUsePreview
+    /// { display_height, display_width, environment: "browser"|"ubuntu"|
+    /// "windows"|"mac", type: "computer_use_preview" }`.
+    #[serde(rename = "computer_use_preview")]
+    ComputerUsePreview(ComputerUsePreviewTool),
+
+    /// User-defined custom tool with optional grammar-constrained input.
+    ///
+    /// Spec: `{ name, type: "custom", allowed_callers?, async?, defer_loading?, description?, format? }`.
+    /// `format` constrains the model's free-form `input` payload — `Text` is
+    /// unconstrained, `Grammar` enforces a Lark or regex production at decode
+    /// time. The model returns a `custom_tool_call` output item carrying the
+    /// raw `input` string back to the client; the client owns execution.
+    #[serde(rename = "custom")]
+    Custom(CustomTool),
+
+    /// Grouping of `Function` / `Custom` tools under a shared namespace.
+    ///
+    /// Spec (openai-responses-api-spec.md §tools L475):
+    /// `Namespace { description, name, tools: array of Function | Custom,
+    /// type: "namespace" }` — inner elements share the top-level shape but
+    /// are restricted to `Function` or `Custom`. Nested namespaces and
+    /// hosted/built-in tools are explicitly not permitted as elements.
+    #[serde(rename = "namespace")]
+    Namespace(NamespaceToolDef),
+
+    /// Containerized `shell` tool. Distinct from `local_shell` — the tool
+    /// definition itself may carry an optional [`ShellEnvironment`]
+    /// (container-auto, local, or existing container reference) that the
+    /// platform resolves into a concrete execution target. Emitted
+    /// `shell_call` items use the narrower call-side unions
+    /// [`ShellCallEnvironment`] (input path) and
+    /// [`ResponseShellCallEnvironment`] (response path), which drop the
+    /// `container_auto` variant.
+    ///
+    /// Spec (openai-responses-api-spec.md §tools, L463-470):
+    /// `Shell { type: "shell", environment? }`.
+    #[serde(rename = "shell")]
+    Shell(ShellTool),
+
+    /// Built-in `apply_patch` tool — `{ type: "apply_patch" }`.
+    ///
+    /// Spec (openai-responses-api-spec.md §tools, L478): `ApplyPatch
+    /// { type: "apply_patch" }`. Unit variant with no payload — the model is
+    /// simply told the apply_patch surface is available and subsequently emits
+    /// `apply_patch_call` items carrying file-edit operations (see
+    /// [`ResponseInputOutputItem::ApplyPatchCall`]). Pairs with
+    /// [`ResponsesToolChoice::ApplyPatch`] when callers want to force usage.
+    #[serde(rename = "apply_patch")]
+    ApplyPatch,
+
+    /// Built-in host-execute shell tool — `{ type: "local_shell" }`.
+    ///
+    /// Spec (openai-responses-api-spec.md §tools L462): `LocalShell { type:
+    /// "local_shell" }` — carries no payload. Distinct from `shell`,
+    /// which carries a containerized `environment`. The model emits
+    /// `local_shell_call` output items carrying a `LocalShellExec` action;
+    /// the client executes the command on the host and replies with a
+    /// matching `local_shell_call_output` item.
+    #[serde(rename = "local_shell")]
+    LocalShell,
+
+    /// Tool-search tool — `{ type: "tool_search", execution?, description?, parameters? }`.
+    ///
+    /// Emitted by Codex and Responses clients using deferred tool loading.
+    #[serde(rename = "tool_search")]
+    ToolSearch(ToolSearchTool),
+}
+
+impl ResponseTool {
+    /// Wire `type` tag for this variant — matches the variant's
+    /// `#[serde(rename = ...)]` attribute. Stable across serde
+    /// roundtrips and safe to use as a discriminator string.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ResponseTool::Function(_) => "function",
+            ResponseTool::WebSearchPreview(_) => "web_search_preview",
+            ResponseTool::WebSearch(_) => "web_search",
+            ResponseTool::CodeInterpreter(_) => "code_interpreter",
+            ResponseTool::Mcp(_) => "mcp",
+            ResponseTool::FileSearch(_) => "file_search",
+            ResponseTool::ImageGeneration(_) => "image_generation",
+            ResponseTool::Computer => "computer",
+            ResponseTool::ComputerUsePreview(_) => "computer_use_preview",
+            ResponseTool::Custom(_) => "custom",
+            ResponseTool::Namespace(_) => "namespace",
+            ResponseTool::Shell(_) => "shell",
+            ResponseTool::ApplyPatch => "apply_patch",
+            ResponseTool::LocalShell => "local_shell",
+            ResponseTool::ToolSearch(_) => "tool_search",
+        }
+    }
+}
+
+/// Tool-search declaration (`type: "tool_search"`).
+///
+/// Spec / Codex: `{ type: "tool_search", execution?, description?, parameters? }`.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ToolSearchTool {
+    /// Execution target (`"client"` or `"server"`).
+    pub execution: Option<String>,
+    /// Optional description surfaced to the model.
+    pub description: Option<String>,
+    /// Optional JSON Schema parameters for client-executed tool search.
+    pub parameters: Option<Value>,
+}
+
+/// Payload carried by [`ResponseTool::Namespace`].
+///
+/// Using a dedicated struct (rather than inline struct-variant fields) lets
+/// us apply `#[serde(deny_unknown_fields)]`, matching sibling variants like
+/// [`CustomTool`] and [`FunctionTool`] so unrecognized namespace-level keys
+/// are rejected instead of silently swallowed.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NamespaceToolDef {
+    /// Human-readable description surfaced to the model alongside the group.
+    pub description: String,
+    /// Stable identifier the model uses to address the namespace in
+    /// `function_call` / `custom_tool_call` items (via the `namespace` field).
+    pub name: String,
+    /// Tools in this namespace. Spec restricts elements to `Function` or
+    /// `Custom`; the dedicated [`NamespaceTool`] enum prevents nested
+    /// namespaces and hosted-tool leakage that the parent `ResponseTool`
+    /// enum would otherwise allow.
+    pub tools: Vec<NamespaceTool>,
+    /// Optional namespace-level deferred loading hint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defer_loading: Option<bool>,
+}
+
+/// Element type accepted inside a [`NamespaceToolDef`]'s `tools` array.
+///
+/// Spec (openai-responses-api-spec.md §tools L475): namespace elements must be
+/// either a `Function` or a `Custom` tool. Using a dedicated enum rather than
+/// `ResponseTool` prevents recursive nesting (`Namespace` inside `Namespace`)
+/// and hosted/built-in tool leakage that the spec forbids.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type")]
+#[serde(rename_all = "snake_case")]
+pub enum NamespaceTool {
+    /// Function tool — same shape as [`ResponseTool::Function`].
+    #[serde(rename = "function")]
+    Function(FunctionTool),
+
+    /// Custom tool — same shape as [`ResponseTool::Custom`].
+    #[serde(rename = "custom")]
+    Custom(CustomTool),
+}
+
+#[derive(Debug, Clone, schemars::JsonSchema)]
+pub struct FunctionTool {
+    /// Flat, as the Responses API tool JSON shape is; the schema follows the
+    /// function object, the wire form is written below.
+    #[serde(flatten)]
+    pub function: Function,
+}
+
+impl FunctionTool {
+    /// The public API's function-tool keys beyond the function object's own
+    /// (`FunctionTool` in the spec): how the API calls the tool rather than
+    /// what the model calls. They are kept in [`Function::extra`] and
+    /// forwarded as given.
+    pub const TOOL_KEYS: &'static [&'static str] =
+        &["async", "defer_loading", "output_schema", "allowed_callers"];
+
+    /// Every key a function tool takes, as its refusal of another key lists
+    /// them: the function object's own, then [`Self::TOOL_KEYS`].
+    const FIELDS: &'static [&'static str] = &[
+        "name",
+        "description",
+        "parameters",
+        "strict",
+        "async",
+        "defer_loading",
+        "output_schema",
+        "allowed_callers",
+    ];
+
+    /// The function object a chat template is handed: the tool's function
+    /// without [`Self::TOOL_KEYS`], which describe the call, not the function.
+    pub fn chat_function(&self) -> Function {
+        let mut function = self.function.clone();
+        function
+            .extra
+            .retain(|key, _| !Self::TOOL_KEYS.contains(&key.as_str()));
+        function
+    }
+
+    /// Whether the model may call the tool itself: `allowed_callers` is absent,
+    /// `null` or names `direct`. A tool only code may call (`["programmatic"]`)
+    /// needs a router that runs programmatic tool calls.
+    pub fn allows_direct_calls(&self) -> bool {
+        match self.function.extra.get("allowed_callers") {
+            Some(Value::Array(callers)) => callers.iter().any(|caller| caller == "direct"),
+            _ => true,
+        }
+    }
+}
+
+/// A function tool rejects keys outside its schema, as the sibling tool
+/// structs do with `deny_unknown_fields`. The function object collects such
+/// keys in [`Function::extra`] (the chat API keeps them for the template), and
+/// serde does not support `deny_unknown_fields` on a struct that flattens a
+/// struct with a flattened map of its own, so the check is made here. The
+/// public API's own tool keys ([`FunctionTool::TOOL_KEYS`]) stay in `extra`.
+impl<'de> Deserialize<'de> for FunctionTool {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let function = Function::deserialize(deserializer)?;
+        if let Some(key) = function
+            .extra
+            .keys()
+            .find(|key| !FunctionTool::TOOL_KEYS.contains(&key.as_str()))
+        {
+            return Err(serde::de::Error::unknown_field(key, FunctionTool::FIELDS));
+        }
+        Ok(Self { function })
+    }
+}
+
+/// A function tool writes `parameters` whether or not the client gave a
+/// schema: the Responses API reference lists the field as required and
+/// nullable (the chat API's reference, which [`Function`]'s own form follows,
+/// as optional), so a tool declared without one is forwarded, and echoed back,
+/// with `"parameters": null`, as the engine's own server writes it. The other
+/// fields keep the function object's form and order.
+impl Serialize for FunctionTool {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let Function {
+            name,
+            description,
+            parameters,
+            strict,
+            extra,
+        } = &self.function;
+        let mut tool = serializer.serialize_map(Some(
+            2 + usize::from(description.is_some()) + usize::from(strict.is_some()) + extra.len(),
+        ))?;
+        tool.serialize_entry("name", name)?;
+        if let Some(description) = description {
+            tool.serialize_entry("description", description)?;
+        }
+        tool.serialize_entry("parameters", parameters)?;
+        if let Some(strict) = strict {
+            tool.serialize_entry("strict", strict)?;
+        }
+        for (key, value) in extra {
+            tool.serialize_entry(key, value)?;
+        }
+        tool.end()
+    }
+}
+
+/// File search tool configuration.
+///
+/// Spec: `{ type: "file_search", vector_store_ids, filters?, max_num_results?, ranking_options? }`.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FileSearchTool {
+    /// Vector store IDs to search over.
+    pub vector_store_ids: Vec<String>,
+    /// Optional filter applied to candidate documents.
+    pub filters: Option<FileSearchFilter>,
+    /// Maximum number of results to return.
+    pub max_num_results: Option<u32>,
+    /// Ranking options for the search.
+    pub ranking_options: Option<FileSearchRankingOptions>,
+}
+
+/// Filter expression for file search.
+///
+/// Either a single comparison or a boolean compound (`and` / `or`) over nested filters.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type")]
+pub enum FileSearchFilter {
+    #[serde(rename = "eq")]
+    Eq(ComparisonFilter),
+    #[serde(rename = "ne")]
+    Ne(ComparisonFilter),
+    #[serde(rename = "gt")]
+    Gt(ComparisonFilter),
+    #[serde(rename = "gte")]
+    Gte(ComparisonFilter),
+    #[serde(rename = "lt")]
+    Lt(ComparisonFilter),
+    #[serde(rename = "lte")]
+    Lte(ComparisonFilter),
+    #[serde(rename = "in")]
+    In(ComparisonFilter),
+    #[serde(rename = "nin")]
+    Nin(ComparisonFilter),
+    #[serde(rename = "and")]
+    And(CompoundFilter),
+    #[serde(rename = "or")]
+    Or(CompoundFilter),
+}
+
+/// Key/value comparison used by the `eq`/`ne`/`gt`/`gte`/`lt`/`lte`/`in`/`nin` filter variants.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ComparisonFilter {
+    pub key: String,
+    /// Spec allows `string | number | boolean | array of string | number`.
+    pub value: Value,
+}
+
+/// Boolean composition over nested filters (used by `and` / `or` variants).
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CompoundFilter {
+    pub filters: Vec<FileSearchFilter>,
+}
+
+/// Ranking options for file search results.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FileSearchRankingOptions {
+    pub hybrid_search: Option<HybridSearchOptions>,
+    pub ranker: Option<FileSearchRanker>,
+    pub score_threshold: Option<f64>,
+}
+
+/// Weights combining embedding-based and text-based similarity.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HybridSearchOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_weight: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_weight: Option<f64>,
+}
+
+/// Ranker selection for file search.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, schemars::JsonSchema)]
+pub enum FileSearchRanker {
+    #[serde(rename = "auto")]
+    Auto,
+    #[serde(rename = "default-2024-11-15")]
+    Default20241115,
+}
+
+/// User-defined custom tool definition.
+///
+/// Spec: `{ name, type: "custom", allowed_callers?, async?, defer_loading?, description?, format? }`.
+/// The discriminator (`type: "custom"`) is enforced by the parent
+/// [`ResponseTool`] enum; this struct only carries the payload fields so the
+/// `flatten`-style wire shape survives a round-trip.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CustomTool {
+    /// Stable identifier the model uses to address this tool in
+    /// `custom_tool_call` items.
+    pub name: String,
+    /// Optional human-readable description supplied to the model.
+    pub description: Option<String>,
+    /// When `true`, the tool definition is deferred to a later
+    /// `tool_search`-style fetch instead of being loaded inline.
+    pub defer_loading: Option<bool>,
+    /// Optional input-format constraint — `text` (unconstrained) or
+    /// `grammar` (Lark / regex production).
+    pub format: Option<CustomToolInputFormat>,
+    /// Whether the tool's response may come back asynchronously rather than
+    /// on the next response creation.
+    #[serde(rename = "async")]
+    pub r#async: Option<bool>,
+    /// The contexts the tool may be invoked from (`CallableToolAllowedCaller`:
+    /// `direct`, `programmatic`), forwarded as given.
+    pub allowed_callers: Option<Vec<String>>,
+}
+
+impl CustomTool {
+    /// Whether the model may call the tool itself: `allowed_callers` is absent
+    /// or names `direct` (see [`FunctionTool::allows_direct_calls`]).
+    pub fn allows_direct_calls(&self) -> bool {
+        self.allowed_callers
+            .as_ref()
+            .is_none_or(|callers| callers.iter().any(|caller| caller == "direct"))
+    }
+}
+
+/// Input-format constraint applied to a [`CustomTool`].
+///
+/// Spec: `CustomToolInputFormat = Text { type: "text" } |
+/// Grammar { definition, syntax: "lark" | "regex", type: "grammar" }`.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type")]
+#[serde(rename_all = "snake_case")]
+pub enum CustomToolInputFormat {
+    /// Unconstrained free-form text input.
+    #[serde(rename = "text")]
+    Text,
+    /// Grammar-constrained input. The model's free-form output must match
+    /// `definition` interpreted under `syntax`.
+    #[serde(rename = "grammar")]
+    Grammar(CustomToolGrammar),
+}
+
+/// Grammar payload carried by [`CustomToolInputFormat::Grammar`].
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CustomToolGrammar {
+    /// Grammar source text. Interpretation depends on `syntax`.
+    pub definition: String,
+    /// `"lark"` or `"regex"` per spec.
+    pub syntax: CustomToolGrammarSyntax,
+}
+
+/// Grammar dialect for [`CustomToolGrammar::syntax`].
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CustomToolGrammarSyntax {
+    /// Lark grammar (<https://lark-parser.readthedocs.io/>).
+    Lark,
+    /// Regular expression.
+    Regex,
+}
+
+/// Input-only content part accepted inside a `custom_tool_call_output` array.
+///
+/// Spec (openai-responses-api-spec.md L269): the array form of
+/// `custom_tool_call_output.output` permits only `ResponseInputText |
+/// ResponseInputImage | ResponseInputFile` — assistant-facing shapes such as
+/// `output_text` and `refusal` are explicitly not allowed here. This enum
+/// mirrors the three input variants of [`ResponseContentPart`] with identical
+/// field shapes so spec-compliant payloads round-trip unchanged, while
+/// deserialization of `output_text`/`refusal` fails loudly instead of being
+/// silently coerced.
+///
+/// Other call sites that legitimately carry mixed input/output content parts
+/// continue to use [`ResponseContentPart`] (Postel-of-liberality preserved for
+/// cross-tool reuse).
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type")]
+#[serde(rename_all = "snake_case")]
+// Variant names intentionally mirror the spec's `input_*` tag set; the shared
+// prefix communicates the input-only restriction that justifies this enum's
+// existence (see type-level docs above).
+#[expect(
+    clippy::enum_variant_names,
+    reason = "variant names mirror spec `input_*` tags by design"
+)]
+pub enum CustomToolInputContentPart {
+    /// `type: "input_text"` — inline textual input.
+    #[serde(rename = "input_text")]
+    InputText { text: String },
+    /// `type: "input_image"` — reference to an image supplied by the client.
+    /// Exactly one of `file_id` / `image_url` is typically set; both may be
+    /// absent when only `detail` is being conveyed.
+    #[serde(rename = "input_image")]
+    InputImage {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<Detail>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        image_url: Option<String>,
+    },
+    /// `type: "input_file"` — reference to an attached file. `file_data` is a
+    /// base64 blob; `file_url` / `file_id` reference external/uploaded files.
+    #[serde(rename = "input_file")]
+    InputFile {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<FileDetail>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_data: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_url: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        filename: Option<String>,
+    },
+}
+
+/// Output payload variant accepted by `custom_tool_call_output`.
+///
+/// Spec: `output: string or array of ResponseInputText | ResponseInputImage |
+/// ResponseInputFile`. The array variant uses the restricted
+/// [`CustomToolInputContentPart`] type so assistant-only shapes
+/// (`output_text`, `refusal`) are rejected at the type boundary rather than
+/// accepted and silently reinterpreted.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum CustomToolCallOutputContent {
+    /// Plain string output.
+    Text(String),
+    /// Array of input-typed content parts (`input_text` / `input_image` /
+    /// `input_file`) per the spec's `output` array shape.
+    Parts(Vec<CustomToolInputContentPart>),
+}
+
+/// Containerized `shell` tool. Spec
+/// (openai-responses-api-spec.md §tools, L463-470):
+/// `Shell { type: "shell", environment? }`.
+///
+/// The discriminator (`type: "shell"`) is enforced by the parent
+/// [`ResponseTool`] enum; this struct carries only the optional environment
+/// payload so the flatten-style wire shape survives a round-trip.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ShellTool {
+    /// Optional environment scope for the shell tool. When omitted, the
+    /// model runs commands inside the platform-default environment.
+    pub environment: Option<ShellEnvironment>,
+}
+
+/// Tool-side environment union carried on [`ShellTool::environment`].
+///
+/// Spec (openai-responses-api-spec.md §tools, L464-470):
+/// `environment: ContainerAuto | LocalEnvironment | ContainerReference`.
+///
+/// Distinct from the call-side environment unions
+/// [`ShellCallEnvironment`] (input-side call form, reuses
+/// [`LocalShellEnvironment`]) and
+/// [`ResponseShellCallEnvironment`] (response-side call form, carries the
+/// narrower [`ResponseLocalShellEnvironment`]): the tool
+/// form permits the `container_auto` variant, which asks the platform to
+/// provision a new container; both call forms only carry the resolved
+/// `local` / `container_reference` shape that the model echoes back.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type")]
+pub enum ShellEnvironment {
+    /// `type: "container_auto"` — spec L465-468. Requests a
+    /// platform-provisioned container with optional `file_ids`,
+    /// `memory_limit`, and `network_policy`.
+    #[serde(rename = "container_auto")]
+    ContainerAuto(ContainerAutoEnvironment),
+    /// `type: "local"` — spec L469. Runs in the caller-owned environment.
+    #[serde(rename = "local")]
+    Local(LocalShellEnvironment),
+    /// `type: "container_reference"` — spec L470. Pins execution to an
+    /// existing container by id.
+    #[serde(rename = "container_reference")]
+    ContainerReference(ContainerReferenceEnvironment),
+}
+
+/// Payload for [`ShellEnvironment::ContainerAuto`]. All fields are optional
+/// per spec.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerAutoEnvironment {
+    /// Files pre-mounted into the container by id.
+    pub file_ids: Option<Vec<String>>,
+    /// Memory budget. Spec (CodeInterpreter §447): `"1g"|"4g"|"16g"|"64g"`
+    /// — kept `String`-typed here for forward compatibility with future tiers.
+    pub memory_limit: Option<String>,
+    /// Network isolation policy.
+    pub network_policy: Option<ContainerNetworkPolicy>,
+}
+
+/// Payload for [`ShellEnvironment::Local`]. Carries no fields.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LocalShellEnvironment {}
+
+/// Payload for [`ShellEnvironment::ContainerReference`]. Pins the tool to
+/// an existing container id.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerReferenceEnvironment {
+    /// Existing container id.
+    pub container_id: String,
+}
+
+/// Network isolation policy for [`ContainerAutoEnvironment::network_policy`].
+///
+/// Spec (openai-responses-api-spec.md §tools, L448):
+/// `ContainerNetworkPolicyDisabled { type: "disabled" } |
+/// ContainerNetworkPolicyAllowlist { allowed_domains, type: "allowlist",
+/// domain_secrets? }`.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type")]
+pub enum ContainerNetworkPolicy {
+    /// `type: "disabled"` — no outbound network access.
+    #[serde(rename = "disabled")]
+    Disabled,
+    /// `type: "allowlist"` — only the listed domains are reachable.
+    #[serde(rename = "allowlist")]
+    Allowlist(ContainerNetworkAllowlist),
+}
+
+/// Payload for [`ContainerNetworkPolicy::Allowlist`].
+///
+/// Spec (openai-responses-api-spec.md §tools, L448-449):
+/// `{ allowed_domains, type: "allowlist", domain_secrets? }` where
+/// `domain_secrets: array of { domain, name, value }`.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerNetworkAllowlist {
+    /// Outbound-reachable hostnames.
+    pub allowed_domains: Vec<String>,
+    /// Optional per-domain secret bindings.
+    pub domain_secrets: Option<Vec<ContainerDomainSecret>>,
+}
+
+/// Per-domain secret binding carried by
+/// [`ContainerNetworkAllowlist::domain_secrets`].
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerDomainSecret {
+    /// Target domain the secret applies to.
+    pub domain: String,
+    /// Secret identifier / lookup name.
+    pub name: String,
+    /// Secret value.
+    pub value: String,
+}
+
+/// Input-side environment union carried on
+/// [`ResponseInputOutputItem::ShellCall`].
+///
+/// Spec (openai-responses-api-spec.md §ShellCall, L228-230): the input-side
+/// call form carries `environment: optional LocalEnvironment { type: "local"
+/// } | ContainerReference { container_id, type: "container_reference"
+/// }`. `container_auto` is rejected here — it is a request-side *tool*
+/// hint (§tools L465) that the platform resolves into `local` /
+/// `container_reference` before a call is surfaced, not a call-form value.
+///
+/// The tool-side [`LocalShellEnvironment`] is intentionally reused so
+/// spec-compliant replay flows that echo back input call items round-trip
+/// losslessly. Response-side emissions use the narrower
+/// [`ResponseShellCallEnvironment`] instead.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type")]
+pub enum ShellCallEnvironment {
+    /// `type: "local"` — input-side local environment. Reuses the tool-form
+    /// [`LocalShellEnvironment`] verbatim.
+    #[serde(rename = "local")]
+    Local(LocalShellEnvironment),
+    /// `type: "container_reference"` — resolved container binding.
+    #[serde(rename = "container_reference")]
+    ContainerReference(ContainerReferenceEnvironment),
+}
+
+/// Response-side environment union carried on
+/// [`ResponseOutputItem::ShellCall`].
+///
+/// Spec (openai-responses-api-spec.md §returns L512-513): the ShellCall
+/// response form has `environment: ResponseLocalEnvironment { type: "local"
+/// } | ResponseContainerReference { container_id, type: "container_reference"
+/// }`. The response-side local arm is
+/// `ResponseLocalEnvironment { type: "local" }`.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type")]
+pub enum ResponseShellCallEnvironment {
+    /// `type: "local"` — resolved local environment on the response-side
+    /// call form. Per spec L513 this is `ResponseLocalEnvironment { type:
+    /// "local" }`.
+    #[serde(rename = "local")]
+    Local(ResponseLocalShellEnvironment),
+    /// `type: "container_reference"` — resolved container binding.
+    /// Structurally identical to the input-side variant; reused directly.
+    #[serde(rename = "container_reference")]
+    ContainerReference(ContainerReferenceEnvironment),
+}
+
+/// Payload for [`ResponseShellCallEnvironment::Local`].
+///
+/// Spec (openai-responses-api-spec.md §returns L513): response-side local
+/// environment is `ResponseLocalEnvironment { type: "local" }` — the
+/// discriminator is the only field the model echoes back.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResponseLocalShellEnvironment {}
+
+/// Action payload for [`ResponseInputOutputItem::ShellCall`] /
+/// [`ResponseOutputItem::ShellCall`].
+///
+/// Spec (openai-responses-api-spec.md §ShellCall, L229):
+/// `action: { commands, max_output_length?, timeout_ms? }`.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ShellCallAction {
+    /// Command line to run inside the environment, as a positional-argv
+    /// array (equivalent to `argv` of `execve`).
+    pub commands: Vec<String>,
+    /// Optional cap on captured stdout / stderr bytes.
+    pub max_output_length: Option<u64>,
+    /// Optional per-command timeout in milliseconds.
+    pub timeout_ms: Option<u64>,
+}
+
+/// Status for [`ResponseInputOutputItem::ShellCall`] /
+/// [`ResponseOutputItem::ShellCall`] and their `*_output` siblings.
+///
+/// Spec (openai-responses-api-spec.md §ShellCall, L221+L238):
+/// `status: "in_progress" | "completed" | "incomplete"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellCallStatus {
+    /// `in_progress` — call is still executing.
+    InProgress,
+    /// `completed` — call finished and `output` chunks are final.
+    Completed,
+    /// `incomplete` — call aborted or never reached completion.
+    Incomplete,
+}
+
+/// One entry of a `shell_call_output.output` array.
+///
+/// Spec (openai-responses-api-spec.md §ShellCallOutput, L234-238):
+/// `{ outcome, stderr, stdout }` plus the optional `created_by` marker
+/// mirroring the same tag on `FunctionCallOutput`/`ComputerCallOutput` for
+/// provenance.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ShellOutputChunk {
+    /// Call outcome — timeout or numeric exit.
+    pub outcome: ShellOutcome,
+    /// Captured stderr bytes (UTF-8 where possible).
+    pub stderr: String,
+    /// Captured stdout bytes (UTF-8 where possible).
+    pub stdout: String,
+    /// Optional provenance marker — `"system"`, `"user"`, or similar per
+    /// spec. Kept `Option<String>` for forward-compatibility with future
+    /// `created_by` tags.
+    pub created_by: Option<String>,
+}
+
+/// Outcome of a shell call. Spec (openai-responses-api-spec.md
+/// §ShellCallOutput, L235):
+/// `outcome: Timeout { type: "timeout" } | Exit { exit_code, type: "exit" }`.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type")]
+pub enum ShellOutcome {
+    /// `type: "timeout"` — the call exceeded `action.timeout_ms` and was
+    /// killed by the environment.
+    #[serde(rename = "timeout")]
+    Timeout,
+    /// `type: "exit"` — the process exited, carrying the numeric exit code.
+    #[serde(rename = "exit")]
+    Exit(ShellExit),
+}
+
+/// Exit payload for [`ShellOutcome::Exit`]. Spec: `{ exit_code, type: "exit" }`.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ShellExit {
+    /// Process exit code. Signed to preserve negative error codes on
+    /// platforms that report them.
+    pub exit_code: i32,
+}
+
+/// File-edit operation payload carried by
+/// [`ResponseInputOutputItem::ApplyPatchCall`] /
+/// [`ResponseOutputItem::ApplyPatchCall`].
+///
+/// Spec (openai-responses-api-spec.md §ApplyPatchCall L240-L246): the
+/// `operation` field is a `type`-tagged union of three shapes —
+/// `CreateFile { diff, path, type: "create_file" }`,
+/// `DeleteFile { path, type: "delete_file" }`, and
+/// `UpdateFile { diff, path, type: "update_file" }`. `DeleteFile` carries no
+/// diff because the whole file is removed; the other two carry a unified
+/// diff payload describing the edit.
+///
+/// `deny_unknown_fields` is applied so variants fail fast on foreign keys —
+/// e.g. `{"type":"delete_file","path":"x","diff":"..."}` is rejected rather
+/// than silently dropping the stray `diff`, matching the P5 fail-fast
+/// contract applied elsewhere on protocol-surface structs.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type", deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+// Variant names intentionally mirror the spec's `*_file` tag set; the shared
+// `File` postfix tracks the spec verbatim and keeps the type discriminator
+// symmetric with the JSON wire shape.
+#[expect(
+    clippy::enum_variant_names,
+    reason = "variant names mirror spec `create_file` / `delete_file` / `update_file` tags by design"
+)]
+pub enum ApplyPatchOperation {
+    /// `{ type: "create_file", diff, path }` — create a new file whose
+    /// contents are described by `diff`.
+    CreateFile { diff: String, path: String },
+    /// `{ type: "delete_file", path }` — remove an existing file.
+    DeleteFile { path: String },
+    /// `{ type: "update_file", diff, path }` — apply a unified diff to an
+    /// existing file at `path`.
+    UpdateFile { diff: String, path: String },
+}
+
+/// Status for a [`ResponseInputOutputItem::ApplyPatchCall`] /
+/// [`ResponseOutputItem::ApplyPatchCall`] item.
+///
+/// Spec (openai-responses-api-spec.md §ApplyPatchCall L245):
+/// `status: "in_progress" | "completed"`. Distinct from
+/// [`ApplyPatchCallOutputStatus`] which adds `"failed"` for the output item.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplyPatchCallStatus {
+    InProgress,
+    Completed,
+}
+
+/// Status for a [`ResponseInputOutputItem::ApplyPatchCallOutput`] /
+/// [`ResponseOutputItem::ApplyPatchCallOutput`] item.
+///
+/// Spec (openai-responses-api-spec.md §ApplyPatchCallOutput L249):
+/// `status: "completed" | "failed"`. The output-side status intentionally
+/// drops `"in_progress"` because the output only materialises once the
+/// apply_patch attempt has terminated — either the edit applied cleanly or
+/// it failed — so an in-progress output would be spec-invalid.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplyPatchCallOutputStatus {
+    Completed,
+    Failed,
+}
+
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct McpTool {
+    pub server_url: Option<String>,
+    pub authorization: Option<String>,
+    /// Custom headers to send to MCP server (from request payload, not HTTP headers)
+    #[serde(serialize_with = "crate::common::serialize_with_sorted_keys")]
+    pub headers: Option<HashMap<String, String>>,
+    pub server_label: String,
+    pub server_description: Option<String>,
+    /// Approval requirement configuration for MCP tools.
+    pub require_approval: Option<RequireApproval>,
+    /// List of allowed tool names, or a filter object with `read_only` /
+    /// `tool_names` fields. Spec (openai-responses-api-spec.md L442):
+    /// `allowed_tools: McpAllowedTools = array of string | McpToolFilter`.
+    /// Backward-compat: legacy `["a","b"]` wire shape still deserializes via
+    /// the untagged `List` variant.
+    pub allowed_tools: Option<McpAllowedTools>,
+    /// Identifier for service connectors (e.g. Dropbox, Gmail). One of
+    /// `server_url` or `connector_id` must be provided per spec
+    /// (openai-responses-api-spec.md L441-445).
+    pub connector_id: Option<McpConnectorId>,
+    /// When `true`, the MCP server's tool list is fetched lazily on first
+    /// use rather than eagerly at request time. Spec
+    /// (openai-responses-api-spec.md L441): `defer_loading?: bool`.
+    /// Not yet present in OpenAI Python SDK 2.8.1 `types/responses/tool.py`;
+    /// included here to track the documented Responses API surface.
+    pub defer_loading: Option<bool>,
+}
+
+/// Allowed-tools filter for an MCP tool.
+///
+/// Spec (openai-responses-api-spec.md L442): `array of string | McpToolFilter`.
+///
+/// Variant order matters for `#[serde(untagged)]`: serde tries `List` first
+/// (JSON array) so a bare `["foo","bar"]` wire shape keeps deserializing into
+/// `List(vec!["foo","bar"])`. A JSON object falls through to `Filter`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum McpAllowedTools {
+    /// Flat allow-list of tool names.
+    List(Vec<String>),
+    /// Object filter selecting tools by read-only flag and/or explicit names.
+    Filter(McpToolFilter),
+}
+
+/// Object filter selecting MCP tools by read-only flag and/or explicit names.
+///
+/// Spec (openai-responses-api-spec.md L442): `McpToolFilter { read_only?, tool_names? }`.
+///
+/// `deny_unknown_fields` is applied so typoed keys (e.g. `"tool_namse"`) fail
+/// fast at deserialize time rather than silently collapsing to an empty filter
+/// — an empty filter would be projected by the router to "no name constraint",
+/// unexpectedly broadening MCP tool exposure for payloads that meant to scope
+/// it down.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct McpToolFilter {
+    /// Match tools flagged read-only via MCP `readOnlyHint` annotation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<bool>,
+    /// Explicit list of allowed tool names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_names: Option<Vec<String>>,
+}
+
+/// Service-connector identifier for hosted MCP tools.
+///
+/// Spec (openai-responses-api-spec.md L443): exactly one of `server_url` or
+/// `connector_id` is required on `McpTool`. The wire values are literal
+/// snake-case strings such as `"connector_dropbox"`.
+///
+/// Enum values mirror OpenAI Python SDK 2.8.1
+/// `types/responses/tool.py::Mcp.connector_id`.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, schemars::JsonSchema)]
+pub enum McpConnectorId {
+    #[serde(rename = "connector_dropbox")]
+    Dropbox,
+    #[serde(rename = "connector_gmail")]
+    Gmail,
+    #[serde(rename = "connector_googlecalendar")]
+    GoogleCalendar,
+    #[serde(rename = "connector_googledrive")]
+    GoogleDrive,
+    #[serde(rename = "connector_microsoftteams")]
+    MicrosoftTeams,
+    #[serde(rename = "connector_outlookcalendar")]
+    OutlookCalendar,
+    #[serde(rename = "connector_outlookemail")]
+    OutlookEmail,
+    #[serde(rename = "connector_sharepoint")]
+    SharePoint,
+}
+
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, Default, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WebSearchPreviewTool {
+    pub search_context_size: Option<String>,
+    pub user_location: Option<Value>,
+    /// The kinds of content the search returns, `text` and `image` in the
+    /// public API (`SearchContentType`).
+    pub search_content_types: Option<Vec<String>>,
+}
+
+/// Non-preview hosted web search tool configuration.
+///
+/// Spec: `{ type: "web_search" | "web_search_2025_08_26", filters? { allowed_domains? },
+/// return_token_budget?: "default"|"unlimited", search_context_size?: "low"|"medium"|"high",
+/// user_location? }`.
+///
+/// Distinct from `WebSearchPreviewTool`: adds `filters.allowed_domains` (domain
+/// allowlist), `return_token_budget`, and pins `search_context_size` to the spec-listed enum.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, Default, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WebSearchTool {
+    /// Whether the tool may fetch live external sources rather than cached results.
+    pub external_web_access: Option<bool>,
+    /// Whether the tool may fetch indexed web sources.
+    pub indexed_web_access: Option<bool>,
+    /// Optional domain allowlist applied to candidate sources.
+    pub filters: Option<WebSearchFilters>,
+    /// Search-result context token budget. Spec enum: `"default" | "unlimited"`.
+    pub return_token_budget: Option<WebSearchReturnTokenBudget>,
+    /// Search context budget. Spec enum: `"low" | "medium" | "high"`.
+    pub search_context_size: Option<WebSearchContextSize>,
+    /// Content kinds the search may return (e.g. `"text"`, `"image"`).
+    pub search_content_types: Option<Vec<String>>,
+    /// Approximate user location used to bias results.
+    pub user_location: Option<WebSearchUserLocation>,
+}
+
+/// Filters for the non-preview `web_search` tool.
+///
+/// Spec: `filters? { allowed_domains? }`.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, Default, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WebSearchFilters {
+    /// Optional list of domains to restrict search results to.
+    pub allowed_domains: Option<Vec<String>>,
+}
+
+/// Search context budget for the non-preview `web_search` tool.
+///
+/// Spec: `search_context_size?: "low" | "medium" | "high"`.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WebSearchContextSize {
+    Low,
+    Medium,
+    High,
+}
+
+/// Search-result token budget for the non-preview `web_search` tool.
+///
+/// Spec: `return_token_budget?: "default" | "unlimited"`.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WebSearchReturnTokenBudget {
+    Default,
+    Unlimited,
+}
+
+/// Approximate user location for the non-preview `web_search` tool.
+///
+/// Spec: `user_location: { city?, country?: ISO2, region?, timezone?: IANA, type?: "approximate" }`.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, Default, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WebSearchUserLocation {
+    /// City name.
+    pub city: Option<String>,
+    /// ISO-3166-1 alpha-2 country code (e.g. `"US"`).
+    pub country: Option<String>,
+    /// Region / state / province name.
+    pub region: Option<String>,
+    /// IANA timezone identifier (e.g. `"America/Los_Angeles"`).
+    pub timezone: Option<String>,
+    /// Discriminator. Spec only enumerates `"approximate"`.
+    #[serde(rename = "type")]
+    pub location_type: Option<String>,
+}
+
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, Default, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CodeInterpreterTool {
+    pub container: Option<Value>,
+    pub environment: Option<ResponseToolEnvironment>,
+}
+
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, Default, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResponseToolEnvironment {}
+
+/// Configuration payload for the `image_generation` built-in tool.
+///
+/// Spec: `{ type: "image_generation", action?, background?, input_fidelity?,
+/// input_image_mask?, model?, moderation?, output_compression?, output_format?,
+/// partial_images?, quality?, size? }`. All inner fields are optional; the
+/// model picks defaults documented in the spec.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, Default, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ImageGenerationTool {
+    /// `"generate" | "edit" | "auto"` (default `auto`). Free-form string here so
+    /// future actions added by OpenAI deserialize without a wire break.
+    pub action: Option<String>,
+    /// `"transparent" | "opaque" | "auto"` (default `auto`).
+    pub background: Option<String>,
+    /// `"high" | "low"` — gpt-image-1 / gpt-image-1.5 only (not 1-mini).
+    pub input_fidelity: Option<String>,
+    /// Reference image used by `edit` action; mask either by uploaded file or URL.
+    pub input_image_mask: Option<ImageInputMask>,
+    /// `string | "gpt-image-1" | "gpt-image-1-mini" | "gpt-image-1.5"` — kept as
+    /// `String` so unknown model identifiers passed through unchanged.
+    pub model: Option<String>,
+    /// `"auto" | "low"`.
+    pub moderation: Option<String>,
+    /// Output compression level. Spec default `100` when omitted; we keep
+    /// `Option` so an unset field round-trips as absent (not `null`, via
+    /// `#[serde_with::skip_serializing_none]`) rather than forcing 100.
+    pub output_compression: Option<u32>,
+    /// `"png" | "webp" | "jpeg"`.
+    pub output_format: Option<String>,
+    /// `0..3` — number of partial images to stream.
+    pub partial_images: Option<u32>,
+    /// `"low" | "medium" | "high" | "auto"`.
+    pub quality: Option<String>,
+    /// `"1024x1024" | "1024x1536" | "1536x1024" | "auto"`.
+    pub size: Option<String>,
+}
+
+/// Mask reference for image-generation `edit` calls. Spec: `{ file_id?, image_url? }`.
+/// Reuses the same upload conventions as P1 `InputImage`.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, Default, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ImageInputMask {
+    pub file_id: Option<String>,
+    pub image_url: Option<String>,
+}
+
+/// Status values for an `image_generation_call` output item.
+///
+/// Spec: `"in_progress" | "completed" | "generating" | "failed"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageGenerationCallStatus {
+    InProgress,
+    Completed,
+    Generating,
+    Failed,
+}
+
+/// `require_approval` values.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum RequireApproval {
+    Mode(RequireApprovalMode),
+    Rules(RequireApprovalRules),
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RequireApprovalMode {
+    Always,
+    Never,
+}
+
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RequireApprovalRules {
+    pub always: Option<RequireApprovalFilter>,
+    pub never: Option<RequireApprovalFilter>,
+}
+
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RequireApprovalFilter {
+    pub tool_names: Option<Vec<String>>,
+    pub read_only: Option<bool>,
+}
+
+// ============================================================================
+// Computer Tool
+// ============================================================================
+
+/// Computer-use preview tool payload.
+///
+/// Spec (openai-responses-api-spec.md §tools): `ComputerUsePreview
+/// { display_height, display_width, environment, type: "computer_use_preview" }`.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ComputerUsePreviewTool {
+    /// Height of the simulated display in pixels.
+    pub display_height: u32,
+    /// Width of the simulated display in pixels.
+    pub display_width: u32,
+    /// Operating environment the model should target.
+    pub environment: ComputerEnvironment,
+}
+
+/// Environment selector for [`ComputerUsePreviewTool`].
+///
+/// Spec (openai-responses-api-spec.md §tools): `environment:
+/// "windows"|"mac"|"linux"|"ubuntu"|"browser"`.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputerEnvironment {
+    Windows,
+    Mac,
+    Linux,
+    Ubuntu,
+    Browser,
+}
+
+/// Mouse button used by the `Click` action.
+///
+/// Spec (openai-responses-api-spec.md §ComputerAction): `button:
+/// "left"|"right"|"wheel"|"back"|"forward"`. Only the `Click` action carries a
+/// `button` field; `Scroll` uses `scroll_x`/`scroll_y` offsets.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MouseButton {
+    Left,
+    Right,
+    Wheel,
+    Back,
+    Forward,
+}
+
+/// `(x, y)` coordinate pair used in `Drag.path` and `Move/Click/Scroll` actions.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ComputerCoordinate {
+    pub x: i32,
+    pub y: i32,
+}
+
+/// Discriminated union of computer-use actions the model may emit.
+///
+/// Spec (openai-responses-api-spec.md §ComputerAction):
+/// `Click | DoubleClick | Drag | Keypress | Move | Screenshot | Scroll | Type | Wait`.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ComputerAction {
+    /// `{ type: "click", button, x, y, keys? }`.
+    Click {
+        button: MouseButton,
+        x: i32,
+        y: i32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        keys: Option<Vec<String>>,
+    },
+    /// `{ type: "double_click", x, y, keys? }`.
+    DoubleClick {
+        x: i32,
+        y: i32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        keys: Option<Vec<String>>,
+    },
+    /// `{ type: "drag", path, keys? }`.
+    Drag {
+        path: Vec<ComputerCoordinate>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        keys: Option<Vec<String>>,
+    },
+    /// `{ type: "keypress", keys }`.
+    Keypress { keys: Vec<String> },
+    /// `{ type: "move", x, y, keys? }`.
+    Move {
+        x: i32,
+        y: i32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        keys: Option<Vec<String>>,
+    },
+    /// `{ type: "screenshot" }`.
+    Screenshot,
+    /// `{ type: "scroll", scroll_x, scroll_y, x, y, keys? }`.
+    Scroll {
+        scroll_x: i32,
+        scroll_y: i32,
+        x: i32,
+        y: i32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        keys: Option<Vec<String>>,
+    },
+    /// `{ type: "type", text }`.
+    Type { text: String },
+    /// `{ type: "wait" }`.
+    Wait,
+}
+
+/// Status for a [`ResponseInputOutputItem::ComputerCall`] /
+/// [`ResponseOutputItem::ComputerCall`] item.
+///
+/// Spec (openai-responses-api-spec.md §ComputerCall): `status: "in_progress"
+/// | "completed" | "incomplete"`.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputerCallStatus {
+    InProgress,
+    Completed,
+    Incomplete,
+}
+
+/// One pending or acknowledged safety check attached to a computer-use call.
+///
+/// Spec (openai-responses-api-spec.md §ComputerCall): `pending_safety_checks:
+/// array of { id, code, message }`. Per SDK v2.8.1
+/// (`types/responses/response_computer_tool_call.py::PendingSafetyCheck`),
+/// `code` and `message` are `Optional[str] = None`, so we mirror that here to
+/// round-trip payloads that omit either field.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ComputerSafetyCheck {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// Output payload of a [`ResponseInputOutputItem::ComputerCallOutput`] item.
+///
+/// Spec (openai-responses-api-spec.md §ComputerCallOutput.output):
+/// `ResponseComputerToolCallOutputScreenshot { type: "computer_screenshot",
+/// file_id?, image_url? }`.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ComputerCallOutputContent {
+    /// `{ type: "computer_screenshot", file_id?, image_url? }`.
+    ComputerScreenshot {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        image_url: Option<String>,
+    },
+}
+
+// ============================================================================
+// Reasoning Parameters
+// ============================================================================
+
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ResponseReasoningParam {
+    #[serde(default = "default_reasoning_effort")]
+    pub effort: Option<ReasoningEffort>,
+    pub summary: Option<ReasoningSummary>,
+    /// The reasoning execution mode (`ReasoningModeEnum`: `standard`, `pro`,
+    /// or another string the upstream takes), forwarded as given.
+    pub mode: Option<String>,
+    /// Which reasoning items are rendered back to the model on later turns.
+    pub context: Option<ReasoningContext>,
+    /// The deprecated spelling of `summary`, forwarded as given. It is a field
+    /// of its own rather than an alias, so a body that sends both spellings
+    /// still parses.
+    pub generate_summary: Option<ReasoningSummary>,
+}
+
+/// Which reasoning items are rendered back to the model on later turns
+/// (`Reasoning.context` in the spec); `auto` lets the model decide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningContext {
+    Auto,
+    CurrentTurn,
+    AllTurns,
+}
+
+impl ReasoningContext {
+    /// The wire value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::CurrentTurn => "current_turn",
+            Self::AllTurns => "all_turns",
+        }
+    }
+}
+
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "serde default function must match field type Option<T>"
+)]
+fn default_reasoning_effort() -> Option<ReasoningEffort> {
+    Some(ReasoningEffort::Medium)
+}
+
+/// OpenAI `reasoning.effort` tiers, lowest to highest. `none` turns reasoning
+/// off; it is distinct from an absent field, which defaults to `medium`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl ReasoningEffort {
+    /// The wire value, which is also the Chat `reasoning_effort` string.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+
+    /// Parse a wire value; `None` for anything outside the OpenAI tiers.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "none" => Some(Self::None),
+            "minimal" => Some(Self::Minimal),
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "xhigh" => Some(Self::Xhigh),
+            "max" => Some(Self::Max),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningSummary {
+    Auto,
+    Concise,
+    Detailed,
+}
+
+impl ReasoningSummary {
+    /// The wire value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Concise => "concise",
+            Self::Detailed => "detailed",
+        }
+    }
+}
+
+// ============================================================================
+// Input/Output Items
+// ============================================================================
+
+/// Content can be either a simple string or array of content parts (for SimpleInputMessage)
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum StringOrContentParts {
+    String(String),
+    Array(Vec<ResponseContentPart>),
+}
+
+impl StringOrContentParts {
+    /// Project tool output into a text-only backend without silently losing
+    /// media: a part without text is refused, and the refusal names the part.
+    pub fn to_text_only(&self) -> Result<String, String> {
+        match self {
+            Self::String(text) => Ok(text.clone()),
+            Self::Array(parts) => {
+                let mut text = String::new();
+                for part in parts {
+                    let Some(part_text) = part.text() else {
+                        let kind = part.type_name();
+                        return Err(format!(
+                            "Unsupported content part type {kind:?} in a function output for text-only backends: only text parts are carried as a tool result"
+                        ));
+                    };
+                    text.push_str(part_text);
+                }
+                Ok(text)
+            }
+        }
+    }
+}
+
+impl From<String> for StringOrContentParts {
+    fn from(text: String) -> Self {
+        Self::String(text)
+    }
+}
+
+/// Phase label for assistant messages in the Responses API.
+///
+/// For gpt-5.3-codex+ multi-turn conversations, preserving and resending the
+/// original `phase` value avoids quality / latency degradation — the model
+/// relies on it to disambiguate commentary-style reasoning from the final
+/// answer. Opaque to SMG otherwise; preserved verbatim through store+retrieve,
+/// SSE output, and upstream passthrough.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MessagePhase {
+    Commentary,
+    FinalAnswer,
+}
+
+/// Content part carried inside a [`ResponseInputOutputItem::AgentMessage`].
+///
+/// Mirrors Codex's `AgentMessageInputContent` (`input_text` or
+/// `encrypted_content`). Unknown part kinds fail deserialization fast so
+/// callers get a clear error naming the offending part rather than silently
+/// dropping sub-agent payload.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentMessageContentPart {
+    InputText { text: String },
+    EncryptedContent { encrypted_content: String },
+}
+
+impl AgentMessageContentPart {
+    /// Plaintext carried by this part, or `None` for encrypted payloads.
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            Self::InputText { text } => Some(text),
+            Self::EncryptedContent { .. } => None,
+        }
+    }
+
+    /// The wire-format type name of this part.
+    pub const fn type_name(&self) -> &'static str {
+        match self {
+            Self::InputText { .. } => "input_text",
+            Self::EncryptedContent { .. } => "encrypted_content",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type")]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseInputOutputItem {
+    #[serde(rename = "message")]
+    Message {
+        id: String,
+        role: String,
+        content: Vec<ResponseContentPart>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        /// Optional phase label, preserved from previous assistant output so
+        /// gpt-5.3-codex+ multi-turn does not degrade (spec: ResponseOutputMessage.phase).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        phase: Option<MessagePhase>,
+    },
+    #[serde(rename = "reasoning")]
+    #[non_exhaustive]
+    Reasoning {
+        /// Optional on input: Codex models `reasoning.id` as optional and
+        /// strips non-conforming IDs before resending history.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
+        summary: Vec<SummaryTextContent>,
+        #[serde(
+            default,
+            deserialize_with = "deserialize_null_as_empty_vec",
+            skip_serializing_if = "Vec::is_empty"
+        )]
+        content: Vec<ResponseReasoningContent>,
+        /// Encrypted reasoning payload for gpt-5 / o-series round-trip via
+        /// `previous_response_id`. Opaque to SMG; preserved verbatim.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
+        encrypted_content: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+    },
+    #[serde(rename = "function_call")]
+    FunctionToolCall {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        call_id: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
+        arguments: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+    },
+    #[serde(rename = "function_call_output")]
+    FunctionCallOutput {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        call_id: String,
+        output: StringOrContentParts,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+    },
+    #[serde(rename = "mcp_approval_request")]
+    McpApprovalRequest {
+        id: String,
+        server_label: String,
+        name: String,
+        arguments: String,
+    },
+    #[serde(rename = "mcp_approval_response")]
+    McpApprovalResponse {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        approval_request_id: String,
+        approve: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// `type: "image_generation_call"` — round-trip form for an image generated
+    /// in a prior turn. Spec (OpenAI Responses API, multi-turn image-edit
+    /// flow): clients may resubmit only `{ type, id }` to reference a prior
+    /// generation by identifier, so `result` and `status` are accepted as
+    /// absent on the input side. The full shape is
+    /// `{ id, action?, background?, output_format?, quality?, result?: base64,
+    /// revised_prompt?, size?, status?, type }`.
+    ///
+    /// This mirrors the OpenAI Python SDK 2.8.x
+    /// `response_input_item_param.ImageGenerationCall` TypedDict: while the
+    /// TypedDict types those fields as `Required[Optional[...]]`, the HTTP
+    /// API itself documents the id-only multi-turn reference form (see the
+    /// image-generation tool guide), and `skip_serializing_if` keeps the
+    /// serialized form spec-compatible when a full item is round-tripped.
+    /// The server-side `ResponseOutputItem::ImageGenerationCall` variant
+    /// carries the same metadata so real OpenAI responses
+    /// (`action`/`background`/`output_format`/`quality`/`size`) survive
+    /// cloud-passthrough and persistence round-trips.
+    ///
+    /// The metadata fields (`action`, `background`, `output_format`,
+    /// `quality`, `size`) are typed as `Option<String>` rather than
+    /// narrow enums so unknown or future-added values pass through
+    /// unchanged — this mirrors `ImageGenerationTool` on the input-tool
+    /// side.
+    #[serde(rename = "image_generation_call")]
+    ImageGenerationCall {
+        id: String,
+        /// `"generate" | "edit" | "auto"` — which image-generation action the
+        /// prior turn dispatched. Preserved free-form so future actions pass
+        /// through without a wire break.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        action: Option<String>,
+        /// `"transparent" | "opaque" | "auto"`. Matches the
+        /// `image_generation` tool input knob of the same name.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        background: Option<String>,
+        /// `"png" | "webp" | "jpeg"`. Matches the `image_generation` tool
+        /// input knob of the same name.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_format: Option<String>,
+        /// `"auto" | "low" | "medium" | "high" | "standard" | "hd"`. Matches
+        /// the `image_generation` tool input knob of the same name.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quality: Option<String>,
+        /// Base64-encoded image bytes. Omitted on id-only references.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<String>,
+        /// Prompt text the mainline model rewrote before dispatching the
+        /// image-generation call. Preserved so downstream turns/storage do
+        /// not drop it on replay.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        revised_prompt: Option<String>,
+        /// `"auto" | "1024x1024" | "1024x1536" | "1536x1024"`. Matches the
+        /// `image_generation` tool input knob of the same name.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        size: Option<String>,
+        /// Generation status. Omitted on id-only references.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<ImageGenerationCallStatus>,
+    },
+    /// `type: "compaction"` — opaque compacted-history payload generated by
+    /// the `/v1/responses/compact` API. Spec
+    /// (openai-responses-api-spec.md §InputItemList L203-205):
+    /// `Compaction { encrypted_content, type, id }`. `id` is optional on the
+    /// input wire so newly-minted client-side compactions can omit it; it is
+    /// always present on items round-tripped from a previous response.
+    #[serde(rename = "compaction")]
+    Compaction {
+        encrypted_content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
+    /// `{ type: "computer_call", id, call_id, action?, actions?, status,
+    /// pending_safety_checks }`.
+    ///
+    /// Spec (openai-responses-api-spec.md §ComputerCall): single-action
+    /// `action` is the legacy shape; `actions` carries the flattened batch
+    /// for `computer_use`. Both fields are optional independently, so callers
+    /// can roundtrip either form.
+    #[serde(rename = "computer_call")]
+    ComputerCall {
+        id: String,
+        call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        action: Option<ComputerAction>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actions: Option<Vec<ComputerAction>>,
+        status: ComputerCallStatus,
+        /// Always serialized (including an empty `[]`). The official OpenAI
+        /// Python SDK (`openai==2.8.1`,
+        /// `types/responses/response_computer_tool_call.py`) declares this as a
+        /// non-`Optional` `List[PendingSafetyCheck]`, so the field must always
+        /// appear on the wire — an empty array is semantically distinct from
+        /// omitting the field.
+        #[serde(default)]
+        pending_safety_checks: Vec<ComputerSafetyCheck>,
+    },
+    /// `{ type: "computer_call_output", id?, call_id, output,
+    /// acknowledged_safety_checks?, status? }`.
+    ///
+    /// Spec (openai-responses-api-spec.md §ComputerCallOutput): `output` is the
+    /// [`ComputerCallOutputContent::ComputerScreenshot`] payload;
+    /// `acknowledged_safety_checks` and `status` are both optional per spec.
+    #[serde(rename = "computer_call_output")]
+    ComputerCallOutput {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        call_id: String,
+        output: ComputerCallOutputContent,
+        /// The safety checks the developer acknowledged. The public API's
+        /// input item takes an array or `null`; `null` reads as none.
+        #[serde(
+            default,
+            deserialize_with = "deserialize_null_as_empty_vec",
+            skip_serializing_if = "Vec::is_empty"
+        )]
+        acknowledged_safety_checks: Vec<ComputerSafetyCheck>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<ComputerCallStatus>,
+    },
+    /// `type: "custom_tool_call"` — assistant's call into a registered
+    /// custom tool. Spec: `{ call_id, input, name, type, id?, namespace? }`.
+    /// `id` / `namespace` are modelled as `Option<String>` so newly-minted
+    /// client-side calls can omit them; they are populated on items
+    /// round-tripped from a previous response. `input` is the model's
+    /// free-form payload (constrained by the tool's `format` if grammar is
+    /// set); the client owns execution and replies with a matching
+    /// [`Self::CustomToolCallOutput`].
+    #[serde(rename = "custom_tool_call")]
+    CustomToolCall {
+        call_id: String,
+        input: String,
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
+    },
+    /// `type: "custom_tool_call_output"` — client's response to a
+    /// `custom_tool_call`. Spec: `{ call_id, output, type, id? }` (no
+    /// `status` field per spec). `id` is
+    /// `Option<String>` for the same reason as `CustomToolCall.id` above.
+    /// `output` is either a plain string or an array of input-typed content
+    /// parts (`input_text` / `input_image` / `input_file`).
+    #[serde(rename = "custom_tool_call_output")]
+    CustomToolCallOutput {
+        call_id: String,
+        output: CustomToolCallOutputContent,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
+    /// `type: "shell_call"` — assistant's call into the containerized
+    /// [`ResponseTool::Shell`] tool.
+    ///
+    /// Spec (openai-responses-api-spec.md §ShellCall, L228-231) +
+    /// OpenAI SDK v2.8.1 `ResponseFunctionShellToolCall`:
+    /// `{ action, call_id, type, id, environment, status, created_by? }`.
+    /// `id` is `Option<String>` so newly-minted client-side calls can omit
+    /// it; the model populates it on items round-tripped from a previous
+    /// response. `created_by` carries provenance metadata the SDK types
+    /// as `Optional[str]` — present when the item was emitted by the
+    /// platform, absent on client-authored calls.
+    #[serde(rename = "shell_call")]
+    ShellCall {
+        action: ShellCallAction,
+        call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        /// Resolved execution environment. Spec constrains this to
+        /// `local` or `container_reference` on the call form (see
+        /// [`ShellCallEnvironment`] docs).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        environment: Option<ShellCallEnvironment>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<ShellCallStatus>,
+        /// Provenance tag mirroring the SDK's `created_by: Optional[str]`
+        /// on `ResponseFunctionShellToolCall`. Dropped at serialize time
+        /// when absent so client-authored calls do not carry a null
+        /// placeholder.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        created_by: Option<String>,
+    },
+    /// `type: "shell_call_output"` — client's reply to a `shell_call`.
+    ///
+    /// Spec (openai-responses-api-spec.md §ShellCallOutput, L233-238) +
+    /// OpenAI SDK v2.8.1 `ResponseFunctionShellToolCallOutput`:
+    /// `{ call_id, output, type, id, max_output_length?, status, created_by? }`.
+    /// `id`, `max_output_length`, and `created_by` are modelled as
+    /// `Option` per the SDK's `Optional[...]` typing; the server populates
+    /// them on items round-tripped from a previous response.
+    #[serde(rename = "shell_call_output")]
+    ShellCallOutput {
+        call_id: String,
+        output: Vec<ShellOutputChunk>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_output_length: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<ShellCallStatus>,
+        /// Provenance tag mirroring the SDK's `created_by: Optional[str]`
+        /// on `ResponseFunctionShellToolCallOutput`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        created_by: Option<String>,
+    },
+    /// `type: "apply_patch_call"` — model-issued file-edit request. Spec
+    /// (openai-responses-api-spec.md §ApplyPatchCall L240-L246):
+    /// `{ call_id, operation, status, type, id }`. `id` is `Option<String>`
+    /// so newly-minted client-side calls can omit it; it is always present on
+    /// items round-tripped from a previous response. The `operation` union is
+    /// `CreateFile | DeleteFile | UpdateFile` per
+    /// [`ApplyPatchOperation`]; the client owns execution (apply the diff on
+    /// disk) and replies with a matching [`Self::ApplyPatchCallOutput`].
+    #[serde(rename = "apply_patch_call")]
+    ApplyPatchCall {
+        call_id: String,
+        operation: ApplyPatchOperation,
+        status: ApplyPatchCallStatus,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
+    /// `type: "apply_patch_call_output"` — client's response to an
+    /// `apply_patch_call`. Spec (openai-responses-api-spec.md
+    /// §ApplyPatchCallOutput L248-L251): `{ call_id, status, type, id,
+    /// output }` where `output` is optional log text. `id` is
+    /// `Option<String>` for the same reason as `ApplyPatchCall.id` above;
+    /// `output` uses `skip_serializing_if` so a no-log success round-trips
+    /// without emitting an explicit `null`.
+    #[serde(rename = "apply_patch_call_output")]
+    ApplyPatchCallOutput {
+        call_id: String,
+        status: ApplyPatchCallOutputStatus,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
+    },
+    /// `type: "local_shell_call"` — assistant's call into the
+    /// `local_shell` built-in tool. Spec
+    /// (openai-responses-api-spec.md §LocalShellCall L219-222):
+    /// `{ id, action, call_id, status, type }` where `action` is a
+    /// [`LocalShellExec`] payload describing the command to run on the
+    /// host. The client executes the command and replies with a
+    /// matching [`Self::LocalShellCallOutput`].
+    #[serde(rename = "local_shell_call")]
+    LocalShellCall {
+        id: String,
+        call_id: String,
+        action: LocalShellExec,
+        status: LocalShellCallStatus,
+    },
+    /// `type: "local_shell_call_output"` — client's response to a
+    /// `local_shell_call`. Spec
+    /// (openai-responses-api-spec.md §LocalShellCallOutput L224-226):
+    /// `{ id, output, type, status }`. `output` is a single string
+    /// carrying the command's serialized JSON output; `status` is
+    /// optional per SDK v2.8.1 (`openai==2.8.1`,
+    /// `types/responses/response_input_item_param.py`
+    /// `LocalShellCallOutput` — `Optional` on `status`).
+    #[serde(rename = "local_shell_call_output")]
+    LocalShellCallOutput {
+        id: String,
+        output: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<LocalShellCallStatus>,
+    },
+    /// `type: "mcp_call"` — assistant-emitted hosted-MCP tool call replayed
+    /// as an input item for stateless multi-turn (`store=false`) flows.
+    ///
+    /// Spec (openai-responses-api-spec.md §McpCall L264-266):
+    /// `{ id, arguments, name, server_label, type, approval_request_id?, error?, output?, status? }`.
+    /// Shape mirrors [`ResponseOutputItem::McpCall`] but `approval_request_id`,
+    /// `error`, `output`, and `status` are optional on the input side so
+    /// replay of an abridged or in-flight call (no output yet) stays
+    /// lossless.
+    #[serde(rename = "mcp_call")]
+    McpCall {
+        id: String,
+        arguments: String,
+        name: String,
+        server_label: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        approval_request_id: Option<String>,
+        #[serde(
+            default,
+            deserialize_with = "mcp_call_error_compat",
+            skip_serializing_if = "Option::is_none"
+        )]
+        error: Option<McpToolCallError>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+    },
+    /// `type: "mcp_list_tools"` — hosted-MCP server's tool listing replayed
+    /// as an input item.
+    ///
+    /// Spec (openai-responses-api-spec.md §McpListTools L253-255):
+    /// `{ id, server_label, tools, type, error? }` where each `tools` entry
+    /// is `{ input_schema, name, annotations?, description? }`. Shape
+    /// mirrors [`ResponseOutputItem::McpListTools`] with `error` optional
+    /// per SDK v2.8.1
+    /// `types/responses/response_input_item.py::McpListTools`.
+    #[serde(rename = "mcp_list_tools")]
+    McpListTools {
+        id: String,
+        server_label: String,
+        tools: Vec<McpToolInfo>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// `type: "additional_tools"` — inline tool declarations injected at a
+    /// specific point in the conversation `input` (OpenAI Responses API /
+    /// Codex Responses Lite).
+    #[serde(rename = "additional_tools")]
+    AdditionalTools {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<String>,
+        tools: Vec<ResponseTool>,
+    },
+    /// `type: "agent_message"` — inter-agent message emitted by Codex native
+    /// multi-agent (`spawn_agent` / `send_message`) to deliver a parent task
+    /// or peer message to a sub-agent.
+    #[serde(rename = "agent_message")]
+    AgentMessage {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        author: String,
+        recipient: String,
+        content: Vec<AgentMessageContentPart>,
+        /// Codex stamps agent mail with creation time and content attribution.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        internal_chat_message_metadata_passthrough: Option<serde_json::Map<String, Value>>,
+    },
+    #[serde(untagged)]
+    SimpleInputMessage {
+        content: StringOrContentParts,
+        role: String,
+        /// Spec: `EasyInputMessage.type` is `optional "message"`. Constrained
+        /// to a single-value tag enum so payloads with an unknown `type`
+        /// (e.g. `"input_file"`, `"totally_made_up"`) do not silently land
+        /// in this untagged catch-all variant — P5 fail-fast contract.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(rename = "type")]
+        r#type: Option<SimpleInputMessageTypeTag>,
+        /// Optional phase label (spec: EasyInputMessage.phase).
+        ///
+        /// Preserved through conversation storage so gpt-5.3-codex+ does not
+        /// lose the commentary/final_answer distinction across turns.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        phase: Option<MessagePhase>,
+    },
+    /// `type: "item_reference"` — pointer to a previously-stored item in the
+    /// active conversation. Spec (openai-responses-api-spec.md §InputItemList
+    /// L275-276): `ItemReference { id, type }` where `type` is
+    /// `optional "item_reference"`. The variant is declared as
+    /// `#[serde(untagged)]` because the `type` discriminator is optional on
+    /// the wire; `r#type` is pinned to [`ItemReferenceTypeTag`] so payloads
+    /// whose `type` is not `"item_reference"` (e.g. `"totally_made_up"`) do
+    /// not silently land in this catch-all variant — P5 fail-fast contract.
+    ///
+    /// Declared AFTER [`Self::SimpleInputMessage`] so a `{id, role, content}`
+    /// payload (the id-carrying shape of `SimpleInputMessage`) still lands in
+    /// `SimpleInputMessage` first; only `{id}` / `{id, type: "item_reference"}`
+    /// payloads — which fail `SimpleInputMessage`'s required-field check —
+    /// fall through to this arm.
+    ///
+    /// Backend resolution (router looks up `id` from conversation history and
+    /// substitutes the referenced item inline) is deferred to a future R
+    /// task; this variant only adds the schema surface.
+    #[serde(untagged)]
+    ItemReference {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(rename = "type")]
+        r#type: Option<ItemReferenceTypeTag>,
+    },
+}
+
+/// One `input` item read by its shape. The derived reader of
+/// [`ResponseInputOutputItem`] (the `type` tag, with the two shapes sent
+/// without one as its fallbacks) reports a refusal inside a message sent
+/// without a tag, the shape every client sends, as "data did not match any
+/// variant of untagged enum ResponseInputOutputItem", naming no part and no
+/// field, and the same for a `message` sent without an `id`, which fails
+/// its tagged variant and lands in the same fallback. Both are read field
+/// by field instead, so the refusal names the field (`content[1].detail:
+/// unknown variant ...`); every other item is read in place by the reader
+/// of the tagged shapes alone ([`TaggedItem`]) when its `type` names one,
+/// and by the derived reader otherwise or when that shape refuses it, its
+/// refusal traced to the part it is about when the item carries parts, or
+/// to the item's own field (see [`typed_item_refusal`]).
+struct InputItem(ResponseInputOutputItem);
+
+impl<'de> Deserialize<'de> for InputItem {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let fields = ItemFields::deserialize(deserializer)?;
+        let has = |name: &str| fields.get(name).is_some();
+        let item_type = fields.get("type");
+        let kind = item_type.and_then(Value::as_str);
+        // A message without a `type` carries a role and a content, or one
+        // of them and no `id`: an `{id, content}` or `{id, role}` stays the
+        // item reference the derived reader reads it as. A `message` with an
+        // `id` and a string `content` is the untagged shape too (the derived
+        // reader drops the `id`), read field by field so its refusal names
+        // the field and not the `content` the shape takes.
+        let by_field = if has("type") {
+            kind == Some("message")
+                && (!has("id") || fields.get("content").is_some_and(Value::is_string))
+        } else {
+            (has("role") && has("content")) || (!has("id") && (has("role") || has("content")))
+        };
+        let tag = (kind == Some("message")).then_some(SimpleInputMessageTypeTag::Message);
+        let item = if by_field {
+            simple_input_message(fields, tag)
+        } else {
+            // An item reference carries a `type` and has no tagged shape.
+            let in_place = item_type
+                .filter(|_| kind.is_some_and(|kind| kind != "item_reference"))
+                .and_then(|item_type| {
+                    let entries = fields.0.iter().map(|(name, value)| (name.as_str(), value));
+                    tagged_item(
+                        item_type,
+                        MapDeserializer::<_, serde_json::Error>::new(entries),
+                    )
+                    .ok()
+                });
+            match in_place {
+                Some(item) => Ok(item),
+                None => {
+                    let item = Value::Object(fields.0.into_iter().collect());
+                    ResponseInputOutputItem::deserialize(&item)
+                        .map_err(|error| typed_item_refusal(&item, error))
+                }
+            }
+        };
+        item.map(InputItem).map_err(serde::de::Error::custom)
+    }
+}
+
+/// An item's fields, read one entry at a time so a repeated key is refused
+/// with serde's own words (`duplicate field `role``), as the derived readers
+/// refuse it, instead of the last value winning; each value is read by the
+/// crate's strict value reader, so a key repeated at any depth below the
+/// item's own is refused the same way. That is the derived readers' answer
+/// for a key a typed struct reads; a key it does not know, and a free-form
+/// value or a map inside an item (a shell call's `env`, an MCP tool's
+/// `input_schema`), is refused too, where a derived read passes over the
+/// key or keeps the last value: one rule for the whole item, since the
+/// buffer cannot tell these places apart. The place is the deserializer's
+/// to name, as it is for the derived readers (the door's path tracker
+/// records the nested read: `input[0].content[0]: duplicate field `text``).
+/// The item's own fields stay in arrival order: an item has a handful of
+/// keys, and a walk over them finds one for less than a hashed map spends
+/// on it.
+struct ItemFields(Vec<(String, Value)>);
+
+impl ItemFields {
+    fn get(&self, name: &str) -> Option<&Value> {
+        self.0
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value)
+    }
+
+    fn take(&mut self, name: &str) -> Option<Value> {
+        let at = self.0.iter().position(|(key, _)| key == name)?;
+        Some(self.0.swap_remove(at).1)
+    }
+}
+
+impl<'de> Deserialize<'de> for ItemFields {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct FieldsVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for FieldsVisitor {
+            type Value = ItemFields;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("an input item")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut entries: A,
+            ) -> Result<Self::Value, A::Error> {
+                crate::strict_value::strict_fields(&mut entries).map(ItemFields)
+            }
+        }
+
+        deserializer.deserialize_map(FieldsVisitor)
+    }
+}
+
+/// A message read field by field (see [`InputItem`]): the fields of
+/// [`ResponseInputOutputItem::SimpleInputMessage`] one by one so a refusal
+/// names its field, the content parts each from the buffered value so a
+/// part's refusal names its field too (see [`content_part_refusal`]).
+fn simple_input_message(
+    mut fields: ItemFields,
+    r#type: Option<SimpleInputMessageTypeTag>,
+) -> Result<ResponseInputOutputItem, String> {
+    let role = required_field(&mut fields, "role")?;
+    let content = match fields.take("content") {
+        Some(Value::String(text)) => StringOrContentParts::String(text),
+        Some(Value::Array(parts)) => StringOrContentParts::Array(content_parts("content", &parts)?),
+        Some(other) => {
+            let expected: &dyn serde::de::Expected = &"a string or an array of content parts";
+            let error =
+                <serde_json::Error as serde::de::Error>::invalid_type(unexpected(&other), expected);
+            return Err(format!("content: {error}"));
+        }
+        None => return Err("missing field `content`".to_string()),
+    };
+    let phase = optional_field(&mut fields, "phase")?;
+    Ok(ResponseInputOutputItem::SimpleInputMessage {
+        content,
+        role,
+        r#type,
+        phase,
+    })
+}
+
+/// The parts under `field`, each from its buffered value so a refusal names
+/// the part and its field.
+fn content_parts(field: &str, parts: &[Value]) -> Result<Vec<ResponseContentPart>, String> {
+    parts
+        .iter()
+        .enumerate()
+        .map(|(index, part)| {
+            ResponseContentPart::deserialize(part)
+                .map_err(|error| content_part_refusal(field, index, part, &error))
+        })
+        .collect()
+}
+
+/// The parts under `field` of an `agent_message`, each from its buffered value
+/// so a refusal names the part and its field.
+fn agent_message_content_parts(
+    field: &str,
+    parts: &[Value],
+) -> Result<Vec<AgentMessageContentPart>, String> {
+    parts
+        .iter()
+        .enumerate()
+        .map(|(index, part)| {
+            AgentMessageContentPart::deserialize(part).map_err(|error| {
+                let reason = error.to_string();
+                let located = part.as_object().and_then(|fields| {
+                    refused_field(fields, &reason, |entries| {
+                        AgentMessageContentPart::deserialize(
+                            MapDeserializer::<_, serde_json::Error>::new(entries.iter().copied()),
+                        )
+                        .err()
+                        .map(|error| error.to_string())
+                    })
+                });
+                match located {
+                    Some(name) => format!("{field}[{index}].{name}: {reason}"),
+                    None => format!("{field}[{index}]: {reason}"),
+                }
+            })
+        })
+        .collect()
+}
+
+/// A typed item's refusal from the derived reader, named. When the item
+/// carries content parts (a `message`'s `content`, a `function_call_output`'s
+/// `output`, an `agent_message`'s `content`) and serde refuses one on its own,
+/// that part's refusal. An
+/// `item_reference`, the untagged shape with a `type` of its own, is refused
+/// for its `id` alone, named by the field reader. Otherwise the words of the
+/// tagged shapes alone (see [`TaggedItem`]): the derived reader's fallback to
+/// the untagged shapes drops them, so a `function_call` without its `call_id`
+/// was "data did not match any variant of untagged enum
+/// ResponseInputOutputItem" to it; they stand at the field they are about
+/// (see [`refused_field`]). The derived reader's own words for an item
+/// without a `type`, and for one the tagged shapes read.
+fn typed_item_refusal(item: &Value, derived: serde_json::Error) -> String {
+    let kind = item.get("type").and_then(Value::as_str);
+    let refused_part = match kind {
+        Some("message") => item
+            .get("content")
+            .and_then(Value::as_array)
+            .and_then(|parts| content_parts("content", parts).err()),
+        Some("function_call_output") => item
+            .get("output")
+            .and_then(Value::as_array)
+            .and_then(|parts| content_parts("output", parts).err()),
+        Some("agent_message") => item
+            .get("content")
+            .and_then(Value::as_array)
+            .and_then(|parts| agent_message_content_parts("content", parts).err()),
+        _ => None,
+    };
+    if let Some(refusal) = refused_part {
+        return refusal;
+    }
+    let (Some(fields), Some(tag)) = (item.as_object(), item.get("type")) else {
+        return derived.to_string();
+    };
+    if kind == Some("item_reference") {
+        let mut fields = ItemFields(fields.clone().into_iter().collect());
+        return required_field::<String>(&mut fields, "id")
+            .err()
+            .unwrap_or_else(|| derived.to_string());
+    }
+    let Err(error) = tagged_item(tag, item) else {
+        return derived.to_string();
+    };
+    let reason = error.to_string();
+    let field = refused_field(fields, &reason, |entries| {
+        tagged_item(
+            tag,
+            MapDeserializer::<_, serde_json::Error>::new(entries.iter().copied()),
+        )
+        .err()
+        .map(|error| error.to_string())
+    });
+    match field {
+        Some(field) => format!("{field}: {reason}"),
+        None => reason,
+    }
+}
+
+/// A typed item read through [`TaggedItem`]: the variant from `tag`, the
+/// item's `type`; the variant's fields from `fields`, the item's entries
+/// where they stand, the `type` entry among them passed over like any key
+/// the variant does not know. Nothing is buffered.
+fn tagged_item<'de, F>(
+    tag: &'de Value,
+    fields: F,
+) -> Result<ResponseInputOutputItem, serde_json::Error>
+where
+    F: serde::de::IntoDeserializer<'de, serde_json::Error>,
+{
+    TaggedItem::deserialize(MapAccessDeserializer::new(MapDeserializer::new(
+        std::iter::once((tag, fields)),
+    )))
+}
+
+/// The tagged shapes of [`ResponseInputOutputItem`] on their own, keyed by
+/// variant name and read by [`tagged_item`], which is what the public
+/// reader's tag reads, with no buffered copy of the item. The request
+/// reader reads a typed item through it (see [`InputItem`]). So does the
+/// error path (see [`typed_item_refusal`]): the public reader falls back
+/// to its two untagged shapes (a message sent without a tag, an item
+/// reference) and reports their fallthrough text when a tagged variant
+/// refuses an item, so a typed item it refused is read again here, where the
+/// words name the reason (``missing field `call_id` ``). The derive
+/// constructs the public type, so a field added to, removed from or retyped
+/// in a tagged variant of the public enum fails the build until it is
+/// mirrored here; a field's serde attribute (a default, a custom reader) is
+/// repeated by hand, and the test feeding every variant's smallest payload
+/// to both readers tells one that is not. Nothing constructs this enum.
+#[derive(Deserialize)]
+#[serde(remote = "ResponseInputOutputItem", rename_all = "snake_case")]
+enum TaggedItem {
+    #[serde(rename = "message")]
+    Message {
+        id: String,
+        role: String,
+        content: Vec<ResponseContentPart>,
+        status: Option<String>,
+        #[serde(default)]
+        phase: Option<MessagePhase>,
+    },
+    #[serde(rename = "reasoning")]
+    Reasoning {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
+        summary: Vec<SummaryTextContent>,
+        #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
+        content: Vec<ResponseReasoningContent>,
+        #[serde(default)]
+        encrypted_content: Option<String>,
+        status: Option<String>,
+    },
+    #[serde(rename = "function_call")]
+    FunctionToolCall {
+        #[serde(default)]
+        id: Option<String>,
+        call_id: String,
+        name: String,
+        #[serde(default)]
+        namespace: Option<String>,
+        arguments: String,
+        output: Option<String>,
+        status: Option<String>,
+    },
+    #[serde(rename = "function_call_output")]
+    FunctionCallOutput {
+        #[serde(default)]
+        id: Option<String>,
+        call_id: String,
+        output: StringOrContentParts,
+        status: Option<String>,
+    },
+    #[serde(rename = "mcp_approval_request")]
+    McpApprovalRequest {
+        id: String,
+        server_label: String,
+        name: String,
+        arguments: String,
+    },
+    #[serde(rename = "mcp_approval_response")]
+    McpApprovalResponse {
+        id: Option<String>,
+        approval_request_id: String,
+        approve: bool,
+        reason: Option<String>,
+    },
+    #[serde(rename = "image_generation_call")]
+    ImageGenerationCall {
+        id: String,
+        #[serde(default)]
+        action: Option<String>,
+        #[serde(default)]
+        background: Option<String>,
+        #[serde(default)]
+        output_format: Option<String>,
+        #[serde(default)]
+        quality: Option<String>,
+        #[serde(default)]
+        result: Option<String>,
+        #[serde(default)]
+        revised_prompt: Option<String>,
+        #[serde(default)]
+        size: Option<String>,
+        #[serde(default)]
+        status: Option<ImageGenerationCallStatus>,
+    },
+    #[serde(rename = "compaction")]
+    Compaction {
+        encrypted_content: String,
+        #[serde(default)]
+        id: Option<String>,
+    },
+    #[serde(rename = "computer_call")]
+    ComputerCall {
+        id: String,
+        call_id: String,
+        #[serde(default)]
+        action: Option<ComputerAction>,
+        #[serde(default)]
+        actions: Option<Vec<ComputerAction>>,
+        status: ComputerCallStatus,
+        #[serde(default)]
+        pending_safety_checks: Vec<ComputerSafetyCheck>,
+    },
+    #[serde(rename = "computer_call_output")]
+    ComputerCallOutput {
+        #[serde(default)]
+        id: Option<String>,
+        call_id: String,
+        output: ComputerCallOutputContent,
+        #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
+        acknowledged_safety_checks: Vec<ComputerSafetyCheck>,
+        #[serde(default)]
+        status: Option<ComputerCallStatus>,
+    },
+    #[serde(rename = "custom_tool_call")]
+    CustomToolCall {
+        call_id: String,
+        input: String,
+        name: String,
+        id: Option<String>,
+        namespace: Option<String>,
+    },
+    #[serde(rename = "custom_tool_call_output")]
+    CustomToolCallOutput {
+        call_id: String,
+        output: CustomToolCallOutputContent,
+        id: Option<String>,
+    },
+    #[serde(rename = "shell_call")]
+    ShellCall {
+        action: ShellCallAction,
+        call_id: String,
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        environment: Option<ShellCallEnvironment>,
+        #[serde(default)]
+        status: Option<ShellCallStatus>,
+        #[serde(default)]
+        created_by: Option<String>,
+    },
+    #[serde(rename = "shell_call_output")]
+    ShellCallOutput {
+        call_id: String,
+        output: Vec<ShellOutputChunk>,
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        max_output_length: Option<u64>,
+        #[serde(default)]
+        status: Option<ShellCallStatus>,
+        #[serde(default)]
+        created_by: Option<String>,
+    },
+    #[serde(rename = "apply_patch_call")]
+    ApplyPatchCall {
+        call_id: String,
+        operation: ApplyPatchOperation,
+        status: ApplyPatchCallStatus,
+        id: Option<String>,
+    },
+    #[serde(rename = "apply_patch_call_output")]
+    ApplyPatchCallOutput {
+        call_id: String,
+        status: ApplyPatchCallOutputStatus,
+        id: Option<String>,
+        output: Option<String>,
+    },
+    #[serde(rename = "local_shell_call")]
+    LocalShellCall {
+        id: String,
+        call_id: String,
+        action: LocalShellExec,
+        status: LocalShellCallStatus,
+    },
+    #[serde(rename = "local_shell_call_output")]
+    LocalShellCallOutput {
+        id: String,
+        output: String,
+        #[serde(default)]
+        status: Option<LocalShellCallStatus>,
+    },
+    #[serde(rename = "mcp_call")]
+    McpCall {
+        id: String,
+        arguments: String,
+        name: String,
+        server_label: String,
+        #[serde(default)]
+        approval_request_id: Option<String>,
+        #[serde(default, deserialize_with = "mcp_call_error_compat")]
+        error: Option<McpToolCallError>,
+        #[serde(default)]
+        output: Option<String>,
+        #[serde(default)]
+        status: Option<String>,
+    },
+    #[serde(rename = "mcp_list_tools")]
+    McpListTools {
+        id: String,
+        server_label: String,
+        tools: Vec<McpToolInfo>,
+        #[serde(default)]
+        error: Option<String>,
+    },
+    #[serde(rename = "additional_tools")]
+    AdditionalTools {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        role: Option<String>,
+        tools: Vec<ResponseTool>,
+    },
+    #[serde(rename = "agent_message")]
+    AgentMessage {
+        #[serde(default)]
+        id: Option<String>,
+        author: String,
+        recipient: String,
+        content: Vec<AgentMessageContentPart>,
+        #[serde(default)]
+        internal_chat_message_metadata_passthrough: Option<serde_json::Map<String, Value>>,
+    },
+}
+
+/// A part's refusal, naming the part (`content[1]`) and, when one is, the
+/// field it is about (see [`refused_field`]).
+fn content_part_refusal(
+    field: &str,
+    index: usize,
+    part: &Value,
+    error: &serde_json::Error,
+) -> String {
+    let reason = error.to_string();
+    let located = part.as_object().and_then(|fields| {
+        refused_field(fields, &reason, |entries| {
+            ResponseContentPart::deserialize(MapDeserializer::<_, serde_json::Error>::new(
+                entries.iter().copied(),
+            ))
+            .err()
+            .map(|error| error.to_string())
+        })
+    });
+    match located {
+        Some(name) => format!("{field}[{index}].{name}: {reason}"),
+        None => format!("{field}[{index}]: {reason}"),
+    }
+}
+
+/// The field of a tagged object (a content part, a typed item) a refusal is
+/// about, `read` giving its reader's words for a probe, a list of entries
+/// (none when it reads them): `type` when the kind itself is refused;
+/// otherwise the first field whose value alone, beside the kind, draws the
+/// same words (serde names the value and the rule, not the field, inside a
+/// tagged object), and inside an array value the element that does
+/// (`annotations[0]`), unless an empty array draws them too: the field
+/// takes no array, and the refusal is its own whatever the array holds
+/// (`arguments`); nothing for a field the object itself misses, which
+/// serde's words name (the extractor appends it). A missed field is told own
+/// from nested by one probe of the whole object with a trailing duplicate of
+/// each of its keys: serde refuses a duplicate known field at the end of its
+/// walk, before it checks the object's own fields, so the same words from
+/// that probe came from inside a value, and other words mean the object's
+/// own field. Every field probe carries the same duplicate, so no probe can
+/// draw the object's own missing field; a key the reader does not know (the
+/// key and its duplicate ignored alike) is told by probing it with an
+/// object: a known field refuses it, or takes it (`logprobs`) and refuses
+/// the duplicate, so only an unknown key draws the kind's words alone.
+/// Every probe is one field or one element beside the kind, so the
+/// search costs the object's size, not its square.
+fn refused_field(
+    fields: &serde_json::Map<String, Value>,
+    reason: &str,
+    read: impl Fn(&[(&str, &Value)]) -> Option<String>,
+) -> Option<String> {
+    fn with<'a>(
+        kind: &[(&'a str, &'a Value)],
+        name: &'a str,
+        value: &'a Value,
+        null: &'a Value,
+    ) -> Vec<(&'a str, &'a Value)> {
+        let mut probe = kind.to_vec();
+        probe.push((name, value));
+        probe.push((name, null));
+        probe
+    }
+    let null = Value::Null;
+    let empty = Value::Object(serde_json::Map::new());
+    let no_elements = Value::Array(Vec::new());
+    let refused = |entries: &[(&str, &Value)]| read(entries).as_deref() == Some(reason);
+    let kind: Vec<(&str, &Value)> = fields
+        .get("type")
+        .map(|kind| ("type", kind))
+        .into_iter()
+        .collect();
+    let others = || fields.iter().filter(|(name, _)| name.as_str() != "type");
+    let missing = reason.starts_with("missing field `");
+    if missing {
+        let mut probe = kind.clone();
+        probe.extend(others().map(|(name, value)| (name.as_str(), value)));
+        probe.extend(others().map(|(name, _)| (name.as_str(), &null)));
+        if !refused(&probe) {
+            return None;
+        }
+    } else if !kind.is_empty() && refused(&kind) {
+        return Some("type".to_string());
+    }
+    let kind_alone = read(&kind);
+    for (name, value) in others() {
+        let name = name.as_str();
+        if missing && read(&with(&kind, name, &empty, &null)) == kind_alone {
+            continue;
+        }
+        if !refused(&with(&kind, name, value, &null)) {
+            continue;
+        }
+        let Some(elements) = value.as_array() else {
+            return Some(name.to_string());
+        };
+        if refused(&with(&kind, name, &no_elements, &null)) {
+            return Some(name.to_string());
+        }
+        let element = elements.iter().position(|element| {
+            let one = Value::Array(vec![element.clone()]);
+            refused(&with(&kind, name, &one, &null))
+        });
+        return Some(match element {
+            Some(position) => format!("{name}[{position}]"),
+            None => name.to_string(),
+        });
+    }
+    None
+}
+
+/// `fields[name]` as a `T`, the refusal naming the field; serde's words for
+/// a missing one.
+fn required_field<T: serde::de::DeserializeOwned>(
+    fields: &mut ItemFields,
+    name: &str,
+) -> Result<T, String> {
+    match fields.take(name) {
+        Some(value) => serde_json::from_value(value).map_err(|error| format!("{name}: {error}")),
+        None => Err(format!("missing field `{name}`")),
+    }
+}
+
+/// `fields[name]` as a `T` when present and not null, the refusal naming
+/// the field.
+fn optional_field<T: serde::de::DeserializeOwned>(
+    fields: &mut ItemFields,
+    name: &str,
+) -> Result<Option<T>, String> {
+    match fields.take(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => serde_json::from_value(value)
+            .map(Some)
+            .map_err(|error| format!("{name}: {error}")),
+    }
+}
+
+/// The value as serde describes a refused one (`integer `7``, `map`, ...).
+fn unexpected(value: &Value) -> serde::de::Unexpected<'_> {
+    match value {
+        Value::Null => serde::de::Unexpected::Unit,
+        Value::Bool(flag) => serde::de::Unexpected::Bool(*flag),
+        Value::Number(number) => number
+            .as_u64()
+            .map(serde::de::Unexpected::Unsigned)
+            .or_else(|| number.as_i64().map(serde::de::Unexpected::Signed))
+            .or_else(|| number.as_f64().map(serde::de::Unexpected::Float))
+            .unwrap_or(serde::de::Unexpected::Other("a number")),
+        Value::String(text) => serde::de::Unexpected::Str(text),
+        Value::Array(_) => serde::de::Unexpected::Seq,
+        Value::Object(_) => serde::de::Unexpected::Map,
+    }
+}
+
+/// Single-value tag enum pinning [`ResponseInputOutputItem::ItemReference`]'s
+/// optional `type` discriminator to the spec's only permitted value,
+/// `"item_reference"`. Used because the outer enum is `type`-tagged and the
+/// `ItemReference` variant is declared `#[serde(untagged)]` to accept payloads
+/// that omit `type` entirely — without this pin the catch-all would silently
+/// swallow payloads whose `type` discriminator is an unknown string.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ItemReferenceTypeTag {
+    ItemReference,
+}
+
+/// Single-value tag enum pinning `EasyInputMessage.type` to the spec's only
+/// permitted value, `"message"`. Used to keep [`ResponseInputOutputItem::SimpleInputMessage`]
+/// — which is the `#[serde(untagged)]` fallback in the outer `type`-tagged enum
+/// — from silently swallowing payloads whose `type` discriminator is unknown
+/// (P5 fail-fast contract).
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SimpleInputMessageTypeTag {
+    Message,
+}
+
+/// Detail level for [`ResponseContentPart::InputFile`] (`FileInputDetail`
+/// in the spec): `auto`, the public API's default, lets the system choose;
+/// `low` and `high` pick a level. It is narrower than [`Detail`], used for
+/// images, which also admits `original`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FileDetail {
+    #[default]
+    Auto,
+    Low,
+    High,
+}
+
+/// Typed annotation attached to [`ResponseContentPart::OutputText`]. Matches
+/// the OpenAI Responses API `Annotation` union; a `type` discriminator selects
+/// the variant on the wire.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Annotation {
+    /// `type: "file_citation"` — points at a file previously uploaded.
+    FileCitation {
+        file_id: String,
+        filename: String,
+        index: u32,
+    },
+    /// `type: "url_citation"` — citation back to a URL in a web-search result.
+    UrlCitation {
+        url: String,
+        title: String,
+        start_index: u32,
+        end_index: u32,
+    },
+    /// `type: "container_file_citation"` — citation to a file inside a
+    /// code-interpreter / computer-use container.
+    ContainerFileCitation {
+        container_id: String,
+        file_id: String,
+        filename: String,
+        start_index: u32,
+        end_index: u32,
+    },
+    /// `type: "file_path"` — reference to a generated file path.
+    FilePath { file_id: String, index: u32 },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type")]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseContentPart {
+    #[serde(rename = "output_text")]
+    OutputText {
+        text: String,
+        #[serde(default)]
+        annotations: Vec<Annotation>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        logprobs: Option<ChatLogProbs>,
+    },
+    #[serde(rename = "input_text")]
+    InputText { text: String },
+    /// `type: "input_image"` — reference to an image supplied by the client.
+    /// Exactly one of `file_id` / `image_url` is typically set; both may be
+    /// absent when only `detail` is being conveyed.
+    #[serde(rename = "input_image")]
+    InputImage {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<Detail>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        image_url: Option<String>,
+    },
+    /// `type: "input_file"` — reference to an attached file. `file_data` is a
+    /// base64 blob; `file_url` / `file_id` reference external/uploaded files.
+    #[serde(rename = "input_file")]
+    InputFile {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<FileDetail>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_data: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_url: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        filename: Option<String>,
+    },
+    /// `type: "refusal"` — model refusal surfaced as a content part (spec's
+    /// `ResponseOutputRefusal`).
+    #[serde(rename = "refusal")]
+    Refusal { refusal: String },
+}
+
+impl ResponseContentPart {
+    /// The text a part carries toward the prompt: an input or output text
+    /// part's text; none for an image, a file or a refusal.
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            Self::OutputText { text, .. } | Self::InputText { text } => Some(text),
+            Self::InputImage { .. } | Self::InputFile { .. } | Self::Refusal { .. } => None,
+        }
+    }
+
+    /// The wire-format type name (e.g. `"input_image"`), for a refusal that
+    /// names the part.
+    const fn type_name(&self) -> &'static str {
+        match self {
+            Self::OutputText { .. } => "output_text",
+            Self::InputText { .. } => "input_text",
+            Self::InputImage { .. } => "input_image",
+            Self::InputFile { .. } => "input_file",
+            Self::Refusal { .. } => "refusal",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type")]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseReasoningContent {
+    #[serde(rename = "reasoning_text")]
+    ReasoningText { text: String },
+}
+
+/// Tagged content element carried in `Reasoning.summary`.
+///
+/// OpenAI spec: `summary: array of SummaryTextContent { text, type: "summary_text" }`.
+/// Replaces the prior `Vec<String>` wire-type that broke bidirectional
+/// interoperability with spec-compliant clients.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type")]
+#[serde(rename_all = "snake_case")]
+pub enum SummaryTextContent {
+    #[serde(rename = "summary_text")]
+    SummaryText { text: String },
+}
+
+/// MCP Tool information for the mcp_list_tools output item
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct McpToolInfo {
+    pub name: String,
+    pub description: Option<String>,
+    pub input_schema: Value,
+    pub annotations: Option<Value>,
+}
+
+/// Structured `mcp_call.error`: a `type`-tagged union of protocol,
+/// tool-execution, and HTTP failures. OpenAI removed the legacy plain-string
+/// shape from the wire; stored/replayed string errors still deserialize via
+/// `mcp_call_error_compat`.
+#[expect(
+    clippy::enum_variant_names,
+    reason = "variant names mirror the spec's `*_error` tag set"
+)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type")]
+pub enum McpToolCallError {
+    #[serde(rename = "mcp_protocol_error")]
+    ProtocolError { code: i64, message: String },
+    #[serde(rename = "mcp_tool_execution_error")]
+    ToolExecutionError { content: Value },
+    #[serde(rename = "http_error")]
+    HttpError { code: i64, message: String },
+}
+
+impl McpToolCallError {
+    /// Wrap a bare failure message in the tool-execution variant.
+    pub fn execution(message: impl Into<String>) -> Self {
+        Self::ToolExecutionError {
+            content: Value::String(message.into()),
+        }
+    }
+}
+
+/// Accept both the structured union and the legacy plain-string error shape.
+fn mcp_call_error_compat<'de, D>(deserializer: D) -> Result<Option<McpToolCallError>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Compat {
+        Structured(McpToolCallError),
+        Legacy(String),
+    }
+    Ok(
+        Option::<Compat>::deserialize(deserializer)?.map(|error| match error {
+            Compat::Structured(error) => error,
+            Compat::Legacy(message) => McpToolCallError::execution(message),
+        }),
+    )
+}
+
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type")]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseOutputItem {
+    #[serde(rename = "message")]
+    Message {
+        id: String,
+        role: String,
+        content: Vec<ResponseContentPart>,
+        status: String,
+        /// Optional phase label (spec: ResponseOutputMessage.phase).
+        ///
+        /// Labels assistant messages; for gpt-5.3-codex+ we must preserve and
+        /// resend this on subsequent turns to avoid perf degradation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        phase: Option<MessagePhase>,
+    },
+    #[serde(rename = "reasoning")]
+    #[non_exhaustive]
+    Reasoning {
+        id: String,
+        #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
+        summary: Vec<SummaryTextContent>,
+        /// The reasoning text. The public API does not require the key and
+        /// often leaves it out (or writes `null`), so an item written without
+        /// it reads as having none.
+        #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
+        content: Vec<ResponseReasoningContent>,
+        /// Encrypted reasoning payload for gpt-5 / o-series round-trip.
+        /// Opaque to SMG; preserved verbatim.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
+        encrypted_content: Option<String>,
+        status: Option<String>,
+    },
+    #[serde(rename = "function_call")]
+    FunctionToolCall {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        call_id: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
+        arguments: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
+        status: String,
+    },
+    /// `type: "custom_tool_call"` — the model's invocation of a user-declared
+    /// custom tool. Same wire shape as the [`ResponseInputOutputItem`] variant
+    /// so emitted items replay losslessly.
+    #[serde(rename = "custom_tool_call")]
+    CustomToolCall {
+        call_id: String,
+        input: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
+    },
+    #[serde(rename = "mcp_list_tools")]
+    McpListTools {
+        id: String,
+        server_label: String,
+        tools: Vec<McpToolInfo>,
+        /// Spec (openai-responses-api-spec.md §McpListTools L253-255):
+        /// `error?: string`. Preserves the failure message when the MCP
+        /// server could not list tools; symmetric with the matching field
+        /// on `ResponseInputOutputItem::McpListTools` so emit↔replay is
+        /// lossless.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    #[serde(rename = "mcp_call")]
+    McpCall {
+        id: String,
+        status: String,
+        approval_request_id: Option<String>,
+        arguments: String,
+        #[serde(default, deserialize_with = "mcp_call_error_compat")]
+        error: Option<McpToolCallError>,
+        name: String,
+        output: String,
+        server_label: String,
+    },
+    #[serde(rename = "mcp_approval_request")]
+    McpApprovalRequest {
+        id: String,
+        server_label: String,
+        name: String,
+        arguments: String,
+    },
+    #[serde(rename = "web_search_call")]
+    WebSearchCall {
+        id: String,
+        status: WebSearchCallStatus,
+        action: WebSearchAction,
+        /// Search hits surfaced when callers request `web_search_call.results`
+        /// via the top-level `include[]` array. Mirrors the `file_search_call.results`
+        /// shape — array of typed entries when populated, omitted otherwise so the
+        /// default wire shape (`{id, action, status, type}`) stays spec-byte-identical.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        results: Option<Vec<WebSearchResult>>,
+    },
+    #[serde(rename = "code_interpreter_call")]
+    CodeInterpreterCall {
+        id: String,
+        status: CodeInterpreterCallStatus,
+        container_id: String,
+        code: Option<String>,
+        outputs: Option<Vec<CodeInterpreterOutput>>,
+    },
+    #[serde(rename = "file_search_call")]
+    FileSearchCall {
+        id: String,
+        status: FileSearchCallStatus,
+        queries: Vec<String>,
+        results: Option<Vec<FileSearchResult>>,
+    },
+    /// `type: "image_generation_call"` — output item carrying a base64 image
+    /// produced by the `image_generation` built-in tool. Spec:
+    /// `{ id, action?, background?, output_format?, quality?, result: base64,
+    /// revised_prompt?, size?, status, type }`.
+    ///
+    /// Real OpenAI production responses include the five metadata fields
+    /// (`action`, `background`, `output_format`, `quality`, `size`) even
+    /// though the OpenAI Rust SDK v2.8.1 omits them. We carry them as
+    /// `Option<String>` so cloud passthrough and persistence round-trips
+    /// preserve them verbatim — and so downstream consumers can read them
+    /// without a second round-trip to the provider.
+    ///
+    /// The metadata fields are typed as `Option<String>` rather than narrow
+    /// enums so unknown or future-added values pass through unchanged;
+    /// this mirrors `ImageGenerationTool` on the input-tool side.
+    #[serde(rename = "image_generation_call")]
+    ImageGenerationCall {
+        id: String,
+        /// `"generate" | "edit" | "auto"` — which image-generation action
+        /// this call dispatched. Preserved free-form so future actions pass
+        /// through without a wire break.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        action: Option<String>,
+        /// `"transparent" | "opaque" | "auto"`. Mirrors the
+        /// `image_generation` tool input knob of the same name.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        background: Option<String>,
+        /// `"png" | "webp" | "jpeg"`. Mirrors the `image_generation` tool
+        /// input knob of the same name.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_format: Option<String>,
+        /// `"auto" | "low" | "medium" | "high" | "standard" | "hd"`. Mirrors
+        /// the `image_generation` tool input knob of the same name.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quality: Option<String>,
+        /// Base64-encoded image bytes.
+        result: String,
+        /// Prompt text the mainline model rewrote before dispatching the
+        /// image-generation call. Preserved so downstream turns/storage do
+        /// not drop it on replay.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        revised_prompt: Option<String>,
+        /// `"auto" | "1024x1024" | "1024x1536" | "1536x1024"`. Mirrors the
+        /// `image_generation` tool input knob of the same name.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        size: Option<String>,
+        status: ImageGenerationCallStatus,
+    },
+    /// `type: "compaction"` — server-emitted item carrying an opaque
+    /// compacted-history payload. Spec
+    /// (openai-responses-api-spec.md §InputItemList L203-205,
+    /// §`output: array of ResponseOutputItem`): `{ encrypted_content, type, id }`.
+    /// `id` is required on the output wire because the server always assigns
+    /// one when emitting the compaction item.
+    #[serde(rename = "compaction")]
+    Compaction {
+        id: String,
+        encrypted_content: String,
+    },
+    /// `{ type: "computer_call", id, call_id, action?, actions?, status,
+    /// pending_safety_checks }`.
+    ///
+    /// Spec (openai-responses-api-spec.md §ComputerCall): output-side mirror of
+    /// the input variant — emitted when the model issues a computer-use action.
+    /// See [`ComputerAction`].
+    #[serde(rename = "computer_call")]
+    ComputerCall {
+        id: String,
+        call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        action: Option<ComputerAction>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actions: Option<Vec<ComputerAction>>,
+        status: ComputerCallStatus,
+        /// Always serialized (including an empty `[]`). The official OpenAI
+        /// Python SDK (`openai==2.8.1`,
+        /// `types/responses/response_computer_tool_call.py`) declares this as a
+        /// non-`Optional` `List[PendingSafetyCheck]`, so the field must always
+        /// appear on the wire — an empty array is semantically distinct from
+        /// omitting the field.
+        #[serde(default)]
+        pending_safety_checks: Vec<ComputerSafetyCheck>,
+    },
+    /// `{ type: "computer_call_output", id?, call_id, output,
+    /// acknowledged_safety_checks?, status? }`.
+    ///
+    /// Spec (openai-responses-api-spec.md §ComputerCallOutput).
+    #[serde(rename = "computer_call_output")]
+    ComputerCallOutput {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        call_id: String,
+        output: ComputerCallOutputContent,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        acknowledged_safety_checks: Vec<ComputerSafetyCheck>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<ComputerCallStatus>,
+    },
+    /// `type: "shell_call"` — output-side mirror of the input variant.
+    ///
+    /// Spec (openai-responses-api-spec.md §ShellCall, L228-231 and §returns
+    /// L512-513) + OpenAI SDK v2.8.1 `ResponseFunctionShellToolCall`:
+    /// emitted when the model issues a containerized shell action. The
+    /// environment echoed back is restricted to `local` /
+    /// `container_reference` via [`ResponseShellCallEnvironment`] — per spec
+    /// L513 the response form uses `ResponseLocalEnvironment { type: "local" }`
+    /// only.
+    ///
+    /// `id` and `status` are required on the output wire — the SDK types
+    /// them as non-`Optional` on `ResponseFunctionShellToolCall`, mirroring
+    /// the `ComputerCall` treatment above. `created_by` is the SDK's
+    /// `Optional[str]` provenance tag, populated when the platform stamps
+    /// the item.
+    #[serde(rename = "shell_call")]
+    ShellCall {
+        id: String,
+        call_id: String,
+        action: ShellCallAction,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        environment: Option<ResponseShellCallEnvironment>,
+        status: ShellCallStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        created_by: Option<String>,
+    },
+    /// `type: "shell_call_output"` — output-side mirror of the input
+    /// variant.
+    ///
+    /// Spec (openai-responses-api-spec.md §ShellCallOutput, L233-238) +
+    /// OpenAI SDK v2.8.1 `ResponseFunctionShellToolCallOutput`:
+    /// `{ call_id, output, type, id, max_output_length?, status, created_by? }`.
+    /// Emitted when the platform surfaces captured stdout/stderr plus an
+    /// [`ShellOutcome`] for a prior shell call.
+    ///
+    /// `id` and `status` are required per the SDK's non-`Optional` typing.
+    /// `max_output_length` is `Optional[int]` in the SDK (the platform may
+    /// emit shell outputs when the originating `shell_call.action` did not
+    /// specify a cap) and `created_by` is `Optional[str]` — both dropped at
+    /// serialize time when absent so downstream consumers do not see null
+    /// placeholders.
+    #[serde(rename = "shell_call_output")]
+    ShellCallOutput {
+        id: String,
+        call_id: String,
+        output: Vec<ShellOutputChunk>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_output_length: Option<u64>,
+        status: ShellCallStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        created_by: Option<String>,
+    },
+    /// `type: "apply_patch_call"` — server-emitted mirror of the input
+    /// variant. Spec (openai-responses-api-spec.md §ApplyPatchCall L240-L246):
+    /// `{ call_id, operation, status, type, id }`. `id` is required on the
+    /// output wire because the server always assigns one when emitting the
+    /// apply_patch call item.
+    #[serde(rename = "apply_patch_call")]
+    ApplyPatchCall {
+        id: String,
+        call_id: String,
+        operation: ApplyPatchOperation,
+        status: ApplyPatchCallStatus,
+    },
+    /// `type: "apply_patch_call_output"` — server-emitted mirror of the
+    /// input variant. Spec (openai-responses-api-spec.md
+    /// §ApplyPatchCallOutput L248-L251): `{ call_id, status, type, id,
+    /// output }`. `id` is required on the output wire; `output` is optional
+    /// log text surfaced by the upstream apply_patch executor.
+    #[serde(rename = "apply_patch_call_output")]
+    ApplyPatchCallOutput {
+        id: String,
+        call_id: String,
+        status: ApplyPatchCallOutputStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
+    },
+    /// `type: "local_shell_call"` — output-side mirror of the input
+    /// variant — emitted when the model issues a `local_shell` tool call.
+    /// Spec (openai-responses-api-spec.md §LocalShellCall L219-222):
+    /// `{ id, action, call_id, status, type }` with `action` as a
+    /// [`LocalShellExec`] payload. See [`ResponseInputOutputItem::LocalShellCall`].
+    #[serde(rename = "local_shell_call")]
+    LocalShellCall {
+        id: String,
+        call_id: String,
+        action: LocalShellExec,
+        status: LocalShellCallStatus,
+    },
+    /// `type: "local_shell_call_output"` — output-side mirror of the
+    /// input variant. Spec
+    /// (openai-responses-api-spec.md §LocalShellCallOutput L224-226):
+    /// `{ id, output, type, status }` with `status` optional per SDK
+    /// v2.8.1. See [`ResponseInputOutputItem::LocalShellCallOutput`].
+    #[serde(rename = "local_shell_call_output")]
+    LocalShellCallOutput {
+        id: String,
+        output: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<LocalShellCallStatus>,
+    },
+}
+
+// ============================================================================
+// Built-in Tool Call Types
+// ============================================================================
+
+/// Status for web search tool calls (`WebSearchCallStatus` in the spec).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WebSearchCallStatus {
+    InProgress,
+    Searching,
+    Completed,
+    Failed,
+    Incomplete,
+}
+
+/// Action performed during a web search.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WebSearchAction {
+    Search {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        query: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        queries: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        sources: Vec<WebSearchSource>,
+    },
+    /// The page the model opened. The public API does not require the URL,
+    /// and may write it as `null`.
+    OpenPage {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+    },
+    /// A search for a pattern in a page. The public API names the action
+    /// `find_in_page`; `find`, the name this crate wrote before, still reads.
+    #[serde(rename = "find_in_page", alias = "find")]
+    Find { url: String, pattern: String },
+}
+
+/// A source returned from web search.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct WebSearchSource {
+    #[serde(rename = "type")]
+    pub source_type: String,
+    pub url: String,
+}
+
+/// A single search result attached to a `WebSearchCall` when the caller
+/// requested `web_search_call.results` via the top-level `include[]` array.
+///
+/// Optional fields mirror the `FileSearchResult` shape — only `url` is
+/// guaranteed; titles, snippets, and scores ride along when the upstream
+/// search backend supplies them.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct WebSearchResult {
+    /// Canonical URL of the result.
+    pub url: String,
+    /// Page or document title, when surfaced by the search backend.
+    pub title: Option<String>,
+    /// Short text snippet excerpted from the result.
+    pub snippet: Option<String>,
+    /// Relevance score in `[0, 1]`, when the backend supplies one.
+    pub score: Option<f32>,
+}
+
+/// Status for code interpreter tool calls.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeInterpreterCallStatus {
+    InProgress,
+    Completed,
+    Incomplete,
+    Interpreting,
+    Failed,
+}
+
+/// Output from code interpreter execution.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CodeInterpreterOutput {
+    Logs { logs: String },
+    Image { url: String },
+}
+
+/// Status for file search tool calls.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FileSearchCallStatus {
+    InProgress,
+    Searching,
+    Completed,
+    Incomplete,
+    Failed,
+}
+
+/// A result from file search.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct FileSearchResult {
+    pub file_id: String,
+    pub filename: String,
+    pub text: Option<String>,
+    pub score: Option<f32>,
+    pub attributes: Option<Value>,
+}
+
+/// Status for `local_shell` tool calls.
+///
+/// Spec (openai-responses-api-spec.md §LocalShellCall L221): `"in_progress"
+/// | "completed" | "incomplete"`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalShellCallStatus {
+    InProgress,
+    Completed,
+    Incomplete,
+}
+
+/// `action` payload carried by a [`ResponseInputOutputItem::LocalShellCall`] /
+/// [`ResponseOutputItem::LocalShellCall`] item.
+///
+/// Spec (openai-responses-api-spec.md §LocalShellCall L220):
+/// `{ command: array of string, env: map[string], type: "exec",
+///   timeout_ms?, user?, working_directory? }`. `env` is always present
+/// (an empty object is semantically distinct from omitting the field),
+/// matching the OpenAI Python SDK (`openai==2.8.1`,
+/// `types/responses/response_input_item_param.py` `LocalShellCallAction`
+/// — non-`Optional` `Dict[str, str]`).
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum LocalShellExec {
+    /// `type: "exec"` — the only action kind defined by the spec today.
+    #[serde(rename = "exec")]
+    Exec {
+        /// Argv of the command to run on the host.
+        command: Vec<String>,
+        /// Environment variables overlaid on the host process env.
+        /// Always serialized (possibly empty) to match SDK shape.
+        env: std::collections::BTreeMap<String, String>,
+        /// Hard timeout in milliseconds.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
+        /// User to run the command as.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user: Option<String>,
+        /// Working directory for the command.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        working_directory: Option<String>,
+    },
+}
+
+// ============================================================================
+// Configuration Enums
+// ============================================================================
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(rename = "ResponsesServiceTier")]
+pub enum ServiceTier {
+    #[default]
+    Auto,
+    Default,
+    Flex,
+    Scale,
+    Priority,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Default, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Truncation {
+    Auto,
+    #[default]
+    Disabled,
+}
+
+impl Truncation {
+    /// The wire value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ResponseStatus {
+    Queued,
+    InProgress,
+    Completed,
+    Incomplete,
+    Failed,
+    Cancelled,
+}
+
+/// Why a response stopped before producing complete output: the public API's
+/// `incomplete_details.reason`.
+///
+/// The gateway's own Responses report `max_output_tokens` alone: any other stop
+/// condition of its own (wall-clock timeout, `max_tool_calls` exhaustion,
+/// provider errors) is surfaced as a `failed` status with an `error` payload
+/// instead. The other reasons are an upstream's, which a typed reader of its
+/// Response parses.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum IncompleteReason {
+    /// Output was truncated because it hit `max_output_tokens`.
+    MaxOutputTokens,
+    /// An upstream's `max_messages`, which the public API lists without
+    /// describing it.
+    MaxMessages,
+    /// Output was truncated by the content filter.
+    ContentFilter,
+    /// The response stopped at a safe output boundary after a WebSocket
+    /// `response.steer` event; the server may then create a successor response
+    /// with the queued input.
+    Steered,
+}
+
+/// Structured detail attached to a response whose status is `incomplete`.
+///
+/// Wire shape: `{ "reason": "max_output_tokens" | "max_messages" | "content_filter" | "steered" }`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct IncompleteDetails {
+    /// The reason the response is incomplete.
+    pub reason: IncompleteReason,
+}
+
+/// The `reasoning` block of a Response object. The public API returns it on
+/// every response with `effort` and `summary` present (`null` when the request
+/// set none), so neither is skipped here. `mode`, `context` and
+/// `generate_summary` echo the request's when it set them, and are left out
+/// otherwise.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ReasoningInfo {
+    pub effort: Option<String>,
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generate_summary: Option<String>,
+}
+
+impl From<&ResponseReasoningParam> for ReasoningInfo {
+    fn from(param: &ResponseReasoningParam) -> Self {
+        Self {
+            effort: param.effort.map(|effort| effort.as_str().to_string()),
+            summary: param.summary.map(|summary| summary.as_str().to_string()),
+            mode: param.mode.clone(),
+            context: param.context.map(|context| context.as_str().to_string()),
+            generate_summary: param
+                .generate_summary
+                .map(|summary| summary.as_str().to_string()),
+        }
+    }
+}
+
+// ============================================================================
+// Text Format (structured outputs)
+// ============================================================================
+
+/// Text configuration for structured output requests
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct TextConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<TextFormat>,
+
+    /// Spec: `text.verbosity` (`"low"` | `"medium"` | `"high"`). Accepted on
+    /// the request and echoed on the response, where the public API reports
+    /// `"medium"` when the request set none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verbosity: Option<Verbosity>,
+}
+
+impl TextConfig {
+    /// The shape the public API reports on a Response object: `format`
+    /// defaults to `{"type": "text"}` and `verbosity` to `"medium"`.
+    pub fn with_response_defaults(self) -> Self {
+        Self {
+            format: self.format.or(Some(TextFormat::Text)),
+            verbosity: self.verbosity.or(Some(Verbosity::Medium)),
+        }
+    }
+}
+
+/// `text.verbosity` tiers of the Responses API.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum Verbosity {
+    Low,
+    #[default]
+    Medium,
+    High,
+}
+
+/// Text format: text (default), json_object (legacy), or json_schema (recommended)
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type")]
+pub enum TextFormat {
+    #[serde(rename = "text")]
+    Text,
+
+    #[serde(rename = "json_object")]
+    JsonObject,
+
+    #[serde(rename = "json_schema")]
+    JsonSchema {
+        name: String,
+        schema: Value,
+        description: Option<String>,
+        strict: Option<bool>,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum IncludeField {
+    #[serde(rename = "code_interpreter_call.outputs")]
+    CodeInterpreterCallOutputs,
+    #[serde(rename = "computer_call_output.output.image_url")]
+    ComputerCallOutputImageUrl,
+    #[serde(rename = "file_search_call.results")]
+    FileSearchCallResults,
+    #[serde(rename = "message.input_image.image_url")]
+    MessageInputImageUrl,
+    #[serde(rename = "message.output_text.logprobs")]
+    MessageOutputTextLogprobs,
+    #[serde(rename = "reasoning.encrypted_content")]
+    ReasoningEncryptedContent,
+    #[serde(rename = "web_search_call.action.sources")]
+    WebSearchCallActionSources,
+    #[serde(rename = "web_search_call.results")]
+    WebSearchCallResults,
+}
+
+// ============================================================================
+// Usage Types (Responses API format)
+// ============================================================================
+
+/// OpenAI Responses API usage format (different from standard UsageInfo).
+///
+/// The public schema marks `input_tokens_details` and `output_tokens_details`
+/// required, so both blocks are always on the wire (zeros when nothing was
+/// cached or no reasoning tokens were counted).
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ResponseUsage {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub total_tokens: u32,
+    #[serde(default)]
+    pub input_tokens_details: InputTokensDetails,
+    #[serde(default)]
+    pub output_tokens_details: OutputTokensDetails,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum ResponsesUsage {
+    Classic(UsageInfo),
+    Modern(ResponseUsage),
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct InputTokensDetails {
+    pub cached_tokens: u32,
+}
+
+impl From<&PromptTokenUsageInfo> for InputTokensDetails {
+    fn from(d: &PromptTokenUsageInfo) -> Self {
+        Self {
+            cached_tokens: d.cached_tokens,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct OutputTokensDetails {
+    pub reasoning_tokens: u32,
+}
+
+impl UsageInfo {
+    /// Convert to OpenAI Responses API format
+    pub fn to_response_usage(&self) -> ResponseUsage {
+        ResponseUsage {
+            input_tokens: self.prompt_tokens,
+            output_tokens: self.completion_tokens,
+            total_tokens: self.total_tokens,
+            input_tokens_details: self
+                .prompt_tokens_details
+                .as_ref()
+                .map(InputTokensDetails::from)
+                .unwrap_or_default(),
+            output_tokens_details: OutputTokensDetails {
+                reasoning_tokens: self.reasoning_tokens.unwrap_or(0),
+            },
+        }
+    }
+}
+
+impl From<UsageInfo> for ResponseUsage {
+    fn from(usage: UsageInfo) -> Self {
+        usage.to_response_usage()
+    }
+}
+
+/// The usage of an answer as the Responses API reports it, from the usage of
+/// a chat-style answer: the three counts with both detail objects present,
+/// zero included, the cached and reasoning counts read from the details the
+/// usage carries. A response's final object and its `response.completed`
+/// event build their usage here, so the two are the same.
+impl From<&Usage> for ResponseUsage {
+    fn from(usage: &Usage) -> Self {
+        Self {
+            input_tokens: usage.prompt_tokens,
+            output_tokens: usage.completion_tokens,
+            total_tokens: usage.total_tokens,
+            input_tokens_details: usage
+                .prompt_tokens_details
+                .as_ref()
+                .map(InputTokensDetails::from)
+                .unwrap_or_default(),
+            output_tokens_details: OutputTokensDetails {
+                reasoning_tokens: usage
+                    .completion_tokens_details
+                    .as_ref()
+                    .and_then(|details| details.reasoning_tokens)
+                    .unwrap_or(0),
+            },
+        }
+    }
+}
+
+impl ResponseUsage {
+    /// Convert back to standard UsageInfo format
+    pub fn to_usage_info(&self) -> UsageInfo {
+        UsageInfo {
+            prompt_tokens: self.input_tokens,
+            completion_tokens: self.output_tokens,
+            total_tokens: self.total_tokens,
+            reasoning_tokens: Some(self.output_tokens_details.reasoning_tokens),
+            prompt_tokens_details: Some(PromptTokenUsageInfo {
+                cached_tokens: self.input_tokens_details.cached_tokens,
+                audio_tokens: None,
+                text_tokens: None,
+                image_tokens: None,
+                cache_write_tokens: None,
+            }),
+        }
+    }
+}
+
+impl ResponsesUsage {
+    pub fn to_response_usage(&self) -> ResponseUsage {
+        match self {
+            ResponsesUsage::Classic(usage) => usage.to_response_usage(),
+            ResponsesUsage::Modern(usage) => usage.clone(),
+        }
+    }
+
+    pub fn to_usage_info(&self) -> UsageInfo {
+        match self {
+            ResponsesUsage::Classic(usage) => usage.clone(),
+            ResponsesUsage::Modern(usage) => usage.to_usage_info(),
+        }
+    }
+}
+
+// ============================================================================
+// Helper Functions for Defaults
+// ============================================================================
+
+fn default_top_k() -> i32 {
+    -1
+}
+
+fn default_repetition_penalty() -> f32 {
+    1.0
+}
+
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "serde default function must match field type Option<T>"
+)]
+fn default_temperature() -> Option<f32> {
+    Some(1.0)
+}
+
+// ============================================================================
+// Request/Response Types
+// ============================================================================
+
+/// The body of `POST /v1/responses`.
+///
+/// Unknown top-level parameters are rejected (`deny_unknown_fields`), as the
+/// public API rejects them with `unknown_parameter`; a parameter the gateway
+/// accepts must be declared here, including the sampling extensions below.
+#[derive(Debug, Clone, Deserialize, Serialize, Validate, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[validate(schema(function = "validate_responses_cross_parameters"))]
+pub struct ResponsesRequest {
+    /// Fields to include in the response
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include: Option<Vec<IncludeField>>,
+
+    /// Run the response in the background. Spec: body param `background`.
+    /// The request answers at once with a `queued` Response object that is
+    /// polled with `GET /v1/responses/{id}` and cancelled with
+    /// `POST /v1/responses/{id}/cancel`; it needs the response stored
+    /// (`store` true or omitted), as an unstored response could not be polled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<bool>,
+
+    /// Input content - can be string or structured items
+    #[validate(custom(function = "validate_response_input"))]
+    pub input: ResponseInput,
+
+    /// System instructions for the model
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+
+    /// Maximum number of output tokens. At least 1, as `max_tokens` on the
+    /// chat endpoint: the vendors' Responses contracts accept small values
+    /// (a one-word answer under 8), so the public API's own floor of 16 is
+    /// not imposed on the models served here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 1))]
+    pub max_output_tokens: Option<u32>,
+
+    /// Maximum number of tool calls
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 1))]
+    pub max_tool_calls: Option<u32>,
+
+    /// Additional metadata: at most 16 pairs, keys up to 64 characters,
+    /// string values up to 512 characters (the public API's limits)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(custom(function = "validate_metadata"))]
+    #[serde(serialize_with = "crate::common::serialize_with_sorted_keys")]
+    pub metadata: Option<HashMap<String, Value>>,
+
+    /// Model to use
+    pub model: String,
+
+    /// Optional conversation reference to persist input/output as items.
+    ///
+    /// Spec: `conversation` accepts either a bare ID string or
+    /// `ResponseConversationParam { id }`. Both wire shapes deserialize into
+    /// [`ConversationRef`]; downstream code reads the id via
+    /// [`ConversationRef::as_id`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(custom(function = "validate_conversation_id"))]
+    pub conversation: Option<ConversationRef>,
+
+    /// Whether to enable parallel tool calls
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
+
+    /// ID of previous response to continue from
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_response_id: Option<String>,
+
+    /// Reasoning configuration
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ResponseReasoningParam>,
+
+    /// Service tier
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<ServiceTier>,
+
+    /// Whether to store the response
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub store: Option<bool>,
+
+    /// Whether to stream the response
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
+
+    /// Temperature for sampling
+    #[serde(
+        default = "default_temperature",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[validate(range(min = 0.0, max = 2.0))]
+    pub temperature: Option<f32>,
+
+    /// Tool choice behavior (Responses-spec enum — see `ResponsesToolChoice`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ResponsesToolChoice>,
+
+    /// Available tools
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(custom(function = "validate_response_tools"))]
+    pub tools: Option<Vec<ResponseTool>>,
+
+    /// Number of top logprobs to return
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 0, max = 20))]
+    pub top_logprobs: Option<u32>,
+
+    /// Top-p sampling parameter
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(custom(function = "validate_top_p_value"))]
+    pub top_p: Option<f32>,
+
+    /// Truncation behavior
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncation: Option<Truncation>,
+
+    /// Text format for structured outputs (text, json_object, json_schema)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(custom(function = "validate_text_format"))]
+    pub text: Option<TextConfig>,
+
+    /// User identifier
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+
+    /// Request ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+
+    /// Request priority
+    #[serde(default)]
+    pub priority: i32,
+
+    /// Frequency penalty
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = -2.0, max = 2.0))]
+    pub frequency_penalty: Option<f32>,
+
+    /// Presence penalty
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = -2.0, max = 2.0))]
+    pub presence_penalty: Option<f32>,
+
+    /// Stop sequences
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(custom(function = "validate_stop"))]
+    pub stop: Option<StringOrArray>,
+
+    /// Reference to a prompt template and its variables.
+    /// Spec: body param `prompt` (ResponsePrompt).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<ResponsePrompt>,
+
+    /// Stable cache key used by upstream to share prompt-prefix caches across
+    /// requests. Spec: body param `prompt_cache_key` (replaces `user`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
+
+    /// Retention policy for prompt-cache entries.
+    /// Spec: body param `prompt_cache_retention` (`"in_memory"` | `"24h"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_retention: Option<PromptCacheRetention>,
+
+    /// Stable user identifier for policy/abuse detection (max 64 chars on the
+    /// spec, but we do not enforce length here — routers may pass through).
+    /// Spec: body param `safety_identifier` (replaces `user` on request side).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safety_identifier: Option<String>,
+
+    /// Streaming-only options. Spec: body param `stream_options`.
+    /// On the Responses API the only documented field is `include_obfuscation`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<StreamOptions>,
+
+    /// Per-request context-management configuration.
+    /// Spec: body param `context_management` — array of entries describing how
+    /// the upstream should compact context for this request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_management: Option<Vec<ContextManagementEntry>>,
+
+    /// Client-side tracing metadata (Codex sends installation / session /
+    /// thread / turn ids and a W3C traceparent here on every request).
+    /// Accepted so such clients are not rejected with `unknown_parameter`;
+    /// never serialized, so it does not reach the workers.
+    #[serde(default, skip_serializing)]
+    pub client_metadata: Option<HashMap<String, Value>>,
+
+    /// Top-k sampling parameter (an engine extension)
+    #[serde(default = "default_top_k")]
+    #[validate(custom(function = "validate_top_k_value"))]
+    pub top_k: i32,
+
+    /// Min-p sampling parameter (an engine extension)
+    #[serde(default)]
+    #[validate(range(min = 0.0, max = 1.0))]
+    pub min_p: f32,
+
+    /// Repetition penalty (an engine extension)
+    #[serde(default = "default_repetition_penalty")]
+    #[validate(range(min = 0.0, max = 2.0))]
+    pub repetition_penalty: f32,
+}
+
+/// The request's `input`: the conversation as an array of input items, or
+/// one text.
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum ResponseInput {
+    Items(Vec<ResponseInputOutputItem>),
+    Text(String),
+}
+
+/// `input` read by its JSON type. The derived untagged reader buffered the
+/// whole value, tried the items and then the text, and reported a refusal
+/// inside one item as "data did not match any variant of untagged enum
+/// ResponseInput" at `input`, naming no item; this one keeps the item's own
+/// refusal under its index, each item read by its shape (see `InputItem`).
+impl<'de> Deserialize<'de> for ResponseInput {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct InputVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for InputVisitor {
+            type Value = ResponseInput;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a string or an array of input items")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<Self::Value, E> {
+                Ok(ResponseInput::Text(text.to_owned()))
+            }
+
+            fn visit_string<E: serde::de::Error>(self, text: String) -> Result<Self::Value, E> {
+                Ok(ResponseInput::Text(text))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut items: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut read = Vec::new();
+                while let Some(InputItem(item)) = items.next_element()? {
+                    read.push(item);
+                }
+                Ok(ResponseInput::Items(read))
+            }
+        }
+
+        deserializer.deserialize_any(InputVisitor)
+    }
+}
+
+impl ResponsesRequest {
+    /// `top_k` when the request set it: the field is a plain value whose
+    /// serde default (`-1`) stands for unset, so a reader whose own `top_k`
+    /// is an `Option` (the chat request, where `None` lets the model's own
+    /// defaults fill the knob) does not take the default for a choice. A
+    /// request that writes `-1` by hand reads as unset too; keeping the two
+    /// apart would take an `Option` field.
+    pub fn top_k_if_set(&self) -> Option<i32> {
+        (self.top_k != default_top_k()).then_some(self.top_k)
+    }
+
+    /// `min_p` when the request set it; the serde default (`0.0`) stands for
+    /// unset, as for [`Self::top_k_if_set`].
+    pub fn min_p_if_set(&self) -> Option<f32> {
+        (self.min_p != 0.0).then_some(self.min_p)
+    }
+
+    /// `repetition_penalty` when the request set it; the serde default
+    /// (`1.0`) stands for unset, as for [`Self::top_k_if_set`].
+    pub fn repetition_penalty_if_set(&self) -> Option<f32> {
+        (self.repetition_penalty != default_repetition_penalty()).then_some(self.repetition_penalty)
+    }
+}
+
+impl Default for ResponsesRequest {
+    fn default() -> Self {
+        Self {
+            include: None,
+            background: None,
+            input: ResponseInput::Text(String::new()),
+            instructions: None,
+            max_output_tokens: None,
+            max_tool_calls: None,
+            metadata: None,
+            model: String::new(),
+            conversation: None,
+            parallel_tool_calls: None,
+            previous_response_id: None,
+            reasoning: None,
+            service_tier: None,
+            store: None,
+            stream: None,
+            temperature: None,
+            tool_choice: None,
+            tools: None,
+            top_logprobs: None,
+            top_p: None,
+            truncation: None,
+            text: None,
+            user: None,
+            request_id: None,
+            priority: 0,
+            frequency_penalty: None,
+            presence_penalty: None,
+            stop: None,
+            prompt: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+            safety_identifier: None,
+            stream_options: None,
+            context_management: None,
+            client_metadata: None,
+            top_k: default_top_k(),
+            min_p: 0.0,
+            repetition_penalty: default_repetition_penalty(),
+        }
+    }
+}
+
+impl Normalizable for ResponsesRequest {
+    /// Normalize the request by applying defaults:
+    /// 1. Apply tool_choice defaults based on tools presence (including inline
+    ///    `additional_tools` declarations so an empty top-level `tools: []`
+    ///    does not silently default to `"none"` and disable inline tools)
+    /// 2. Apply parallel_tool_calls defaults
+    /// 3. Apply store field defaults
+    fn normalize(&mut self) {
+        let has_declared_tools = all_declared_tools(self).next().is_some();
+
+        // 1. Apply tool_choice defaults (preserve any caller-supplied value)
+        if self.tool_choice.is_none() {
+            if has_declared_tools {
+                self.tool_choice = Some(ResponsesToolChoice::Options(ToolChoiceOptions::Auto));
+            } else if self.tools.is_some()
+                && self.previous_response_id.is_none()
+                && self.conversation.is_none()
+            {
+                // A continuation can inherit inline tools. Leave its choice
+                // open until the backend has loaded the preceding turn.
+                self.tool_choice = Some(ResponsesToolChoice::Options(ToolChoiceOptions::None));
+            }
+            // If neither top-level `tools` nor inline `additional_tools` is
+            // present, leave tool_choice as None.
+        }
+
+        // 2. Apply default for parallel_tool_calls if tools are present
+        if self.parallel_tool_calls.is_none() && (self.tools.is_some() || has_declared_tools) {
+            self.parallel_tool_calls = Some(true);
+        }
+
+        // 3. Ensure store defaults to true if not specified
+        if self.store.is_none() {
+            self.store = Some(true);
+        }
+    }
+}
+
+impl GenerationRequest for ResponsesRequest {
+    fn is_stream(&self) -> bool {
+        self.stream.unwrap_or(false)
+    }
+
+    fn max_output_tokens(&self) -> Option<u32> {
+        self.max_output_tokens
+    }
+
+    fn get_model(&self) -> Option<&str> {
+        Some(self.model.as_str())
+    }
+
+    fn extract_text_for_routing(&self) -> String {
+        match &self.input {
+            ResponseInput::Text(text) => text.clone(),
+            ResponseInput::Items(items) => {
+                let mut result = String::with_capacity(256);
+                let mut has_parts = false;
+
+                let mut append_text = |text: &str| {
+                    if has_parts {
+                        result.push(' ');
+                    }
+                    has_parts = true;
+                    result.push_str(text);
+                };
+
+                for item in items {
+                    match item {
+                        ResponseInputOutputItem::Message { content, .. } => content
+                            .iter()
+                            .filter_map(ResponseContentPart::text)
+                            .for_each(&mut append_text),
+                        ResponseInputOutputItem::SimpleInputMessage { content, .. } => {
+                            match content {
+                                StringOrContentParts::String(s) => append_text(s.as_str()),
+                                StringOrContentParts::Array(parts) => parts
+                                    .iter()
+                                    .filter_map(ResponseContentPart::text)
+                                    .for_each(&mut append_text),
+                            }
+                        }
+                        ResponseInputOutputItem::Reasoning { content, .. } => {
+                            for part in content {
+                                match part {
+                                    ResponseReasoningContent::ReasoningText { text } => {
+                                        append_text(text.as_str());
+                                    }
+                                }
+                            }
+                        }
+                        ResponseInputOutputItem::AgentMessage { content, .. } => content
+                            .iter()
+                            .filter_map(AgentMessageContentPart::text)
+                            .for_each(&mut append_text),
+                        ResponseInputOutputItem::AdditionalTools { .. }
+                        | ResponseInputOutputItem::FunctionToolCall { .. }
+                        | ResponseInputOutputItem::FunctionCallOutput { .. }
+                        | ResponseInputOutputItem::McpApprovalRequest { .. }
+                        | ResponseInputOutputItem::McpApprovalResponse { .. }
+                        | ResponseInputOutputItem::ImageGenerationCall { .. }
+                        | ResponseInputOutputItem::Compaction { .. }
+                        | ResponseInputOutputItem::ComputerCall { .. }
+                        | ResponseInputOutputItem::ComputerCallOutput { .. }
+                        | ResponseInputOutputItem::CustomToolCall { .. }
+                        | ResponseInputOutputItem::CustomToolCallOutput { .. }
+                        | ResponseInputOutputItem::ShellCall { .. }
+                        | ResponseInputOutputItem::ShellCallOutput { .. }
+                        | ResponseInputOutputItem::ItemReference { .. }
+                        | ResponseInputOutputItem::ApplyPatchCall { .. }
+                        | ResponseInputOutputItem::ApplyPatchCallOutput { .. }
+                        | ResponseInputOutputItem::LocalShellCall { .. }
+                        | ResponseInputOutputItem::LocalShellCallOutput { .. }
+                        | ResponseInputOutputItem::McpCall { .. }
+                        | ResponseInputOutputItem::McpListTools { .. } => {}
+                    }
+                }
+
+                result
+            }
+        }
+    }
+}
+
+/// Validate the conversation reference's ID format.
+///
+/// The validator crate auto-unwraps `Option<ConversationRef>` for the
+/// `#[validate(custom(...))]` attribute, so this function only runs when
+/// the field is present. Both wire shapes (bare string or `{ id }` object)
+/// are validated against the same rule by extracting the underlying id via
+/// [`ConversationRef::as_id`].
+pub fn validate_conversation_id(conv: &ConversationRef) -> Result<(), ValidationError> {
+    let conv_id = conv.as_id();
+    if !conv_id.starts_with("conv_") {
+        return Err(invalid(
+            "invalid_conversation_id",
+            format!(
+                "Invalid 'conversation': '{conv_id}'. Expected an ID that begins with 'conv_'."
+            ),
+        ));
+    }
+
+    // Check if the conversation ID contains only valid characters
+    let is_valid = conv_id
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '-');
+
+    if !is_valid {
+        return Err(invalid(
+            "invalid_conversation_id",
+            format!(
+                "Invalid 'conversation': '{conv_id}'. Expected an ID that contains letters, numbers, underscores, or dashes, but this value contained additional characters."
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Iterate over every tool declared on the request: top-level `tools` first,
+/// followed by tools declared inline via `additional_tools` items in `input`.
+fn all_declared_tools(request: &ResponsesRequest) -> impl Iterator<Item = (&ResponseTool, bool)> {
+    let top_level = request
+        .tools
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|tool| (tool, false));
+    let inline = match &request.input {
+        ResponseInput::Items(items) => items.as_slice(),
+        ResponseInput::Text(_) => &[],
+    }
+    .iter()
+    .flat_map(|item| match item {
+        ResponseInputOutputItem::AdditionalTools { tools, .. } => tools.as_slice(),
+        _ => &[],
+    })
+    .map(|tool| (tool, true));
+    top_level.chain(inline)
+}
+
+/// Validates tool_choice requires tools and references exist
+fn validate_tool_choice_with_tools(request: &ResponsesRequest) -> Result<(), ValidationError> {
+    let Some(tool_choice) = &request.tool_choice else {
+        return Ok(());
+    };
+
+    let has_tools = all_declared_tools(request).next().is_some();
+    // `none` and `auto` name no tool, so they stand without tools (with nothing
+    // to call, `auto` answers in text as an omitted `tool_choice` does); Codex
+    // sends `tools: []` with `tool_choice: "auto"` when it compacts a
+    // conversation.
+    let is_some_choice = !matches!(
+        tool_choice,
+        ResponsesToolChoice::Options(ToolChoiceOptions::None | ToolChoiceOptions::Auto)
+    );
+
+    // Check if tool_choice requires tools but none are provided
+    if is_some_choice && !has_tools {
+        return Err(invalid(
+            "tool_choice_requires_tools",
+            "Invalid value for 'tool_choice': 'tool_choice' is only allowed when 'tools' are specified.",
+        ));
+    }
+
+    // Validate tool references exist when tools are present
+    if !has_tools {
+        return Ok(());
+    }
+
+    // Extract function tool names from top-level tools and inline additional_tools
+    let mut function_tool_names: Vec<&str> = Vec::new();
+    for (tool, from_additional_tools) in all_declared_tools(request) {
+        match tool {
+            ResponseTool::Function(ft) => function_tool_names.push(ft.function.name.as_str()),
+            ResponseTool::Namespace(namespace)
+                if from_additional_tools && namespace.name == "functions" =>
+            {
+                for member in &namespace.tools {
+                    if let NamespaceTool::Function(ft) = member {
+                        function_tool_names.push(ft.function.name.as_str());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Validate tool references exist
+    match tool_choice {
+        ResponsesToolChoice::Function(choice) => {
+            // Accessor goes through `function_name()` so we stay agnostic to
+            // the underlying wire shape (flat vs. legacy nested) — both are
+            // normalized at deserialize time.
+            if let Some(name) = tool_choice.function_name() {
+                let found = all_declared_tools(request).any(|(tool, from_additional_tools)| {
+                    match (tool, choice.namespace.as_deref()) {
+                        (ResponseTool::Function(function), None) => function.function.name == name,
+                        (ResponseTool::Namespace(namespace), None)
+                            if from_additional_tools && namespace.name == "functions" =>
+                        {
+                            namespace.tools.iter().any(|member| {
+                                matches!(member, NamespaceTool::Function(function) if function.function.name == name)
+                            })
+                        }
+                        (ResponseTool::Namespace(namespace), Some(selected_namespace)) => {
+                            namespace.name == selected_namespace && namespace.tools.iter().any(|member| {
+                                matches!(member, NamespaceTool::Function(function) if function.function.name == name)
+                            })
+                        }
+                        _ => false,
+                    }
+                });
+                if !found {
+                    return Err(invalid(
+                        "tool_choice_function_not_found",
+                        format!(
+                            "Invalid value for 'tool_choice': function '{name}' not found in 'tools'."
+                        ),
+                    ));
+                }
+            }
+        }
+        ResponsesToolChoice::AllowedTools {
+            mode,
+            tools: allowed_tools,
+            ..
+        } => {
+            // Validate mode is "auto" or "required"
+            if mode != "auto" && mode != "required" {
+                return Err(invalid(
+                    "tool_choice_invalid_mode",
+                    format!(
+                        "Invalid value for 'tool_choice.mode': must be 'auto' or 'required', got '{mode}'."
+                    ),
+                ));
+            }
+
+            // Validate that all function tool references exist
+            for tool_ref in allowed_tools {
+                if let ToolReference::Function { name } = tool_ref {
+                    if !function_tool_names.contains(&name.as_str()) {
+                        return Err(invalid(
+                            "tool_choice_tool_not_found",
+                            format!(
+                                "Invalid value for 'tool_choice.tools': tool '{name}' not found in 'tools'."
+                            ),
+                        ));
+                    }
+                }
+                // Note: MCP and hosted tools don't need existence validation here
+                // as they are resolved dynamically at runtime
+            }
+        }
+        // Remaining variants have no cross-field existence constraints —
+        // hosted built-ins, MCP server selection, custom tool names, and
+        // `apply_patch` / `shell` are resolved at routing time.
+        ResponsesToolChoice::Options(_)
+        | ResponsesToolChoice::Types { .. }
+        | ResponsesToolChoice::Mcp { .. }
+        | ResponsesToolChoice::Custom { .. }
+        | ResponsesToolChoice::ApplyPatch { .. }
+        | ResponsesToolChoice::Shell { .. } => {}
+    }
+
+    Ok(())
+}
+
+/// Schema-level validation for cross-field dependencies
+fn validate_responses_cross_parameters(request: &ResponsesRequest) -> Result<(), ValidationError> {
+    // 1. Validate tool_choice requires tools (enhanced)
+    validate_tool_choice_with_tools(request)?;
+
+    // 2. `top_logprobs` without `include: ["message.output_text.logprobs"]` is
+    //    accepted as the public API accepts it: the logprobs are simply not
+    //    attached to the output text.
+
+    // 3. Validate conversation and previous_response_id are mutually exclusive
+    if request.conversation.is_some() && request.previous_response_id.is_some() {
+        return Err(invalid(
+            "mutually_exclusive_parameters",
+            "Mutually exclusive parameters. Ensure you are only providing one of: 'previous_response_id' or 'conversation'.",
+        ));
+    }
+
+    // 4. The public OpenAI API's rules on request content beyond the schema
+    //    hold for OpenAI's own models only; a self-hosted model passes these
+    //    shapes through to the engine, whose grammar compiler decides what it
+    //    can constrain (see `profile::is_openai_vendor_model`).
+    if is_openai_vendor_model(&request.model) {
+        validate_openai_structured_output_rules(request)?;
+    }
+
+    // 5. `background: true` with `store: false` is a valid pair, as in the
+    //    public API: the gateway keeps such a response for its polling
+    //    window, then retains nothing of it.
+
+    // Tool-result-only continuations are valid; validate_response_input checks
+    // individual items without requiring a message already held in history.
+
+    Ok(())
+}
+
+/// The public OpenAI API's structured-output rules: a strict function schema
+/// (a top-level function's or a namespace member's) or a strict `json_schema`
+/// text format pins `additionalProperties: false` on every object node, and a
+/// `json_object` format needs the word "json" somewhere in the prompt
+/// (instructions or input text).
+fn validate_openai_structured_output_rules(
+    request: &ResponsesRequest,
+) -> Result<(), ValidationError> {
+    for (tool, _) in all_declared_tools(request) {
+        match tool {
+            ResponseTool::Function(function_tool) => {
+                validate_strict_function_schema(&function_tool.function)?;
+            }
+            ResponseTool::Namespace(namespace) => {
+                for member in &namespace.tools {
+                    if let NamespaceTool::Function(function_tool) = member {
+                        validate_strict_function_schema(&function_tool.function)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    match request.text.as_ref().and_then(|t| t.format.as_ref()) {
+        Some(TextFormat::JsonSchema {
+            name,
+            schema,
+            strict: Some(true),
+            ..
+        }) => {
+            if let Some(path) = strict_schema_missing_additional_properties(schema) {
+                return Err(invalid(
+                    "invalid_json_schema",
+                    format!(
+                        "Invalid schema for response_format '{name}': In context={path}, 'additionalProperties' is required to be supplied and to be false."
+                    ),
+                ));
+            }
+        }
+        Some(TextFormat::JsonObject) if !request_mentions_json(request) => {
+            return Err(invalid(
+                "json_object_requires_json_in_input",
+                "Response input messages must contain the word 'json' in some form to use 'text.format' of type 'json_object'.",
+            ));
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// A strict function's schema pins `additionalProperties: false` on every
+/// object node; a function that is not strict is not judged.
+fn validate_strict_function_schema(function: &Function) -> Result<(), ValidationError> {
+    if function.strict != Some(true) {
+        return Ok(());
+    }
+    let Some(path) = strict_schema_missing_additional_properties(function.parameters_schema())
+    else {
+        return Ok(());
+    };
+    Err(invalid(
+        "invalid_function_parameters",
+        format!(
+            "Invalid schema for function '{}': In context={path}, 'additionalProperties' is required to be supplied and to be false.",
+            function.name
+        ),
+    ))
+}
+
+/// Whether the instructions or any input text mention "json" (case-insensitive).
+fn request_mentions_json(request: &ResponsesRequest) -> bool {
+    let mentions = |text: &str| text.to_ascii_lowercase().contains("json");
+    if request.instructions.as_deref().is_some_and(mentions) {
+        return true;
+    }
+    match &request.input {
+        ResponseInput::Text(text) => mentions(text),
+        ResponseInput::Items(items) => items.iter().any(|item| {
+            match item {
+            ResponseInputOutputItem::Message { content, .. } => content.iter().any(|part| {
+                matches!(part, ResponseContentPart::InputText { text } if mentions(text))
+            }),
+            ResponseInputOutputItem::SimpleInputMessage { content, .. } => match content {
+                StringOrContentParts::String(text) => mentions(text),
+                StringOrContentParts::Array(parts) => parts.iter().any(|part| {
+                    matches!(part, ResponseContentPart::InputText { text } if mentions(text))
+                }),
+            },
+            ResponseInputOutputItem::AgentMessage { content, .. } => content.iter().any(|part| {
+                matches!(part, AgentMessageContentPart::InputText { text } if mentions(text))
+            }),
+            _ => false,
+        }
+        }),
+    }
+}
+
+/// The public API's metadata limits: 16 pairs, 64-character keys, 512-character string values.
+const MAX_METADATA_PAIRS: usize = 16;
+const MAX_METADATA_KEY_CHARS: usize = 64;
+const MAX_METADATA_VALUE_CHARS: usize = 512;
+
+/// The request's `metadata` under the public API's bounds (the field's custom
+/// rule; see [`validate_metadata_pairs`]).
+fn validate_metadata(metadata: &HashMap<String, Value>) -> Result<(), ValidationError> {
+    validate_metadata_pairs(metadata.iter())
+}
+
+/// The public API's bound on the number of `metadata` pairs (16) for a count
+/// read on its own (a stored object once a patch is merged into it):
+/// `object_above_max_properties` above it.
+pub fn validate_metadata_pair_count(count: usize) -> Result<(), ValidationError> {
+    if count > MAX_METADATA_PAIRS {
+        return Err(invalid(
+            "object_above_max_properties",
+            format!(
+                "Invalid 'metadata': too many properties. The object has {count} properties, but the maximum is {MAX_METADATA_PAIRS}."
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// The public API's bounds on a `metadata` object, for any map of its pairs:
+/// at most 16 pairs (`object_above_max_properties`), keys of at most 64
+/// characters and string values of at most 512 (`string_above_max_length`),
+/// and every value a string (`invalid_type`). The Responses request validates
+/// its `metadata` with this rule; a route that reads a metadata object of its
+/// own (the gateway's Conversations routes) validates it the same way.
+pub fn validate_metadata_pairs<'a>(
+    pairs: impl ExactSizeIterator<Item = (&'a String, &'a Value)>,
+) -> Result<(), ValidationError> {
+    validate_metadata_pair_count(pairs.len())?;
+    for (key, value) in pairs {
+        if key.chars().count() > MAX_METADATA_KEY_CHARS {
+            return Err(invalid(
+                "string_above_max_length",
+                format!(
+                    "Invalid 'metadata': a key is too long. Expected a key with a maximum length of {MAX_METADATA_KEY_CHARS}, but got one of {} characters instead.",
+                    key.chars().count()
+                ),
+            ));
+        }
+        let Value::String(text) = value else {
+            return Err(invalid(
+                "invalid_type",
+                format!(
+                    "Invalid type for 'metadata.{key}': expected a string, but got {} instead.",
+                    json_type_name(value)
+                ),
+            ));
+        };
+        if text.chars().count() > MAX_METADATA_VALUE_CHARS {
+            return Err(invalid(
+                "string_above_max_length",
+                format!(
+                    "Invalid 'metadata.{key}': string too long. Expected a string with maximum length {MAX_METADATA_VALUE_CHARS}, but got a string with length {} instead.",
+                    text.chars().count()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The roles an input message may carry.
+const INPUT_MESSAGE_ROLES: [&str; 4] = ["assistant", "system", "developer", "user"];
+
+/// An input message's `role` under the public API's set (`assistant`,
+/// `system`, `developer`, `user`; `invalid_value` otherwise). The Responses
+/// request validates its message items with this rule; a route that stores
+/// message items of its own (the gateway's Conversations routes) validates
+/// them the same way.
+pub fn validate_input_message_role(role: &str) -> Result<(), ValidationError> {
+    if INPUT_MESSAGE_ROLES.contains(&role) {
+        return Ok(());
+    }
+    Err(invalid(
+        "invalid_value",
+        format!(
+            "Invalid value: '{role}'. Supported values are: 'assistant', 'system', 'developer', and 'user'."
+        ),
+    ))
+}
+
+// ============================================================================
+// Field-Level Validation Functions
+// ============================================================================
+
+/// Validates response input is not empty and has valid content
+fn validate_response_input(input: &ResponseInput) -> Result<(), ValidationError> {
+    match input {
+        ResponseInput::Text(text) => {
+            if text.is_empty() {
+                return Err(invalid("input_text_empty", "Input text cannot be empty"));
+            }
+        }
+        ResponseInput::Items(items) => {
+            if items.is_empty() {
+                return Err(invalid("input_items_empty", "Input items cannot be empty"));
+            }
+            // Validate each item has valid content
+            for (item_idx, item) in items.iter().enumerate() {
+                validate_input_item(item, item_idx)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validates individual input items have valid content
+fn validate_input_item(
+    item: &ResponseInputOutputItem,
+    item_idx: usize,
+) -> Result<(), ValidationError> {
+    match item {
+        ResponseInputOutputItem::AdditionalTools { role, tools, .. } => {
+            if let Some(role) = role {
+                validate_input_message_role(role)?;
+            }
+            validate_response_tools_at(tools, &format!("input[{item_idx}].tools"))?;
+        }
+        ResponseInputOutputItem::AgentMessage { content, .. } => {
+            if content.is_empty() {
+                return Err(invalid(
+                    "message_content_empty",
+                    "Agent message content cannot be empty",
+                ));
+            }
+        }
+        ResponseInputOutputItem::Message { content, role, .. } => {
+            validate_input_message_role(role)?;
+            if content.is_empty() {
+                return Err(invalid(
+                    "message_content_empty",
+                    "Message content cannot be empty",
+                ));
+            }
+        }
+        ResponseInputOutputItem::SimpleInputMessage { content, role, .. } => {
+            validate_input_message_role(role)?;
+            match content {
+                StringOrContentParts::String(s) if s.is_empty() => {
+                    return Err(invalid(
+                        "message_content_empty",
+                        "Message content cannot be empty",
+                    ));
+                }
+                StringOrContentParts::Array(parts) if parts.is_empty() => {
+                    return Err(invalid(
+                        "message_content_empty",
+                        "Message content parts cannot be empty",
+                    ));
+                }
+                _ => {}
+            }
+        }
+        ResponseInputOutputItem::Reasoning { .. } => {
+            // Reasoning content can be empty - no validation needed
+        }
+        ResponseInputOutputItem::FunctionCallOutput { .. } => {}
+        ResponseInputOutputItem::FunctionToolCall { .. } => {}
+        ResponseInputOutputItem::McpApprovalRequest { .. } => {}
+        ResponseInputOutputItem::McpApprovalResponse { .. } => {}
+        ResponseInputOutputItem::ImageGenerationCall { .. } => {}
+        ResponseInputOutputItem::Compaction { .. } => {}
+        ResponseInputOutputItem::ComputerCall { .. } => {}
+        ResponseInputOutputItem::ComputerCallOutput { .. } => {}
+        // CustomToolCall is model-generated and echoed back on multi-turn
+        // replay; matches the FunctionToolCall arm above with no content
+        // validation so a parameterless custom tool with empty input can
+        // round-trip cleanly.
+        ResponseInputOutputItem::CustomToolCall { .. } => {}
+        ResponseInputOutputItem::CustomToolCallOutput { output, .. } => match output {
+            CustomToolCallOutputContent::Text(s) if s.is_empty() => {
+                return Err(invalid(
+                    "custom_tool_call_output_empty",
+                    "Custom tool call output cannot be empty",
+                ));
+            }
+            CustomToolCallOutputContent::Parts(parts) if parts.is_empty() => {
+                return Err(invalid(
+                    "custom_tool_call_output_empty",
+                    "Custom tool call output parts cannot be empty",
+                ));
+            }
+            _ => {}
+        },
+        // ShellCall is model-generated and echoed back on multi-turn replay;
+        // mirrors FunctionToolCall above with no content validation so a
+        // parameterless shell call can round-trip cleanly.
+        ResponseInputOutputItem::ShellCall { .. } => {}
+        ResponseInputOutputItem::ShellCallOutput { .. } => {
+            // The router returns 501 for shell calls, so SMG never synthesises
+            // a ShellCallOutput itself. Skip content validation here so
+            // round-tripping a previously-recorded response (even with an
+            // empty chunk list) stays lossless — the cross-turn replay
+            // contract is the motivating use case for keeping this arm
+            // content-agnostic.
+        }
+        // A bare reference to a prior item; no content to validate.
+        ResponseInputOutputItem::ItemReference { .. } => {}
+        // ApplyPatchCall is model-generated and echoed back on multi-turn
+        // replay; matches the FunctionToolCall / CustomToolCall arms with no
+        // diff/path validation — the operation payload is structurally
+        // enforced by the `ApplyPatchOperation` enum, and accepting empty
+        // diffs for `create_file` / `update_file` preserves round-trip
+        // fidelity with items emitted by upstream providers.
+        ResponseInputOutputItem::ApplyPatchCall { .. } => {}
+        // ApplyPatchCallOutput.output is optional log text per spec
+        // (openai-responses-api-spec.md §ApplyPatchCallOutput L251); an
+        // absent or empty log is spec-legal (a clean `completed` with no
+        // output, or a `failed` where the executor had nothing to log) so
+        // no emptiness check applies here.
+        ResponseInputOutputItem::ApplyPatchCallOutput { .. } => {}
+        // Validation mirrors `ComputerCall` / `ImageGenerationCall` above
+        // (no payload-level content checks).
+        ResponseInputOutputItem::LocalShellCall { .. } => {}
+        ResponseInputOutputItem::LocalShellCallOutput { .. } => {}
+        // MCP call/list-tools input items replayed for stateless multi-turn.
+        // Matches `McpApprovalRequest` above with no content validation so an
+        // abridged or in-flight call (output / error absent) can round-trip
+        // cleanly.
+        ResponseInputOutputItem::McpCall { .. } => {}
+        ResponseInputOutputItem::McpListTools { .. } => {}
+    }
+    Ok(())
+}
+
+/// A function's place in a tool array (`tools` or `input[i].tools`) as a
+/// refusal names it: a direct function's index, or its namespace's index and
+/// its own inside the namespace. It is written only into a refusal, so a
+/// function that passes formats no place.
+#[derive(Clone, Copy)]
+enum FunctionPlace<'a> {
+    Tool(&'a str, usize),
+    Member(&'a str, usize, usize),
+}
+
+impl std::fmt::Display for FunctionPlace<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match *self {
+            Self::Tool(prefix, tool) => write!(formatter, "{prefix}[{tool}]"),
+            Self::Member(prefix, namespace, member) => {
+                write!(formatter, "{prefix}[{namespace}].tools[{member}]")
+            }
+        }
+    }
+}
+
+/// The public API's function-tool keys ([`FunctionTool::TOOL_KEYS`]) are kept
+/// untyped in the function's `extra`, so their shapes are checked here, as the
+/// custom tool's typed fields check theirs: `async` and `defer_loading` a
+/// boolean, `allowed_callers` an array of strings, `output_schema` an object,
+/// each of them also `null`.
+fn validate_function_tool_keys(
+    function: &Function,
+    at: FunctionPlace<'_>,
+) -> Result<(), ValidationError> {
+    for key in FunctionTool::TOOL_KEYS {
+        let Some(value) = function.extra.get(*key) else {
+            continue;
+        };
+        let (expected, got) = match *key {
+            "async" | "defer_loading" if !(value.is_boolean() || value.is_null()) => {
+                ("a boolean", json_type_name(value))
+            }
+            "allowed_callers" => match value {
+                Value::Null => continue,
+                Value::Array(callers) => match callers.iter().find(|caller| !caller.is_string()) {
+                    Some(caller) => ("an array of strings", json_type_name(caller)),
+                    None => continue,
+                },
+                _ => ("an array of strings", json_type_name(value)),
+            },
+            "output_schema" if !(value.is_object() || value.is_null()) => {
+                ("an object", json_type_name(value))
+            }
+            _ => continue,
+        };
+        return Err(invalid(
+            "invalid_type",
+            format!("Invalid type for '{at}.{key}': expected {expected}, but got {got} instead."),
+        ));
+    }
+    Ok(())
+}
+
+/// A function's `parameters` are a JSON Schema object, a top-level function's
+/// and a namespace member's alike: the model is handed either as a function of
+/// its own.
+fn validate_function_parameters(
+    function: &Function,
+    at: FunctionPlace<'_>,
+) -> Result<(), ValidationError> {
+    let schema = function.parameters_schema();
+    if schema.is_object() {
+        return Ok(());
+    }
+    Err(invalid(
+        "invalid_type",
+        format!(
+            "Invalid type for '{at}.parameters': expected an object, but got {} instead.",
+            json_type_name(schema)
+        ),
+    ))
+}
+
+/// Validates ResponseTool structure based on tool type
+fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), ValidationError> {
+    validate_response_tools_at(tools, "tools")
+}
+
+/// Validates a ResponseTool array, naming any refusal under `prefix`
+/// (`"tools"` for top-level declarations or `"input[i].tools"` for inline
+/// `additional_tools`).
+fn validate_response_tools_at(tools: &[ResponseTool], prefix: &str) -> Result<(), ValidationError> {
+    // MCP server_label must be present and unique (case-insensitive).
+    let mut seen_mcp_labels: HashSet<String> = HashSet::new();
+
+    for (idx, tool) in tools.iter().enumerate() {
+        match tool {
+            // A function has a name, and its parameters are a JSON Schema
+            // object (the strict-mode pin on additionalProperties is a
+            // public-API rule applied under the OpenAI vendor profile in the
+            // cross-parameter validation).
+            ResponseTool::Function(function_tool) => {
+                let function = &function_tool.function;
+                if function.name.is_empty() {
+                    return Err(empty_tool_name(&format!("{prefix}[{idx}].name")));
+                }
+                let at = FunctionPlace::Tool(prefix, idx);
+                validate_function_parameters(function, at)?;
+                validate_function_tool_keys(function, at)?;
+            }
+            // A custom tool has a name: the model is given a function of that
+            // name for it.
+            ResponseTool::Custom(custom) => {
+                if custom.name.is_empty() {
+                    return Err(empty_tool_name(&format!("{prefix}[{idx}].name")));
+                }
+            }
+            // A namespace has a name, and so has each of its members: the
+            // model addresses a member as `namespace.member`. A function
+            // member is handed to the model as a function of its own, so its
+            // parameters are held to a top-level function's rule.
+            ResponseTool::Namespace(namespace) => {
+                if namespace.name.is_empty() {
+                    return Err(empty_tool_name(&format!("{prefix}[{idx}].name")));
+                }
+                for (member_idx, member) in namespace.tools.iter().enumerate() {
+                    let name = match member {
+                        NamespaceTool::Function(function_tool) => &function_tool.function.name,
+                        NamespaceTool::Custom(custom) => &custom.name,
+                    };
+                    if name.is_empty() {
+                        return Err(empty_tool_name(&format!(
+                            "{prefix}[{idx}].tools[{member_idx}].name"
+                        )));
+                    }
+                    if let NamespaceTool::Function(function_tool) = member {
+                        let at = FunctionPlace::Member(prefix, idx, member_idx);
+                        validate_function_parameters(&function_tool.function, at)?;
+                        validate_function_tool_keys(&function_tool.function, at)?;
+                    }
+                }
+            }
+            // The hosted local_shell tool is not served by the gateway, and the
+            // public API no longer accepts it either.
+            ResponseTool::LocalShell => {
+                return Err(invalid(
+                    "tool_not_supported",
+                    format!("Invalid '{prefix}[{idx}]': the local_shell tool is not supported."),
+                ));
+            }
+            _ => {}
+        }
+        if let ResponseTool::Mcp(mcp) = tool {
+            let raw_label = mcp.server_label.as_str();
+            if raw_label.is_empty() {
+                return Err(invalid(
+                    "missing_required_parameter",
+                    format!("Missing required parameter: '{prefix}[{idx}].server_label'."),
+                ));
+            }
+
+            // OpenAI spec-compatible validation: require a non-empty label that starts with a
+            // letter and contains only letters, digits, '-' and '_'.
+            let valid = raw_label.starts_with(|c: char| c.is_ascii_alphabetic())
+                && raw_label
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+            if !valid {
+                return Err(invalid(
+                    "invalid_server_label",
+                    format!(
+                        "Invalid input {raw_label}: 'server_label' must start with a letter and consist of only letters, digits, '-' and '_'"
+                    ),
+                ));
+            }
+
+            let normalized = raw_label.to_lowercase();
+            if !seen_mcp_labels.insert(normalized) {
+                return Err(invalid(
+                    "mcp_tool_duplicate_server_label",
+                    format!(
+                        "Duplicate MCP server_label '{raw_label}' found in '{prefix}' parameter."
+                    ),
+                ));
+            }
+
+            // One of `server_url` or `connector_id` is required, and the two
+            // are mutually exclusive. Reject payloads that set both so
+            // downstream target resolution is unambiguous.
+            if mcp.server_url.is_some() && mcp.connector_id.is_some() {
+                return Err(invalid(
+                    "mcp_tool_conflicting_targets",
+                    format!(
+                        "MCP tool with server_label '{raw_label}' sets both 'server_url' and 'connector_id'; exactly one is required."
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validates text format configuration (JSON schema name non-empty, schema an object)
+fn validate_text_format(text: &TextConfig) -> Result<(), ValidationError> {
+    if let Some(TextFormat::JsonSchema { name, schema, .. }) = &text.format {
+        validate_json_schema_shape(name, schema)?;
+    }
+    Ok(())
+}
+
+/// Normalize a SimpleInputMessage to a proper Message item
+///
+/// This helper converts SimpleInputMessage (which can have flexible content)
+/// into a fully-structured Message item with a generated ID, role, and content array.
+///
+/// SimpleInputMessage items are converted to Message items with IDs generated using
+/// the centralized ID generation pattern with "msg_" prefix for consistency.
+///
+/// # Arguments
+/// * `item` - The input item to normalize, taken by value: a SimpleInputMessage
+///   gives its content and role to the Message built from it, every other item
+///   comes back as it came, moved and not copied
+///
+/// # Returns
+/// A normalized ResponseInputOutputItem (either Message if converted, or original if not SimpleInputMessage)
+pub fn normalize_input_item(item: ResponseInputOutputItem) -> ResponseInputOutputItem {
+    match item {
+        ResponseInputOutputItem::SimpleInputMessage {
+            content,
+            role,
+            phase,
+            ..
+        } => {
+            let content_vec = match content {
+                StringOrContentParts::String(s) => {
+                    vec![ResponseContentPart::InputText { text: s }]
+                }
+                StringOrContentParts::Array(parts) => parts,
+            };
+
+            ResponseInputOutputItem::Message {
+                id: generate_id("msg"),
+                role,
+                content: content_vec,
+                status: Some("completed".to_string()),
+                phase,
+            }
+        }
+        other => other,
+    }
+}
+
+/// `items` without the tool outputs whose call is not among them. The newest
+/// items of a long conversation can begin between a call and its output, and
+/// an output of a call the model never made is no history an engine-side
+/// builder renders (one refuses it, a chat template sees a tool result nothing
+/// asked for). Every other item keeps its place.
+pub fn without_outputs_of_missing_calls(
+    items: Vec<ResponseInputOutputItem>,
+) -> Vec<ResponseInputOutputItem> {
+    let calls: HashSet<String> = items
+        .iter()
+        .filter_map(tool_call_id)
+        .map(str::to_string)
+        .collect();
+    items
+        .into_iter()
+        .filter(|item| tool_output_call_id(item).is_none_or(|call_id| calls.contains(call_id)))
+        .collect()
+}
+
+/// `items` without the tool calls that only an output among `skipped`
+/// answers, items of the same history that are not replayed: a call replays
+/// only with its output, as an output only with its call. A call with its
+/// output among `items` stays, whatever `skipped` holds for it, and so does
+/// a call that no output answers: the request may bring its output.
+pub fn without_calls_answered_by(
+    items: Vec<ResponseInputOutputItem>,
+    skipped: &[ResponseInputOutputItem],
+) -> Vec<ResponseInputOutputItem> {
+    let unreplayed: HashSet<&str> = skipped.iter().filter_map(tool_output_call_id).collect();
+    if unreplayed.is_empty() {
+        return items;
+    }
+    let answered: HashSet<&str> = items.iter().filter_map(tool_output_call_id).collect();
+    let stays: Vec<bool> = items
+        .iter()
+        .map(|item| {
+            is_answered_call(item, &answered)
+                || tool_call_id(item).is_none_or(|call_id| !unreplayed.contains(call_id))
+        })
+        .collect();
+    items
+        .into_iter()
+        .zip(stays)
+        .filter_map(|(item, stays)| stays.then_some(item))
+        .collect()
+}
+
+/// `items` from their first turn boundary on: the first message the client
+/// sent (a user, developer or system message), or, when no client message is
+/// among them (one long turn of the model's calls), the first tool call with
+/// its output (one an output among them answers, one that carries its
+/// output, a hosted call with its output or its failure), with the reasoning
+/// right before that call. The newest items of a long conversation can begin
+/// inside a turn, with the tail of a turn whose request is not among them:
+/// the answer to a question the model does not see, the output of a call it
+/// did not make. What is before the first boundary is left out, a call with
+/// its output before the client's first message included (it is the tail of
+/// the turn the cut split, and a strict chat template reads a conversation
+/// that opens with the client); items with no boundary come back as they are.
+pub fn from_turn_boundary(items: Vec<ResponseInputOutputItem>) -> Vec<ResponseInputOutputItem> {
+    let boundary = items.iter().position(is_client_message).or_else(|| {
+        let answered: HashSet<&str> = items.iter().filter_map(tool_output_call_id).collect();
+        items
+            .iter()
+            .position(|item| is_answered_call(item, &answered))
+    });
+    let Some(boundary) = boundary else {
+        return items;
+    };
+    let mut start = boundary;
+    if !is_client_message(&items[boundary]) {
+        // the reasoning that led to the call is the call's
+        while start > 0 && matches!(items[start - 1], ResponseInputOutputItem::Reasoning { .. }) {
+            start -= 1;
+        }
+    }
+    if start == 0 {
+        return items;
+    }
+    let mut prefix = items;
+    let tail = prefix.split_off(start);
+    let mut kept: Vec<_> = prefix
+        .into_iter()
+        .filter(|item| matches!(item, ResponseInputOutputItem::AdditionalTools { .. }))
+        .collect();
+    if kept.is_empty() {
+        return tail;
+    }
+    kept.extend(tail);
+    kept
+}
+
+/// Whether `item` is a message the client sent (a user, developer or system
+/// message): the start of a turn.
+fn is_client_message(item: &ResponseInputOutputItem) -> bool {
+    match item {
+        ResponseInputOutputItem::Message { role, .. }
+        | ResponseInputOutputItem::SimpleInputMessage { role, .. } => role.as_str() != "assistant",
+        ResponseInputOutputItem::AgentMessage { .. } => true,
+        _ => false,
+    }
+}
+
+/// Whether `item` is a tool call with its output: a call an output among the
+/// items answers (`answered` holds their call ids), a call that carries its
+/// output, or a hosted call whose output, or whose failure, is in the item
+/// (one still in progress is a call without its output).
+fn is_answered_call(item: &ResponseInputOutputItem, answered: &HashSet<&str>) -> bool {
+    match item {
+        ResponseInputOutputItem::FunctionToolCall {
+            output: Some(_), ..
+        } => true,
+        ResponseInputOutputItem::McpCall {
+            output,
+            error,
+            status,
+            ..
+        } => output.is_some() || error.is_some() || status.as_deref() == Some("failed"),
+        _ => tool_call_id(item).is_some_and(|call_id| answered.contains(call_id)),
+    }
+}
+
+/// The call id of a tool call the model made that a separate output item
+/// answers.
+fn tool_call_id(item: &ResponseInputOutputItem) -> Option<&str> {
+    match item {
+        ResponseInputOutputItem::FunctionToolCall { call_id, .. }
+        | ResponseInputOutputItem::CustomToolCall { call_id, .. }
+        | ResponseInputOutputItem::ComputerCall { call_id, .. }
+        | ResponseInputOutputItem::ShellCall { call_id, .. }
+        | ResponseInputOutputItem::ApplyPatchCall { call_id, .. }
+        | ResponseInputOutputItem::LocalShellCall { call_id, .. } => Some(call_id),
+        _ => None,
+    }
+}
+
+/// The call id a tool output item answers (a local shell output names its
+/// call's id as `id`).
+fn tool_output_call_id(item: &ResponseInputOutputItem) -> Option<&str> {
+    match item {
+        ResponseInputOutputItem::FunctionCallOutput { call_id, .. }
+        | ResponseInputOutputItem::CustomToolCallOutput { call_id, .. }
+        | ResponseInputOutputItem::ComputerCallOutput { call_id, .. }
+        | ResponseInputOutputItem::ShellCallOutput { call_id, .. }
+        | ResponseInputOutputItem::ApplyPatchCallOutput { call_id, .. } => Some(call_id),
+        ResponseInputOutputItem::LocalShellCallOutput { id, .. } => Some(id),
+        _ => None,
+    }
+}
+
+/// A fresh id: `prefix`, an underscore and 50 lowercase hex digits (25 random
+/// bytes), written into one string sized for the whole id.
+pub fn generate_id(prefix: &str) -> String {
+    use rand::Rng;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut rng = rand::rng();
+    let mut bytes = [0u8; 25];
+    rng.fill_bytes(&mut bytes);
+    let mut id = String::with_capacity(prefix.len() + 1 + 2 * bytes.len());
+    id.push_str(prefix);
+    id.push('_');
+    for byte in bytes {
+        id.push(char::from(HEX[usize::from(byte >> 4)]));
+        id.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    id
+}
+
+/// `Response.conversation` on the wire. The public API writes the linked
+/// conversation as an object, `{"id": "conv_..."}` (`ResponseConversation`);
+/// the field keeps the id alone. This module writes that object and reads it,
+/// or a bare id, the shape the crate wrote before, which stored responses
+/// keep.
+mod response_conversation {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use crate::common::ConversationRef;
+
+    /// The object the public API writes.
+    #[derive(Serialize)]
+    struct ResponseConversation<'a> {
+        /// The id of the conversation the response is linked to.
+        id: &'a str,
+    }
+
+    #[expect(
+        clippy::ref_option,
+        reason = "serde's `with` hands the field to its serializer by reference"
+    )]
+    pub(super) fn serialize<S: Serializer>(
+        conversation: &Option<String>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match conversation {
+            Some(id) => ResponseConversation { id }.serialize(serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<String>, D::Error> {
+        Ok(
+            Option::<ConversationRef>::deserialize(deserializer)?.map(
+                |reference| match reference {
+                    ConversationRef::Id(id) | ConversationRef::Object { id } => id,
+                },
+            ),
+        )
+    }
+}
+
+/// The Response object of `POST /v1/responses`.
+///
+/// The public API returns every field of this object on every response
+/// (`null` when a request parameter was not set), and the public schema marks
+/// `error`, `instructions`, `top_p`, `incomplete_details`, `temperature`,
+/// `tool_choice` and `tools` required; the `serialize_always` fields below
+/// therefore stay on the wire as `null` instead of being skipped. Only
+/// `conversation` is omitted when the response is not linked to one, as the
+/// public API does.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[non_exhaustive]
+pub struct ResponsesResponse {
+    /// Response ID
+    pub id: String,
+
+    /// Object type
+    #[serde(default = "default_object_type")]
+    pub object: String,
+
+    /// Creation timestamp (unix seconds)
+    pub created_at: i64,
+
+    /// Completion timestamp (unix seconds). `None` until the response reaches
+    /// a terminal state (`completed`, `incomplete`, `failed`, `cancelled`).
+    #[serde(default)]
+    #[serialize_always]
+    pub completed_at: Option<i64>,
+
+    /// Whether the response was created in background mode.
+    #[serde(default)]
+    #[serialize_always]
+    pub background: Option<bool>,
+
+    /// Conversation this response is linked to, if any, by its id. Written
+    /// as the public API writes it, `{"id": ...}`; a bare id, as the crate
+    /// wrote it before, still reads. The schema takes both shapes, as the
+    /// reader does: a response stored before the object was written is
+    /// served back with the bare id, and a client generated from the schema
+    /// reads it too.
+    #[serde(default, with = "response_conversation")]
+    #[schemars(with = "Option<ConversationRef>")]
+    pub conversation: Option<String>,
+
+    /// Response status
+    pub status: ResponseStatus,
+
+    /// Error information if status is failed
+    #[serialize_always]
+    pub error: Option<Value>,
+
+    /// Incomplete details if the response was truncated (`incomplete` status).
+    #[serialize_always]
+    pub incomplete_details: Option<IncompleteDetails>,
+
+    /// System instructions used
+    #[serialize_always]
+    pub instructions: Option<String>,
+
+    /// Max output tokens setting
+    #[serialize_always]
+    pub max_output_tokens: Option<u32>,
+
+    /// Maximum number of built-in tool calls allowed for the response.
+    #[serde(default)]
+    #[serialize_always]
+    pub max_tool_calls: Option<u32>,
+
+    /// Model name
+    pub model: String,
+
+    /// Output items
+    #[serde(default)]
+    pub output: Vec<ResponseOutputItem>,
+
+    /// Whether parallel tool calls are enabled
+    #[serde(default = "default_true")]
+    pub parallel_tool_calls: bool,
+
+    /// Previous response ID if this is a continuation
+    #[serialize_always]
+    pub previous_response_id: Option<String>,
+
+    /// Prompt cache key the request carried.
+    #[serde(default)]
+    #[serialize_always]
+    pub prompt_cache_key: Option<String>,
+
+    /// Prompt cache retention the request carried.
+    #[serde(default)]
+    #[serialize_always]
+    pub prompt_cache_retention: Option<PromptCacheRetention>,
+
+    /// Reasoning information
+    #[serialize_always]
+    pub reasoning: Option<ReasoningInfo>,
+
+    /// Service tier the response was processed with.
+    #[serde(default)]
+    #[serialize_always]
+    pub service_tier: Option<ServiceTier>,
+
+    /// Whether the response is stored
+    #[serde(default = "default_true")]
+    pub store: bool,
+
+    /// Temperature setting used
+    #[serialize_always]
+    pub temperature: Option<f32>,
+
+    /// Text format settings
+    #[serialize_always]
+    pub text: Option<TextConfig>,
+
+    /// Tool choice setting, echoed as the request sent it: a bare string
+    /// (`"auto"`, `"none"`, `"required"`) or the object form (`{"type":
+    /// "function", "name": ...}`, `{"type": "allowed_tools", ...}`, a hosted
+    /// tool type), as the public API returns it.
+    #[serde(default)]
+    pub tool_choice: ResponsesToolChoice,
+
+    /// Available tools
+    #[serde(default)]
+    pub tools: Vec<ResponseTool>,
+
+    /// Number of top logprobs requested (0 when none).
+    #[serde(default)]
+    #[serialize_always]
+    pub top_logprobs: Option<u32>,
+
+    /// Top-p setting used
+    #[serialize_always]
+    pub top_p: Option<f32>,
+
+    /// Truncation strategy used
+    #[serialize_always]
+    pub truncation: Option<String>,
+
+    /// Usage information
+    #[serialize_always]
+    pub usage: Option<ResponsesUsage>,
+
+    /// User identifier
+    #[serialize_always]
+    pub user: Option<String>,
+
+    /// Safety identifier for content moderation
+    #[serialize_always]
+    pub safety_identifier: Option<String>,
+
+    /// Frequency penalty used (0.0 when the request set none).
+    #[serde(default)]
+    #[serialize_always]
+    pub frequency_penalty: Option<f32>,
+
+    /// Presence penalty used (0.0 when the request set none).
+    #[serde(default)]
+    #[serialize_always]
+    pub presence_penalty: Option<f32>,
+
+    /// Additional metadata. An upstream may write `null`, as the public API's
+    /// `Metadata` allows, which reads as the empty map.
+    #[serde(default, deserialize_with = "deserialize_null_as_empty_map")]
+    pub metadata: HashMap<String, Value>,
+}
+
+fn default_object_type() -> String {
+    "response".to_string()
+}
+
+impl ResponsesResponse {
+    /// Create a builder for constructing a ResponsesResponse
+    pub fn builder(id: impl Into<String>, model: impl Into<String>) -> ResponsesResponseBuilder {
+        ResponsesResponseBuilder::new(id, model)
+    }
+
+    /// Check if the response is complete
+    pub fn is_complete(&self) -> bool {
+        matches!(self.status, ResponseStatus::Completed)
+    }
+
+    /// Check if the response is in progress
+    pub fn is_in_progress(&self) -> bool {
+        matches!(self.status, ResponseStatus::InProgress)
+    }
+
+    /// Check if the response failed
+    pub fn is_failed(&self) -> bool {
+        matches!(self.status, ResponseStatus::Failed)
+    }
+
+    /// Check if the response terminated as incomplete (max_output_tokens / content_filter)
+    pub fn is_incomplete(&self) -> bool {
+        matches!(self.status, ResponseStatus::Incomplete)
+    }
+}
+
+impl ResponseInputOutputItem {
+    /// Create a new reasoning input/output item.
+    ///
+    /// `encrypted_content` defaults to `None`; use
+    /// [`Self::new_reasoning_encrypted`] when round-tripping gpt-5 /
+    /// o-series encrypted reasoning.
+    pub fn new_reasoning(
+        id: String,
+        summary: Vec<SummaryTextContent>,
+        content: Vec<ResponseReasoningContent>,
+        status: Option<String>,
+    ) -> Self {
+        Self::Reasoning {
+            id: Some(id),
+            summary,
+            content,
+            encrypted_content: None,
+            status,
+        }
+    }
+
+    /// Create a new reasoning input/output item carrying an encrypted
+    /// reasoning payload. The `encrypted_content` must be the opaque
+    /// ciphertext.
+    pub fn new_reasoning_encrypted(
+        id: String,
+        summary: Vec<SummaryTextContent>,
+        content: Vec<ResponseReasoningContent>,
+        encrypted_content: String,
+        status: Option<String>,
+    ) -> Self {
+        Self::Reasoning {
+            id: Some(id),
+            summary,
+            content,
+            encrypted_content: Some(encrypted_content),
+            status,
+        }
+    }
+}
+
+impl ResponseOutputItem {
+    /// Create a new message output item (no phase).
+    pub fn new_message(
+        id: String,
+        role: String,
+        content: Vec<ResponseContentPart>,
+        status: String,
+    ) -> Self {
+        Self::Message {
+            id,
+            role,
+            content,
+            status,
+            phase: None,
+        }
+    }
+
+    /// Create a new reasoning output item.
+    ///
+    /// `encrypted_content` defaults to `None`; use
+    /// [`Self::new_reasoning_encrypted`] when carrying gpt-5 / o-series
+    /// encrypted reasoning.
+    pub fn new_reasoning(
+        id: String,
+        summary: Vec<SummaryTextContent>,
+        content: Vec<ResponseReasoningContent>,
+        status: Option<String>,
+    ) -> Self {
+        Self::Reasoning {
+            id,
+            summary,
+            content,
+            encrypted_content: None,
+            status,
+        }
+    }
+
+    /// Create a new reasoning output item carrying an encrypted reasoning payload.
+    ///
+    /// The `encrypted_content` must be the opaque ciphertext; a `None` value
+    /// would defeat the purpose of the `_encrypted` constructor — callers
+    /// without ciphertext should use [`Self::new_reasoning`] instead.
+    pub fn new_reasoning_encrypted(
+        id: String,
+        summary: Vec<SummaryTextContent>,
+        content: Vec<ResponseReasoningContent>,
+        encrypted_content: String,
+        status: Option<String>,
+    ) -> Self {
+        Self::Reasoning {
+            id,
+            summary,
+            content,
+            encrypted_content: Some(encrypted_content),
+            status,
+        }
+    }
+
+    /// Create a new function tool call output item
+    pub fn new_function_tool_call(
+        id: String,
+        call_id: String,
+        name: String,
+        arguments: String,
+        output: Option<String>,
+        status: String,
+    ) -> Self {
+        Self::FunctionToolCall {
+            id: Some(id),
+            call_id,
+            name,
+            namespace: None,
+            arguments,
+            output,
+            status,
+        }
+    }
+}
+
+impl ResponseContentPart {
+    /// Create a new `output_text` content part.
+    pub fn new_text(
+        text: String,
+        annotations: Vec<Annotation>,
+        logprobs: Option<ChatLogProbs>,
+    ) -> Self {
+        Self::OutputText {
+            text,
+            annotations,
+            logprobs,
+        }
+    }
+}
+
+impl ResponseReasoningContent {
+    /// Create a new reasoning text content
+    pub fn new_reasoning_text(text: String) -> Self {
+        Self::ReasoningText { text }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A function tool's refusal of an unknown key lists the public API's tool
+    /// keys among those it takes.
+    #[test]
+    fn a_function_tools_fields_end_with_its_tool_keys() {
+        assert!(FunctionTool::FIELDS.ends_with(FunctionTool::TOOL_KEYS));
+    }
+
+    /// A twelve-turn conversation input (text turns and part turns, an
+    /// image, a function call and its output), read two hundred times: the
+    /// readers' cost on a representative request, for the measurement of a
+    /// change to them. Nothing is asserted beyond the read.
+    #[test]
+    #[ignore = "a read-cost measurement for perf stat, not a check"]
+    fn a_conversation_input_reads_two_hundred_times() {
+        let text = "the previous turn's text, long enough to carry some weight ".repeat(4);
+        let mut items = Vec::new();
+        for _ in 0..5 {
+            items.push(serde_json::json!({"role": "user", "content": [
+                {"type": "input_text", "text": text},
+                {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==", "detail": "low"},
+            ]}));
+            items.push(serde_json::json!({"role": "assistant", "content": text}));
+        }
+        items.push(serde_json::json!({"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "lookup", "arguments": "{\"q\":\"x\"}", "status": "completed"}));
+        items.push(serde_json::json!({"type": "function_call_output", "call_id": "call_1", "output": text}));
+        let body =
+            serde_json::json!({"model": "m", "input": items, "max_output_tokens": 8}).to_string();
+        for _ in 0..200 {
+            let request: ResponsesRequest = serde_json::from_str(&body).expect("the body reads");
+            let ResponseInput::Items(items) = &request.input else {
+                panic!("the input is the items")
+            };
+            assert_eq!(items.len(), 12);
+        }
+    }
+
+    /// A long part is read in its own size: a missing field inside the last
+    /// of many annotations is located at its element, and a part with many
+    /// array-valued keys is refused at the part; a long item too: a missing
+    /// field inside the last of many safety checks beside a long own `id` of
+    /// the same name is located at its element. All within one generous
+    /// wall-clock bound (the quadratic shapes took tens of seconds here).
+    #[test]
+    fn a_long_part_is_located_in_linear_time() {
+        let started = std::time::Instant::now();
+        let mut annotations: Vec<Value> = (0..20_000)
+            .map(|index| {
+                serde_json::json!({"type": "file_citation", "file_id": "f", "filename": "n", "index": index})
+            })
+            .collect();
+        annotations.push(serde_json::json!({"type": "file_citation", "index": 20_000}));
+        let part =
+            serde_json::json!({"type": "output_text", "text": "hi", "annotations": annotations});
+        let error = ResponseContentPart::deserialize(&part)
+            .expect_err("the last annotation lacks its file_id");
+        assert_eq!(
+            content_part_refusal("content", 0, &part, &error),
+            "content[0].annotations[20000]: missing field `file_id`"
+        );
+        let mut fields = serde_json::Map::new();
+        fields.insert("type".to_string(), Value::String("input_text".to_string()));
+        for index in 0..20_000 {
+            fields.insert(format!("k{index}"), serde_json::json!([{}]));
+        }
+        let part = Value::Object(fields);
+        let error = ResponseContentPart::deserialize(&part).expect_err("the part lacks its text");
+        assert_eq!(
+            content_part_refusal("content", 0, &part, &error),
+            "content[0]: missing field `text`"
+        );
+        let mut checks: Vec<Value> = (0..20_000)
+            .map(|index| serde_json::json!({"id": format!("sc_{index}")}))
+            .collect();
+        checks.push(serde_json::json!({}));
+        let item = serde_json::json!({
+            "type": "computer_call",
+            "id": "x".repeat(1 << 20),
+            "call_id": "call_1",
+            "status": "completed",
+            "pending_safety_checks": checks,
+        });
+        let error = ResponseInputOutputItem::deserialize(&item)
+            .expect_err("the last safety check lacks its id");
+        assert_eq!(
+            typed_item_refusal(&item, error),
+            "pending_safety_checks[20000]: missing field `id`"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "located in {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// An input item with a repeated key is refused with serde's words, as
+    /// the derived readers refuse it, instead of the last value winning: at
+    /// the item's own keys (one a shape reads, one no shape knows, one past
+    /// the keys the reader walks) and at any depth below them (the place is
+    /// the deserializer's to name, as for the derived readers; the door's
+    /// test reads it). The last row is a free-form value inside an item: a
+    /// derived read keeps its last value, the item's one rule refuses it.
+    #[test]
+    fn an_input_item_with_a_repeated_key_is_refused() {
+        for (body, refusal) in [
+            (
+                r#"{"model":"m","input":[{"role":"user","content":"hi","role":"system"}]}"#,
+                "duplicate field `role`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"function_call","type":"message","role":"user","content":"hi"}]}"#,
+                "duplicate field `type`",
+            ),
+            (
+                r#"{"model":"m","input":[{"role":"user","content":"hi","x":1,"x":2}]}"#,
+                "duplicate field `x`",
+            ),
+            (
+                r#"{"model":"m","input":[{"role":"user","content":"hi","k0":0,"k1":0,"k2":0,"k3":0,"k4":0,"k5":0,"k6":0,"k7":0,"k8":0,"k9":0,"k10":0,"k11":0,"k12":0,"k13":0,"k14":0,"k15":0,"k16":0,"k16":1}]}"#,
+                "duplicate field `k16`",
+            ),
+            (
+                r#"{"model":"m","input":[{"role":"user","content":[{"type":"input_text","text":"a","text":"b"}]}]}"#,
+                "duplicate field `text`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"t","annotations":[{"type":"file_citation","file_id":"f","filename":"n","index":0,"index":1}]}]}]}"#,
+                "duplicate field `index`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"function_call_output","call_id":"c","output":[{"type":"input_text","text":"a"},{"type":"input_image","detail":"low","detail":"high"}]}]}"#,
+                "duplicate field `detail`",
+            ),
+            (
+                r#"{"model":"m","input":[{"role":"user","content":[{"type":"input_text","type":"input_image","text":"a"}]}]}"#,
+                "duplicate field `type`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"computer_call","id":"cu_1","call_id":"c","action":{"type":"screenshot"},"pending_safety_checks":[{"id":"s1","code":"k","message":"m","id":"s2"}],"status":"completed"}]}"#,
+                "duplicate field `id`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"apply_patch_call","id":"ap_1","call_id":"c","operation":{"type":"create_file","path":"a","diff":"d","path":"b"},"status":"completed"}]}"#,
+                "duplicate field `path`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"local_shell_call","id":"ls_1","call_id":"c","action":{"type":"exec","command":["ls"],"env":{"A":"1","A":"2"}},"status":"completed"}]}"#,
+                "duplicate field `A`",
+            ),
+        ] {
+            let error = serde_json::from_str::<ResponsesRequest>(body)
+                .expect_err("the repeated key is refused");
+            assert!(error.to_string().starts_with(refusal), "{error}");
+        }
+    }
+
+    /// A typed item refused at its own field says which: serde's words for a
+    /// missing one (the extractor appends the field), the field before the
+    /// reason for an invalid one, `type` for a kind with no variant, the
+    /// element of one of the item's arrays for a field missing inside it or
+    /// an element refused on its own, the field itself when it takes no
+    /// array and is sent one.
+    #[test]
+    fn a_typed_item_refused_at_its_own_field_names_it() {
+        for (body, words) in [
+            (
+                r#"{"model":"m","input":[{"type":"function_call","id":"fc_1","name":"lookup","arguments":"{}"}]}"#,
+                "missing field `call_id`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"function_call","call_id":"call_1","name":"lookup","arguments":7}]}"#,
+                "arguments: invalid type: integer `7`, expected a string",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"function_call","call_id":"call_1","name":"lookup","arguments":["{}"]}]}"#,
+                "arguments: invalid type: sequence, expected a string",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"mcp_list_tools","id":"mcpl_1","server_label":"docs","tools":[{"name":"search","input_schema":{}},{"name":7,"input_schema":{}}]}]}"#,
+                "tools[1]: invalid type: integer `7`, expected a string",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"message","id":"msg_1","role":7,"content":[{"type":"input_text","text":"hi"}]}]}"#,
+                "role: invalid type: integer `7`, expected a string",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"web_search_results","id":"ws_1"}]}"#,
+                "type: unknown variant `web_search_results`, expected one of `message`, `reasoning`, `function_call`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"mcp_list_tools","id":"mcpl_1","server_label":"docs","tools":[{"name":"search"}]}]}"#,
+                "tools[0]: missing field `input_schema`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"computer_call_output","call_id":"call_1","output":{"type":"computer_screenshot"},"acknowledged_safety_checks":[{}]}]}"#,
+                "acknowledged_safety_checks[0]: missing field `id`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"item_reference"}]}"#,
+                "missing field `id`",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"item_reference","id":7}]}"#,
+                "id: invalid type: integer `7`, expected a string",
+            ),
+            (
+                r#"{"model":"m","input":[{"type":"message","id":"msg_1","content":"hi","role":7}]}"#,
+                "role: invalid type: integer `7`, expected a string",
+            ),
+        ] {
+            let error = serde_json::from_str::<ResponsesRequest>(body)
+                .expect_err("the typed item is refused");
+            assert!(error.to_string().starts_with(words), "{body}: {error}");
+        }
+    }
+
+    /// Every tagged variant's smallest payload.
+    const SMALLEST_TAGGED_ITEMS: [&str; 22] = [
+        r#"{"type":"additional_tools","tools":[]}"#,
+        r#"{"type":"agent_message","author":"root","recipient":"worker","content":[]}"#,
+        r#"{"type":"message","id":"msg_1","role":"user","content":[]}"#,
+        r#"{"type":"reasoning","content":null}"#,
+        r#"{"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"}"#,
+        r#"{"type":"function_call_output","call_id":"call_1","output":"found"}"#,
+        r#"{"type":"mcp_approval_request","id":"mcpr_1","server_label":"docs","name":"search","arguments":"{}"}"#,
+        r#"{"type":"mcp_approval_response","approval_request_id":"mcpr_1","approve":true}"#,
+        r#"{"type":"image_generation_call","id":"ig_1"}"#,
+        r#"{"type":"compaction","encrypted_content":"opaque"}"#,
+        r#"{"type":"computer_call","id":"cu_1","call_id":"call_1","status":"completed"}"#,
+        r#"{"type":"computer_call_output","call_id":"call_1","output":{"type":"computer_screenshot"},"acknowledged_safety_checks":null}"#,
+        r#"{"type":"custom_tool_call","call_id":"call_1","input":"x","name":"grep"}"#,
+        r#"{"type":"custom_tool_call_output","call_id":"call_1","output":"y"}"#,
+        r#"{"type":"shell_call","call_id":"call_1","action":{"commands":["ls"]}}"#,
+        r#"{"type":"shell_call_output","call_id":"call_1","output":[]}"#,
+        r#"{"type":"apply_patch_call","call_id":"call_1","operation":{"type":"delete_file","path":"old.txt"},"status":"completed"}"#,
+        r#"{"type":"apply_patch_call_output","call_id":"call_1","status":"completed"}"#,
+        r#"{"type":"local_shell_call","id":"lsh_1","call_id":"call_1","action":{"type":"exec","command":["ls"],"env":{}},"status":"completed"}"#,
+        r#"{"type":"local_shell_call_output","id":"lsh_1","output":"ok"}"#,
+        r#"{"type":"mcp_call","id":"mcp_1","arguments":"{}","name":"search","server_label":"docs","error":"boom"}"#,
+        r#"{"type":"mcp_list_tools","id":"mcpl_1","server_label":"docs","tools":[]}"#,
+    ];
+
+    /// Every tagged variant's smallest payload reads the same through the
+    /// public reader and the tagged-only mirror, and the payloads' kinds are
+    /// the kinds the public schema lists: a serde attribute a mirrored field
+    /// does not repeat (a default, a custom reader), or a variant the mirror
+    /// lacks, shows here, where the compiler cannot see it.
+    #[test]
+    fn the_tagged_mirror_reads_every_variant_as_the_public_reader_does() {
+        // The kinds the public schema lists: every object shape whose `type`
+        // is pinned to one word, under the variants and not under the
+        // definitions (the named types the fields refer to, tagged in their
+        // own right); the two untagged shapes left out, whatever the
+        // generator makes of them.
+        fn pinned_kinds(schema: &Value, kinds: &mut std::collections::BTreeSet<String>) {
+            match schema {
+                Value::Object(fields) => {
+                    let pinned = fields
+                        .get("properties")
+                        .and_then(|properties| properties.get("type"))
+                        .and_then(|tag| {
+                            tag.get("const")
+                                .or_else(|| tag.get("enum")?.as_array()?.first())
+                        })
+                        .and_then(Value::as_str);
+                    if let Some(kind) = pinned {
+                        kinds.insert(kind.to_string());
+                    }
+                    for (key, value) in fields {
+                        if key != "$defs" && key != "definitions" {
+                            pinned_kinds(value, kinds);
+                        }
+                    }
+                }
+                Value::Array(items) => {
+                    for item in items {
+                        pinned_kinds(item, kinds);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut covered = std::collections::BTreeSet::new();
+        for payload in SMALLEST_TAGGED_ITEMS {
+            let value: Value = serde_json::from_str(payload).expect("a JSON object");
+            covered.insert(value["type"].as_str().expect("a tag").to_string());
+            let public = ResponseInputOutputItem::deserialize(&value).expect(payload);
+            let mirror = tagged_item(&value["type"], &value).expect(payload);
+            assert_eq!(format!("{public:?}"), format!("{mirror:?}"), "{payload}");
+        }
+        let mut listed = std::collections::BTreeSet::new();
+        pinned_kinds(
+            &schemars::schema_for!(ResponseInputOutputItem).to_value(),
+            &mut listed,
+        );
+        for untagged in ["simple_input_message", "item_reference"] {
+            listed.remove(untagged);
+        }
+        assert_eq!(listed, covered, "the payloads cover the schema's kinds");
+    }
+
+    /// The request reader takes an input item as the derived reader does,
+    /// class by class. The tagged forms: every tagged variant's smallest
+    /// payload and fuller items of the common kinds. Each as it stands, with
+    /// one key absent, with one value null (null against absent), with one
+    /// value swapped for another JSON value, with a key no shape knows, with
+    /// its `type` renamed and with a `phase`. The untagged forms: a message
+    /// and an item reference sent without a `type`, and the items neither
+    /// takes. The same item from both readers, or a refusal from both. A
+    /// repeated key is the reader's own rule, stricter than a derived read:
+    /// `an_input_item_with_a_repeated_key_is_refused` pins it.
+    #[test]
+    fn the_request_reader_takes_every_item_shape_as_the_derived_reader_does() {
+        let fuller = [
+            r#"{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"done","annotations":[]}]}"#,
+            r#"{"id":"msg_2","type":"message","role":"user","status":"completed","content":[{"type":"input_text","text":"hi"}]}"#,
+            r#"{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}"#,
+            r#"{"type":"message","role":"user","content":"hi"}"#,
+            r#"{"role":"user","content":"hi"}"#,
+            r#"{"role":"user","content":[{"type":"input_text","text":"hi"}]}"#,
+            r#"{"type":"function_call","id":"fc_1","call_id":"call_1","name":"lookup","arguments":"{\"q\":1}","status":"completed"}"#,
+            r#"{"type":"function_call_output","call_id":"call_1","output":"{\"found\":true}"}"#,
+            r#"{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"think"}],"content":[{"type":"reasoning_text","text":"step"}],"status":"completed"}"#,
+        ];
+        let untagged = [
+            serde_json::json!({"id": "msg_1"}),
+            serde_json::json!({"id": "msg_1", "type": "item_reference"}),
+            serde_json::json!({"type": "item_reference"}),
+            serde_json::json!({"id": "msg_1", "role": "user"}),
+            serde_json::json!({"id": "msg_1", "content": "hi"}),
+            serde_json::json!({"id": "msg_1", "role": "user", "content": "hi"}),
+            serde_json::json!({"type": "message", "id": "msg_1", "role": "user", "content": "hi"}),
+            serde_json::json!({"role": "user"}),
+            serde_json::json!({"content": "hi"}),
+            serde_json::json!({"role": 7, "content": "hi"}),
+            serde_json::json!({"role": "user", "content": 7}),
+            serde_json::json!({"role": "user", "content": [{"type": "input_text"}]}),
+            serde_json::json!({"type": 0, "id": "msg_1", "role": "user", "content": []}),
+            serde_json::json!({}),
+            serde_json::json!(7),
+            serde_json::json!("x"),
+            Value::Null,
+            serde_json::json!([]),
+        ];
+        let through_request = |item: &Value| {
+            let body = serde_json::json!({"model": "m", "input": [item]});
+            serde_json::from_value::<ResponsesRequest>(body)
+                .ok()
+                .map(|request| format!("{:?}", request.input))
+        };
+        let through_derive = |item: &Value| {
+            ResponseInputOutputItem::deserialize(item)
+                .ok()
+                .map(|item| format!("{:?}", ResponseInput::Items(vec![item])))
+        };
+        let mut probes: Vec<(&str, Value)> = untagged
+            .into_iter()
+            .map(|item| ("an untagged form", item))
+            .collect();
+        for text in SMALLEST_TAGGED_ITEMS.iter().chain(&fuller) {
+            let item: Value = serde_json::from_str(text).expect("a JSON object");
+            probes.push(("as it stands", item.clone()));
+            for key in item.as_object().expect("an object").keys() {
+                let mut absent = item.clone();
+                absent.as_object_mut().expect("an object").remove(key);
+                probes.push(("a key absent", absent));
+                for (class, other) in [
+                    ("a value null", Value::Null),
+                    ("a value swapped", serde_json::json!(7)),
+                    ("a value swapped", serde_json::json!("x")),
+                    ("a value swapped", serde_json::json!([])),
+                    ("a value swapped", serde_json::json!({})),
+                    ("a value swapped", serde_json::json!(true)),
+                ] {
+                    let mut swapped = item.clone();
+                    swapped[key.as_str()] = other;
+                    probes.push((class, swapped));
+                }
+            }
+            let mut unknown = item.clone();
+            unknown["a_key_no_shape_knows"] = serde_json::json!(1);
+            probes.push(("an unknown key", unknown));
+            for kind in [
+                "totally_made_up",
+                "item_reference",
+                "simple_input_message",
+                "message",
+            ] {
+                let mut renamed = item.clone();
+                renamed["type"] = serde_json::json!(kind);
+                probes.push(("the type renamed", renamed));
+            }
+            for phase in [serde_json::json!("commentary"), serde_json::json!(7)] {
+                let mut phased = item.clone();
+                phased["phase"] = phase;
+                probes.push(("a phase", phased));
+            }
+        }
+        let mut taken = 0;
+        for (class, probe) in &probes {
+            let expected = through_derive(probe);
+            assert_eq!(through_request(probe), expected, "{class}: {probe}");
+            taken += usize::from(expected.is_some());
+        }
+        assert!(
+            taken > SMALLEST_TAGGED_ITEMS.len() + fuller.len(),
+            "{taken} of {} probes taken",
+            probes.len()
+        );
+    }
+
+    /// The three sampling knobs the request keeps as plain values read as set
+    /// only off their serde defaults: absent is unset, a value is set, and a
+    /// knob written as the default's own value reads as unset (the limit of a
+    /// plain field).
+    #[test]
+    fn the_plain_valued_sampling_knobs_read_as_set_only_off_their_defaults() {
+        let parse = |body: Value| -> ResponsesRequest {
+            serde_json::from_value(body).expect("the request deserializes")
+        };
+
+        let unset = parse(serde_json::json!({"model": "m", "input": "hi"}));
+        assert_eq!(unset.top_k_if_set(), None, "an absent top_k is unset");
+        assert_eq!(unset.min_p_if_set(), None, "an absent min_p is unset");
+        assert_eq!(
+            unset.repetition_penalty_if_set(),
+            None,
+            "an absent repetition_penalty is unset"
+        );
+
+        let set = parse(serde_json::json!({
+            "model": "m", "input": "hi", "top_k": 40, "min_p": 0.05, "repetition_penalty": 1.1
+        }));
+        assert_eq!(
+            set.top_k_if_set(),
+            Some(40),
+            "a top_k the request wrote is set"
+        );
+        assert_eq!(
+            set.min_p_if_set(),
+            Some(0.05),
+            "a min_p the request wrote is set"
+        );
+        assert_eq!(
+            set.repetition_penalty_if_set(),
+            Some(1.1),
+            "a repetition_penalty the request wrote is set"
+        );
+
+        let at_default = parse(serde_json::json!({
+            "model": "m", "input": "hi", "top_k": -1, "min_p": 0.0, "repetition_penalty": 1.0
+        }));
+        assert_eq!(
+            at_default.top_k_if_set(),
+            None,
+            "a top_k written as -1 reads as unset"
+        );
+        assert_eq!(
+            at_default.min_p_if_set(),
+            None,
+            "a min_p written as 0 reads as unset"
+        );
+        assert_eq!(
+            at_default.repetition_penalty_if_set(),
+            None,
+            "a repetition_penalty written as 1 reads as unset"
+        );
+    }
+
+    /// The outputs of calls not among the items go; every other item keeps
+    /// its place.
+    #[test]
+    fn without_outputs_of_missing_calls_keeps_the_outputs_of_the_calls_present() {
+        let items: Vec<ResponseInputOutputItem> = serde_json::from_value(serde_json::json!([
+            {"type": "function_call_output", "call_id": "call_gone", "output": "1"},
+            {"type": "message", "id": "msg_1", "role": "user",
+             "content": [{"type": "input_text", "text": "hi"}]},
+            {"type": "function_call", "call_id": "call_kept", "name": "calc",
+             "arguments": "{}", "status": "completed"},
+            {"type": "function_call_output", "call_id": "call_kept", "output": "2"},
+            {"type": "custom_tool_call_output", "call_id": "call_gone_too", "output": "3"},
+            {"type": "local_shell_call_output", "id": "call_gone_shell", "output": "4"},
+            {"type": "message", "id": "msg_2", "role": "assistant",
+             "content": [{"type": "output_text", "text": "ok", "annotations": []}]},
+        ]))
+        .expect("the items deserialize");
+
+        let kept = without_outputs_of_missing_calls(items);
+
+        let kinds: Vec<String> = kept
+            .iter()
+            .map(|item| {
+                serde_json::to_value(item).expect("an item serializes")["type"]
+                    .as_str()
+                    .unwrap_or("?")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "message",
+                "function_call",
+                "function_call_output",
+                "message"
+            ]
+        );
+        assert!(matches!(
+            &kept[2],
+            ResponseInputOutputItem::FunctionCallOutput { call_id, .. } if call_id == "call_kept"
+        ));
+    }
+
+    fn items(value: Value) -> Vec<ResponseInputOutputItem> {
+        serde_json::from_value(value).expect("the items deserialize")
+    }
+
+    /// The kind of each item, with the role of a message.
+    fn kinds(items: &[ResponseInputOutputItem]) -> Vec<String> {
+        items
+            .iter()
+            .map(|item| match item {
+                ResponseInputOutputItem::Message { role, .. }
+                | ResponseInputOutputItem::SimpleInputMessage { role, .. } => {
+                    format!("message:{role}")
+                }
+                other => serde_json::to_value(other).expect("an item serializes")["type"]
+                    .as_str()
+                    .unwrap_or("?")
+                    .to_string(),
+            })
+            .collect()
+    }
+
+    /// A window that begins with the tail of a turn (the output of a call
+    /// before it, the assistant's answer) begins at the client's next
+    /// message, whichever role the client wrote it as; everything from there
+    /// on keeps its place.
+    #[test]
+    fn from_turn_boundary_begins_at_the_first_client_message() {
+        let items = items(serde_json::json!([
+            {"type": "function_call_output", "call_id": "call_gone", "output": "1"},
+            {"type": "message", "id": "msg_1", "role": "assistant",
+             "content": [{"type": "output_text", "text": "the tail of a turn", "annotations": []}]},
+            {"role": "developer", "content": "a note"},
+            {"type": "message", "id": "msg_2", "role": "user",
+             "content": [{"type": "input_text", "text": "hi"}]},
+            {"type": "function_call", "call_id": "call_kept", "name": "calc",
+             "arguments": "{}", "status": "completed"},
+            {"type": "function_call_output", "call_id": "call_kept", "output": "2"},
+        ]));
+
+        let kept = from_turn_boundary(items);
+
+        assert_eq!(
+            kinds(&kept),
+            [
+                "message:developer",
+                "message:user",
+                "function_call",
+                "function_call_output"
+            ]
+        );
+    }
+
+    /// A window with no client message (one long turn of the model's calls)
+    /// begins at its first call with its output, with the reasoning that led
+    /// to it: the output of the call before them and the model's aside go,
+    /// the rest keeps its place, an open call at the end included.
+    #[test]
+    fn from_turn_boundary_begins_at_a_call_with_its_output_and_its_reasoning() {
+        let items = items(serde_json::json!([
+            {"type": "function_call_output", "call_id": "call_gone", "output": "1"},
+            {"type": "message", "id": "msg_1", "role": "assistant",
+             "content": [{"type": "output_text", "text": "let me check", "annotations": []}]},
+            {"type": "reasoning", "id": "rs_1", "summary": [],
+             "content": [{"type": "reasoning_text", "text": "thinking"}]},
+            {"type": "function_call", "call_id": "call_kept", "name": "calc",
+             "arguments": "{}", "status": "completed"},
+            {"type": "function_call_output", "call_id": "call_kept", "output": "2"},
+            {"type": "function_call", "call_id": "call_open", "name": "calc",
+             "arguments": "{}", "status": "in_progress"},
+        ]));
+
+        let kept = from_turn_boundary(items);
+
+        assert_eq!(
+            kinds(&kept),
+            [
+                "reasoning",
+                "function_call",
+                "function_call_output",
+                "function_call"
+            ]
+        );
+    }
+
+    /// A call with its output before the client's first message is the tail
+    /// of the turn the cut split: the window begins at that message, not at
+    /// the call, whichever row the cut landed on.
+    #[test]
+    fn from_turn_boundary_passes_a_call_with_its_output_before_the_first_client_message() {
+        let items = items(serde_json::json!([
+            {"type": "function_call", "call_id": "call_13", "name": "calc",
+             "arguments": "{}", "status": "completed"},
+            {"type": "function_call_output", "call_id": "call_13", "output": "1"},
+            {"type": "message", "id": "msg_1", "role": "assistant",
+             "content": [{"type": "output_text", "text": "the answer of turn 13", "annotations": []}]},
+            {"type": "message", "id": "msg_2", "role": "user",
+             "content": [{"type": "input_text", "text": "turn 14"}]},
+            {"type": "function_call", "call_id": "call_14", "name": "calc",
+             "arguments": "{}", "status": "completed"},
+            {"type": "function_call_output", "call_id": "call_14", "output": "2"},
+        ]));
+
+        let kept = from_turn_boundary(items);
+
+        assert_eq!(
+            kinds(&kept),
+            ["message:user", "function_call", "function_call_output"]
+        );
+    }
+
+    /// A hosted call with its output, or with its failure, is a boundary; one
+    /// still in progress is a call without its output and is none. A window
+    /// with no boundary, and one already at a boundary, come back as they are.
+    #[test]
+    fn from_turn_boundary_takes_a_hosted_call_and_keeps_a_window_without_one() {
+        let answer = |text: &str| {
+            serde_json::json!({"type": "message", "id": "msg", "role": "assistant",
+                "content": [{"type": "output_text", "text": text, "annotations": []}]})
+        };
+        let hosted = items(serde_json::json!([
+            answer("the tail of a turn"),
+            {"type": "mcp_call", "id": "mcp_1", "name": "search", "server_label": "docs",
+             "arguments": "{}", "output": "found", "status": "completed"},
+            answer("found it"),
+        ]));
+        assert_eq!(
+            kinds(&from_turn_boundary(hosted)),
+            ["mcp_call", "message:assistant"]
+        );
+
+        let failed = items(serde_json::json!([
+            answer("the tail of a turn"),
+            {"type": "mcp_call", "id": "mcp_1", "name": "search", "server_label": "docs",
+             "arguments": "{}", "status": "failed"},
+            answer("it failed"),
+        ]));
+        assert_eq!(
+            kinds(&from_turn_boundary(failed)),
+            ["mcp_call", "message:assistant"]
+        );
+
+        let in_progress = items(serde_json::json!([
+            answer("the tail of a turn"),
+            {"type": "mcp_call", "id": "mcp_1", "name": "search", "server_label": "docs",
+             "arguments": "{}", "status": "in_progress"},
+            answer("still looking"),
+        ]));
+        assert_eq!(
+            kinds(&from_turn_boundary(in_progress)),
+            ["message:assistant", "mcp_call", "message:assistant"]
+        );
+
+        let tail_only = items(serde_json::json!([
+            answer("the tail of a turn"),
+            {"type": "reasoning", "id": "rs_1", "summary": [],
+             "content": [{"type": "reasoning_text", "text": "thinking"}]},
+        ]));
+        assert_eq!(
+            kinds(&from_turn_boundary(tail_only)),
+            ["message:assistant", "reasoning"]
+        );
+
+        let whole = items(serde_json::json!([
+            {"type": "message", "id": "msg_1", "role": "user",
+             "content": [{"type": "input_text", "text": "hi"}]},
+            answer("hello"),
+        ]));
+        assert_eq!(
+            kinds(&from_turn_boundary(whole)),
+            ["message:user", "message:assistant"]
+        );
+    }
+
+    #[test]
+    fn from_turn_boundary_retains_additional_tools_from_trimmed_prefix() {
+        let window = items(serde_json::json!([
+            {"type": "function_call_output", "call_id": "call_gone", "output": "1"},
+            {"type": "additional_tools", "id": "at_1", "role": "developer",
+             "tools": [{"type": "function", "name": "exec_command", "parameters": {"type": "object"}}]},
+            {"type": "message", "id": "msg_1", "role": "assistant",
+             "content": [{"type": "output_text", "text": "tail", "annotations": []}]},
+            {"type": "agent_message", "id": "am_1", "author": "/root", "recipient": "/root/worker",
+             "content": [{"type": "input_text", "text": "run check"}]}
+        ]));
+        let kept = from_turn_boundary(window);
+        assert_eq!(kinds(&kept), ["additional_tools", "agent_message"]);
+    }
+
+    /// The Responses API usage of a chat-style usage: both detail objects
+    /// present, zero included, the cached and reasoning counts from the
+    /// details the usage carries.
+    #[test]
+    fn response_usage_from_a_usage_carries_both_detail_objects() {
+        let usage = serde_json::to_value(ResponseUsage::from(
+            &Usage::from_counts(71, 16)
+                .with_cached_tokens(5)
+                .with_reasoning_tokens(3),
+        ))
+        .expect("a JSON usage");
+        assert_eq!(
+            usage,
+            serde_json::json!({
+                "input_tokens": 71,
+                "output_tokens": 16,
+                "total_tokens": 87,
+                "input_tokens_details": {"cached_tokens": 5},
+                "output_tokens_details": {"reasoning_tokens": 3},
+            })
+        );
+        let plain = serde_json::to_value(ResponseUsage::from(&Usage::from_counts(71, 16)))
+            .expect("a JSON usage");
+        assert_eq!(
+            plain["input_tokens_details"],
+            serde_json::json!({"cached_tokens": 0})
+        );
+        assert_eq!(
+            plain["output_tokens_details"],
+            serde_json::json!({"reasoning_tokens": 0})
+        );
+    }
+
+    /// `validate_metadata_pairs` holds the public API's bounds for any map of
+    /// pairs: the pair count, the key and value lengths, and strings only,
+    /// each under the public code; a map at the bounds passes.
+    #[test]
+    fn metadata_pairs_are_bounded_as_the_public_api_bounds_them() {
+        let code = |pairs: Vec<(String, Value)>| {
+            let map: serde_json::Map<String, Value> = pairs.into_iter().collect();
+            validate_metadata_pairs(map.iter()).map_err(|error| error.code.to_string())
+        };
+        assert_eq!(
+            code(
+                (0..16)
+                    .map(|i| (format!("{i:0>64}"), serde_json::json!("v".repeat(512))))
+                    .collect()
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            code(
+                (0..17)
+                    .map(|i| (format!("k{i}"), serde_json::json!("v")))
+                    .collect()
+            ),
+            Err("object_above_max_properties".to_string())
+        );
+        assert_eq!(
+            code(vec![("k".repeat(65), serde_json::json!("v"))]),
+            Err("string_above_max_length".to_string())
+        );
+        assert_eq!(
+            code(vec![("k".to_string(), serde_json::json!("v".repeat(513)))]),
+            Err("string_above_max_length".to_string())
+        );
+        for (value, named) in [
+            (serde_json::json!({"nested": 1}), "an object"),
+            (serde_json::json!(5), "a number"),
+            (serde_json::json!(true), "a boolean"),
+            (serde_json::json!(null), "null"),
+            (serde_json::json!(["v"]), "an array"),
+        ] {
+            let map: serde_json::Map<String, Value> =
+                [("k".to_string(), value)].into_iter().collect();
+            let error = validate_metadata_pairs(map.iter())
+                .expect_err("a value that is not a string is refused");
+            assert_eq!(error.code, "invalid_type");
+            let message = error.message.as_deref().unwrap_or_default();
+            assert!(
+                message.contains("'metadata.k'") && message.contains(named),
+                "{message}"
+            );
+        }
+    }
+
+    /// Codex puts `client_metadata` on every request: it must parse, and it
+    /// must not be forwarded to the workers.
+    #[test]
+    fn client_metadata_is_accepted_and_not_forwarded() {
+        let request: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "input": "hi",
+            "client_metadata": {"session_id": "s", "x-codex-window-id": "s:0"},
+        }))
+        .expect("client_metadata parses");
+        assert_eq!(
+            request
+                .client_metadata
+                .as_ref()
+                .and_then(|m| m.get("session_id")),
+            Some(&Value::from("s"))
+        );
+        let forwarded = serde_json::to_value(&request).expect("a JSON request");
+        assert!(forwarded.get("client_metadata").is_none());
+    }
+
+    /// Lock `as_str()` to the canonical serde tag for the unit variants
+    /// — drift between the two would produce inconsistent wire labels
+    /// across dispatch paths and serializers.
+    #[test]
+    fn response_tool_as_str_matches_serde_tag_for_unit_variants() {
+        for tool in [
+            ResponseTool::Computer,
+            ResponseTool::ApplyPatch,
+            ResponseTool::LocalShell,
+        ] {
+            let serialized = serde_json::to_value(&tool).unwrap();
+            let serde_tag = serialized.get("type").and_then(|v| v.as_str()).unwrap();
+            assert_eq!(tool.as_str(), serde_tag);
+        }
+    }
+
+    const REASONING_EFFORT_TIERS: [ReasoningEffort; 7] = [
+        ReasoningEffort::None,
+        ReasoningEffort::Minimal,
+        ReasoningEffort::Low,
+        ReasoningEffort::Medium,
+        ReasoningEffort::High,
+        ReasoningEffort::Xhigh,
+        ReasoningEffort::Max,
+    ];
+
+    /// `as_str`/`parse` must agree with the serde tag: the Chat pipeline
+    /// receives the string form, and drift would change a tier in transit.
+    #[test]
+    fn reasoning_effort_str_forms_match_serde_tag() {
+        for effort in REASONING_EFFORT_TIERS {
+            let tag = serde_json::to_value(effort).unwrap();
+            assert_eq!(tag, Value::String(effort.as_str().to_string()));
+            assert_eq!(ReasoningEffort::parse(effort.as_str()), Some(effort));
+            assert_eq!(
+                serde_json::from_value::<ReasoningEffort>(tag).unwrap(),
+                effort
+            );
+        }
+        assert_eq!(ReasoningEffort::parse("bogus"), None);
+    }
+
+    /// Every OpenAI tier deserializes inside `reasoning`; an absent effort
+    /// still defaults to medium.
+    #[test]
+    fn reasoning_param_accepts_every_openai_tier() {
+        for tier in ["none", "minimal", "low", "medium", "high", "xhigh", "max"] {
+            let param: ResponseReasoningParam =
+                serde_json::from_value(serde_json::json!({ "effort": tier })).unwrap();
+            assert_eq!(param.effort.map(ReasoningEffort::as_str), Some(tier));
+        }
+        let param: ResponseReasoningParam = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(param.effort, Some(ReasoningEffort::Medium));
+    }
+
+    /// The routing text of a Responses request: a text input as is; the
+    /// items' text parts in order, joined by one space, images, files and
+    /// refusals skipped; a simple message's string or its parts; a reasoning
+    /// item's text.
+    #[test]
+    fn the_routing_text_reads_every_text_part_once_in_order() {
+        let request = ResponsesRequest {
+            input: ResponseInput::Items(vec![
+                ResponseInputOutputItem::Message {
+                    id: "m1".to_string(),
+                    role: "user".to_string(),
+                    content: vec![
+                        ResponseContentPart::InputText {
+                            text: "one".to_string(),
+                        },
+                        ResponseContentPart::InputImage {
+                            detail: None,
+                            file_id: None,
+                            image_url: Some("https://a/1.png".to_string()),
+                        },
+                        ResponseContentPart::OutputText {
+                            text: "two".to_string(),
+                            annotations: vec![],
+                            logprobs: None,
+                        },
+                        ResponseContentPart::Refusal {
+                            refusal: "no".to_string(),
+                        },
+                    ],
+                    status: None,
+                    phase: None,
+                },
+                ResponseInputOutputItem::SimpleInputMessage {
+                    content: StringOrContentParts::String("three".to_string()),
+                    role: "user".to_string(),
+                    r#type: None,
+                    phase: None,
+                },
+                ResponseInputOutputItem::SimpleInputMessage {
+                    content: StringOrContentParts::Array(vec![
+                        ResponseContentPart::InputFile {
+                            detail: None,
+                            file_data: None,
+                            file_id: Some("f".to_string()),
+                            file_url: None,
+                            filename: None,
+                        },
+                        ResponseContentPart::InputText {
+                            text: "four".to_string(),
+                        },
+                    ]),
+                    role: "user".to_string(),
+                    r#type: None,
+                    phase: None,
+                },
+                ResponseInputOutputItem::Reasoning {
+                    id: Some("r1".to_string()),
+                    summary: vec![],
+                    content: vec![ResponseReasoningContent::ReasoningText {
+                        text: "five".to_string(),
+                    }],
+                    encrypted_content: None,
+                    status: None,
+                },
+            ]),
+            ..Default::default()
+        };
+        assert_eq!(
+            request.extract_text_for_routing(),
+            "one two three four five"
+        );
+
+        let text = ResponsesRequest {
+            input: ResponseInput::Text("plain".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(text.extract_text_for_routing(), "plain");
+    }
+
+    /// Text-only content takes the text parts and refuses any other part,
+    /// naming the first part it cannot carry.
+    #[test]
+    fn text_only_content_refuses_a_part_without_text() {
+        let with_image = StringOrContentParts::Array(vec![
+            ResponseContentPart::InputText {
+                text: "a".to_string(),
+            },
+            ResponseContentPart::InputImage {
+                detail: None,
+                file_id: None,
+                image_url: Some("https://a/1.png".to_string()),
+            },
+        ]);
+        assert_eq!(
+            with_image.to_text_only().unwrap_err(),
+            "Unsupported content part type \"input_image\" in a function output for text-only backends: only text parts are carried as a tool result"
+        );
+        let with_file = StringOrContentParts::Array(vec![ResponseContentPart::InputFile {
+            detail: None,
+            file_data: None,
+            file_id: Some("file_1".to_string()),
+            file_url: None,
+            filename: None,
+        }]);
+        assert_eq!(
+            with_file.to_text_only().unwrap_err(),
+            "Unsupported content part type \"input_file\" in a function output for text-only backends: only text parts are carried as a tool result"
+        );
+
+        let text = StringOrContentParts::Array(vec![
+            ResponseContentPart::InputText {
+                text: "a".to_string(),
+            },
+            ResponseContentPart::OutputText {
+                text: "b".to_string(),
+                annotations: vec![],
+                logprobs: None,
+            },
+        ]);
+        assert_eq!(text.to_text_only().unwrap(), "ab");
+    }
+
+    /// The normaliser takes an item by value: a bare `{role, content}` message
+    /// becomes a message item carrying that content and role, and every other
+    /// item comes back as it came.
+    #[test]
+    fn normalize_input_item_reshapes_a_bare_message_and_keeps_every_other_item() {
+        let item = |body: Value| -> ResponseInputOutputItem {
+            serde_json::from_value(body).expect("the input item deserializes")
+        };
+        let wire = |item: &ResponseInputOutputItem| serde_json::to_value(item).unwrap();
+
+        let bare = normalize_input_item(item(
+            serde_json::json!({"role": "user", "content": "continue", "phase": "commentary"}),
+        ));
+        let ResponseInputOutputItem::Message {
+            id,
+            role,
+            content,
+            status,
+            phase,
+        } = &bare
+        else {
+            panic!("a bare message becomes a message item, got {bare:?}");
+        };
+        assert!(id.starts_with("msg_"), "a generated message id, got {id}");
+        assert_eq!(role, "user");
+        assert_eq!(
+            serde_json::to_value(content).unwrap(),
+            serde_json::json!([{"type": "input_text", "text": "continue"}])
+        );
+        assert_eq!(status.as_deref(), Some("completed"));
+        assert_eq!(*phase, Some(MessagePhase::Commentary));
+
+        let parts = normalize_input_item(item(serde_json::json!({
+            "role": "user",
+            "content": [{"type": "input_text", "text": "a"}, {"type": "input_text", "text": "b"}]
+        })));
+        assert_eq!(
+            wire(&parts)["content"],
+            serde_json::json!([{"type": "input_text", "text": "a"}, {"type": "input_text", "text": "b"}]),
+            "the parts move over in order"
+        );
+
+        let call = item(serde_json::json!({
+            "type": "function_call", "id": "fc_1", "call_id": "call_1",
+            "name": "lookup", "arguments": "{\"key\": \"k\"}"
+        }));
+        let before = wire(&call);
+        assert_eq!(
+            wire(&normalize_input_item(call)),
+            before,
+            "an item that is not a bare message is returned as it came"
+        );
+    }
+}

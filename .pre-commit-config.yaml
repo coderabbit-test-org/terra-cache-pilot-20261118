@@ -1,0 +1,120 @@
+default_stages: [pre-commit, manual]
+default_install_hook_types: [pre-commit, commit-msg, pre-push]
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-symlinks
+      - id: destroyed-symlinks
+        stages: [pre-commit, manual]
+      - id: trailing-whitespace
+        stages: [pre-commit, manual]
+        # Patch files keep their whitespace: a blank context line is a single space.
+        # Chat-template fixtures are kept as published; their whitespace is part of the template.
+        exclude: \.patch$|tests/fixtures/.*\.jinja$
+      - id: end-of-file-fixer
+        stages: [pre-commit, manual]
+        # Recorded SSE streams end with the protocol's blank line, and the
+        # streaming tests compare them byte for byte.
+        exclude: \.sse$
+      - id: check-yaml
+        args: [--allow-multiple-documents, --unsafe]
+        exclude: ^deploy/helm/.*/templates/|^deploy/helm/.*/tests/
+      - id: check-toml
+      - id: check-added-large-files
+        stages: [pre-commit, manual]
+      - id: check-merge-conflict
+      - id: check-shebang-scripts-are-executable
+        stages: [pre-commit, manual]
+        exclude: \.rs$
+      - id: detect-private-key
+        exclude: .*tests/.*_test\.rs$
+      - id: mixed-line-ending
+        # Recorded SSE streams carry a CRLF-terminated frame on purpose, and
+        # the relay tests compare them with the relayed bytes byte for byte.
+        exclude: \.sse$
+      - id: no-commit-to-branch
+
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.4.1
+    hooks:
+      - id: codespell
+        additional_dependencies: ['tomli']
+        args: ['-L', 'cann,thi,makro,wil,rouge,PRIS,hel,te,ans,ser,wit,WIT,implementors,caf,nin,Nin,doubleclick,allocatedp,notin,NotIn,ure,preformed,Nd,atmost,AtMost,InForce']
+        exclude: |
+          (?x)^(
+            Cargo\.lock|
+            src/proto/.*\.proto$|
+            src/mesh/proto/.*\.proto$|
+            src/tokenizer/chat_template\.rs|
+            crates/multimodal/tests/fixtures/.*|
+            crates/response_template/tests/fixtures/.*|
+            target/.*
+          )$
+
+  - repo: local
+    hooks:
+      - id: rustfmt
+        name: rustfmt
+        description: Format Rust code with rustfmt
+        entry: cargo +nightly fmt --all --
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: rustfmt-symphony-fuzz
+        name: rustfmt (symphony fuzz workspace)
+        description: Format the Symphony fuzz crate, a workspace of its own that `cargo fmt --all` from the root does not reach
+        entry: cargo +nightly fmt --manifest-path crates/symphony/fuzz/Cargo.toml --all --
+        language: system
+        types: [rust]
+        files: ^crates/symphony/fuzz/
+        pass_filenames: false
+
+      - id: clippy
+        name: clippy
+        description: Lint Rust code with clippy
+        entry: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: branch-name-check
+        name: Branch naming convention
+        description: Ensure the branch name follows the rule in scripts/branch-name-check.sh, the one the pull-request workflow reads too
+        entry: scripts/branch-name-check.sh
+        language: system
+        stages: [pre-push]
+        always_run: true
+        pass_filenames: false
+
+      - id: dco-check
+        name: DCO sign-off check
+        description: Check that the commit message contains a DCO sign-off matching git user config
+        entry: scripts/dco-check.sh
+        language: system
+        stages: [commit-msg]
+        always_run: true
+
+      - id: no-ai-co-author
+        name: No AI co-author or sign-off
+        description: Reject Co-authored-by or Signed-off-by lines referencing Claude or noreply@anthropic.com
+        entry: |
+          bash -c '
+            if grep -iE "^(Co-authored-by|Signed-off-by):.*(Claude|noreply@anthropic\.com)" "$1"; then
+              echo ""
+              echo "ERROR: Commit message must not reference Claude or noreply@anthropic.com in Co-authored-by/Signed-off-by lines."
+              exit 1
+            fi
+          ' --
+        language: system
+        stages: [commit-msg]
+        always_run: true
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.0
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format

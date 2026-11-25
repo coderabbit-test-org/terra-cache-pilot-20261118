@@ -1,0 +1,628 @@
+//! Cross-router shared utilities.
+//!
+//! This module collects helpers that every router (HTTP, gRPC,
+//! OpenAI, Anthropic, Gemini, etc.) needs but no individual router
+//! owns. Putting them here keeps `routers/mod.rs` focused on the
+//! `RouterTrait` definition and the per-protocol submodules.
+//!
+//! Submodules:
+//! - [`body_policy`] — per-family [`body_policy::BodyPolicy`] capability,
+//!   the per-request buffer-vs-stream decision matrix and its counter
+//!   vocabulary
+//! - [`header_utils`] — request header parsing helpers
+//!   (`extract_routing_key`, `extract_target_worker`, etc.)
+//! - [`mcp_utils`] — Model Context Protocol tool-call orchestration
+//! - [`persistence_utils`] — response/conversation persistence
+//!   helpers shared across the chat / responses / messages routes
+//! - [`realtime`] — Realtime API transport (WS/WebRTC/REST relay +
+//!   session registry) shared by the OpenAI and HTTP routers
+//! - [`overload`] — shed responses for the absolute worker-overload
+//!   guard, shared by the HTTP and gRPC selection paths
+//! - `pair_classes` — a pair index's partner lists as the policy engine
+//!   reads them: a class on each worker and the table of classes that pair
+//! - `pair_index` — the prefill and decode workers that may pair, decided
+//!   once for a membership generation and read by every placement
+//! - [`pd_admission`] — the disaggregated dispatch's admission gate: never
+//!   post more bootstrap rooms to a pair than its decode engine can admit
+//! - `pd_failure` — the one vocabulary a prefill or decode side's failure is
+//!   named by (the side, the phase, the failure's own status), the HTTP and
+//!   gRPC prefill-decode paths' answers built from it
+//! - `placement` — policy-driven worker placement over the routing
+//!   pools (single worker and prefill/decode pairs), the one sequence the
+//!   HTTP and gRPC families used to each carry a copy of
+//! - [`worker_selection`] — per-request worker-selection helpers used
+//!   by every routing path (regular, PD, fallback, external provider)
+//! - `test_support` (test builds only) — the fast retry policy the HTTP
+//!   and gRPC routers' tests retry under
+//! - `bench_support` (test builds and the `test-util` feature) — the
+//!   regular and the pair selection over a registered fleet, for a
+//!   benchmark of each path
+//! - `attempt_ledger` — one request's bookkeeping across its retry
+//!   attempts: the circuit breaker charged once per request per worker,
+//!   and a worker's definitive answer never replayed on it
+//! - `rate_limit_cell` — one logical request's tenant rate-limit
+//!   reservation: reserved once before any dispatch, then settled, handed
+//!   to a streaming body, or closed unsettled
+//! - [`request_lease`] — dispatch-phase owner of a request's parsed
+//!   body, routing derivatives and serialized upstream bytes, with a
+//!   retry-aware release point
+//! - [`retry`] — generic async retry executor + backoff calculator,
+//!   used by every router for transport-level retries. Has zero
+//!   coupling to the `Worker` trait — it lived in `worker/` for
+//!   historical reasons before this extraction.
+//! - [`sglang_fields`] — the engine-specific request fields the HTTP proxy
+//!   strips at their defaults and the provider transformers drop outright
+//! - [`snapshot`] — the gateway's value of a membership generation (the
+//!   routing pools, the pairs, the window floors and the labels kept with
+//!   the members), and the registry and the load monitor named over it
+//! - [`sse`] — shared SSE codec (encoder + decoder) for streaming
+//!   responses to clients and parsing upstream SSE byte streams
+
+pub(crate) mod attempt_ledger;
+pub mod body_policy;
+pub(crate) mod decisions;
+pub use smg_external_router::header_utils;
+pub(crate) mod kv_transfer;
+pub use smg_external_router::{mcp_utils, openai_bridge};
+pub mod overload;
+pub(crate) mod pair_classes;
+pub(crate) mod pair_index;
+pub mod pd_admission;
+pub(crate) mod pd_failure;
+pub use smg_external_router::persistence_utils;
+pub(crate) mod place_request;
+pub(crate) mod placement;
+pub mod prefill_admission;
+pub(crate) mod rate_limit_cell;
+pub use smg_external_router::realtime;
+pub mod request_lease;
+pub(crate) mod responses_compat;
+pub(crate) use smg_external_router::sglang_fields;
+pub use smg_external_router::{retry, sse};
+pub mod snapshot;
+pub mod sse_rechunk;
+pub mod stream;
+#[cfg(test)]
+mod worker_health_tests;
+pub mod worker_selection;
+
+/// Threshold above which upstream request bodies are sent as one-shot
+/// streams. A streamed body's `try_clone()` is `None` in every layer that
+/// would otherwise hold a refcount until response headers (the stale-conn
+/// resend guard, reqwest's internal retry and redirect clones), so the
+/// allocation frees at upload completion instead of living for the whole
+/// generation on buffered upstreams. The explicit Content-Length keeps h1
+/// framing non-chunked; h2 is unaffected.
+pub(crate) const STREAM_UPSTREAM_BODY_OVER: usize = 1 << 20;
+
+/// Buffer capacity for reserializing a parsed request of `raw_len` incoming
+/// bytes: the round trip stays close to raw size, and the 1/16 + 512B slack
+/// absorbs injected fields (bootstrap, kv_transfer_params, dp ranks).
+fn serialized_capacity(raw_len: usize) -> usize {
+    raw_len + raw_len / 16 + 512
+}
+
+/// `serde_json::to_vec` into a buffer pre-sized from the raw request length,
+/// avoiding doubling growth (and its final huge memcpy) for large bodies.
+pub(crate) fn serialize_json_sized<T: serde::Serialize>(
+    value: &T,
+    raw_len: Option<usize>,
+) -> serde_json::Result<Vec<u8>> {
+    let mut buf = Vec::with_capacity(raw_len.map_or(128, serialized_capacity));
+    serde_json::to_writer(&mut buf, value)?;
+    Ok(buf)
+}
+
+/// The capacity a thread's JSON answer buffer keeps between answers: a chat
+/// completion, a Messages answer or a JSON-schema answer of a few hundred
+/// bytes fits it many times over; the buffer a larger answer grew goes with
+/// that answer.
+const JSON_ANSWER_RETAINED: usize = 64 * 1024;
+
+thread_local! {
+    /// The buffer a thread's typed JSON answers are serialized into.
+    static JSON_ANSWER_BUFFER: std::cell::RefCell<Vec<u8>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A typed answer as a JSON response: serialized once into the thread's
+/// buffer (serde's own sink, one `extend_from_slice` per write) and copied
+/// once into a body of exactly its size, with the `application/json`
+/// content type. That is one allocation per answer: a buffer sized per
+/// answer and handed to the body by refcount cost two, the buffer and the
+/// shared header `Bytes::from` boxes for a buffer with spare capacity, and
+/// grew again for a body past its size. `axum::Json` writes the same bytes
+/// through `BytesMut::with_capacity(128).writer()`: the `bytes` writer
+/// adapter slices every write to the buffer's remaining room before it
+/// appends, which prices the one-byte JSON tokens (2.5 % of a chat
+/// request's user instructions on the mock bed), and the 128-byte start
+/// reallocates and copies a 700-byte body three times. A value that does
+/// not serialize answers as axum does: a 500 with the error's text.
+pub fn json_response<T: serde::Serialize>(value: &T) -> axum::response::Response {
+    JSON_ANSWER_BUFFER.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut buffer) => {
+            buffer.clear();
+            let result = serde_json::to_writer(&mut *buffer, value);
+            let response = json_answer(&buffer, result);
+            if buffer.capacity() > JSON_ANSWER_RETAINED {
+                *buffer = Vec::new();
+            }
+            response
+        }
+        // A serializer that answers while this thread's buffer is borrowed
+        // (none does today): a buffer of this answer's own.
+        Err(_) => {
+            let mut buffer = Vec::new();
+            let result = serde_json::to_writer(&mut buffer, value);
+            json_answer(&buffer, result)
+        }
+    })
+}
+
+/// The response of a serialized answer, compiled once for every `T`.
+fn json_answer(body: &[u8], result: serde_json::Result<()>) -> axum::response::Response {
+    use axum::{
+        http::{header, HeaderValue, StatusCode},
+        response::IntoResponse,
+    };
+    match result {
+        Ok(()) => (
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            )],
+            bytes::Bytes::copy_from_slice(body),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            )],
+            error.to_string(),
+        )
+            .into_response(),
+    }
+}
+
+/// A typed request as a `Value`, for the forwarding paths that edit it:
+/// `openai_protocol::common::to_value_exact` with the buffer pre-sized from
+/// the raw request length. Every typed `f32` goes out as the client wrote
+/// it (`serde_json::to_value` would widen `0.95` to `0.949999988079071`).
+pub(crate) fn request_to_value<T: serde::Serialize>(
+    value: &T,
+    raw_len: Option<usize>,
+) -> serde_json::Result<serde_json::Value> {
+    serde_json::from_slice(&serialize_json_sized(value, raw_len)?)
+}
+
+/// `Bytes::from(Vec)` keeps the Vec's capacity, so unshrunk doubling growth
+/// (up to 2x len) would be retained for the buffer's whole lifetime; trade
+/// one bounded memcpy to free it. The threshold is double the intended
+/// pre-size slack so well-hinted buffers are never re-copied.
+pub(crate) fn trim_serialization_slack(buf: &mut Vec<u8>) {
+    if buf.capacity() > buf.len() + buf.len() / 8 + 1024 {
+        buf.shrink_to_fit();
+    }
+}
+
+pub(crate) fn attach_sized_body(
+    builder: reqwest::RequestBuilder,
+    body: bytes::Bytes,
+) -> reqwest::RequestBuilder {
+    let len = body.len();
+    let builder = builder.header(reqwest::header::CONTENT_LENGTH, len);
+    if len >= STREAM_UPSTREAM_BODY_OVER {
+        builder.body(reqwest::Body::wrap_stream(futures::stream::once(
+            async move { Ok::<_, std::convert::Infallible>(body) },
+        )))
+    } else {
+        builder.body(body)
+    }
+}
+
+/// What a benchmark needs of the routers' selection: the regular placement
+/// over one model's registered pool and the default pair selection over its
+/// registered prefill-decode fleet, each as a router runs it for a request,
+/// and whether the process captures every request's cache trace.
+#[cfg(any(test, feature = "test-util"))]
+pub mod bench_support {
+    use std::sync::Arc;
+
+    use axum::http::HeaderMap;
+    use smg_worker::{identity::basic::Worker, load::state::LoadReceiver};
+
+    use super::{
+        attempt_ledger::AttemptLedger,
+        overload,
+        placement::{select_pair, select_single, Placed, PlacementInputs, Stated},
+    };
+    use crate::{
+        config::RouterConfig,
+        observability::cache_trace,
+        policies::{PolicyRegistry, Side},
+        routers::common::{
+            pair_index::{PdPairIndex, PdWire},
+            snapshot::{RoutingPool, WorkerRegistry, WorkerRegistryExt},
+        },
+    };
+
+    /// The route a request is placed on: the pool its router places over.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Route {
+        /// The regular HTTP router.
+        Http,
+        /// The gRPC pipeline's regular selection stage.
+        Grpc,
+    }
+
+    impl Route {
+        /// The pool the route's router places a single request over.
+        fn pool(self) -> RoutingPool {
+            match self {
+                Self::Http => RoutingPool::HttpRegular,
+                Self::Grpc => RoutingPool::GrpcPipelineRegular,
+            }
+        }
+    }
+
+    /// Bytes the calling thread has allocated since it started, by the
+    /// allocator's own count of the thread: a free does not subtract.
+    /// `None` in a build that links no such count.
+    pub fn thread_allocated_bytes() -> Option<u64> {
+        #[cfg(all(
+            feature = "jemalloc-stats",
+            not(target_env = "msvc"),
+            not(target_env = "musl")
+        ))]
+        {
+            tikv_jemalloc_ctl::thread::allocatedp::read()
+                .ok()
+                .map(|allocated| allocated.get())
+        }
+        #[cfg(not(all(
+            feature = "jemalloc-stats",
+            not(target_env = "msvc"),
+            not(target_env = "musl")
+        )))]
+        {
+            None
+        }
+    }
+
+    /// The worker a route placed a request on, as a number a bench compares
+    /// with another request's: the place of the worker's object in memory,
+    /// which stands for as long as the worker is registered. Nothing else is
+    /// read of it.
+    fn placed_on(worker: &Arc<dyn Worker>) -> usize {
+        Arc::as_ptr(worker).addr()
+    }
+
+    /// Hands the classic policies the load feed the monitor would publish.
+    pub fn attach_loads(policies: &PolicyRegistry, loads: Option<LoadReceiver>) {
+        policies.set_load_receiver(loads);
+    }
+
+    /// Sets a pair gateway's side policies on `policies` as the router
+    /// factory sets them at the start: each side's own policy of `config`,
+    /// or its main policy.
+    pub fn set_pair_sides(policies: &PolicyRegistry, config: &RouterConfig) {
+        let main = &config.policy;
+        policies.set_side_policy(Side::Prefill, config.mode.get_prefill_policy(main));
+        policies.set_side_policy(Side::Decode, config.mode.get_decode_policy(main));
+    }
+
+    /// One request's routing under the classic policies on `route`: the
+    /// placement over the route's own pool, the dispatch-time read of the
+    /// chosen worker's overload veto, and the worker's load guard from the
+    /// send to the request's end, whose drop tells the model's policy.
+    /// `headers` are the request's, where it carries any: a routing key is
+    /// read from them as a router reads it, for the placement and for the
+    /// load guard. The worker the request went to (`placed_on`), and
+    /// `None` where it had no worker.
+    pub fn route_classic(
+        registry: &WorkerRegistry,
+        policies: &PolicyRegistry,
+        model: &str,
+        route: Route,
+        tokens: Option<&[u32]>,
+        headers: Option<&HeaderMap>,
+    ) -> Option<usize> {
+        let pool = route.pool();
+        let inputs = PlacementInputs {
+            tokens,
+            headers,
+            ..Default::default()
+        };
+        let worker = select_single(
+            registry,
+            policies,
+            model,
+            pool,
+            None,
+            inputs,
+            Stated::nothing,
+        )?;
+        let shed =
+            overload::shed_if_worker_overloaded(&*worker, model, registry.overload_shed_enabled());
+        if shed.is_some() {
+            return None;
+        }
+        let went = placed_on(worker.worker());
+        let guard = worker.into_guard(policies.sticky_key(headers, None));
+        drop(guard);
+        Some(went)
+    }
+
+    /// One request's routing through a pair gateway's classic placement
+    /// on the gRPC wire: the pair index of the model's snapshot, the pair
+    /// placed over it by the registry's two side policies, and each side's
+    /// load guard from the send to the request's end. The prefill worker
+    /// the request went to (`placed_on`), and `None` where it had no
+    /// pair.
+    pub fn route_pair(
+        registry: &WorkerRegistry,
+        policies: &PolicyRegistry,
+        model: &str,
+        tokens: Option<&[u32]>,
+    ) -> Option<usize> {
+        let pairs = registry
+            .get_routing_snapshot(model)
+            .pd_pairs(PdWire::Grpc, policies.pd_pairing_mode());
+        let inputs = PlacementInputs {
+            tokens,
+            ..Default::default()
+        };
+        let pair = select_pair(
+            registry,
+            policies,
+            model,
+            &pairs,
+            None,
+            None,
+            inputs,
+            Stated::nothing,
+        )
+        .ok()?;
+        let went = placed_on(pair.prefill.worker());
+        let key = policies.sticky_key(None, None);
+        let prefill = pair.prefill.into_guard(key);
+        // The decode's guard as a pair route makes it: ahead of the decode's
+        // send, and sent behind the prefill.
+        let decode = pair.decode.ahead(key);
+        let decode = pair.decode.sent(decode);
+        drop((prefill, decode));
+        Some(went)
+    }
+
+    /// Whether a process switch captures every request's cache trace
+    /// (`SMG_CACHE_TRACE=1` or `SMG_CACHE_TRACE_HEADER=1`). A benchmark cell
+    /// labelled untraced is not untraced in such a process.
+    pub fn process_trace_configured() -> bool {
+        cache_trace::configured()
+    }
+
+    /// One model's regular pool over the gRPC pipeline and its policies.
+    pub struct RegularPath {
+        registry: Arc<WorkerRegistry>,
+        policies: Arc<PolicyRegistry>,
+        model: String,
+    }
+
+    impl RegularPath {
+        /// The regular pool of `model` as `registry` holds it at each
+        /// placement.
+        pub fn new(
+            registry: Arc<WorkerRegistry>,
+            policies: Arc<PolicyRegistry>,
+            model: &str,
+        ) -> Self {
+            Self {
+                registry,
+                policies,
+                model: model.to_string(),
+            }
+        }
+
+        /// One placement of a request carrying `tokens`, with no filter, no
+        /// wire pin and no tried engine: the pool drawn from the registry
+        /// and one policy pick over it.
+        pub fn place(&self, tokens: Option<&[u32]>) -> Option<Arc<dyn Worker>> {
+            self.select(PlacementInputs {
+                tokens,
+                ..Default::default()
+            })
+        }
+
+        /// [`Self::place`] under a candidate filter that refuses nobody and
+        /// costs nothing itself: what the selection adds when a router hands
+        /// it a filter, as the gRPC pipeline does on a request's first
+        /// attempt for its media and context demands.
+        pub fn place_filtered(&self, tokens: Option<&[u32]>) -> Option<Arc<dyn Worker>> {
+            let everyone = |_: &dyn Worker| true;
+            self.select(PlacementInputs {
+                tokens,
+                candidate_filter: Some(&everyone),
+                ..Default::default()
+            })
+        }
+
+        /// [`Self::place`] as the HTTP router runs a request's first
+        /// attempt: under the candidate filter a new request's attempt
+        /// ledger hands. The filter and the entry are that router's; the
+        /// pool is this path's, the gRPC pipeline's regular one.
+        pub fn place_first_attempt(&self, tokens: Option<&[u32]>) -> Option<Arc<dyn Worker>> {
+            AttemptLedger::default().with_candidate_filter(|candidate_filter| {
+                self.select(PlacementInputs {
+                    tokens,
+                    candidate_filter,
+                    ..Default::default()
+                })
+            })
+        }
+
+        fn select(&self, inputs: PlacementInputs<'_>) -> Option<Arc<dyn Worker>> {
+            select_single(
+                &self.registry,
+                &self.policies,
+                &self.model,
+                RoutingPool::GrpcPipelineRegular,
+                None,
+                inputs,
+                Stated::nothing,
+            )
+            .map(Placed::into_worker)
+        }
+    }
+
+    /// One model's fleet, its policies and its pair index over the gRPC wire.
+    pub struct PairPath {
+        registry: Arc<WorkerRegistry>,
+        policies: Arc<PolicyRegistry>,
+        model: String,
+        pairs: Arc<PdPairIndex>,
+    }
+
+    impl PairPath {
+        /// The pair index of `model` over the workers `registry` holds now.
+        pub fn new(
+            registry: Arc<WorkerRegistry>,
+            policies: Arc<PolicyRegistry>,
+            model: &str,
+        ) -> Self {
+            let pairs = registry
+                .get_routing_snapshot(model)
+                .pd_pairs(PdWire::Grpc, policies.pd_pairing_mode());
+            Self {
+                registry,
+                policies,
+                model: model.to_string(),
+                pairs,
+            }
+        }
+
+        /// One placement of a request carrying `tokens`, with no admission
+        /// window: the prefill and the decode paired with it. With `traced`
+        /// it runs inside a cache-trace capture, as a request that asked for
+        /// its decision record does.
+        pub async fn place(
+            &self,
+            tokens: Option<&[u32]>,
+            traced: bool,
+        ) -> Option<(Arc<dyn Worker>, Arc<dyn Worker>)> {
+            cache_trace::scope(traced, async {
+                let inputs = PlacementInputs {
+                    tokens,
+                    ..Default::default()
+                };
+                select_pair(
+                    &self.registry,
+                    &self.policies,
+                    &self.model,
+                    &self.pairs,
+                    None,
+                    None,
+                    inputs,
+                    Stated::nothing,
+                )
+                .ok()
+                .map(|pair| (pair.prefill.into_worker(), pair.decode.into_worker()))
+            })
+            .await
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    //! What the HTTP and gRPC routers' tests share.
+
+    use crate::config::types::RetryConfig;
+
+    /// `max_retries` attempts with one to two milliseconds between them and
+    /// no jitter: a retrying test's whole schedule fits in its own bound.
+    pub(crate) fn fast_retry_config(max_retries: u32) -> RetryConfig {
+        RetryConfig {
+            max_retries,
+            initial_backoff_ms: 1,
+            max_backoff_ms: 2,
+            backoff_multiplier: 1.0,
+            jitter_factor: 0.0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sized_serialization_never_doubles_for_large_bodies() {
+        let raw = serde_json::to_vec(&serde_json::json!({
+            "text": "x".repeat(8 << 20),
+            "stream": false,
+        }))
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+
+        let body = serialize_json_sized(&parsed, Some(raw.len())).unwrap();
+
+        assert_eq!(body.len(), raw.len());
+        assert_eq!(body.capacity(), serialized_capacity(raw.len()));
+        assert!(body.capacity() <= body.len() + body.len() / 8 + 1024);
+    }
+
+    #[test]
+    fn a_json_answer_is_the_serializer_bytes_under_the_json_content_type() {
+        use axum::http::{header, StatusCode};
+        let value = serde_json::json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "x".repeat(600)}}],
+        });
+        let response = json_response(&value);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        let body =
+            futures::executor::block_on(axum::body::to_bytes(response.into_body(), usize::MAX))
+                .unwrap();
+        assert_eq!(body, serde_json::to_vec(&value).unwrap());
+    }
+
+    #[test]
+    fn a_json_answer_that_does_not_serialize_is_a_plain_text_500() {
+        use axum::http::{header, StatusCode};
+        // A map keyed by a tuple has no JSON key: the serializer refuses it.
+        let value: std::collections::BTreeMap<(u8, u8), u8> = [((1, 2), 3)].into_iter().collect();
+        let response = json_response(&value);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/plain; charset=utf-8"
+        );
+    }
+
+    #[test]
+    fn trim_frees_doubling_slack_but_keeps_presized_buffers() {
+        // Mimic a 5MiB body landing in an 8MiB doubling-growth buffer.
+        let mut grown = Vec::with_capacity(8 << 20);
+        grown.resize(5 << 20, b'x');
+        trim_serialization_slack(&mut grown);
+        assert!(grown.capacity() <= grown.len() + grown.len() / 8 + 1024);
+        assert_eq!(grown.len(), 5 << 20);
+
+        let mut sized = Vec::with_capacity(serialized_capacity(1 << 20));
+        sized.resize(1 << 20, b'y');
+        let capacity = sized.capacity();
+        trim_serialization_slack(&mut sized);
+        assert_eq!(sized.capacity(), capacity);
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
+mod classic_pair_select_rows;

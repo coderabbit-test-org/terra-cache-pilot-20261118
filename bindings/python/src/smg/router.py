@@ -1,0 +1,643 @@
+from __future__ import annotations
+
+import dataclasses
+
+from smg.router_args import RouterArgs
+from smg.smg_rs import (
+    BackendType,
+    HistoryBackendType,
+    PolicyType,
+    PyApiKeyEntry,
+    PyControlPlaneAuthConfig,
+    PyJwtConfig,
+    PyOracleConfig,
+    PyPostgresConfig,
+    PyRedisConfig,
+    PyRole,
+)
+from smg.smg_rs import Router as _Router
+
+
+def _is_set(value: object) -> bool:
+    """Whether a discovery field was given: an empty string was, so Rust's
+    validation refuses it rather than this reading it as unset; an empty list
+    is the default of a repeatable flag never given."""
+    return value is not None and value != []
+
+
+@dataclasses.dataclass(frozen=True)
+class _MappedProvider:
+    """A discovery provider `_Router` takes as the tagged `discovery` mapping:
+    the RouterArgs fields that configure it, each under its mapping key, and
+    the fields it cannot start without."""
+
+    name: str
+    fields: dict[str, str]
+    required: tuple[str, ...]
+
+    def given(self, args: RouterArgs) -> list[str]:
+        """This provider's fields that `args` sets."""
+        return [field for field in self.fields if _is_set(getattr(args, field))]
+
+    def mapping(self, args: RouterArgs) -> dict[str, object]:
+        missing = [field for field in self.required if not _is_set(getattr(args, field))]
+        if missing:
+            raise ValueError(f"discovery_provider={self.name!r} needs {', '.join(missing)}")
+        mapping: dict[str, object] = {"provider": self.name}
+        mapping.update({self.fields[field]: getattr(args, field) for field in self.given(args)})
+        return mapping
+
+
+_MAPPED_PROVIDERS = {
+    provider.name: provider
+    for provider in [
+        _MappedProvider("file", {"discovery_file": "path"}, required=("discovery_file",)),
+        _MappedProvider(
+            "slurm",
+            {
+                "slurm_job_name": "job_names",
+                "slurm_encode_job_name": "encode_job_names",
+                "slurm_prefill_job_name": "prefill_job_names",
+                "slurm_decode_job_name": "decode_job_names",
+                "slurm_port": "port",
+                "slurm_bootstrap_port": "bootstrap_port",
+                "slurm_user": "user",
+                "slurm_account": "account",
+                "slurm_partition": "partition",
+            },
+            required=("slurm_port",),
+        ),
+        _MappedProvider(
+            "consul",
+            {
+                "consul_service": "service",
+                "consul_address": "address",
+                "consul_datacenter": "datacenter",
+            },
+            required=("consul_service",),
+        ),
+    ]
+}
+
+# The RouterArgs fields that only select or configure discovery. `from_args`
+# replaces them with the `_Router` arguments `_discovery_arguments` gives.
+_DISCOVERY_FIELDS = (
+    "discovery_provider",
+    "discovery_check_interval_secs",
+    *(field for provider in _MAPPED_PROVIDERS.values() for field in provider.fields),
+)
+
+
+def _discovery_arguments(args: RouterArgs) -> dict[str, object]:
+    """The `_Router` arguments for the discovery provider `args` selects.
+
+    Kubernetes, by either spelling, is `service_discovery=True`, its settings
+    (the interval included) being `_Router`'s own arguments; the other
+    providers are the tagged `discovery` mapping, which carries their
+    interval. Refused: a provider's fields without that provider, the
+    interval without any provider, a provider without a field it needs, and a
+    provider this cannot pass on, which must not start the router without
+    discovery.
+    """
+    provider = args.selected_discovery_provider()
+    for other in _MAPPED_PROVIDERS.values():
+        given = other.given(args)
+        if given and other.name != provider:
+            verb = "applies" if len(given) == 1 else "apply"
+            raise ValueError(f"{', '.join(given)} {verb} only to discovery_provider={other.name!r}")
+    interval = args.discovery_check_interval_secs
+    if interval is not None and provider is None:
+        raise ValueError("discovery_check_interval_secs needs a discovery provider")
+
+    arguments: dict[str, object] = {
+        "service_discovery": provider == "kubernetes",
+        # Kubernetes takes its interval as a constructor argument, as it does
+        # its other settings; a mapping carries its own.
+        "discovery_check_interval_secs": interval if provider == "kubernetes" else None,
+    }
+    if provider in (None, "kubernetes"):
+        return arguments
+    if provider not in _MAPPED_PROVIDERS:
+        raise ValueError(f"Router.from_args cannot pass discovery provider {provider!r} to Rust")
+    mapping = _MAPPED_PROVIDERS[provider].mapping(args)
+    if interval is not None:
+        mapping["check_interval_secs"] = interval
+    return {**arguments, "discovery": mapping}
+
+
+def policy_from_str(policy_str: str | None) -> PolicyType:
+    """Convert policy string to PolicyType enum."""
+    if policy_str is None:
+        return None
+    policy_map = {
+        "random": PolicyType.Random,
+        "round_robin": PolicyType.RoundRobin,
+        "passthrough": PolicyType.Passthrough,
+        "cache_aware": PolicyType.CacheAware,
+        "power_of_two": PolicyType.PowerOfTwo,
+        "least_load": PolicyType.LeastLoad,
+        "bucket": PolicyType.Bucket,
+        "manual": PolicyType.Manual,
+        "consistent_hashing": PolicyType.ConsistentHashing,
+        "prefix_hash": PolicyType.PrefixHash,
+    }
+    return policy_map[policy_str]
+
+
+def backend_from_str(backend_str: str | None) -> BackendType | None:
+    """The ``--backend`` name as the binding's enum. ``None`` stays ``None``: no
+    backend is pinned and the gateway's detection step decides the wire, as it
+    does for the Rust CLI without ``--backend``."""
+    if isinstance(backend_str, BackendType):
+        return backend_str
+    if backend_str is None:
+        return None
+    backend_map = {
+        "sglang": BackendType.Sglang,
+        "openai": BackendType.Openai,
+        "anthropic": BackendType.Anthropic,
+        # Engine backends: routing behaves like the default; over ZMQ they pin
+        # the startup workers' wire protocol (vLLM EngineCore vs TokenSpeed).
+        "vllm": BackendType.Vllm,
+        "tokenspeed": BackendType.Tokenspeed,
+        # As on the Rust CLI: trtllm labels the start-up record and pins no
+        # wire; gemini selects the Gemini provider route.
+        "trtllm": BackendType.Trtllm,
+        "gemini": BackendType.Gemini,
+    }
+    backend_lower = backend_str.lower()
+    if backend_lower not in backend_map:
+        raise ValueError(
+            f"Unknown backend: {backend_str}. Valid options: {', '.join(backend_map.keys())}"
+        )
+    return backend_map[backend_lower]
+
+
+def history_backend_from_str(backend_str: str | None) -> HistoryBackendType:
+    """Convert history backend string to HistoryBackendType enum."""
+    if isinstance(backend_str, HistoryBackendType):
+        return backend_str
+    if backend_str is None:
+        return HistoryBackendType.Memory
+    backend_lower = backend_str.lower()
+    if backend_lower == "memory":
+        return HistoryBackendType.Memory
+    elif backend_lower == "none":
+        # Use getattr to access 'None' which is a Python keyword
+        return getattr(HistoryBackendType, "None")
+    elif backend_lower == "oracle":
+        return HistoryBackendType.Oracle
+    elif backend_lower == "postgres":
+        return HistoryBackendType.Postgres
+    elif backend_lower == "redis":
+        return HistoryBackendType.Redis
+    else:
+        raise ValueError(f"Unknown history backend: {backend_str}")
+
+
+def role_from_str(role_str: str) -> PyRole:
+    """Convert role string to PyRole enum."""
+    if role_str.lower() == "admin":
+        return PyRole.Admin
+    return PyRole.User
+
+
+def build_control_plane_auth_config(
+    args_dict: dict,
+) -> PyControlPlaneAuthConfig | None:
+    """Build control plane auth config from args dict."""
+    api_keys = args_dict.get("control_plane_api_keys", [])
+    jwt_issuer = args_dict.get("jwt_issuer")
+    jwt_audience = args_dict.get("jwt_audience")
+    audit_enabled = args_dict.get("control_plane_audit_enabled", False)
+
+    # Half a JWT configuration is an error, not a silently disabled JWT auth:
+    # the control plane would start open where authentication was asked for.
+    if (jwt_issuer is None) != (jwt_audience is None):
+        raise ValueError(
+            "--jwt-issuer and --jwt-audience are required together: "
+            "control-plane JWT authentication would otherwise be silently disabled"
+        )
+
+    # Check if any auth is configured; a control-plane key file counts, since
+    # the binding reads it into this config's keys.
+    has_api_keys = bool(api_keys) or args_dict.get("control_plane_api_keys_file") is not None
+    has_jwt = jwt_issuer is not None and jwt_audience is not None
+
+    if not has_api_keys and not has_jwt:
+        return None
+
+    # Build API key entries
+    py_api_keys = []
+    for key_tuple in api_keys:
+        # Tuple format: (id, name, key, role)
+        key_id, name, key, role = key_tuple
+        py_api_keys.append(
+            PyApiKeyEntry(
+                id=key_id,
+                name=name,
+                key=key,
+                role=role_from_str(role),
+            )
+        )
+
+    # Build JWT config if present
+    jwt_config = None
+    if has_jwt:
+        jwt_config = PyJwtConfig(
+            issuer=jwt_issuer,
+            audience=jwt_audience,
+            jwks_uri=args_dict.get("jwt_jwks_uri"),
+            role_mapping=args_dict.get("jwt_role_mapping", {}),
+            role_claim=args_dict.get("jwt_role_claim", "roles"),
+        )
+
+    return PyControlPlaneAuthConfig(
+        jwt=jwt_config,
+        api_keys=py_api_keys,
+        audit_enabled=audit_enabled,
+    )
+
+
+class Router:
+    """
+    A high-performance router for distributing requests across worker nodes.
+
+    Args:
+        worker_urls: List of URLs for worker nodes that will handle requests. Each URL
+            should include the protocol, host, and port (e.g.,
+            ['http://worker1:8000', 'http://worker2:8000'])
+        policy: Load balancing policy to use. Options:
+            - PolicyType.Random: Randomly select workers
+            - PolicyType.RoundRobin: Distribute requests in round-robin fashion
+            - PolicyType.CacheAware: Distribute requests based on cache state and load
+              balance
+            - PolicyType.PowerOfTwo: Sample two random workers and route to the
+              one with the lower expected wait (least-load scoring over the pair)
+            - PolicyType.LeastLoad: Route to the worker with the lowest load score
+              (in-flight requests plus KV-cache pressure)
+            Default: PolicyType.CacheAware
+        host: Host address to bind the router server. Supports IPv4, IPv6 (e.g., ::,
+            ::1), or 0.0.0.0 for all interfaces. Default: '0.0.0.0'
+        port: Port number to bind the router server. Default: 30000
+        worker_startup_timeout_secs: Timeout in seconds for worker startup and
+            registration. Large models can take significant time to load into GPU
+            memory. Default: 1800 (30 minutes)
+        worker_startup_delay: Grace period in seconds before the first worker
+            startup check fires. Leaves the engine alone this long, then polls
+            every worker_startup_check_interval. Default: 0
+        worker_startup_check_interval: Interval in seconds between checks for worker
+            initialization. Default: 30
+        job_queue_capacity: Max pending control-plane jobs (worker add/remove,
+            tokenizer, MCP, WASM). Size to fleet scale so a service-discovery
+            reconcile pass can enqueue every worker without blocking.
+            Default: 1000
+        job_queue_concurrency: Max control-plane jobs dispatched concurrently.
+            Default: 200
+        cache_threshold: Cache threshold (0.0-1.0) for cache-aware routing. Routes to
+            cached worker if the match rate exceeds threshold, otherwise routes to the
+            worker with the smallest tree. Default: 0.3
+        cache_boundaries: Token positions at which serving engines retain reusable
+            prefix state; cache-affinity policies hash request heads at the deepest
+            applicable boundary. Default: []
+        cache_index: Index under-layer for cache_aware: 'tree' (radix prefix trees)
+            or 'hash' (TTL'd exact-match placement map keyed on request heads at
+            cache_boundaries; token-bearing requests only — untokenized requests
+            stay load-balanced). Default: 'tree'
+        cache_ttl_secs: Seconds a cache-affinity placement stays routable; should
+            approximate serving-engine cache retention. Default: 180
+        prefix_token_count: Number of prefix tokens hashed by the prefix_hash
+            policy, or four times as many characters of the prompt when the
+            request is untokenized. Size it past any shared system prompt so
+            distinct conversations hash apart. Default: 256
+        prefix_hash_load_factor: Load factor above which the prefix_hash policy
+            walks the ring instead of using the hashed worker (multiple of the
+            average load). Default: 1.25
+        prefix_hash_balance_abs_threshold: Absolute load difference over average
+            a worker must also exceed before prefix_hash treats it as
+            overloaded. Guards the load factor against sampling noise when each
+            router replica sees only a share of a worker's load. Default: 10
+        balance_abs_threshold: Spill gate, absolute part: a matched worker is skipped
+            for the least-loaded one when its load exceeds the healthy-fleet mean by
+            this many requests AND by balance_rel_threshold; the margin is capped at
+            the larger of the in-flight count's natural swing at the pool's current
+            mean (two standard deviations, never under four requests unless this
+            value is lower) and the held prefix's price (balance_prefix_margin_tokens),
+            so a small pool can spill at all; with the bucket policy the
+            pair keeps its own rule (balancing when (max_load - min_load) exceeds
+            this value and max_load exceeds min_load times the relative
+            threshold). Default: 64
+        balance_rel_threshold: Spill gate, relative part: the multiple of the
+            healthy-fleet mean a matched worker's load must exceed, together with
+            the absolute part. Default: 1.5
+        balance_prefix_margin_tokens: Spill gate, price of a held prefix in tokens
+            per request: a matched worker's absolute margin is at least the tokens
+            of the request's prefix it holds over this value, rounded up, up to
+            balance_abs_threshold, so a priced deep prefix keeps its holder through
+            a skew that moves a shallow one (decode picks are never priced). Suits
+            prefill pools serving long multi-turn sessions, e.g. 1024. Default: 0
+            (unpriced)
+        balance_uncached_credit: Credit a cache-aware pick on a worker holding the
+            request's prefix with the prompt it still has to prefill (its token
+            count less the held tokens, never under the mean prefill nor over the
+            whole prompt) instead of the whole prompt, in the expected-wait
+            estimate later picks read. Misses, spills and decode picks keep the
+            whole prompt. Default: False
+        eviction_interval_secs: Interval in seconds between cache eviction operations
+            in cache-aware routing. Default: 120
+        overlap_decay: Cache-aware anti-hotspot decay: each candidate's overlap score
+            is divided by 1 + overlap_decay * x, where x is the worker's
+            waiting-prefill backlog (blocks above the candidate minimum) per request
+            block. Requires backend load reporting. Default: 0.0 (disabled)
+        selection_temperature: Cache-aware softmax temperature over min-max
+            normalized scores for event-driven selection. 0.0 is exact argmax;
+            larger values spread picks across candidates. Default: 0.0
+        max_payload_size: Maximum payload size in bytes. Default: 512 MiB
+        max_tree_size: Maximum total size of each model's approximation tree for
+            cache-aware routing (chars for HTTP, tokens for gRPC), shared across
+            all workers; eviction keeps every tree at or under this bound.
+            Default: 2^26
+        dp_aware: Deprecated, accepted and ignored: every registration reads an
+            engine's data-parallel size and registers one worker per rank (warned at
+            start-up). Default: False
+        dp_minimum_tokens_scheduler: Choose a data-parallel rank per request from the
+            ranks' reported token loads: the HTTP prefill-decode router, for an engine
+            registered as one worker. An engine that reports its data-parallel size
+            registers as one worker per rank and the policy's pick among them is the
+            rank choice, so this chooses nothing there (warned at start-up).
+            Default: False
+        upstream_http2: Speak HTTP/2 to workers via prior knowledge (h2c on
+            cleartext), multiplexing every request to a worker over one
+            connection. Negotiated per worker at registration: a worker that
+            does not answer HTTP/2 stays on HTTP/1.1. Default: False
+        enable_igw: Enable IGW (Inference-Gateway) mode for multi-model support. When
+            enabled, the router can manage multiple models simultaneously with per-model
+            load balancing policies. Default: False
+        api_key: The api key used for the authorization with the worker. Default: None
+        log_dir: Directory to store log files. If None, logs are only output to
+            console. Default: None
+        log_level: Logging level. Options: 'debug', 'info', 'warn', 'error'.
+        access_log_fields: Optional fields of the access-log record, each written
+            once listed: 'client_addr', 'forwarded_for', 'user_agent', 'tenant',
+            'key_id', 'request_bytes', 'response_bytes', 'worker'. An empty list
+            keeps the record's fields as they have always been. Default: []
+        service_discovery: Enable Kubernetes service discovery. When enabled, the
+            router will automatically discover worker pods based on the selector.
+            Default: False
+        discovery: The worker discovery provider's configuration, keyword-only:
+            a mapping with a ``provider`` key and that provider's fields, read
+            like ``RouterConfig.discovery`` (no ``provider`` means Kubernetes).
+            Mutually exclusive with ``service_discovery``. Default: None
+        selector: Dictionary mapping of label keys to values for Kubernetes pod
+            selection. Example: {"app": "sglang-worker"}. Default: {}
+        service_discovery_port: Port to use for service discovery. The router will
+            generate worker URLs using this port. Default: 80
+        service_discovery_namespace: Kubernetes namespace to watch for pods. If not
+            provided, watches pods across all namespaces (requires cluster-wide
+            permissions). Default: None
+        prefill_selector: Dictionary mapping of label keys to values for Kubernetes
+            pod selection for prefill servers (PD mode only). Default: {}
+        decode_selector: Dictionary mapping of label keys to values for Kubernetes pod
+            selection for decode servers (PD mode only). Default: {}
+        prometheus_port: Port to expose Prometheus metrics. Default: None
+        prometheus_host: Host address to bind the Prometheus metrics server. Default:
+            None, which binds the unspecified address of host's family (:: for an IPv6
+            host, 0.0.0.0 otherwise)
+        jemalloc_prof_dir: Directory where POST /heap_profile writes a jemalloc heap
+            profile of the router (a build with the jemalloc-profiling feature, started
+            with _RJEM_MALLOC_CONF=prof:true,prof_active:true). Default: None
+        pd_disaggregation: Enable PD (Prefill-Decode) disaggregated mode. Default:
+            False
+        prefill_urls: List of (url, bootstrap_port) tuples for prefill servers (PD
+            mode only)
+        decode_urls: List of URLs for decode servers (PD mode only)
+        prefill_policy: Specific load balancing policy for prefill nodes (PD mode
+            only). If not specified, uses the main policy. Default: None
+        decode_policy: Specific load balancing policy for decode nodes (PD mode only).
+            If not specified, uses the main policy. Default: None
+        prefill_max_inflight_requests_per_worker: Maximum in-flight Prefill requests
+            per worker in PD or EPD mode. A non-positive value disables the limit.
+            Default: -1
+        prefill_queue_size: Maximum number of requests waiting for Prefill admission.
+            Defaults to 100 when Prefill admission is enabled. Set to 0 to disable
+            waiting. Default: None
+        prefill_queue_timeout_secs: Maximum time in seconds a request may wait for
+            Prefill admission. Defaults to 60 when Prefill admission is enabled.
+            Default: None
+        request_id_headers: List of HTTP headers to check for request IDs. If not
+            specified, uses common defaults: ['x-request-id', 'x-correlation-id',
+            'x-trace-id', 'request-id']. Example: ['x-my-request-id',
+            'x-custom-trace-id']. Default: None
+        storage_context_headers: Mapping of incoming HTTP headers to storage hook
+            context keys. Example: {'x-tenant-id': 'tenant_id'}. Default: {}
+        bootstrap_port_annotation: Kubernetes annotation name for bootstrap port (PD
+            mode). Default: 'sglang.ai/bootstrap-port'
+        worker_ports_annotation: Kubernetes annotation listing a pod's worker data
+            ports (comma-separated) for pods running multiple engine servers.
+            Absent = one worker at service_discovery_port. Default:
+            'smg.ai/worker-ports'
+        kv_connector_annotation: Kubernetes annotation containing the vLLM KV
+            connector name. Changes apply after the Pod is replaced. Default:
+            'smg.ai/kv-connector'
+        kv_engine_id_annotation: Kubernetes annotation containing KV engine IDs,
+            aligned with worker_ports_annotation. Default: 'smg.ai/kv-engine-id'
+        pairing_protocol_label: Kubernetes Pod label containing the worker's
+            prefill/decode pairing protocol. A prefill and a decode pair only
+            when their protocols are equal. A Pod without the label states
+            none. Default: 'smg.ai/pairing-protocol'
+        request_timeout_secs: Request timeout in seconds: the read of the body
+            overall, and each attempt at an HTTP worker from its dispatch to
+            its last message (504 call_upstream_timeout past it, the request's
+            answer; a worker's own pool timeout_secs takes this value's place,
+            on an HTTP worker and on a ZMQ worker's link, whose streams carry
+            the same bound). A request to a gRPC worker is bounded by
+            grpc_request_timeout_secs instead. Default: 1800
+        grpc_request_timeout_secs: Seconds a request to a gRPC worker may take
+            from its dispatch to its last message (504 call_upstream_timeout
+            past it, the request's answer; the call to the worker is dropped,
+            which cancels the request on the worker). 0 arms no deadline (the
+            default): the bound is opt-in. Default: 0
+        max_concurrent_requests: Maximum standing concurrent requests. -1 derives
+            the bound from the host (1024 per available core, at least 4096); 0
+            disables it. Default: -1
+        queue_size: Queue size for pending requests when max concurrent limit reached
+            (0 = no queue, return 429 immediately). Default: 100
+        queue_timeout_secs: Maximum time (in seconds) a request can wait in queue
+            before timing out. Default: 60
+        rate_limit_tokens_per_second: Sustained admission rate (requests per
+            second), bursting up to max_concurrent_requests, which keeps bounding
+            standing concurrency. Unset or 0 = no rate limit. Default: None
+        cors_allowed_origins: Exact origins a browser may call the gateway from, or
+            ['*'] alone for any origin. An empty list sends no CORS headers (no
+            cross-origin allowance). Default: []
+        health_failure_threshold: Number of consecutive health check failures before
+            marking worker unhealthy. Default: 3
+        health_success_threshold: Number of consecutive health check successes before
+            marking worker healthy. Default: 2
+        health_check_timeout_secs: Timeout in seconds for health check requests.
+            Default: 5
+        health_check_interval_secs: Interval in seconds between runtime health checks.
+            Default: 60
+        health_check_endpoint: Health check endpoint path. Default: '/health'
+        model_path: Model path for loading tokenizer (HuggingFace model ID or local
+            path). Default: None
+        tokenizer_path: Explicit tokenizer path (overrides model_path tokenizer if
+            provided). Default: None
+        server_cert_path: Path to server TLS certificate (PEM format). Default: None
+        server_key_path: Path to server TLS private key (PEM format). Default: None
+    """
+
+    def __init__(self, router: _Router):
+        self._router = router
+
+    @staticmethod
+    def from_args(args: RouterArgs) -> Router:
+        """Create a router from a RouterArgs instance."""
+
+        replaced = args.options_a_document_replaces()
+        if replaced:
+            # The settings by their names and values: a flag's spelling is
+            # the parser's, and one setting can have several.
+            settings = ", ".join(f"{name}={getattr(args, name)!r}" for name in replaced)
+            raise ValueError(
+                "A policy document replaces the routing settings, and these are set"
+                f" beside it: {settings}"
+            )
+        args_dict = vars(args).copy()
+        provider = args.selected_discovery_provider()
+        for field in _DISCOVERY_FIELDS:
+            del args_dict[field]
+        args_dict.update(_discovery_arguments(args))
+        # Convert RouterArgs to _Router parameters
+        args_dict["worker_urls"] = (
+            []
+            if (
+                provider is not None
+                or args_dict["pd_disaggregation"]
+                or args_dict["epd_disaggregation"]
+            )
+            else args_dict["worker_urls"]
+        )
+        args_dict["policy"] = policy_from_str(args_dict["policy"])
+        args_dict["encode_urls"] = (
+            args_dict["encode_urls"] if args_dict["epd_disaggregation"] else None
+        )
+        args_dict["prefill_urls"] = (
+            args_dict["prefill_urls"]
+            if args_dict["pd_disaggregation"] or args_dict["epd_disaggregation"]
+            else None
+        )
+        args_dict["decode_urls"] = (
+            args_dict["decode_urls"]
+            if args_dict["pd_disaggregation"] or args_dict["epd_disaggregation"]
+            else None
+        )
+        args_dict["encode_policy"] = policy_from_str(args_dict["encode_policy"])
+        args_dict["prefill_policy"] = policy_from_str(args_dict["prefill_policy"])
+        args_dict["decode_policy"] = policy_from_str(args_dict["decode_policy"])
+
+        # Convert backend
+        args_dict["backend"] = backend_from_str(args_dict.get("backend"))
+
+        # Convert history_backend to enum first
+        history_backend_raw = args_dict.get("history_backend", "memory")
+        history_backend = history_backend_from_str(history_backend_raw)
+
+        # Convert Oracle config if needed
+        oracle_config = None
+        if history_backend == HistoryBackendType.Oracle:
+            # Prioritize TNS alias over connect descriptor
+            tns_alias = args_dict.get("oracle_tns_alias")
+            connect_descriptor = args_dict.get("oracle_connect_descriptor")
+
+            # Use TNS alias if provided, otherwise use connect descriptor
+            final_descriptor = tns_alias if tns_alias else connect_descriptor
+
+            oracle_config = PyOracleConfig(
+                password=args_dict.get("oracle_password"),
+                username=args_dict.get("oracle_username"),
+                connect_descriptor=final_descriptor,
+                wallet_path=args_dict.get("oracle_wallet_path"),
+                external_auth=args_dict.get("oracle_external_auth", False),
+                pool_min=args_dict.get("oracle_pool_min", 1),
+                pool_max=args_dict.get("oracle_pool_max", 16),
+                pool_timeout_secs=args_dict.get("oracle_pool_timeout_secs", 30),
+                op_timeout_secs=args_dict.get("oracle_op_timeout_secs", 5),
+            )
+        args_dict["oracle_config"] = oracle_config
+        args_dict["history_backend"] = history_backend
+
+        # Convert Postgres config if needed
+        postgres_config = None
+        if history_backend == HistoryBackendType.Postgres:
+            postgres_config = PyPostgresConfig(
+                db_url=args_dict.get("postgres_db_url"),
+                pool_max=args_dict.get("postgres_pool_max", 16),
+                op_timeout_secs=args_dict.get("postgres_op_timeout_secs", 5),
+            )
+        args_dict["postgres_config"] = postgres_config
+
+        # Convert Redis config if needed
+        redis_config = None
+        if history_backend == HistoryBackendType.Redis:
+            retention_days = args_dict.get("redis_retention_days", 30)
+            # -1 is the one spelling of persistent records (None in Rust); 0
+            # and the other negatives are refused by name, as the command
+            # line refuses them.
+            if retention_days < -1 or retention_days == 0:
+                raise ValueError(
+                    "redis_retention_days must be at least 1 "
+                    f"(-1 keeps records persistent), got {retention_days}"
+                )
+            retention_arg = None if retention_days == -1 else retention_days
+
+            redis_config = PyRedisConfig(
+                url=args_dict.get("redis_url"),
+                pool_max=args_dict.get("redis_pool_max", 16),
+                retention_days=retention_arg,
+                op_timeout_secs=args_dict.get("redis_op_timeout_secs", 5),
+            )
+        args_dict["redis_config"] = redis_config
+
+        # Build control plane auth config
+        args_dict["control_plane_auth"] = build_control_plane_auth_config(args_dict)
+
+        # Remove fields that shouldn't be passed to Rust Router constructor
+        fields_to_remove = [
+            "oracle_wallet_path",
+            "oracle_tns_alias",
+            "oracle_connect_descriptor",
+            "oracle_username",
+            "oracle_password",
+            "oracle_external_auth",
+            "oracle_pool_min",
+            "oracle_pool_max",
+            "oracle_pool_timeout_secs",
+            "oracle_op_timeout_secs",
+            "postgres_db_url",
+            "postgres_pool_max",
+            "postgres_op_timeout_secs",
+            "redis_url",
+            "redis_pool_max",
+            "redis_retention_days",
+            "redis_op_timeout_secs",
+            # Control plane auth fields (converted to control_plane_auth)
+            "control_plane_api_keys",
+            "control_plane_audit_enabled",
+            "jwt_issuer",
+            "jwt_audience",
+            "jwt_jwks_uri",
+            "jwt_role_mapping",
+            "jwt_role_claim",
+        ]
+        for field in fields_to_remove:
+            args_dict.pop(field, None)
+
+        return Router(_Router(**args_dict))
+
+    def start(self) -> None:
+        """Start the router server.
+
+        This method blocks until the server is shut down.
+        """
+        self._router.start()

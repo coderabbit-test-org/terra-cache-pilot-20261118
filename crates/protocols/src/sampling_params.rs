@@ -1,0 +1,126 @@
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use validator::Validate;
+
+use super::common::{invalid, invalid_at, StringOrArray};
+
+/// Sampling parameters for text generation
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, Default, Validate, schemars::JsonSchema)]
+#[validate(schema(function = "validate_sampling_params"))]
+pub struct SamplingParams {
+    /// Temperature for sampling (must be >= 0.0, no upper limit)
+    #[validate(range(min = 0.0))]
+    pub temperature: Option<f32>,
+    /// Maximum number of new tokens to generate (must be >= 0)
+    #[validate(range(min = 0))]
+    pub max_new_tokens: Option<u32>,
+    /// Top-p nucleus sampling (0.0 < top_p <= 1.0)
+    #[validate(custom(function = "validate_top_p_value"))]
+    pub top_p: Option<f32>,
+    /// Top-k sampling (-1 to disable, or >= 1)
+    #[validate(custom(function = "validate_top_k_value"))]
+    pub top_k: Option<i32>,
+    #[validate(range(min = -2.0, max = 2.0))]
+    pub frequency_penalty: Option<f32>,
+    #[validate(range(min = -2.0, max = 2.0))]
+    pub presence_penalty: Option<f32>,
+    #[validate(range(min = 0.0, max = 2.0))]
+    pub repetition_penalty: Option<f32>,
+    pub stop: Option<StringOrArray>,
+    pub ignore_eos: Option<bool>,
+    pub skip_special_tokens: Option<bool>,
+    pub json_schema: Option<String>,
+    pub regex: Option<String>,
+    pub ebnf: Option<String>,
+    #[validate(range(min = 0.0, max = 1.0))]
+    pub min_p: Option<f32>,
+    /// Minimum number of new tokens (validated in schema function for cross-field check with max_new_tokens)
+    pub min_new_tokens: Option<u32>,
+    pub stop_token_ids: Option<Vec<u32>>,
+    pub no_stop_trim: Option<bool>,
+    /// The number of choices to sample, one or more: the lower bound the chat
+    /// route puts on its `n`.
+    #[validate(range(min = 1))]
+    pub n: Option<u32>,
+    pub sampling_seed: Option<u64>,
+    /// Custom parameters for engine-specific sampling behavior.
+    pub custom_params: Option<Map<String, Value>>,
+}
+
+// ============================================================================
+// Shared Validation Functions
+// ============================================================================
+
+/// Validates top_p: 0.0 < top_p <= 1.0 (can't use range validator for open
+/// interval). The error names the bound crossed as the public API does
+/// (`decimal_above_max_value`, `decimal_below_min_value`).
+pub fn validate_top_p_value(top_p: f32) -> Result<(), validator::ValidationError> {
+    if top_p > 1.0 {
+        return Err(invalid(
+            "decimal_above_max_value",
+            format!(
+                "Invalid 'top_p': decimal above maximum value. Expected a value <= 1.0, but got {top_p} instead."
+            ),
+        ));
+    }
+    if top_p <= 0.0 || top_p.is_nan() {
+        return Err(invalid(
+            "decimal_below_min_value",
+            format!(
+                "Invalid 'top_p': decimal below minimum value. Expected a value > 0.0, but got {top_p} instead."
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Validates top_k: -1 (disabled) or >= 1 (special -1 case - can't use range validator)
+pub fn validate_top_k_value(top_k: i32) -> Result<(), validator::ValidationError> {
+    if top_k != -1 && top_k < 1 {
+        return Err(validator::ValidationError::new(
+            "top_k must be -1 (disabled) or at least 1",
+        ));
+    }
+    Ok(())
+}
+
+// ============================================================================
+// SamplingParams-Specific Validation
+// ============================================================================
+
+/// Validation function for SamplingParams - cross-field validation only
+fn validate_sampling_params(params: &SamplingParams) -> Result<(), validator::ValidationError> {
+    // 1. Cross-field validation: min_new_tokens <= max_new_tokens
+    if let (Some(min), Some(max)) = (params.min_new_tokens, params.max_new_tokens) {
+        if min > max {
+            return Err(invalid_at(
+                "min_new_tokens",
+                "invalid_value",
+                "min_new_tokens cannot exceed max_new_tokens",
+            ));
+        }
+    }
+
+    // 2. Validate mutually exclusive structured output constraints; the
+    //    refusal names the second one set.
+    let set: Vec<&str> = [
+        ("regex", params.regex.is_some()),
+        ("ebnf", params.ebnf.is_some()),
+        ("json_schema", params.json_schema.is_some()),
+    ]
+    .iter()
+    .filter(|(_, present)| *present)
+    .map(|(name, _)| *name)
+    .collect();
+
+    if set.len() > 1 {
+        return Err(invalid_at(
+            set[1],
+            "invalid_value",
+            "only one of regex, ebnf, or json_schema can be set",
+        ));
+    }
+
+    Ok(())
+}

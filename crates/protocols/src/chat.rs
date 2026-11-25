@@ -1,0 +1,2774 @@
+use std::{borrow::Cow, collections::HashMap, fmt, sync::Arc};
+
+use serde::{de, Deserialize, Deserializer, Serialize};
+use serde_json::{Map, Value};
+use validator::Validate;
+
+use super::{
+    common::{
+        default_true, deserialize_null_as_empty_vec, deserialize_null_as_false,
+        deserialize_null_as_true, empty_tool_name, invalid, invalid_at, is_false, is_true,
+        json_type_name, on_field, validate_json_schema_shape, validate_logit_bias, validate_stop,
+        CachePartition, ChatLogProbs, ContentPart, Function, FunctionCall, FunctionCallResponse,
+        FunctionChoice, GenerationRequest, ResponseFormat, StreamOptions, StringOrArray, Tool,
+        ToolCall, ToolCallDelta, ToolChoice, ToolChoiceValue, ToolReference, Usage,
+    },
+    sampling_params::{validate_top_k_value, validate_top_p_value},
+};
+use crate::{
+    builders::{ChatCompletionResponseBuilder, ChatCompletionStreamResponseBuilder},
+    ext::kimi::{KimiAssistantExt, KimiDeveloperExt, KimiSystemExt, KimiUserExt},
+    profile::ProviderProfile,
+    strict_value::StrictValue,
+    validated::Normalizable,
+};
+
+// ============================================================================
+// Chat Messages
+// ============================================================================
+
+crate::kind_read::by_kind! {
+/// One message of a chat conversation, tagged by its `role` (system, user,
+/// assistant, tool, function, developer or root), carrying the content and
+/// fields that role has.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+#[serde(tag = "role")]
+pub enum ChatMessage {
+    #[serde(rename = "system")]
+    System {
+        /// Defaults to empty text: K3 tools-only system messages omit content entirely
+        #[serde(default)]
+        content: MessageContent,
+        name: Option<String>,
+        #[serde(flatten)]
+        ext: KimiSystemExt,
+    },
+    #[serde(rename = "user")]
+    User {
+        content: MessageContent,
+        name: Option<String>,
+        #[serde(flatten)]
+        #[schemars(skip)]
+        ext: KimiUserExt,
+    },
+    /// An earlier model turn, replayed by the client. The refusal, the audio
+    /// reference and the deprecated function call are carried as the client
+    /// sent them, for an upstream that reads them; the gRPC chat template
+    /// never sees them, as the engines' own chat utils leave them out.
+    ///
+    /// The variant is the largest of the enum, so its room is every turn's:
+    /// the deprecated function call and the provider extension ride behind a
+    /// pointer each, which keeps a turn under 192 bytes (a history of four
+    /// turns in the allocator's 768-byte class, of eight in the 1,536 one).
+    #[serde(rename = "assistant")]
+    Assistant {
+        content: Option<MessageContent>,
+        refusal: Option<String>,
+        name: Option<String>,
+        audio: Option<ChatAssistantAudio>,
+        tool_calls: Option<Vec<ToolCall>>,
+        function_call: Option<Box<FunctionCallResponse>>,
+        /// Reasoning content for O1-style models (an engine extension), read
+        /// from `reasoning_content` or `reasoning`; see [`AssistantReasoning`].
+        #[serde(flatten)]
+        reasoning: AssistantReasoning,
+        #[serde(flatten)]
+        #[schemars(skip)]
+        ext: KimiAssistantExt,
+    },
+    #[serde(rename = "tool")]
+    Tool {
+        content: MessageContent,
+        tool_call_id: String,
+    },
+    /// The deprecated function result: its content is a string or null, as
+    /// the public API has it, and the key is required there, so a `null`
+    /// stays on the wire when the request is written back for an upstream.
+    #[serde(rename = "function")]
+    Function {
+        #[serialize_always]
+        content: Option<String>,
+        name: String,
+    },
+    #[serde(rename = "developer")]
+    Developer {
+        content: MessageContent,
+        name: Option<String>,
+        #[serde(flatten)]
+        ext: KimiDeveloperExt,
+    },
+    /// MiniMax extension: top-priority instruction message, above system.
+    /// Hoisted to the front for dispatch (several merge into one), where the
+    /// chat template reads it; a template without a root branch gets it as
+    /// the leading system message. Rejected by other profiles.
+    #[serde(rename = "root")]
+    Root {
+        content: MessageContent,
+        name: Option<String>,
+    },
+}
+}
+
+/// The audio answer of an earlier assistant turn, referred to by its id: the
+/// history carries the reference, not the audio.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ChatAssistantAudio {
+    pub id: String,
+}
+
+/// The reasoning text of an assistant message on input. It is read from
+/// `reasoning_content` (the key this crate writes) or from `reasoning` (the key
+/// of vLLM and OpenRouter). Agent clients send some messages with both keys.
+/// One key, or both keys with the same text, gives that text. Both keys with
+/// different text are refused as a value (`invalid_value`): the gateway cannot
+/// know which text the model produced. An empty text does not count and cannot
+/// disagree. A serde alias between the two keys refused a message with both as
+/// a duplicate field (#5092).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+pub struct AssistantReasoning {
+    /// Reasoning content for O1-style models (an engine extension). The
+    /// `reasoning` key is accepted on input too.
+    #[serde(rename = "reasoning_content", skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+/// Reads each key by its own name, with no alias between them.
+/// `deserialize_struct` names the two keys. Under `#[serde(flatten)]` serde then
+/// gives this reader only those keys; the provider extension keeps its own.
+impl<'de> Deserialize<'de> for AssistantReasoning {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        const FIELDS: &[&str] = &["reasoning_content", "reasoning"];
+
+        #[derive(Deserialize)]
+        #[serde(field_identifier, rename_all = "snake_case")]
+        enum Field {
+            ReasoningContent,
+            Reasoning,
+            #[serde(other)]
+            Other,
+        }
+
+        struct ReasoningVisitor;
+
+        impl<'de> de::Visitor<'de> for ReasoningVisitor {
+            type Value = AssistantReasoning;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an assistant message's reasoning")
+            }
+
+            fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut reasoning_content: Option<Option<String>> = None;
+                let mut reasoning: Option<Option<String>> = None;
+                while let Some(key) = map.next_key()? {
+                    match key {
+                        Field::ReasoningContent => {
+                            if reasoning_content.is_some() {
+                                return Err(de::Error::duplicate_field("reasoning_content"));
+                            }
+                            reasoning_content = Some(map.next_value()?);
+                        }
+                        Field::Reasoning => {
+                            if reasoning.is_some() {
+                                return Err(de::Error::duplicate_field("reasoning"));
+                            }
+                            reasoning = Some(map.next_value()?);
+                        }
+                        Field::Other => {
+                            map.next_value::<de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                let text = match (reasoning_content.flatten(), reasoning.flatten()) {
+                    (Some(content), Some(alias))
+                        if !content.is_empty() && !alias.is_empty() && content != alias =>
+                    {
+                        // Opens with serde's words, so the public code is `invalid_value`.
+                        return Err(de::Error::custom(
+                            "invalid value: `reasoning_content` and `reasoning` disagree; \
+                             send one of them, or the same text in both",
+                        ));
+                    }
+                    (Some(content), Some(alias)) => {
+                        Some(if content.is_empty() { alias } else { content })
+                    }
+                    (Some(text), None) | (None, Some(text)) => Some(text),
+                    (None, None) => None,
+                };
+                Ok(AssistantReasoning { text })
+            }
+        }
+
+        deserializer.deserialize_struct("AssistantReasoning", FIELDS, ReasoningVisitor)
+    }
+}
+
+/// A message's content as the wire carries it: one text string, or a list of
+/// typed parts (text, image, audio, video, refusal).
+#[derive(Debug, Clone, Serialize, PartialEq, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum MessageContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+/// A string is the text, a list is the parts. A part's refusal is kept as
+/// the refusal, under the part's place in the list (`content[1]`): a derived
+/// untagged read would replace it with its own generic words, and serde's
+/// path stops at the message a tagged enum buffers. Each part is buffered by
+/// the strict value reader: the plain one keeps the last of a repeated key,
+/// and the typed read after it would never see the repeat.
+impl<'de> Deserialize<'de> for MessageContent {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ContentVisitor;
+
+        impl<'de> de::Visitor<'de> for ContentVisitor {
+            type Value = MessageContent;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a string or a list of content parts")
+            }
+
+            fn visit_str<E: de::Error>(self, text: &str) -> Result<Self::Value, E> {
+                Ok(MessageContent::Text(text.to_owned()))
+            }
+
+            fn visit_string<E: de::Error>(self, text: String) -> Result<Self::Value, E> {
+                Ok(MessageContent::Text(text))
+            }
+
+            fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut parts = Vec::new();
+                loop {
+                    // Only a repeated key's refusal takes the part's place (any other error is
+                    // the deserializer's own), and as it is: the key is the client's and may
+                    // hold the separator `part_reason_at` splits on.
+                    let next = seq.next_element_seed(StrictValue).map_err(|error| {
+                        let reason = error.to_string();
+                        if reason.starts_with("duplicate field `") {
+                            de::Error::custom(format!("{reason}, in `content[{}]`", parts.len()))
+                        } else {
+                            error
+                        }
+                    })?;
+                    let Some(value) = next else { break };
+                    // The buffer's map is the part's fields: read by kind, not built a second time.
+                    let part = match value {
+                        Value::Object(fields) => ContentPart::from_fields(fields),
+                        other => serde_json::from_value(other),
+                    }
+                    .map_err(|error| {
+                        <A::Error as de::Error>::custom(part_reason_at(parts.len(), &error))
+                    })?;
+                    parts.push(part);
+                }
+                Ok(MessageContent::Parts(parts))
+            }
+        }
+
+        deserializer.deserialize_any(ContentVisitor)
+    }
+}
+
+/// A part's refusal under its place in the list, in serde's own path form,
+/// so the reason keeps its opening words (the public code reads them) and
+/// the field its path: `missing field `image_url.url`` at the second part is
+/// `missing field `content[1].image_url.url``, `..., in `image_url`` is
+/// `..., in `content[1].image_url``, a reason naming no body ends
+/// `, in `content[1]``.
+fn part_reason_at(index: usize, error: &serde_json::Error) -> String {
+    let reason = error.to_string();
+    if let Some(field) = reason.strip_prefix("missing field `") {
+        return format!("missing field `content[{index}].{field}");
+    }
+    // The suffix a known part appends ends in a backtick; serde's own tail (`expected ...`) never
+    // does, so a value the client sent that happens to hold ", in `" cannot move the split.
+    match reason
+        .rsplit_once(", in `")
+        .filter(|(_, body)| body.ends_with('`'))
+    {
+        Some((head, body)) => format!("{head}, in `content[{index}].{body}"),
+        None => format!("{reason}, in `content[{index}]`"),
+    }
+}
+
+impl Default for MessageContent {
+    fn default() -> Self {
+        MessageContent::Text(String::new())
+    }
+}
+
+impl MessageContent {
+    /// Returns the text content, cloning only when necessary.
+    /// For simple text, returns a clone of the string.
+    /// For parts, concatenates text parts with spaces.
+    pub fn to_simple_string(&self) -> String {
+        match self {
+            MessageContent::Text(text) => text.clone(),
+            MessageContent::Parts(parts) => {
+                let mut result = String::new();
+                let mut first = true;
+                for text in parts.iter().filter_map(ContentPart::text) {
+                    if !first {
+                        result.push(' ');
+                    }
+                    result.push_str(text);
+                    first = false;
+                }
+                result
+            }
+        }
+    }
+
+    /// Appends text content directly to a buffer, avoiding intermediate allocations.
+    /// Returns true if any content was appended.
+    #[inline]
+    pub fn append_text_to(&self, buffer: &mut String) -> bool {
+        match self {
+            MessageContent::Text(text) => {
+                if text.is_empty() {
+                    false
+                } else {
+                    buffer.push_str(text);
+                    true
+                }
+            }
+            MessageContent::Parts(parts) => {
+                let mut appended = false;
+                for text in parts.iter().filter_map(ContentPart::text) {
+                    if !text.is_empty() {
+                        if appended {
+                            buffer.push(' ');
+                        }
+                        buffer.push_str(text);
+                        appended = true;
+                    }
+                }
+                appended
+            }
+        }
+    }
+
+    /// Returns true if this content contains any non-empty text.
+    #[inline]
+    pub fn has_text(&self) -> bool {
+        match self {
+            MessageContent::Text(text) => !text.is_empty(),
+            MessageContent::Parts(parts) => parts
+                .iter()
+                .filter_map(ContentPart::text)
+                .any(|text| !text.is_empty()),
+        }
+    }
+}
+
+// ============================================================================
+// Chat Completion Request
+// ============================================================================
+
+/// A request to the chat completions route: the conversation so far, the model,
+/// and the sampling, tool, response-format and streaming parameters, validated
+/// together before dispatch.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, Default, Validate, schemars::JsonSchema)]
+#[validate(schema(function = "validate_chat_cross_parameters"))]
+pub struct ChatCompletionRequest {
+    /// A list of messages comprising the conversation so far
+    #[validate(custom(function = "validate_messages"))]
+    #[serde(deserialize_with = "crate::kind_read::list")]
+    pub messages: Vec<ChatMessage>,
+
+    /// ID of the model to use
+    pub model: String,
+
+    /// Number between -2.0 and 2.0. Positive values penalize new tokens based on their existing frequency in the text so far
+    #[validate(range(min = -2.0, max = 2.0))]
+    pub frequency_penalty: Option<f32>,
+
+    /// Deprecated: Replaced by tool_choice
+    #[deprecated(note = "Use tool_choice instead")]
+    pub function_call: Option<FunctionCall>,
+
+    /// Deprecated: Replaced by tools
+    #[deprecated(note = "Use tools instead")]
+    pub functions: Option<Vec<Function>>,
+
+    /// Modify the likelihood of specified tokens appearing in the completion:
+    /// token id to a bias in -100..=100, applied by the engine's sampler
+    #[validate(custom(function = "validate_logit_bias"))]
+    #[serde(serialize_with = "crate::common::serialize_with_sorted_keys")]
+    pub logit_bias: Option<HashMap<String, f32>>,
+
+    /// Whether to return log probabilities of the output tokens
+    #[serde(default, deserialize_with = "deserialize_null_as_false")]
+    pub logprobs: bool,
+
+    /// Deprecated: Replaced by max_completion_tokens
+    #[deprecated(note = "Use max_completion_tokens instead")]
+    #[validate(range(min = 1))]
+    pub max_tokens: Option<u32>,
+
+    /// An upper bound for the number of tokens that can be generated for a completion
+    #[validate(range(min = 1))]
+    pub max_completion_tokens: Option<u32>,
+
+    /// Developer-defined tags and values used for filtering completions in the dashboard
+    #[serde(serialize_with = "crate::common::serialize_with_sorted_keys")]
+    pub metadata: Option<HashMap<String, String>>,
+
+    /// Output types that you would like the model to generate for this request
+    pub modalities: Option<Vec<String>>,
+
+    /// Whether to return audio output.
+    pub return_audio: Option<bool>,
+
+    /// How many chat completion choices to generate for each input message (1 to 128)
+    #[validate(range(min = 1, max = 128))]
+    pub n: Option<u32>,
+
+    /// Whether to enable parallel function calling during tool use
+    pub parallel_tool_calls: Option<bool>,
+
+    /// Number between -2.0 and 2.0. Positive values penalize new tokens based on whether they appear in the text so far
+    #[validate(range(min = -2.0, max = 2.0))]
+    pub presence_penalty: Option<f32>,
+
+    /// Cache key for prompts (beta feature)
+    pub prompt_cache_key: Option<String>,
+
+    /// Effort level for reasoning models.
+    ///
+    /// OpenAI-compatible callers normally send a named string, while some
+    /// model integrations accept a numeric value. Keep the public Rust shape
+    /// as a string for compatibility, but accept either JSON representation at
+    /// the HTTP boundary; model-specific normalization happens in the gateway.
+    #[serde(default, deserialize_with = "deserialize_reasoning_effort")]
+    pub reasoning_effort: Option<String>,
+
+    /// Vendor thinking control (Kimi `type`/`keep`/`effort`, MiniMax `type`)
+    pub thinking: Option<ThinkingParam>,
+
+    /// An object specifying the format that the model must output
+    pub response_format: Option<ResponseFormat>,
+
+    /// Safety identifier for content moderation
+    pub safety_identifier: Option<String>,
+
+    /// Deprecated: This feature is in Legacy mode
+    #[deprecated(note = "This feature is in Legacy mode")]
+    pub seed: Option<i64>,
+
+    /// The service tier to use for this request
+    pub service_tier: Option<String>,
+
+    /// Up to 4 sequences where the API will stop generating further tokens
+    #[validate(custom(function = "validate_stop"))]
+    pub stop: Option<StringOrArray>,
+
+    /// If set, partial message deltas will be sent
+    #[serde(default, deserialize_with = "deserialize_null_as_false")]
+    pub stream: bool,
+
+    /// Options for streaming response
+    pub stream_options: Option<StreamOptions>,
+
+    /// What sampling temperature to use, between 0 and 2
+    #[validate(range(min = 0.0, max = 2.0))]
+    pub temperature: Option<f32>,
+
+    /// Controls which (if any) tool is called by the model
+    pub tool_choice: Option<ToolChoice>,
+
+    /// A list of tools the model may call
+    // Shared, not copied, with what reads the set on the serving path (the
+    // response spec, the readers that type the calls): the parser allocates
+    // the list once and hands it over (`Self::shared_tool_list`).
+    pub tools: Option<Arc<[Tool]>>,
+
+    /// An integer between 0 and 20 specifying the number of most likely tokens to return
+    #[validate(range(min = 0, max = 20))]
+    pub top_logprobs: Option<u32>,
+
+    /// An alternative to sampling with temperature
+    #[validate(custom(function = "validate_top_p_value"))]
+    pub top_p: Option<f32>,
+
+    /// How verbose the answer should be: `low`, `medium` or `high`
+    #[validate(custom(function = "validate_verbosity"))]
+    pub verbosity: Option<String>,
+
+    // =============================================================================
+    // Engine-Specific Sampling Parameters
+    // =============================================================================
+    // These parameters are extensions beyond the OpenAI API specification and
+    // control model generation behavior in engine-specific ways.
+    // =============================================================================
+    /// Top-k sampling parameter (-1 to disable)
+    #[validate(custom(function = "validate_top_k_value"))]
+    pub top_k: Option<i32>,
+
+    /// Min-p nucleus sampling parameter
+    #[validate(range(min = 0.0, max = 1.0))]
+    pub min_p: Option<f32>,
+
+    /// Minimum number of tokens to generate
+    #[validate(range(min = 0))]
+    pub min_tokens: Option<u32>,
+
+    /// Repetition penalty for reducing repetitive text
+    #[validate(range(min = 0.0, max = 2.0))]
+    pub repetition_penalty: Option<f32>,
+
+    /// Regex constraint for output generation
+    pub regex: Option<String>,
+
+    /// EBNF grammar constraint for structured output
+    pub ebnf: Option<String>,
+
+    /// Specific token IDs to use as stop conditions
+    pub stop_token_ids: Option<Vec<u32>>,
+
+    /// Skip trimming stop tokens from output
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_as_false",
+        skip_serializing_if = "is_false"
+    )]
+    pub no_stop_trim: bool,
+
+    /// Ignore end-of-sequence tokens during generation
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_as_false",
+        skip_serializing_if = "is_false"
+    )]
+    pub ignore_eos: bool,
+
+    /// Continue generating from final assistant message
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_as_false",
+        skip_serializing_if = "is_false"
+    )]
+    pub continue_final_message: bool,
+
+    /// Whether the prompt ends with the assistant's generation header, the
+    /// template's `add_generation_prompt`: absent is `true`, what the engines
+    /// apply without the field; `false` leaves the conversation closed for
+    /// the model to continue on its own. Serialized only when set. Set to
+    /// `true` beside `continue_final_message` it is refused, as the engine
+    /// that has the field refuses the pair.
+    pub add_generation_prompt: Option<bool>,
+
+    /// Skip special tokens during detokenization. Serialized only when
+    /// `false`, like `separate_reasoning`: `true` is what the engine applies
+    /// without the field.
+    #[serde(
+        default = "default_true",
+        deserialize_with = "deserialize_null_as_true",
+        skip_serializing_if = "is_true"
+    )]
+    pub skip_special_tokens: bool,
+
+    /// Path to LoRA adapter(s) for model customization
+    pub lora_path: Option<String>,
+
+    /// Session parameters for continual prompting
+    #[serde(serialize_with = "crate::common::serialize_with_sorted_keys")]
+    pub session_params: Option<HashMap<String, Value>>,
+
+    /// Separate reasoning content from final answer (O1-style models)
+    #[serde(
+        default = "default_true",
+        deserialize_with = "deserialize_null_as_true",
+        skip_serializing_if = "is_true"
+    )]
+    pub separate_reasoning: bool,
+
+    /// Stream reasoning tokens during generation
+    #[serde(
+        default = "default_true",
+        deserialize_with = "deserialize_null_as_true",
+        skip_serializing_if = "is_true"
+    )]
+    pub stream_reasoning: bool,
+
+    /// Chat template kwargs
+    #[serde(serialize_with = "crate::common::serialize_with_sorted_keys")]
+    pub chat_template_kwargs: Option<HashMap<String, Value>>,
+
+    /// Return model hidden states
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_as_false",
+        skip_serializing_if = "is_false"
+    )]
+    pub return_hidden_states: bool,
+
+    /// Random seed for sampling for deterministic outputs
+    pub sampling_seed: Option<u64>,
+
+    /// Request ID forwarded to the backend for log correlation (an engine extension)
+    pub rid: Option<String>,
+
+    /// Additional fields not explicitly defined above (e.g. engine-specific parameters)
+    #[serde(flatten)]
+    pub other: Map<String, Value>,
+}
+
+/// `thinking.type`: the request's thinking toggle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingType {
+    Enabled,
+    Disabled,
+    Adaptive,
+}
+
+/// The `thinking` object shared by the Kimi, MiniMax and z.ai chat APIs.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ThinkingParam {
+    #[serde(rename = "type")]
+    pub r#type: Option<ThinkingType>,
+    /// Kimi `keep` mode; accepted and ignored by the renderers.
+    pub keep: Option<String>,
+    /// Vendor effort level; more specific than the top-level `reasoning_effort`.
+    pub effort: Option<String>,
+    /// z.ai `clear_thinking`: whether the history's reasoning is dropped from
+    /// the rendered prompt (`true`, the vendor default) or kept (`false`).
+    pub clear_thinking: Option<bool>,
+}
+
+impl ThinkingParam {
+    /// `enabled` → on, `disabled` → off, `adaptive` or omitted → no preference.
+    pub fn toggle(&self) -> Option<bool> {
+        match self.r#type {
+            Some(ThinkingType::Enabled) => Some(true),
+            Some(ThinkingType::Disabled) => Some(false),
+            Some(ThinkingType::Adaptive) | None => None,
+        }
+    }
+}
+
+impl ChatCompletionRequest {
+    /// The cap the client put on the completion: `max_completion_tokens`,
+    /// else the deprecated `max_tokens`; when the client wrote both, the
+    /// current name wins, as the serving engines resolve the pair. The
+    /// request keeps whichever fields the client wrote, so a proxied body
+    /// reaches its upstream unchanged; everything that needs the number
+    /// reads it here.
+    pub fn output_token_cap(&self) -> Option<u32> {
+        #[expect(deprecated, reason = "the one place the deprecated field is read")]
+        let max_tokens = self.max_tokens;
+        self.max_completion_tokens.or(max_tokens)
+    }
+
+    /// The thinking preference stated by `thinking.type`, if any.
+    pub fn thinking_toggle(&self) -> Option<bool> {
+        self.thinking.as_ref().and_then(ThinkingParam::toggle)
+    }
+
+    /// The thinking preference the prompt is rendered with: the typed
+    /// `thinking.type` toggle, else the provider profile's reading of the
+    /// effective `reasoning_effort`
+    /// ([`ProviderProfile::thinking_from_reasoning_effort`]). An explicit
+    /// toggle wins over the profile's reading of any effort, as it does in
+    /// the engine's own server, which keeps a `chat_template_kwargs` toggle
+    /// over the one it would derive from `reasoning_effort`; a renderer with
+    /// a native template effort still ranks that effort above the toggle
+    /// when it reads the prompt (the gateway's parser precedence).
+    pub fn template_thinking(&self) -> Option<bool> {
+        self.template_thinking_for(ProviderProfile::for_model(&self.model))
+    }
+
+    /// [`Self::template_thinking`] with the model's provider profile the caller
+    /// derived already (the gateway's preparation derives it once per request).
+    pub fn template_thinking_for(&self, provider: ProviderProfile) -> Option<bool> {
+        self.thinking_toggle()
+            .or_else(|| provider.thinking_from_reasoning_effort(self.effective_reasoning_effort()))
+    }
+
+    /// The `reasoning_effort` the prompt is rendered with: the effective
+    /// effort as the model's provider profile hands it to the template
+    /// ([`ProviderProfile::template_reasoning_effort`]), given the thinking
+    /// preference the prompt renders with ([`Self::template_thinking_for`]).
+    /// The gateway's kwargs merge adds the template's own switch sent in
+    /// `chat_template_kwargs` where the template reads that key
+    /// ([`ProviderProfile::thinking_from_template_kwargs`] under the detected
+    /// thinking key, which this crate cannot know).
+    pub fn template_reasoning_effort_for(&self, provider: ProviderProfile) -> Option<&str> {
+        provider.template_reasoning_effort(
+            self.effective_reasoning_effort(),
+            self.template_thinking_for(provider),
+        )
+    }
+
+    /// Whether `continue_final_message` applies: it is set and the request
+    /// ends with an assistant message.
+    pub fn continues_final_assistant(&self) -> bool {
+        self.continue_final_message
+            && matches!(self.messages.last(), Some(ChatMessage::Assistant { .. }))
+    }
+
+    /// Whether the prompt ends with the assistant's generation header: the
+    /// request's `add_generation_prompt`, `true` when absent.
+    pub fn adds_generation_prompt(&self) -> bool {
+        self.add_generation_prompt.unwrap_or(true)
+    }
+
+    /// Whether `parallel_tool_calls: false` asks for one tool call at most.
+    pub fn disables_parallel_tool_calls(&self) -> bool {
+        self.parallel_tool_calls == Some(false)
+    }
+
+    /// The choices the request asks for: `n`, one when absent or zero.
+    pub fn choices(&self) -> u32 {
+        self.n.filter(|&n| n > 0).unwrap_or(1)
+    }
+
+    /// The tool calls the history already holds, across the assistant
+    /// messages: the index the next call continues from.
+    pub fn history_tool_calls_count(&self) -> usize {
+        self.messages
+            .iter()
+            .filter_map(|message| match message {
+                ChatMessage::Assistant { tool_calls, .. } => {
+                    tool_calls.as_ref().map(|calls| calls.len())
+                }
+                _ => None,
+            })
+            .sum()
+    }
+
+    /// `thinking.effort` when present, else the top-level `reasoning_effort`.
+    pub fn effective_reasoning_effort(&self) -> Option<&str> {
+        self.thinking
+            .as_ref()
+            .and_then(|thinking| thinking.effort.as_deref())
+            .or(self.reasoning_effort.as_deref())
+    }
+}
+
+/// Map an OpenAI `reasoning_effort` to a thinking on/off preference.
+///
+/// This is the protocol-level interpretation of "does the caller want
+/// reasoning?" — independent of any model/template. `reasoning_effort` is a
+/// *level* (`"low"`/`"medium"`/`"high"`) plus the vendor-extension `"none"`.
+///
+/// Both `"none"` and `"minimal"` map to thinking OFF (`Some(false)`).
+/// `"minimal"` is treated as an off-signal deliberately: templates that expose
+/// only a boolean thinking toggle (GLM/Qwen3) cannot do "a little" reasoning,
+/// so the lowest OpenAI level is the closest available "do not reason".
+/// Level values return `None` — no opinion, defer to the template default or an
+/// explicit thinking kwarg.
+/// The default reading; a provider profile may read the field by its own
+/// contract ([`ProviderProfile::thinking_from_reasoning_effort`]).
+pub fn thinking_from_reasoning_effort(reasoning_effort: Option<&str>) -> Option<bool> {
+    match reasoning_effort {
+        Some("none") | Some("minimal") => Some(false),
+        _ => None,
+    }
+}
+
+pub(crate) fn deserialize_reasoning_effort<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value)),
+        Some(Value::Number(value)) => Ok(Some(value.to_string())),
+        Some(_) => Err(de::Error::custom(
+            "reasoning_effort must be a string, number, or null",
+        )),
+    }
+}
+
+// ============================================================================
+// Validation Functions
+// ============================================================================
+
+fn validate_messages(messages: &[ChatMessage]) -> Result<(), validator::ValidationError> {
+    if messages.is_empty() {
+        return Err(invalid(
+            "empty_array",
+            "Invalid 'messages': empty array. Expected an array with minimum length 1, but got an empty array instead.".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_verbosity(verbosity: &str) -> Result<(), validator::ValidationError> {
+    match verbosity {
+        "low" | "medium" | "high" => Ok(()),
+        other => Err(invalid(
+            "unsupported_value",
+            format!(
+                "Invalid value: '{other}' for parameter 'verbosity'; supported values are 'low', \
+                 'medium' and 'high'"
+            ),
+        )),
+    }
+}
+
+/// Schema-level validation for cross-field dependencies. Each rule names the
+/// field it is about (`invalid_at`), which the error envelope reports as
+/// `param`; the provider profiles' rules keep their own form.
+fn validate_chat_cross_parameters(
+    req: &ChatCompletionRequest,
+) -> Result<(), validator::ValidationError> {
+    // 1. Validate logprobs dependency
+    if req.top_logprobs.is_some() && !req.logprobs {
+        return Err(invalid_at(
+            "top_logprobs",
+            "top_logprobs_requires_logprobs",
+            "top_logprobs is only allowed when logprobs is enabled",
+        ));
+    }
+
+    // 2. Validate stream_options dependency
+    if req.stream_options.is_some() && !req.stream {
+        return Err(invalid_at(
+            "stream_options",
+            "stream_options_requires_stream",
+            "The 'stream_options' parameter is only allowed when 'stream' is enabled",
+        ));
+    }
+
+    // 3. Validate token limits - min <= max
+    if let (Some(min), Some(max)) = (req.min_tokens, req.output_token_cap()) {
+        if min > max {
+            return Err(invalid_at(
+                "min_tokens",
+                "min_tokens_exceeds_max",
+                "min_tokens cannot exceed max_tokens/max_completion_tokens",
+            ));
+        }
+    }
+
+    // 4. Validate structured output conflicts: a response format that
+    //    constrains the output (a JSON one, a structural tag) beside a grammar
+    //    of the request's own
+    let has_format_constraint = matches!(
+        req.response_format,
+        Some(
+            ResponseFormat::JsonObject
+                | ResponseFormat::JsonSchema { .. }
+                | ResponseFormat::StructuralTag { .. }
+        )
+    );
+
+    if has_format_constraint && req.regex.is_some() {
+        return Err(invalid_at(
+            "regex",
+            "regex_conflicts_with_json",
+            "cannot use regex constraint with a JSON or structural_tag response format",
+        ));
+    }
+
+    if has_format_constraint && req.ebnf.is_some() {
+        return Err(invalid_at(
+            "ebnf",
+            "ebnf_conflicts_with_json",
+            "cannot use EBNF constraint with a JSON or structural_tag response format",
+        ));
+    }
+
+    // 5. Validate mutually exclusive structured output constraints
+    let constraint_count = [
+        req.regex.is_some(),
+        req.ebnf.is_some(),
+        matches!(req.response_format, Some(ResponseFormat::JsonSchema { .. })),
+    ]
+    .iter()
+    .filter(|&&x| x)
+    .count();
+
+    // Only `regex` beside `ebnf` reaches this rule (a format beside either
+    // was refused above); the second constraint is the one named.
+    if constraint_count > 1 {
+        return Err(invalid_at(
+            "ebnf",
+            "multiple_constraints",
+            "only one structured output constraint (regex, ebnf, or json_schema) can be active at a time",
+        ));
+    }
+
+    // 6. Validate response format JSON schema name and shape
+    if let Some(ResponseFormat::JsonSchema { json_schema }) = &req.response_format {
+        validate_json_schema_shape(&json_schema.name, &json_schema.schema)
+            .map_err(|error| on_field(error, "response_format"))?;
+    }
+
+    // 7. A function has a name. The rule stands ahead of the choice's, so
+    //    the unnamed tool is the one refused whatever `tool_choice` says
+    for (index, tool) in req.tools.as_deref().into_iter().flatten().enumerate() {
+        if tool.function.name.is_empty() {
+            let field = format!("tools[{index}].function.name");
+            return Err(on_field(empty_tool_name(&field), field));
+        }
+    }
+
+    // The provider profile, derived once here for the tool-choice rule (8)
+    // and the contract rules (11).
+    let provider = ProviderProfile::for_model(&req.model);
+
+    // 8. A tool_choice against the tools the model will see
+    if let Some(tool_choice) = &req.tool_choice {
+        validate_tool_choice(req, provider, tool_choice)?;
+    }
+
+    // 9. A function's `parameters`, when given, is a JSON Schema object (an
+    //    absent or null schema was read as none and passes)
+    for (index, tool) in req.tools.as_deref().into_iter().flatten().enumerate() {
+        let Some(schema) = &tool.function.parameters else {
+            continue;
+        };
+        if !schema.is_object() {
+            return Err(invalid_at(
+                format!("tools[{index}].function.parameters"),
+                "invalid_type",
+                format!(
+                    "Invalid 'tools[{index}].function.parameters': expected an object, but got {} \
+                     instead",
+                    json_type_name(schema)
+                ),
+            ));
+        }
+    }
+
+    // 10. A continued final message and the generation header exclude each
+    //     other: the pair set together is refused, as the engine that has
+    //     the field refuses it; `continue_final_message` alone continues.
+    if req.continue_final_message && req.add_generation_prompt == Some(true) {
+        return Err(invalid_at(
+            "add_generation_prompt",
+            "add_generation_prompt_conflicts_with_continue_final_message",
+            "Cannot set both `continue_final_message` and `add_generation_prompt` to True.",
+        ));
+    }
+
+    // 11. Provider-profile contract rules, selected from the model id. Both
+    //     token limits at once are judged there: the request keeps whichever
+    //     the client wrote and `output_token_cap` reads `max_completion_tokens`
+    //     first, the precedence the serving engines apply themselves; only
+    //     OpenAI's own contract refuses the pair.
+    provider.validate_chat(req)?;
+
+    Ok(())
+}
+
+/// A `tool_choice` against the tools the model will see: the request's tools
+/// plus the dynamic tools its system and developer messages declare under
+/// `provider`, the request's profile the caller derived. Only `none` and
+/// `auto` are allowed without tools; a named function must be declared; an
+/// allowed-tools choice names a mode and function tools only, each declared.
+fn validate_tool_choice(
+    req: &ChatCompletionRequest,
+    provider: ProviderProfile,
+    tool_choice: &ToolChoice,
+) -> Result<(), validator::ValidationError> {
+    // Lazy on purpose: most tool traffic only needs the emptiness check.
+    let effective_tools = || req.effective_tools_for(provider);
+    let has_tools = effective_tools().next().is_some();
+    let requires_tools = !matches!(
+        tool_choice,
+        ToolChoice::Value(ToolChoiceValue::None | ToolChoiceValue::Auto)
+    );
+    if requires_tools && !has_tools {
+        return Err(invalid_at(
+            "tool_choice",
+            "tool_choice_requires_tools",
+            "Invalid value for 'tool_choice': 'tool_choice' is only allowed when 'tools' are specified.",
+        ));
+    }
+    if !has_tools {
+        return Ok(());
+    }
+    let declared = |name: &str| {
+        effective_tools().any(|tool| tool.tool_type == "function" && tool.function.name == name)
+    };
+    match tool_choice {
+        ToolChoice::Function { function, .. } if !declared(&function.name) => Err(invalid_at(
+            "tool_choice",
+            "tool_choice_function_not_found",
+            format!(
+                "Invalid value for 'tool_choice': function '{}' not found in 'tools'.",
+                function.name
+            ),
+        )),
+        ToolChoice::AllowedTools { mode, .. } if mode != "auto" && mode != "required" => {
+            Err(invalid_at(
+                "tool_choice.mode",
+                "tool_choice_invalid_mode",
+                format!(
+                    "Invalid value for 'tool_choice.allowed_tools.mode': must be 'auto' or 'required', got '{mode}'."
+                ),
+            ))
+        }
+        // The Chat Completions API takes function tools only in an allowed-tools choice.
+        ToolChoice::AllowedTools { tools, .. } => tools.iter().try_for_each(|tool_ref| match tool_ref {
+            ToolReference::Function { name } if !declared(name) => Err(invalid_at(
+                "tool_choice.tools",
+                "tool_choice_tool_not_found",
+                format!("Invalid value for 'tool_choice.allowed_tools.tools': tool '{name}' not found in 'tools'."),
+            )),
+            ToolReference::Function { .. } => Ok(()),
+            _ => Err(invalid_at(
+                "tool_choice.tools",
+                "tool_choice_invalid_tool_type",
+                format!(
+                    "Invalid value for 'tool_choice.allowed_tools.tools': Chat Completion API only supports function tools, got '{}'.",
+                    tool_ref.identifier()
+                ),
+            )),
+        }),
+        ToolChoice::Function { .. } | ToolChoice::Value(_) => Ok(()),
+    }
+}
+
+impl ChatCompletionRequest {
+    /// Tools declared on messages rather than at the request level, as the
+    /// request's provider profile defines them (Kimi K3 dynamic tools on
+    /// system and developer messages; see [`ProviderProfile::dynamic_tools`]).
+    pub fn dynamic_tools(&self) -> impl Iterator<Item = &Tool> {
+        self.dynamic_tools_for(ProviderProfile::for_model(&self.model))
+    }
+
+    /// [`Self::dynamic_tools`] under `provider`, the model's profile the
+    /// caller derived already (the gateway's preparation derives it once per
+    /// request, and the stages after it read that one).
+    pub fn dynamic_tools_for(&self, provider: ProviderProfile) -> impl Iterator<Item = &Tool> {
+        provider.dynamic_tools(self)
+    }
+
+    /// Whether the request offers the model any tool: a request-level `tools`
+    /// field, an empty list included (the normalizer answers an empty list
+    /// with `tool_choice: none`, which switches the calls off), or a tool a
+    /// message declares. Every gate on the serving path that asks "does this
+    /// request have tools" (whether the response is scanned for calls, whether
+    /// the engine keeps the special tokens the call markers are made of,
+    /// whether a prompt opens its tool channel) reads this one answer: a gate
+    /// that read `tools` alone took a request whose tools are all declared on
+    /// messages for a request without tools, and its calls came back as text.
+    /// Whether a call can be forced is a question for the narrowed set,
+    /// [`Self::callable_tools`].
+    pub fn declares_tools(&self) -> bool {
+        self.tools.is_some() || self.dynamic_tools().next().is_some()
+    }
+
+    /// [`Self::declares_tools`] under `provider`, the model's profile the
+    /// caller derived already.
+    pub fn declares_tools_for(&self, provider: ProviderProfile) -> bool {
+        self.tools.is_some() || self.dynamic_tools_for(provider).next().is_some()
+    }
+
+    /// Every tool the model will see: the request-level `tools` followed by
+    /// the dynamic tools. Anything that resolves a tool name in the response,
+    /// tool-call parsing first of all, must work from this set rather than
+    /// from `tools` alone, or a call to a dynamic tool comes back as text.
+    pub fn effective_tools(&self) -> impl Iterator<Item = &Tool> {
+        self.effective_tools_for(ProviderProfile::for_model(&self.model))
+    }
+
+    /// [`Self::effective_tools`] under `provider`, the model's profile the
+    /// caller derived already.
+    pub fn effective_tools_for(&self, provider: ProviderProfile) -> impl Iterator<Item = &Tool> {
+        self.tools
+            .as_deref()
+            .into_iter()
+            .flatten()
+            .chain(self.dynamic_tools_for(provider))
+    }
+
+    /// [`Self::effective_tools`] as one list: the request's own `tools`,
+    /// borrowed as they are, when no message declares a tool; a list that
+    /// chains both otherwise. The serving path reads the set several times per
+    /// request (the constraint, the response spec, the table that reads the
+    /// calls), so where nothing narrows it, nothing copies it.
+    pub fn effective_tool_list(&self) -> Cow<'_, [Tool]> {
+        self.effective_tool_list_for(ProviderProfile::for_model(&self.model))
+    }
+
+    /// [`Self::effective_tool_list`] under `provider`, the model's profile
+    /// the caller derived already.
+    pub fn effective_tool_list_for(&self, provider: ProviderProfile) -> Cow<'_, [Tool]> {
+        let mut dynamic = self.dynamic_tools_for(provider).peekable();
+        if dynamic.peek().is_none() {
+            return Cow::Borrowed(self.tools.as_deref().unwrap_or(&[]));
+        }
+        Cow::Owned(
+            self.tools
+                .as_deref()
+                .into_iter()
+                .flatten()
+                .chain(dynamic)
+                .cloned()
+                .collect(),
+        )
+    }
+
+    /// [`Self::effective_tool_list`] for a holder that outlives the request's
+    /// borrow (the response spec, and through it every reader of the
+    /// response): the request's own `tools`, the one list the parser made,
+    /// shared, when no message declares a tool; a list that chains both
+    /// otherwise; an empty list when the request declares none.
+    pub fn shared_tool_list(&self) -> Arc<[Tool]> {
+        self.shared_tool_list_for(ProviderProfile::for_model(&self.model))
+    }
+
+    /// [`Self::shared_tool_list`] under `provider`, the model's profile the
+    /// caller derived already.
+    pub fn shared_tool_list_for(&self, provider: ProviderProfile) -> Arc<[Tool]> {
+        let mut dynamic = self.dynamic_tools_for(provider).peekable();
+        match (&self.tools, dynamic.peek()) {
+            (Some(tools), None) => Arc::clone(tools),
+            (None, None) => Arc::default(),
+            (_, Some(_)) => self
+                .tools
+                .as_deref()
+                .into_iter()
+                .flatten()
+                .chain(dynamic)
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// The tools a `tool_choice` may force: [`Self::effective_tool_list`]
+    /// narrowed by the choice (see [`ToolChoice::narrow_tools`]). A
+    /// `tool_choice` grammar must be built from this set; built from `tools`
+    /// alone, a forced call could only ever land on a request-level tool. The
+    /// list is borrowed from the request where the choice narrows nothing.
+    pub fn callable_tools(&self) -> Cow<'_, [Tool]> {
+        self.callable_tools_for(ProviderProfile::for_model(&self.model))
+    }
+
+    /// [`Self::callable_tools`] under `provider`, the model's profile the
+    /// caller derived already.
+    pub fn callable_tools_for(&self, provider: ProviderProfile) -> Cow<'_, [Tool]> {
+        let tools = self.effective_tool_list_for(provider);
+        match self
+            .tool_choice
+            .as_ref()
+            .and_then(|choice| choice.narrow_tools(&tools))
+        {
+            Some(narrowed) => Cow::Owned(narrowed),
+            None => tools,
+        }
+    }
+}
+
+// ============================================================================
+// Normalizable Implementation
+// ============================================================================
+
+impl Normalizable for ChatCompletionRequest {
+    /// Normalize the request:
+    /// 1. Apply the profile's rewrites to the request as the client sent it,
+    ///    before any migration: drop message extensions that belong to another
+    ///    provider's profile and merge MiniMax `root` messages into one
+    ///    leading root (see [`ProviderProfile::normalize_chat`])
+    /// 2. Migrate deprecated fields to their replacements
+    /// 3. Clear deprecated fields and log warnings
+    /// 4. Apply OpenAI defaults for tool_choice
+    ///
+    /// The deprecated `max_tokens` is not migrated: a proxied request reaches
+    /// its upstream with the cap under the name the client wrote, and the
+    /// router reads the number through [`Self::output_token_cap`].
+    fn normalize(&mut self) {
+        ProviderProfile::for_model(&self.model).normalize_chat(self);
+
+        // Migrate deprecated functions → tools
+        #[expect(
+            deprecated,
+            reason = "the one read of functions: its migration to tools"
+        )]
+        if self.tools.is_none() && self.functions.is_some() {
+            tracing::warn!("functions is deprecated, use tools instead");
+            self.tools = self.functions.as_ref().map(|functions| {
+                functions
+                    .iter()
+                    .map(|func| Tool {
+                        tool_type: "function".to_string(),
+                        function: func.clone(),
+                    })
+                    .collect()
+            });
+            self.functions = None; // Clear deprecated field
+        }
+
+        // Migrate deprecated function_call → tool_choice
+        #[expect(
+            deprecated,
+            reason = "the one read of function_call: its migration to tool_choice"
+        )]
+        if self.tool_choice.is_none() && self.function_call.is_some() {
+            tracing::warn!("function_call is deprecated, use tool_choice instead");
+            self.tool_choice = self.function_call.as_ref().map(|fc| match fc {
+                FunctionCall::None => ToolChoice::Value(ToolChoiceValue::None),
+                FunctionCall::Auto => ToolChoice::Value(ToolChoiceValue::Auto),
+                FunctionCall::Function { name } => ToolChoice::Function {
+                    tool_type: "function".to_string(),
+                    function: FunctionChoice { name: name.clone() },
+                },
+            });
+            self.function_call = None; // Clear deprecated field
+        }
+
+        // Apply tool_choice defaults
+        if self.tool_choice.is_none() {
+            if let Some(tools) = &self.tools {
+                let choice_value = if tools.is_empty() {
+                    ToolChoiceValue::None
+                } else {
+                    ToolChoiceValue::Auto
+                };
+                self.tool_choice = Some(ToolChoice::Value(choice_value));
+            }
+            // If tools is None, leave tool_choice as None (don't set it)
+        }
+    }
+}
+
+// ============================================================================
+// GenerationRequest Trait Implementation
+// ============================================================================
+
+impl GenerationRequest for ChatCompletionRequest {
+    fn rid(&self) -> Option<&str> {
+        self.rid.as_deref()
+    }
+
+    fn max_output_tokens(&self) -> Option<u32> {
+        self.output_token_cap()
+    }
+
+    fn is_stream(&self) -> bool {
+        self.stream
+    }
+
+    fn cache_partition(&self) -> CachePartition<'_> {
+        CachePartition {
+            // Engine extensions carried in the passthrough map, not typed
+            // fields: the engines' `cache_salt`, one engine's `extra_key`.
+            cache_salt: self.other.get("cache_salt").and_then(Value::as_str),
+            extra_key: self.other.get("extra_key").and_then(Value::as_str),
+            lora_path: self.lora_path.as_deref(),
+        }
+    }
+
+    fn get_model(&self) -> Option<&str> {
+        Some(&self.model)
+    }
+
+    fn extract_text_for_routing(&self) -> String {
+        // Extract text from messages for routing decisions
+        // Use a single buffer to avoid intermediate Vec<String> allocations
+        let mut buffer = String::new();
+        let mut has_content = false;
+
+        for msg in &self.messages {
+            match msg {
+                ChatMessage::System { content, .. }
+                | ChatMessage::User { content, .. }
+                | ChatMessage::Tool { content, .. }
+                | ChatMessage::Developer { content, .. }
+                | ChatMessage::Root { content, .. } => {
+                    if has_content && content.has_text() {
+                        buffer.push(' ');
+                    }
+                    if content.append_text_to(&mut buffer) {
+                        has_content = true;
+                    }
+                }
+                ChatMessage::Assistant {
+                    content, reasoning, ..
+                } => {
+                    // Append main content
+                    if let Some(c) = content {
+                        if has_content && c.has_text() {
+                            buffer.push(' ');
+                        }
+                        if c.append_text_to(&mut buffer) {
+                            has_content = true;
+                        }
+                    }
+                    // Append reasoning content
+                    if let Some(text) = &reasoning.text {
+                        if !text.is_empty() {
+                            if has_content {
+                                buffer.push(' ');
+                            }
+                            buffer.push_str(text);
+                            has_content = true;
+                        }
+                    }
+                }
+                ChatMessage::Function { content, .. } => {
+                    if let Some(content) = content.as_deref().filter(|c| !c.is_empty()) {
+                        if has_content {
+                            buffer.push(' ');
+                        }
+                        buffer.push_str(content);
+                        has_content = true;
+                    }
+                }
+            }
+        }
+
+        buffer
+    }
+}
+
+// ============================================================================
+// Response Types
+// ============================================================================
+
+/// The complete (non-streamed) answer of the chat completions route, object
+/// `chat.completion`: the choices with their messages, and the usage.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ChatCompletionResponse {
+    pub id: String,
+    pub object: String, // "chat.completion"
+    pub created: u64,
+    pub model: String,
+    pub choices: Vec<ChatChoice>,
+    pub usage: Option<Usage>,
+    pub system_fingerprint: Option<String>,
+    /// The service tier the completion ran under. Always present, as the
+    /// OpenAI API sends it; the gateway has one tier, `default`.
+    #[serde(default = "default_service_tier")]
+    pub service_tier: String,
+}
+
+/// The one service tier the gateway serves.
+pub const DEFAULT_SERVICE_TIER: &str = "default";
+
+fn default_service_tier() -> String {
+    DEFAULT_SERVICE_TIER.to_string()
+}
+
+impl ChatCompletionResponse {
+    /// Create a new builder for ChatCompletionResponse
+    pub fn builder(
+        id: impl Into<String>,
+        model: impl Into<String>,
+    ) -> ChatCompletionResponseBuilder {
+        ChatCompletionResponseBuilder::new(id, model)
+    }
+}
+
+/// Response message structure for ChatCompletionResponse (different from request ChatMessage)
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ChatCompletionMessage {
+    pub role: String, // Always "assistant" for responses
+    /// Always present, `null` on a tool-call turn (as the OpenAI API sends it).
+    pub content: Option<String>,
+    /// Always present, as the OpenAI API sends it; the gateway produces no
+    /// refusals, so it is `null`.
+    #[serde(default)]
+    pub refusal: Option<String>,
+    /// Always present, as the OpenAI API sends it; the gateway attaches no
+    /// annotations of its own, so the list is empty unless an upstream sent
+    /// some. An upstream's missing key or `null` reads as the empty list.
+    #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
+    pub annotations: Vec<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    pub reasoning_content: Option<String>,
+    // Note: function_call is deprecated and not included
+    // Note: audio is not added yet
+}
+
+/// One generated alternative of a chat completion: its index, the assistant
+/// message, the log probabilities (`null` unless requested) and the reason
+/// generation stopped.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ChatChoice {
+    pub index: u32,
+    pub message: ChatCompletionMessage,
+    /// Always present (`null` unless log probabilities were requested), as
+    /// the OpenAI API sends it.
+    pub logprobs: Option<ChatLogProbs>,
+    pub finish_reason: Option<String>, // "stop", "length", "tool_calls", "content_filter", "function_call"
+    /// Information about which stop condition was matched
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_stop: Option<Value>, // Can be string or integer
+    /// Hidden states from the model (an engine extension)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hidden_states: Option<Vec<f32>>,
+}
+
+/// One chunk of a streamed chat completion, object `chat.completion.chunk`: the
+/// choices' deltas and, when requested, the usage (on the last chunk, or the
+/// running usage on every chunk with `continuous_usage_stats`).
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ChatCompletionStreamResponse {
+    pub id: String,
+    pub object: String, // "chat.completion.chunk"
+    pub created: u64,
+    pub model: String,
+    pub system_fingerprint: Option<String>,
+    pub choices: Vec<ChatStreamChoice>,
+    pub usage: Option<Usage>,
+}
+
+impl ChatCompletionStreamResponse {
+    /// Create a new builder for ChatCompletionStreamResponse
+    pub fn builder(
+        id: impl Into<String>,
+        model: impl Into<String>,
+    ) -> ChatCompletionStreamResponseBuilder {
+        ChatCompletionStreamResponseBuilder::new(id, model)
+    }
+}
+
+/// Delta structure for streaming chat completion responses
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ChatMessageDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCallDelta>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+}
+
+/// One alternative's part of a streamed chunk: its index, the delta since the
+/// previous chunk, the log probabilities when requested, and the finish reason
+/// once it stops.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ChatStreamChoice {
+    pub index: u32,
+    pub delta: ChatMessageDelta,
+    pub logprobs: Option<ChatLogProbs>,
+    pub finish_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_stop: Option<Value>,
+}
+
+/// [`ChatMessageDelta`] over text it may borrow: the same fields, attributes
+/// and bytes on the wire, for a stream that writes each delta once and need
+/// not copy its text out of the buffer the delta was read into.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatMessageDeltaRef<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<Cow<'a, str>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<Cow<'a, str>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCallDelta>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<Cow<'a, str>>,
+}
+
+/// [`ChatStreamChoice`] with a [`ChatMessageDeltaRef`]: the same bytes on the
+/// wire as the owned choice.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatStreamChoiceRef<'a> {
+    pub index: u32,
+    pub delta: ChatMessageDeltaRef<'a>,
+    pub logprobs: Option<ChatLogProbs>,
+    pub finish_reason: Option<Cow<'a, str>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_stop: Option<Value>,
+}
+
+impl<'a> From<ChatStreamChoice> for ChatStreamChoiceRef<'a> {
+    /// The owned choice's text as its own (an owned [`Cow`] each). The owned
+    /// types are taken apart field by field with no rest pattern, so a field
+    /// added to either of them is a compile error here until the borrowed
+    /// type carries it too.
+    fn from(choice: ChatStreamChoice) -> Self {
+        let ChatStreamChoice {
+            index,
+            delta,
+            logprobs,
+            finish_reason,
+            matched_stop,
+        } = choice;
+        let ChatMessageDelta {
+            role,
+            content,
+            tool_calls,
+            reasoning_content,
+        } = delta;
+        ChatStreamChoiceRef {
+            index,
+            delta: ChatMessageDeltaRef {
+                role: role.map(Cow::Owned),
+                content: content.map(Cow::Owned),
+                tool_calls,
+                reasoning_content: reasoning_content.map(Cow::Owned),
+            },
+            logprobs,
+            finish_reason: finish_reason.map(Cow::Owned),
+            matched_stop,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{json, Value};
+
+    use super::{
+        thinking_from_reasoning_effort, ChatCompletionRequest, ChatMessage, ChatMessageDelta,
+        ChatMessageDeltaRef, ChatStreamChoice, ChatStreamChoiceRef, GenerationRequest,
+        ThinkingParam, ThinkingType,
+    };
+    use crate::{
+        common::{FunctionCallDelta, FunctionCallResponse, ToolCall, ToolCallDelta},
+        profile::ProviderProfile,
+    };
+
+    /// The borrowed stream choice serializes to the bytes of the owned one, shape for shape:
+    /// text deltas, a reasoning delta, a tool call's start and arguments, the finishing choice,
+    /// a role, a matched stop.
+    #[test]
+    fn borrowed_stream_choice_serializes_as_the_owned_one() {
+        let delta = |role: Option<&str>,
+                     content: Option<&str>,
+                     reasoning: Option<&str>,
+                     tool_calls: Option<Vec<ToolCallDelta>>| ChatMessageDelta {
+            role: role.map(str::to_string),
+            content: content.map(str::to_string),
+            tool_calls,
+            reasoning_content: reasoning.map(str::to_string),
+        };
+        let call = |id: Option<&str>, name: Option<&str>, arguments: Option<&str>| {
+            vec![ToolCallDelta {
+                index: 1,
+                id: id.map(str::to_string),
+                tool_type: id.map(|_| "function".to_string()),
+                function: Some(FunctionCallDelta {
+                    name: name.map(str::to_string),
+                    arguments: arguments.map(str::to_string),
+                }),
+            }]
+        };
+        let shapes = [
+            (
+                delta(None, Some("Hello, \"world\" \u{1f600}"), None, None),
+                None,
+                None,
+            ),
+            (delta(None, None, Some("let me think"), None), None, None),
+            (
+                delta(
+                    None,
+                    None,
+                    None,
+                    Some(call(Some("call_1"), Some("lookup"), None)),
+                ),
+                None,
+                None,
+            ),
+            (
+                delta(None, None, None, Some(call(None, None, Some("{\"q\":")))),
+                None,
+                None,
+            ),
+            (delta(None, None, None, None), Some("tool_calls"), None),
+            (delta(Some("assistant"), Some(""), None, None), None, None),
+            (
+                delta(None, Some("done"), None, None),
+                Some("stop"),
+                Some(json!("</s>")),
+            ),
+        ];
+        for (delta, finish_reason, matched_stop) in shapes {
+            let owned = ChatStreamChoice {
+                index: 3,
+                delta,
+                logprobs: None,
+                finish_reason: finish_reason.map(str::to_string),
+                matched_stop,
+            };
+            let expected = serde_json::to_string(&owned).unwrap();
+            let borrowed = ChatStreamChoiceRef {
+                index: owned.index,
+                delta: ChatMessageDeltaRef {
+                    role: owned.delta.role.as_deref().map(Into::into),
+                    content: owned.delta.content.as_deref().map(Into::into),
+                    tool_calls: owned.delta.tool_calls.clone(),
+                    reasoning_content: owned.delta.reasoning_content.as_deref().map(Into::into),
+                },
+                logprobs: None,
+                finish_reason: owned.finish_reason.as_deref().map(Into::into),
+                matched_stop: owned.matched_stop.clone(),
+            };
+            assert_eq!(serde_json::to_string(&borrowed).unwrap(), expected);
+            let from_owned: ChatStreamChoiceRef<'static> = owned.into();
+            assert_eq!(serde_json::to_string(&from_owned).unwrap(), expected);
+        }
+    }
+
+    /// `parallel_tool_calls: false` asks for one call; `true` and absent do not.
+    #[test]
+    fn a_chat_request_says_whether_it_disables_parallel_tool_calls() {
+        let request = |body: Value| -> ChatCompletionRequest {
+            serde_json::from_value(body).expect("a chat request")
+        };
+        let base = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+        assert!(!request(base.clone()).disables_parallel_tool_calls());
+        let mut on = base.clone();
+        on["parallel_tool_calls"] = json!(true);
+        assert!(!request(on).disables_parallel_tool_calls());
+        let mut off = base;
+        off["parallel_tool_calls"] = json!(false);
+        assert!(request(off).disables_parallel_tool_calls());
+    }
+
+    fn request_with_output_fields(fields: &[(&str, Value)]) -> ChatCompletionRequest {
+        let mut value = json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let object = value.as_object_mut().expect("request must be an object");
+        for (name, field_value) in fields {
+            object.insert((*name).to_string(), field_value.clone());
+        }
+        serde_json::from_value(value).expect("request must deserialize")
+    }
+
+    /// `add_generation_prompt`: absent is none and reads as `true`, so a
+    /// request without the field serializes without it; `false` round-trips
+    /// as sent; null is absent.
+    #[test]
+    fn add_generation_prompt_is_read_only_when_sent_and_defaults_to_true() {
+        let absent = request_with_output_fields(&[]);
+        assert_eq!(absent.add_generation_prompt, None);
+        assert!(absent.adds_generation_prompt());
+        let value = serde_json::to_value(&absent).expect("serialize");
+        assert!(value.get("add_generation_prompt").is_none());
+
+        let off = request_with_output_fields(&[("add_generation_prompt", json!(false))]);
+        assert_eq!(off.add_generation_prompt, Some(false));
+        assert!(!off.adds_generation_prompt());
+        let value = serde_json::to_value(&off).expect("serialize");
+        assert_eq!(value["add_generation_prompt"], false);
+        let back: ChatCompletionRequest = serde_json::from_value(value).expect("roundtrip");
+        assert_eq!(back.add_generation_prompt, Some(false));
+
+        let nulled = request_with_output_fields(&[("add_generation_prompt", Value::Null)]);
+        assert_eq!(nulled.add_generation_prompt, None);
+    }
+
+    /// The generation header and a continued final message exclude each
+    /// other: both set is refused with the engine's wording;
+    /// `continue_final_message` alone, or beside `add_generation_prompt:
+    /// false`, passes, as does `false` alone.
+    #[test]
+    fn add_generation_prompt_true_is_refused_beside_continue_final_message() {
+        use validator::Validate;
+        let both = request_with_output_fields(&[
+            ("continue_final_message", json!(true)),
+            ("add_generation_prompt", json!(true)),
+        ]);
+        let error = both
+            .validate()
+            .expect_err("the pair is refused")
+            .to_string();
+        assert!(
+            error.contains(
+                "Cannot set both `continue_final_message` and `add_generation_prompt` to True."
+            ),
+            "{error}"
+        );
+        for passing in [
+            vec![("continue_final_message", json!(true))],
+            vec![
+                ("continue_final_message", json!(true)),
+                ("add_generation_prompt", json!(false)),
+            ],
+            vec![("add_generation_prompt", json!(false))],
+        ] {
+            assert!(request_with_output_fields(&passing).validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn default_sglang_flags_are_omitted_and_absent_reads_defaults() {
+        let request = request_with_output_fields(&[]);
+        let value = serde_json::to_value(&request).expect("serialize");
+        for field in [
+            "no_stop_trim",
+            "ignore_eos",
+            "continue_final_message",
+            "return_hidden_states",
+            "skip_special_tokens",
+            "separate_reasoning",
+            "stream_reasoning",
+        ] {
+            assert!(value.get(field).is_none(), "{field} serialized at default");
+        }
+
+        let back: ChatCompletionRequest = serde_json::from_value(value).expect("roundtrip");
+        assert!(!back.no_stop_trim);
+        assert!(!back.ignore_eos);
+        assert!(!back.continue_final_message);
+        assert!(!back.return_hidden_states);
+        assert!(back.skip_special_tokens);
+        assert!(back.separate_reasoning);
+        assert!(back.stream_reasoning);
+    }
+
+    #[test]
+    fn non_default_sglang_flags_round_trip() {
+        let request = request_with_output_fields(&[
+            ("no_stop_trim", json!(true)),
+            ("ignore_eos", json!(true)),
+            ("continue_final_message", json!(true)),
+            ("return_hidden_states", json!(true)),
+            ("skip_special_tokens", json!(false)),
+            ("separate_reasoning", json!(false)),
+            ("stream_reasoning", json!(false)),
+        ]);
+        let value = serde_json::to_value(&request).expect("serialize");
+        assert_eq!(value["no_stop_trim"], true);
+        assert_eq!(value["ignore_eos"], true);
+        assert_eq!(value["continue_final_message"], true);
+        assert_eq!(value["return_hidden_states"], true);
+        assert_eq!(value["skip_special_tokens"], false);
+        assert_eq!(value["separate_reasoning"], false);
+        assert_eq!(value["stream_reasoning"], false);
+
+        let back: ChatCompletionRequest = serde_json::from_value(value).expect("roundtrip");
+        assert!(back.no_stop_trim);
+        assert!(back.ignore_eos);
+        assert!(back.continue_final_message);
+        assert!(back.return_hidden_states);
+        assert!(!back.skip_special_tokens);
+        assert!(!back.separate_reasoning);
+        assert!(!back.stream_reasoning);
+    }
+
+    /// `none` switches thinking off under every profile (under MiniMax the
+    /// contract's reading: the request answers as `thinking.type: disabled`
+    /// does); `minimal` does under the OpenAI reading and is MiniMax's lowest
+    /// level, thinking on; a level leaves the template's default. An explicit
+    /// `thinking.type` wins over any effort under every profile, as an
+    /// explicit toggle wins over the effort in the engine's own server.
+    #[test]
+    fn none_switches_thinking_off_under_every_profile_and_minimal_is_minimax_low() {
+        let request = |model: &str, fields: Value| -> ChatCompletionRequest {
+            let mut value = json!({"model": model, "messages": []});
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().cloned().unwrap_or_default());
+            serde_json::from_value(value).unwrap()
+        };
+        for model in [
+            "MiniMax-M3",
+            "self-hosted-model",
+            "kimi-k3",
+            "deepseek-v4.1",
+        ] {
+            assert_eq!(
+                request(model, json!({"reasoning_effort": "minimal"})).template_thinking(),
+                if model == "MiniMax-M3" {
+                    None
+                } else {
+                    Some(false)
+                },
+                "{model} minimal"
+            );
+            assert_eq!(
+                request(model, json!({"reasoning_effort": "none"})).template_thinking(),
+                Some(false),
+                "{model} none: thinking off"
+            );
+            assert_eq!(
+                request(
+                    model,
+                    json!({"reasoning_effort": "none", "thinking": {"type": "enabled"}})
+                )
+                .template_thinking(),
+                Some(true),
+                "{model} none: thinking.enabled wins"
+            );
+            for effort in ["low", "high", "max"] {
+                assert_eq!(
+                    request(model, json!({"reasoning_effort": effort})).template_thinking(),
+                    None,
+                    "{model} {effort}: the template's default"
+                );
+                assert_eq!(
+                    request(
+                        model,
+                        json!({"reasoning_effort": effort, "thinking": {"type": "disabled"}})
+                    )
+                    .template_thinking(),
+                    Some(false),
+                    "{model} {effort}: thinking.disabled wins"
+                );
+            }
+            assert_eq!(
+                request(model, json!({"thinking": {"type": "disabled"}})).template_thinking(),
+                Some(false),
+                "{model}: thinking.disabled alone switches thinking off"
+            );
+        }
+    }
+
+    /// The effort the template renders is the profile's second reading of
+    /// the field: the value as sent under the default profile; under MiniMax
+    /// a level the contract names only (`minimal` as `low`), and none while
+    /// thinking is off (the typed toggle or the effort; the template's own
+    /// switch sent as a kwarg is the gateway's to apply, see
+    /// [`thinking_from_template_kwargs_reads_the_minimax_switch`]).
+    #[test]
+    fn template_reasoning_effort_follows_the_profile() {
+        let request = |fields: Value| -> ChatCompletionRequest {
+            let mut value = json!({"model": "m", "messages": []});
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().cloned().unwrap_or_default());
+            serde_json::from_value(value).unwrap()
+        };
+        for (fields, minimax, generic) in [
+            (
+                json!({"reasoning_effort": "high"}),
+                Some("high"),
+                Some("high"),
+            ),
+            (
+                json!({"reasoning_effort": "xhigh"}),
+                Some("xhigh"),
+                Some("xhigh"),
+            ),
+            (
+                json!({"thinking": {"type": "enabled", "effort": "low"}, "reasoning_effort": "max"}),
+                Some("low"),
+                Some("low"),
+            ),
+            (json!({"reasoning_effort": "none"}), None, Some("none")),
+            (
+                json!({"reasoning_effort": "minimal"}),
+                Some("low"),
+                Some("minimal"),
+            ),
+            (
+                json!({"reasoning_effort": "ultra_super_max_xyz"}),
+                None,
+                Some("ultra_super_max_xyz"),
+            ),
+            (
+                json!({"reasoning_effort": "high", "thinking": {"type": "disabled"}}),
+                None,
+                Some("high"),
+            ),
+            (
+                json!({"reasoning_effort": "none", "thinking": {"type": "enabled"}}),
+                None,
+                Some("none"),
+            ),
+            // A kwarg switch is not this method's to read: the gateway applies
+            // it where the template reads that key.
+            (
+                json!({"reasoning_effort": "high", "chat_template_kwargs": {"thinking_mode": "disabled"}}),
+                Some("high"),
+                Some("high"),
+            ),
+            (json!({}), None, None),
+        ] {
+            assert_eq!(
+                request(fields.clone()).template_reasoning_effort_for(ProviderProfile::Minimax),
+                minimax,
+                "MiniMax {fields}"
+            );
+            assert_eq!(
+                request(fields.clone()).template_reasoning_effort_for(ProviderProfile::Generic),
+                generic,
+                "generic {fields}"
+            );
+        }
+    }
+
+    /// The template's own `thinking_mode` switch sent as a kwarg, read by the
+    /// profile that knows its templates' key; the gateway applies it where the
+    /// template reads that key.
+    #[test]
+    fn thinking_from_template_kwargs_reads_the_minimax_switch() {
+        let kwargs = |mode: &str| {
+            std::collections::HashMap::from([("thinking_mode".to_string(), json!(mode))])
+        };
+        let minimax = ProviderProfile::Minimax;
+        assert_eq!(
+            minimax.thinking_from_template_kwargs(Some(&kwargs("enabled"))),
+            Some(true)
+        );
+        assert_eq!(
+            minimax.thinking_from_template_kwargs(Some(&kwargs("disabled"))),
+            Some(false)
+        );
+        assert_eq!(
+            minimax.thinking_from_template_kwargs(Some(&kwargs("adaptive"))),
+            None
+        );
+        assert_eq!(minimax.thinking_from_template_kwargs(None), None);
+        assert_eq!(
+            ProviderProfile::Generic.thinking_from_template_kwargs(Some(&kwargs("disabled"))),
+            None
+        );
+    }
+
+    #[test]
+    fn thinking_from_reasoning_effort_maps_disable_values() {
+        // "none"/"minimal" mean do-not-reason -> thinking OFF.
+        assert_eq!(thinking_from_reasoning_effort(Some("none")), Some(false));
+        assert_eq!(thinking_from_reasoning_effort(Some("minimal")), Some(false));
+        // Level values do not toggle thinking on their own.
+        assert_eq!(thinking_from_reasoning_effort(Some("low")), None);
+        assert_eq!(thinking_from_reasoning_effort(Some("medium")), None);
+        assert_eq!(thinking_from_reasoning_effort(Some("high")), None);
+        // Unspecified / unknown -> defer.
+        assert_eq!(thinking_from_reasoning_effort(None), None);
+        assert_eq!(thinking_from_reasoning_effort(Some("bogus")), None);
+    }
+
+    #[test]
+    fn reasoning_effort_accepts_scalar_json_and_rejects_other_types() {
+        for (value, expected) in [
+            (json!("high"), Some("high")),
+            (json!(0.2), Some("0.2")),
+            (json!(0.99), Some("0.99")),
+            (Value::Null, None),
+        ] {
+            let request = request_with_output_fields(&[("reasoning_effort", value)]);
+            assert_eq!(request.reasoning_effort.as_deref(), expected);
+        }
+
+        for value in [json!(true), json!([]), json!({"level": "high"})] {
+            let mut request = json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hello"}],
+            });
+            request["reasoning_effort"] = value;
+            let error = serde_json::from_value::<ChatCompletionRequest>(request).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("reasoning_effort must be a string, number, or null"));
+        }
+    }
+
+    #[test]
+    fn return_audio_preserves_explicit_values() {
+        for fields in [vec![], vec![("return_audio", Value::Null)]] {
+            let request = request_with_output_fields(&fields);
+            assert_eq!(request.return_audio, None);
+            assert!(!request.other.contains_key("return_audio"));
+            let serialized = serde_json::to_value(request).expect("request must serialize");
+            assert!(serialized.get("return_audio").is_none());
+        }
+
+        for value in [false, true] {
+            let request = request_with_output_fields(&[("return_audio", json!(value))]);
+            assert_eq!(request.return_audio, Some(value));
+            assert!(!request.other.contains_key("return_audio"));
+            let serialized = serde_json::to_value(request).expect("request must serialize");
+            assert_eq!(serialized.get("return_audio"), Some(&Value::Bool(value)));
+        }
+    }
+
+    #[test]
+    fn thinking_param_is_typed_not_other() {
+        let request = request_with_output_fields(&[(
+            "thinking",
+            json!({"type": "disabled", "keep": "all", "effort": "high"}),
+        )]);
+        assert_eq!(
+            request.thinking,
+            Some(ThinkingParam {
+                r#type: Some(ThinkingType::Disabled),
+                keep: Some("all".to_string()),
+                effort: Some("high".to_string()),
+                clear_thinking: None,
+            })
+        );
+        assert!(!request.other.contains_key("thinking"));
+        let serialized = serde_json::to_value(request).expect("request must serialize");
+        assert_eq!(
+            serialized["thinking"],
+            json!({"type": "disabled", "keep": "all", "effort": "high"})
+        );
+
+        let request = request_with_output_fields(&[("thinking", json!({"type": "adaptive"}))]);
+        assert_eq!(
+            request.thinking.as_ref().and_then(|t| t.r#type),
+            Some(ThinkingType::Adaptive)
+        );
+        let serialized = serde_json::to_value(request).expect("request must serialize");
+        assert_eq!(serialized["thinking"], json!({"type": "adaptive"}));
+
+        // `type` omitted (KVV test_default_type_is_enabled sends `{"keep": "all"}`).
+        let request = request_with_output_fields(&[("thinking", json!({"keep": "all"}))]);
+        let thinking = request.thinking.as_ref().expect("thinking must be typed");
+        assert_eq!(thinking.r#type, None);
+        assert_eq!(thinking.keep.as_deref(), Some("all"));
+
+        for fields in [vec![], vec![("thinking", Value::Null)]] {
+            let request = request_with_output_fields(&fields);
+            assert_eq!(request.thinking, None);
+            assert!(!request.other.contains_key("thinking"));
+            let serialized = serde_json::to_value(request).expect("request must serialize");
+            assert!(serialized.get("thinking").is_none());
+        }
+    }
+
+    #[test]
+    fn thinking_toggle_and_effective_effort() {
+        for (thinking, expected) in [
+            (json!({"type": "enabled"}), Some(true)),
+            (json!({"type": "disabled"}), Some(false)),
+            (json!({"type": "adaptive"}), None),
+            (json!({"keep": "all"}), None),
+        ] {
+            let request = request_with_output_fields(&[("thinking", thinking.clone())]);
+            assert_eq!(request.thinking_toggle(), expected, "{thinking}");
+        }
+        assert_eq!(request_with_output_fields(&[]).thinking_toggle(), None);
+
+        // `thinking.effort` beats the top-level field; absent, the field applies.
+        let request = request_with_output_fields(&[
+            ("thinking", json!({"type": "enabled", "effort": "low"})),
+            ("reasoning_effort", json!("max")),
+        ]);
+        assert_eq!(request.effective_reasoning_effort(), Some("low"));
+        let request = request_with_output_fields(&[
+            ("thinking", json!({"type": "enabled"})),
+            ("reasoning_effort", json!("max")),
+        ]);
+        assert_eq!(request.effective_reasoning_effort(), Some("max"));
+        assert_eq!(
+            request_with_output_fields(&[]).effective_reasoning_effort(),
+            None
+        );
+
+        // Unknown `type` values and non-object shapes fail deserialization.
+        for thinking in [json!({"type": "bogus"}), json!("enabled"), json!(true)] {
+            let mut request = json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hello"}],
+            });
+            request["thinking"] = thinking.clone();
+            assert!(
+                serde_json::from_value::<ChatCompletionRequest>(request).is_err(),
+                "{thinking} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn chat_request_accepts_function_tool_without_parameters() {
+        // https://github.com/smg-project/smg/issues/1974 — omitting
+        // `parameters` is spec-legal and must not reject the request.
+        let value = json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [
+                {"type": "function", "function": {"name": "web_search", "description": ""}}
+            ],
+        });
+        let request: ChatCompletionRequest =
+            serde_json::from_value(value).expect("request must deserialize");
+        let tools = request.tools.expect("tools must be present");
+        assert_eq!(tools[0].function.parameters_schema(), &json!({}));
+    }
+
+    #[test]
+    fn cache_partition_reads_passthrough_salt_and_typed_lora() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "cache_salt": "tenant-a",
+            "extra_key": "k",
+            "lora_path": "adapter"
+        }))
+        .unwrap();
+        let partition = request.cache_partition();
+        assert_eq!(partition.cache_salt, Some("tenant-a"));
+        assert_eq!(partition.extra_key, Some("k"));
+        assert_eq!(partition.lora_path, Some("adapter"));
+
+        let bare: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        assert!(bare.cache_partition().is_empty());
+    }
+
+    #[test]
+    fn extension_bools_accept_explicit_null_as_their_default() {
+        let base = json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+        });
+        let mut all_null = base.clone();
+        for field in [
+            "no_stop_trim",
+            "ignore_eos",
+            "continue_final_message",
+            "skip_special_tokens",
+            "separate_reasoning",
+            "stream_reasoning",
+            "return_hidden_states",
+        ] {
+            all_null[field] = Value::Null;
+        }
+
+        // A client that serializes an unset option as null gets the default,
+        // the same request an absent key produces.
+        let nulled: ChatCompletionRequest =
+            serde_json::from_value(all_null).expect("null means the field's default");
+        let absent: ChatCompletionRequest = serde_json::from_value(base).unwrap();
+        assert_eq!(nulled.no_stop_trim, absent.no_stop_trim);
+        assert_eq!(nulled.ignore_eos, absent.ignore_eos);
+        assert_eq!(nulled.continue_final_message, absent.continue_final_message);
+        assert_eq!(nulled.skip_special_tokens, absent.skip_special_tokens);
+        assert_eq!(nulled.separate_reasoning, absent.separate_reasoning);
+        assert_eq!(nulled.stream_reasoning, absent.stream_reasoning);
+        assert_eq!(nulled.return_hidden_states, absent.return_hidden_states);
+        assert!(!nulled.no_stop_trim);
+        assert!(!nulled.ignore_eos);
+        assert!(!nulled.continue_final_message);
+        assert!(!nulled.return_hidden_states);
+        assert!(nulled.skip_special_tokens);
+        assert!(nulled.separate_reasoning);
+        assert!(nulled.stream_reasoning);
+    }
+
+    #[test]
+    fn extension_bools_keep_explicit_values() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "no_stop_trim": true,
+            "ignore_eos": true,
+            "continue_final_message": true,
+            "skip_special_tokens": false,
+            "separate_reasoning": false,
+            "stream_reasoning": false,
+            "return_hidden_states": true,
+        }))
+        .unwrap();
+        assert!(request.no_stop_trim);
+        assert!(request.ignore_eos);
+        assert!(request.continue_final_message);
+        assert!(!request.skip_special_tokens);
+        assert!(!request.separate_reasoning);
+        assert!(!request.stream_reasoning);
+        assert!(request.return_hidden_states);
+    }
+
+    #[test]
+    fn tool_call_message_serializes_content_as_null() {
+        let message = super::ChatCompletionMessage {
+            role: "assistant".to_string(),
+            content: None,
+            refusal: None,
+            annotations: Vec::new(),
+            tool_calls: Some(vec![ToolCall {
+                id: "call_1".to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCallResponse {
+                    name: "get_weather".to_string(),
+                    arguments: Some("{}".to_string()),
+                },
+            }]),
+            reasoning_content: None,
+        };
+        let value = serde_json::to_value(&message).expect("serialize");
+        assert_eq!(value.get("content"), Some(&Value::Null), "{value}");
+        assert_eq!(value["tool_calls"][0]["function"]["name"], "get_weather");
+    }
+
+    #[test]
+    fn completion_message_carries_the_always_present_annotations() {
+        // Parsed without annotations (an engine's answer), the message leaves
+        // with the public API's empty list.
+        let message: super::ChatCompletionMessage = serde_json::from_value(json!({
+            "role": "assistant", "content": "Hello!", "refusal": null, "reasoning_content": null
+        }))
+        .expect("parse");
+        let value = serde_json::to_value(&message).expect("serialize");
+        assert_eq!(value["annotations"], json!([]), "{value}");
+    }
+
+    #[test]
+    fn an_upstreams_null_annotations_read_as_the_empty_list_and_a_list_is_kept() {
+        // An upstream that writes the key as `null` parses (the key was ignored
+        // before the field existed) and leaves as the empty list.
+        let message: super::ChatCompletionMessage = serde_json::from_value(json!({
+            "role": "assistant", "content": "Hello!", "refusal": null,
+            "annotations": null, "reasoning_content": null
+        }))
+        .expect("a null annotations list parses");
+        let value = serde_json::to_value(&message).expect("serialize");
+        assert_eq!(value["annotations"], json!([]), "{value}");
+        // A list an upstream sent is kept as it was.
+        let sent =
+            json!([{"type": "url_citation", "url_citation": {"url": "https://example.com"}}]);
+        let message: super::ChatCompletionMessage = serde_json::from_value(json!({
+            "role": "assistant", "content": "Hello!", "refusal": null,
+            "annotations": sent, "reasoning_content": null
+        }))
+        .expect("parse");
+        let value = serde_json::to_value(&message).expect("serialize");
+        assert_eq!(value["annotations"], sent, "{value}");
+    }
+
+    /// `n` is the number of choices; absent and zero both mean one.
+    #[test]
+    fn a_chat_request_asks_for_at_least_one_choice() {
+        let request = |body: Value| -> ChatCompletionRequest {
+            serde_json::from_value(body).expect("a chat request")
+        };
+        let base = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+        assert_eq!(request(base.clone()).choices(), 1);
+        let mut zero = base.clone();
+        zero["n"] = json!(0);
+        assert_eq!(request(zero).choices(), 1);
+        let mut three = base;
+        three["n"] = json!(3);
+        assert_eq!(request(three).choices(), 3);
+    }
+
+    /// The history's tool calls are the assistant messages' `tool_calls`,
+    /// summed in order; user, system and tool messages do not count.
+    #[test]
+    fn the_history_counts_the_assistant_tool_calls() {
+        let request = |messages: Value| -> ChatCompletionRequest {
+            serde_json::from_value(json!({"model": "m", "messages": messages}))
+                .expect("a chat request")
+        };
+        assert_eq!(
+            request(json!([{"role": "user", "content": "hi"}])).history_tool_calls_count(),
+            0
+        );
+        let call = |id: &str| json!({"id": id, "type": "function", "function": {"name": "calc", "arguments": "{}"}});
+        let history = json!([
+            {"role": "system", "content": "be brief"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": null, "tool_calls": [call("c1"), call("c2")]},
+            {"role": "tool", "tool_call_id": "c1", "content": "2"},
+            {"role": "assistant", "content": "done"},
+            {"role": "assistant", "content": null, "tool_calls": [call("c3")]}
+        ]);
+        assert_eq!(request(history).history_tool_calls_count(), 3);
+    }
+
+    /// The deprecated function call and the provider extension of an
+    /// assistant turn ride behind a pointer each. The variant is the enum's
+    /// largest, so its room is every chat message's: 176 bytes on 64-bit
+    /// targets before the refusal, the audio reference and the function call
+    /// were kept, 272 with the two inline, and the history of four turns the
+    /// reader grows a vector to had left the allocator's 768-byte class for
+    /// the 1,280 one (eight turns the 1,536 for the 2,560) on every chat
+    /// request. Under 192 bytes a turn, both histories are back in their
+    /// class. A field that grows the turn past it needs its own read.
+    #[test]
+    fn an_assistant_turns_function_call_and_provider_extension_ride_behind_a_pointer_each() {
+        let message: ChatMessage =
+            serde_json::from_value(json!({"role": "assistant", "content": "Hello."}))
+                .expect("a plain assistant turn");
+        let ChatMessage::Assistant {
+            function_call, ext, ..
+        } = &message
+        else {
+            panic!("not an assistant turn");
+        };
+        assert_eq!(size_of_val(function_call), size_of::<usize>());
+        assert_eq!(size_of_val(&ext.tools), size_of::<usize>());
+        assert!(
+            size_of::<ChatMessage>() <= 192,
+            "a chat message is {} bytes",
+            size_of::<ChatMessage>()
+        );
+    }
+}
+
+#[cfg(test)]
+mod request_contract_tests {
+    use serde_json::{json, Value};
+    use validator::Validate;
+
+    use super::{ChatCompletionRequest, ChatMessage};
+
+    fn request(extra: Value) -> ChatCompletionRequest {
+        let mut value = json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Say hi in one word."}],
+            "max_completion_tokens": 64
+        });
+        value
+            .as_object_mut()
+            .expect("object")
+            .extend(extra.as_object().expect("object").clone());
+        serde_json::from_value(value).expect("request deserializes")
+    }
+
+    /// The validation error codes and messages, joined, or `None` when valid.
+    fn rejection(req: &ChatCompletionRequest) -> Option<String> {
+        req.validate().err().map(|errors| {
+            errors
+                .field_errors()
+                .values()
+                .flat_map(|errors| errors.iter())
+                .map(|error| {
+                    format!(
+                        "{}: {}",
+                        error.code,
+                        error.message.as_deref().unwrap_or_default()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ")
+        })
+    }
+
+    #[test]
+    fn verbosity_is_the_public_enum() {
+        for level in ["low", "medium", "high"] {
+            let req = request(json!({"verbosity": level}));
+            assert_eq!(req.verbosity.as_deref(), Some(level));
+            assert_eq!(rejection(&req), None, "{level}");
+        }
+        let bogus = request(json!({"verbosity": "extreme"}));
+        assert!(rejection(&bogus).is_some_and(|e| e.contains("unsupported_value")));
+        assert!(serde_json::from_value::<ChatCompletionRequest>(json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}], "verbosity": 3
+        }))
+        .is_err());
+    }
+
+    /// The deprecated function message's content is required and nullable
+    /// on the public API: a `null` reads as none and writes back as `null`,
+    /// not as an absent key, so a request forwarded to an upstream keeps the
+    /// client's shape.
+    #[test]
+    fn a_function_message_without_content_keeps_the_null_on_the_wire() {
+        let message: ChatMessage =
+            serde_json::from_value(json!({"role": "function", "name": "f", "content": null}))
+                .expect("a function message");
+        assert!(matches!(&message, ChatMessage::Function { content: None, name } if name == "f"));
+        assert_eq!(
+            serde_json::to_value(&message).expect("json"),
+            json!({"role": "function", "name": "f", "content": null})
+        );
+        let with_text: ChatMessage =
+            serde_json::from_value(json!({"role": "function", "name": "f", "content": "result"}))
+                .expect("a function message");
+        assert_eq!(
+            serde_json::to_value(&with_text).expect("json"),
+            json!({"role": "function", "name": "f", "content": "result"})
+        );
+    }
+
+    /// `n` takes the public API's 1 to 128; 0 and 129 cross the bound and
+    /// the refusal names the field.
+    #[test]
+    fn n_takes_the_public_apis_bound() {
+        for n in [1, 10, 11, 128] {
+            assert_eq!(rejection(&request(json!({"n": n}))), None, "n {n}");
+        }
+        for (n, bound) in [(0, "min"), (129, "max")] {
+            let errors = request(json!({"n": n}))
+                .validate()
+                .expect_err(&format!("n {n}"));
+            let error = &errors.field_errors()["n"][0];
+            assert_eq!(error.code, "range", "n {n}");
+            assert_eq!(error.params[bound], if n == 0 { 1 } else { 128 }, "n {n}");
+        }
+    }
+
+    #[test]
+    fn function_parameters_must_be_an_object() {
+        let bad = request(
+            json!({"tools": [{"type": "function", "function": {"name": "f", "parameters": "oops"}}]}),
+        );
+        let error = rejection(&bad).expect("rejected");
+        assert!(
+            error.contains("invalid_type") && error.contains("tools[0].function.parameters"),
+            "{error}"
+        );
+        assert!(
+            error.contains("expected an object, but got a string instead"),
+            "{error}"
+        );
+        let empty = request(json!({"tools": [{"type": "function", "function": {"name": "f"}}]}));
+        assert_eq!(rejection(&empty), None);
+    }
+
+    /// A function declared with an empty name is refused with its place in
+    /// `tools`: the model can be made to call it, and no client can dispatch
+    /// a call that names nothing. The first such tool is the one named, under
+    /// every `tool_choice`: a choice that names the empty function, and the
+    /// choices their own rule refuses (a function not declared, a mode not
+    /// known), which the name's rule stands ahead of.
+    #[test]
+    fn a_function_has_a_name() {
+        use crate::common::FIELD_PARAM;
+
+        let parameters = json!({"type": "object", "properties": {}});
+        let tool = |name: &str| json!({"type": "function", "function": {"name": name, "parameters": parameters}});
+        for (tools, at) in [
+            (json!([tool("")]), 0),
+            (json!([tool("f"), tool(""), tool("")]), 1),
+        ] {
+            for choice in [
+                json!("auto"),
+                json!("required"),
+                json!("none"),
+                json!({"type": "function", "function": {"name": ""}}),
+                json!({"type": "function", "function": {"name": "not declared"}}),
+                json!({"type": "allowed_tools", "mode": "sometimes",
+                       "tools": [{"type": "function", "name": "f"}]}),
+            ] {
+                let unnamed = request(json!({"tools": tools, "tool_choice": choice}));
+                let errors = unnamed.validate().expect_err("an empty name");
+                let error = &errors.field_errors()["__all__"][0];
+                assert_eq!(error.code, "empty_string", "{choice}");
+                let field = format!("tools[{at}].function.name");
+                assert_eq!(error.params[FIELD_PARAM], field.as_str(), "{choice}");
+                assert_eq!(
+                    error.message.as_deref(),
+                    Some(
+                        format!(
+                            "Invalid '{field}': empty string. Expected a string with minimum \
+                             length 1, but got an empty string instead."
+                        )
+                        .as_str()
+                    ),
+                    "{choice}"
+                );
+            }
+        }
+        let named = request(json!({"tools": [tool("f")], "tool_choice": "required"}));
+        assert_eq!(rejection(&named), None);
+    }
+
+    /// `logit_bias` is keyed by token ids, no two of them spelling one id,
+    /// and its biases stay within the public API's -100..=100; a refusal
+    /// names the field. A single key with a leading zero names its id.
+    #[test]
+    fn logit_bias_is_keyed_by_token_ids_and_bounded() {
+        for (bias, code) in [
+            (json!({"not-a-token": 1}), "logit_bias_invalid_key"),
+            (json!({"-5": 1}), "logit_bias_invalid_key"),
+            (json!({"99999999999": 1}), "logit_bias_invalid_key"),
+            (json!({"5": 1, "05": 2}), "logit_bias_duplicate_key"),
+            (json!({"1": 1000}), "integer_above_max_value"),
+            (json!({"1": 100.5}), "integer_above_max_value"),
+            (json!({"1": -101}), "integer_below_min_value"),
+        ] {
+            let bad = request(json!({"logit_bias": bias}));
+            let errors = bad.validate().expect_err(&bias.to_string());
+            let error = &errors.field_errors()["logit_bias"][0];
+            assert_eq!(error.code, code, "{bias}");
+        }
+        let colliding = request(json!({"logit_bias": {"5": 1, "05": 2}}));
+        let errors = colliding.validate().expect_err("colliding keys");
+        let message = errors.field_errors()["logit_bias"][0]
+            .message
+            .as_deref()
+            .unwrap_or_default();
+        assert!(
+            message.contains("'05' and '5' both name token 5"),
+            "{message}"
+        );
+        let good = request(json!({"logit_bias": {"50256": -100, "0": 1.5, "7": 100, "08": 0}}));
+        assert_eq!(rejection(&good), None);
+    }
+
+    /// Both token limits at once are accepted outside OpenAI's own contract
+    /// (a self-hosted model, a vendor profile), whatever the two values, and
+    /// `max_completion_tokens` is the cap; the deprecated name alone still
+    /// carries it.
+    #[test]
+    fn both_token_limits_are_accepted_and_max_completion_tokens_wins() {
+        for model in ["test-model", "MiniMax-M2"] {
+            for (legacy, current) in [(32, 64), (64, 32), (64, 64)] {
+                let both = request(
+                    json!({"model": model, "max_tokens": legacy, "max_completion_tokens": current}),
+                );
+                assert_eq!(rejection(&both), None, "{model}: {legacy} and {current}");
+                assert_eq!(both.output_token_cap(), Some(current), "{model}");
+            }
+        }
+        let legacy = request(json!({"max_tokens": 32, "max_completion_tokens": null}));
+        assert_eq!(rejection(&legacy), None);
+        assert_eq!(legacy.output_token_cap(), Some(32));
+    }
+}
+
+#[cfg(test)]
+mod tool_choice_tests {
+    use serde_json::{json, Value};
+
+    use super::{validate_tool_choice, ChatCompletionRequest, ProviderProfile};
+
+    fn request(tools: Value, tool_choice: Value) -> ChatCompletionRequest {
+        serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": tools,
+            "tool_choice": tool_choice,
+        }))
+        .expect("a chat request")
+    }
+
+    /// The code the choice is refused with, or `None` when it passes.
+    fn verdict(tools: Value, tool_choice: Value) -> Option<String> {
+        let req = request(tools, tool_choice);
+        let choice = req.tool_choice.as_ref().expect("a tool choice");
+        validate_tool_choice(&req, ProviderProfile::for_model(&req.model), choice)
+            .err()
+            .map(|e| e.code.into_owned())
+    }
+
+    fn weather_tool() -> Value {
+        json!([{
+            "type": "function",
+            "function": {"name": "get_weather", "parameters": {"type": "object"}},
+        }])
+    }
+
+    #[test]
+    fn without_tools_only_none_and_auto_pass() {
+        assert_eq!(verdict(json!([]), json!("none")), None);
+        assert_eq!(verdict(json!([]), json!("auto")), None);
+        assert_eq!(
+            verdict(json!([]), json!("required")),
+            Some("tool_choice_requires_tools".to_string())
+        );
+        assert_eq!(
+            verdict(
+                json!([]),
+                json!({"type": "function", "function": {"name": "get_weather"}})
+            ),
+            Some("tool_choice_requires_tools".to_string())
+        );
+    }
+
+    #[test]
+    fn each_kind_of_choice_is_judged_against_the_declared_tools() {
+        let cases = [
+            (json!("required"), None),
+            (
+                json!({"type": "function", "function": {"name": "get_weather"}}),
+                None,
+            ),
+            (
+                json!({"type": "function", "function": {"name": "get_time"}}),
+                Some("tool_choice_function_not_found"),
+            ),
+            (
+                json!({"type": "allowed_tools", "mode": "auto",
+                       "tools": [{"type": "function", "name": "get_weather"}]}),
+                None,
+            ),
+            (
+                json!({"type": "allowed_tools", "allowed_tools": {"mode": "required",
+                       "tools": [{"type": "function", "function": {"name": "get_weather"}}]}}),
+                None,
+            ),
+            (
+                json!({"type": "allowed_tools", "allowed_tools": {"mode": "auto",
+                       "tools": [{"type": "function", "function": {"name": "get_time"}}]}}),
+                Some("tool_choice_tool_not_found"),
+            ),
+            (
+                json!({"type": "allowed_tools", "mode": "sometimes",
+                       "tools": [{"type": "function", "name": "get_weather"}]}),
+                Some("tool_choice_invalid_mode"),
+            ),
+            (
+                json!({"type": "allowed_tools", "mode": "required",
+                       "tools": [{"type": "function", "name": "get_time"}]}),
+                Some("tool_choice_tool_not_found"),
+            ),
+            (
+                json!({"type": "allowed_tools", "mode": "required",
+                       "tools": [{"type": "mcp", "server_label": "docs"}]}),
+                Some("tool_choice_invalid_tool_type"),
+            ),
+        ];
+        for (tool_choice, code) in cases {
+            assert_eq!(
+                verdict(weather_tool(), tool_choice.clone()),
+                code.map(str::to_string),
+                "{tool_choice}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod content_tests {
+    use serde_json::json;
+
+    use super::{ChatCompletionRequest, ChatMessage, MessageContent};
+
+    fn content_of(message: ChatMessage) -> MessageContent {
+        match message {
+            ChatMessage::User { content, .. } => content,
+            other => panic!("not a user message: {other:?}"),
+        }
+    }
+
+    /// A string is the text, a list is the parts, an unknown part is kept.
+    #[test]
+    fn message_content_reads_text_and_parts() {
+        let text = serde_json::from_value::<ChatMessage>(json!({"role": "user", "content": "hi"}))
+            .unwrap();
+        assert_eq!(content_of(text), MessageContent::Text("hi".to_string()));
+
+        let parts = serde_json::from_value::<ChatMessage>(json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "hi"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+                {"type": "vendor_media", "payload": {"items": [1]}}
+            ]
+        }))
+        .unwrap();
+        let MessageContent::Parts(parts) = content_of(parts) else {
+            panic!("not parts");
+        };
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0].text(), Some("hi"));
+    }
+
+    /// A part's refusal reaches the message's error as the part's own
+    /// reason, under the part's place, never as the generic words of an
+    /// untagged read; a content that is neither a string nor a list names
+    /// both forms.
+    #[test]
+    fn message_content_keeps_a_parts_refusal_under_its_place() {
+        for (content, reason) in [
+            (
+                json!([{"type": "text", "text": "hi"}, {"type": "refusal", "refusal": null}]),
+                "invalid type: null, expected a string, in `content[1].refusal`",
+            ),
+            (
+                json!([{"type": "image_url", "image_url": {"detail": "high"}}]),
+                "missing field `content[0].image_url.url`",
+            ),
+            (
+                json!([{"type": "text", "text": "hi"}, {"type": "image_url"}]),
+                "missing field `content[1].image_url`",
+            ),
+            (
+                json!([{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA==", "max_long_side_pixel": -1}}]),
+                "invalid value: integer `-1`, expected u32, in `content[0].image_url`",
+            ),
+            (
+                json!([5]),
+                "invalid type: integer `5`, expected a map, in `content[0]`",
+            ),
+            // A value the client sent that holds ", in `" does not move the place.
+            (
+                json!(["see, in `x"]),
+                "invalid type: string \"see, in `x\", expected a map, in `content[0]`",
+            ),
+            (
+                json!(5),
+                "invalid type: integer `5`, expected a string or a list of content parts",
+            ),
+        ] {
+            let error =
+                serde_json::from_value::<ChatMessage>(json!({"role": "user", "content": content}))
+                    .unwrap_err();
+            assert_eq!(error.to_string(), reason, "{content}");
+        }
+    }
+
+    /// A key repeated inside a content part is refused with serde's words
+    /// under the part's place, at any depth of the part and for any kind,
+    /// where a plain value read keeps the last value. A key that holds the
+    /// place's own separator does not move the place.
+    #[test]
+    fn a_content_part_with_a_repeated_key_is_refused() {
+        for (message, reason) in [
+            (
+                r#"{"role":"user","content":[{"type":"text","text":"a","text":"b"}]}"#,
+                "duplicate field `text`, in `content[0]`",
+            ),
+            (
+                r#"{"role":"user","content":[{"type":"image_url","type":"text","text":"a"}]}"#,
+                "duplicate field `type`, in `content[0]`",
+            ),
+            (
+                r#"{"role":"user","content":[{"type":"text","text":"a"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AA==","url":"data:image/png;base64,AB=="}}]}"#,
+                "duplicate field `url`, in `content[1]`",
+            ),
+            (
+                r#"{"role":"system","content":[{"type":"text","text":"a","text":"b"}]}"#,
+                "duplicate field `text`, in `content[0]`",
+            ),
+            (
+                r#"{"role":"tool","tool_call_id":"call_1","content":[{"type":"text","text":"a","text":"b"}]}"#,
+                "duplicate field `text`, in `content[0]`",
+            ),
+            (
+                r#"{"role":"user","content":[{"type":"vendor_media","payload":{"a":1,"a":2}}]}"#,
+                "duplicate field `a`, in `content[0]`",
+            ),
+            (
+                r#"{"role":"user","content":[{"type":"text","text":"a","x, in `y":1,"x, in `y":2}]}"#,
+                "duplicate field `x, in `y`, in `content[0]`",
+            ),
+        ] {
+            let error = serde_json::from_str::<ChatMessage>(message).unwrap_err();
+            assert_eq!(error.to_string(), reason, "{message}");
+        }
+    }
+
+    /// A twelve-turn conversation (part turns with an image, text turns, a
+    /// tool call and its result in parts), read two hundred times: the
+    /// content readers' cost on a representative request, for the
+    /// measurement of a change to them. Nothing is asserted beyond the read.
+    #[test]
+    #[ignore = "a read-cost measurement for perf stat, not a check"]
+    fn a_conversation_with_parts_reads_two_hundred_times() {
+        let text = "the previous turn's text, long enough to carry some weight ".repeat(4);
+        let mut messages = Vec::new();
+        for _ in 0..5 {
+            messages.push(json!({"role": "user", "content": [
+                {"type": "text", "text": text},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==", "detail": "low"}},
+            ]}));
+            messages.push(json!({"role": "assistant", "content": text}));
+        }
+        messages.push(json!({"role": "assistant", "content": null, "tool_calls": [
+            {"id": "call_1", "type": "function", "function": {"name": "lookup", "arguments": "{\"q\":\"x\"}"}},
+        ]}));
+        messages.push(
+            json!({"role": "tool", "tool_call_id": "call_1", "content": [
+                {"type": "text", "text": text},
+            ]}),
+        );
+        let body = json!({"model": "m", "messages": messages, "max_tokens": 8}).to_string();
+        for _ in 0..200 {
+            let request: ChatCompletionRequest =
+                serde_json::from_str(&body).expect("the body reads");
+            assert_eq!(request.messages.len(), 12);
+        }
+    }
+}

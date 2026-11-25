@@ -1,0 +1,172 @@
+{{- range $i, $worker := .Values.workers }}
+{{- $defaults := index $.Values.engineDefaults $worker.engine }}
+{{- $port := $worker.port | default $defaults.port }}
+{{- $gpuCount := 1 }}
+{{- $gpuType := "nvidia.com/gpu" }}
+{{- if $worker.gpu }}
+{{- $gpuCount = $worker.gpu.count | default 1 }}
+{{- $gpuType = $worker.gpu.type | default "nvidia.com/gpu" }}
+{{- end }}
+{{- $mode := $worker.connectionMode | default "http" }}
+{{- $metricsPort := include "smg.workerMetricsPort" (dict "worker" $worker) }}
+{{- if and $metricsPort (eq (int $metricsPort) (int $port)) }}
+{{- fail (printf "worker %s: metrics.port %v is the serving port; the metrics listener needs a port of its own" $worker.name $port) }}
+{{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "smg.fullname" $ }}-worker-{{ $worker.name }}
+  labels:
+    {{- include "smg.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: worker
+    smg.lightseek.org/engine: {{ $worker.engine }}
+    smg.lightseek.org/worker: {{ $worker.name }}
+spec:
+  replicas: {{ $worker.replicas | default 1 }}
+  {{- /* The rollout's progress deadline follows the startup probe's budget
+       (initialDelaySeconds + failureThreshold x periodSeconds, the longest a
+       load may take before the probe restarts the container) plus a 600 s
+       margin for what runs on the rollout's clock before the probe's starts
+       (the node's provisioning, the image pull, the container start): a worker
+       sized for a long load is not reported as a failed rollout while it loads
+       (README, Startup Probes). */}}
+  {{- $probe := $worker.startupProbe | default (dict) }}
+  {{- $budget := add ($probe.initialDelaySeconds | default 60) (mul ($probe.failureThreshold | default 30) ($probe.periodSeconds | default 10)) }}
+  progressDeadlineSeconds: {{ $worker.progressDeadlineSeconds | default (add $budget 600) }}
+  selector:
+    matchLabels:
+      {{- include "smg.selectorLabels" $ | nindent 6 }}
+      app.kubernetes.io/component: worker
+      smg.lightseek.org/worker: {{ $worker.name }}
+  template:
+    metadata:
+      labels:
+        {{- include "smg.selectorLabels" $ | nindent 8 }}
+        app.kubernetes.io/component: worker
+        smg.lightseek.org/worker: {{ $worker.name }}
+        smg.lightseek.org/engine: {{ $worker.engine }}
+        {{- if $worker.workerType }}
+        smg.lightseek.org/worker-type: {{ $worker.workerType }}
+        {{- end }}
+    spec:
+      {{- with $.Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- /* The Rust servicer drains in-flight streams on SIGTERM (up to
+           SMG_*_SERVICER_DRAIN_SECS, 30 s), then stops its server (5 s) and
+           terminates the engine (on vLLM, its process manager's
+           --shutdown-timeout first, 5 s when it is 0; then up to 30 s): 70 s,
+           past the kubelet's default grace of 30 s. */}}
+      terminationGracePeriodSeconds: {{ ternary 90 $worker.terminationGracePeriodSeconds (kindIs "invalid" $worker.terminationGracePeriodSeconds) | int }}
+      containers:
+        - name: worker
+          image: {{ include "smg.workerImage" (dict "worker" $worker "global" $.Values.global "chart" $.Chart "defaults" $.Values.engineDefaults) }}
+          imagePullPolicy: {{ $.Values.global.image.pullPolicy }}
+          command: {{- include "smg.workerCommand" (dict "worker" $worker) | trim | nindent 12 }}
+          args:
+            {{- include "smg.workerArgs" (dict "worker" $worker "defaults" $.Values.engineDefaults) | trim | nindent 12 }}
+          ports:
+            - name: serve
+              containerPort: {{ $port }}
+              protocol: TCP
+            {{- if $metricsPort }}
+            - name: metrics
+              containerPort: {{ $metricsPort }}
+              protocol: TCP
+            {{- end }}
+          {{- if $worker.resources }}
+          resources:
+            {{- $res := deepCopy $worker.resources }}
+            {{- if $res.limits }}
+            {{- $_ := set $res.limits $gpuType ($gpuCount | int) }}
+            {{- else }}
+            {{- $_ := set $res "limits" (dict $gpuType ($gpuCount | int)) }}
+            {{- end }}
+            {{- toYaml $res | nindent 12 }}
+          {{- else }}
+          resources:
+            limits:
+              {{ $gpuType }}: {{ $gpuCount }}
+          {{- end }}
+          {{- $servicerImpl := and (eq $mode "grpc") $worker.servicerImpl }}
+          {{- if or $.Values.huggingface.token $worker.extraEnv $metricsPort $servicerImpl }}
+          env:
+            {{- if $.Values.huggingface.token }}
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "smg.fullname" $ }}-hf-token
+                  key: token
+            {{- end }}
+            {{- /* The engine's launcher reads the servicer implementation from
+                   this variable (its --servicer-impl flag overrides it); unset,
+                   it runs its default, the Rust servicer. A gRPC worker's
+                   servicerImpl names one explicitly ("python" = the deprecated
+                   Python servicer, kept for the deprecation window); an HTTP
+                   worker has no servicer, so its value is not exported; a
+                   metrics port names the Rust servicer, whose listener serves it. */}}
+            {{- if $servicerImpl }}
+            - name: SMG_{{ upper $worker.engine }}_SERVICER_IMPL
+              value: {{ $worker.servicerImpl | quote }}
+            {{- else if $metricsPort }}
+            - name: SMG_{{ upper $worker.engine }}_SERVICER_IMPL
+              value: "rust"
+            {{- end }}
+            {{- if $metricsPort }}
+            {{- /* The Rust servicer's metrics listener port (the launcher's
+                   --metrics-port flag, or --servicer-metrics-port for TokenSpeed,
+                   overrides it). */}}
+            - name: SMG_{{ upper $worker.engine }}_SERVICER_METRICS_PORT
+              value: {{ $metricsPort | quote }}
+            {{- end }}
+            {{- with $worker.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- end }}
+          {{- if eq $mode "http" }}
+          startupProbe:
+            httpGet:
+              path: /health
+              port: serve
+            initialDelaySeconds: {{ ($worker.startupProbe).initialDelaySeconds | default 60 }}
+            periodSeconds: {{ ($worker.startupProbe).periodSeconds | default 10 }}
+            failureThreshold: {{ ($worker.startupProbe).failureThreshold | default 30 }}
+          {{- else }}
+          {{- /* gRPC mode: the engine runs behind a servicer, and every
+               servicer serves the gRPC Health Checking Protocol
+               (grpc.health.v1): the Rust servicer for every engine, the
+               Python servicers through their shared health frame. Its answer
+               is SERVING once the engine serves, so the probe follows the
+               engine's load; a TCP connect passed at the servicer's bind,
+               minutes before. The gRPC probe names the port by number (it
+               takes no port name) and no service, which asks for the whole
+               server. */}}
+          startupProbe:
+            grpc:
+              port: {{ $port }}
+            initialDelaySeconds: {{ ($worker.startupProbe).initialDelaySeconds | default 60 }}
+            periodSeconds: {{ ($worker.startupProbe).periodSeconds | default 10 }}
+            failureThreshold: {{ ($worker.startupProbe).failureThreshold | default 30 }}
+          {{- end }}
+      {{- if or $worker.nodeSelector $worker.tolerations $worker.affinity (gt (int $gpuCount) 0) }}
+      {{- with $worker.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if $worker.tolerations }}
+      tolerations:
+        {{- toYaml $worker.tolerations | nindent 8 }}
+      {{- else if gt (int $gpuCount) 0 }}
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      {{- end }}
+      {{- with $worker.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- end }}
+{{- end }}

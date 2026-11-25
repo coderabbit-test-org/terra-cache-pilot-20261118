@@ -1,0 +1,42 @@
+[package]
+name = "data-connector"
+version = "2.5.0"
+edition = "2021"
+description = "Storage backends for conversations and responses"
+license = "Apache-2.0"
+repository = "https://github.com/smg-project/smg"
+authors = [
+    "Simo Lin <linsimo.mark@gmail.com>",
+    "Chang Su <mckvtl@gmail.com>",
+    "Keyang Ru <rukeyang@gmail.com>",
+]
+keywords = ["storage", "database", "postgres", "redis", "oracle"]
+categories = ["database", "asynchronous"]
+
+[dependencies]
+async-trait.workspace = true
+chrono = { workspace = true, features = ["serde"] }
+parking_lot.workspace = true
+rand.workspace = true
+serde = { workspace = true, features = ["derive", "rc"] }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "rt-multi-thread", "time"] }
+tracing.workspace = true
+ulid = "1.2.1"
+url = "2.5"
+
+# Database backends
+deadpool = { version = "0.13", features = ["managed", "rt_tokio_1"] }
+deadpool-postgres = "0.14.1"
+deadpool-redis = "0.23.0"
+oracle = { version = "0.6.3", features = ["chrono"] }
+redis = { version = "1.2.4", features = ["tokio-comp", "json", "connection-manager"] }
+tokio-postgres = { version = "0.7.18", features = ["runtime", "with-chrono-0_4", "with-serde_json-1", "array-impls"] }
+
+[dev-dependencies]
+# `net`: the refused-address fixture of the start-up tests binds a loopback socket.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
+
+[lints]
+workspace = true

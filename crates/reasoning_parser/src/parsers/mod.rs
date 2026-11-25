@@ -1,0 +1,34 @@
+pub mod base;
+pub mod cohere_cmd;
+pub mod deepseek_r1;
+pub mod deepseek_v41;
+pub mod gemma4;
+pub mod glm45;
+pub mod inkling;
+pub mod kimi;
+pub mod kimi_k3;
+pub mod minimax;
+pub mod minimax_m3;
+pub mod nano_v3;
+pub mod passthrough;
+pub mod qwen3;
+pub mod step3;
+
+pub use base::BaseReasoningParser;
+pub use cohere_cmd::CohereCmdParser;
+pub use deepseek_r1::DeepSeekR1Parser;
+pub use deepseek_v41::DeepSeekV41Parser;
+pub use gemma4::Gemma4Parser;
+pub use glm45::Glm45Parser;
+pub use inkling::InklingParser;
+pub use kimi::KimiParser;
+pub use kimi_k3::KimiK3Parser;
+pub use minimax::MiniMaxParser;
+pub use minimax_m3::MinimaxM3Parser;
+pub use nano_v3::NanoV3Parser;
+pub use passthrough::PassthroughParser;
+pub use qwen3::{Qwen3Parser, QwenThinkingParser};
+pub use step3::Step3Parser;
+
+pub mod hy_v4;
+pub use hy_v4::HyV4Parser;

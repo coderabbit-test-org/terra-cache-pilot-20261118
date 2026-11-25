@@ -1,0 +1,2367 @@
+//! Harmony request builder
+//!
+//! Handles encoding of Chat/Responses requests into Harmony format using openai-harmony library.
+
+use std::{
+    collections::HashSet,
+    sync::{Mutex, OnceLock},
+};
+
+use chrono::Local;
+use openai_harmony::{
+    chat::{
+        Author, ChannelConfig, Content, Conversation, DeveloperContent, Message as HarmonyMessage,
+        ReasoningEffort, Role, SystemContent, TextContent, ToolDescription,
+    },
+    HarmonyEncoding, HarmonyEncodingName,
+};
+use openai_protocol::{
+    chat::{ChatCompletionRequest, ChatMessage, MessageContent},
+    common::{ChatLogProbs, ContentPart, Tool},
+    responses::{
+        CustomToolCallOutputContent, CustomToolInputContentPart,
+        ReasoningEffort as ResponsesReasoningEffort, ResponseContentPart, ResponseInput,
+        ResponseInputOutputItem, ResponseReasoningContent, ResponseTool, ResponsesRequest,
+        StringOrContentParts,
+    },
+};
+use serde_json::json;
+use tracing::{debug, enabled, trace, warn, Level};
+
+use super::types::HarmonyBuildOutput;
+use crate::routers::{
+    common::responses_compat::format_agent_message_text,
+    grpc::{
+        common::responses::{
+            history::hosted_call_result,
+            utils::{custom_tool_as_function, extract_tools_from_response_tools},
+        },
+        proto_wrapper::ProtoOutputLogProbs,
+        utils,
+    },
+};
+
+/// Global Harmony encoding (lazy-initialized)
+static HARMONY_ENCODING: OnceLock<HarmonyEncoding> = OnceLock::new();
+
+/// The text of a Responses message item's content parts as Harmony carries
+/// it: input text, output text and a refusal (losslessly text) verbatim. An
+/// image or a file part is refused by name, as chat audio is
+/// ([`reject_chat_media`]), never dropped from the prompt behind an answer
+/// that reads as if the model had seen it.
+fn harmony_text_parts(parts: &[ResponseContentPart]) -> Result<Vec<String>, String> {
+    parts
+        .iter()
+        .map(|part| match part {
+            ResponseContentPart::OutputText { text, .. }
+            | ResponseContentPart::InputText { text } => Ok(text.clone()),
+            ResponseContentPart::Refusal { refusal } => Ok(refusal.clone()),
+            ResponseContentPart::InputImage { .. } => {
+                Err("Harmony does not support \"input_image\" content parts".to_string())
+            }
+            ResponseContentPart::InputFile { .. } => {
+                Err("Harmony does not support \"input_file\" content parts".to_string())
+            }
+        })
+        .collect()
+}
+
+/// Refuses the content parts the Harmony path has no form for. It renders
+/// text only, so an audio, image or video part would be dropped behind an
+/// answer that reads as if the model had seen it; the first such part names
+/// its kind, and the regular multimodal path carries them.
+fn reject_chat_media(messages: &[ChatMessage]) -> Result<(), String> {
+    let kind = messages.iter().find_map(|message| match message {
+        ChatMessage::System { content, .. }
+        | ChatMessage::User { content, .. }
+        | ChatMessage::Tool { content, .. }
+        | ChatMessage::Developer { content, .. }
+        | ChatMessage::Root { content, .. } => media_part_kind(content),
+        ChatMessage::Assistant { content, .. } => content.as_ref().and_then(media_part_kind),
+        ChatMessage::Function { .. } => None,
+    });
+
+    match kind {
+        Some(kind) => Err(format!(
+            "Harmony does not support {kind} content parts; use the regular multimodal path"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The kind of the first part in `content` the Harmony path has no form for.
+fn media_part_kind(content: &MessageContent) -> Option<&'static str> {
+    let MessageContent::Parts(parts) = content else {
+        return None;
+    };
+    parts.iter().find_map(|part| match part {
+        ContentPart::AudioUrl { .. } | ContentPart::InputAudio { .. } => Some("audio"),
+        ContentPart::ImageUrl { .. } => Some("image"),
+        ContentPart::VideoUrl { .. } => Some("video"),
+        ContentPart::Text { .. } | ContentPart::Refusal { .. } | ContentPart::Unknown(_) => None,
+    })
+}
+
+/// Serializes first-load attempts; a failed load leaves the cell empty so a
+/// later attempt (e.g. the next gpt-oss worker registration) can retry.
+static HARMONY_ENCODING_INIT: Mutex<()> = Mutex::new(());
+
+/// Get the Harmony encoding, loading it on first use.
+///
+/// The vocab may come from disk (`TIKTOKEN_ENCODINGS_BASE`) or a cached
+/// download; loading is triggered at gpt-oss worker registration
+/// (`EnsureHarmonyEncodingStep`), so request paths hit the loaded fast path.
+/// A request path can still reach a cold load (a request name-matched to the
+/// Harmony pipeline before any of its workers registered, or after that step
+/// failed them all). The load then runs here, under the init lock, on a thread
+/// of its own (see [`on_its_own_thread`]), so a caller inside a runtime gets
+/// the loader's result (or its error) instead of a panic. The caller's thread
+/// (a runtime worker, on a request path) blocks until the load finishes.
+pub(crate) fn try_harmony_encoding() -> Result<&'static HarmonyEncoding, String> {
+    if let Some(encoding) = HARMONY_ENCODING.get() {
+        return Ok(encoding);
+    }
+    let _init = HARMONY_ENCODING_INIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(encoding) = HARMONY_ENCODING.get() {
+        return Ok(encoding);
+    }
+    let encoding = on_its_own_thread(|| {
+        openai_harmony::load_harmony_encoding(HarmonyEncodingName::HarmonyGptOss)
+    })
+    .map_err(|e| format!("Failed to load Harmony encoding: its thread could not start: {e}"))?
+    .map_err(|e| format!("Failed to load Harmony encoding: {e:#}"))?;
+    Ok(HARMONY_ENCODING.get_or_init(|| encoding))
+}
+
+/// Runs `load` on a thread of its own and returns what it returns.
+///
+/// The vocab loader is synchronous and, on a cache miss, downloads with a
+/// blocking HTTP client that builds and drops an async runtime of its own.
+/// Dropped on a thread that drives a current-thread runtime, as a
+/// `#[tokio::test]` body does, that runtime is a panic ("Cannot drop a
+/// runtime in a context where blocking is not allowed"), so a test that
+/// encodes a Harmony turn passed only once the sync builder tests of the same
+/// binary had filled the cell: test order, not a guarantee, and a failure by
+/// name on a cold machine. A thread of its own drives no runtime, so the load
+/// is the same from any caller. The thread is named, so a panic inside the
+/// loader is reported under it, and a thread the OS refuses to start is an
+/// error for the caller, not a panic.
+fn on_its_own_thread<T: Send>(load: impl FnOnce() -> T + Send) -> std::io::Result<T> {
+    std::thread::scope(|scope| {
+        let loader = std::thread::Builder::new()
+            .name("harmony-encoding-load".into())
+            .spawn_scoped(scope, load)?;
+        Ok(loader
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
+    })
+}
+
+#[cfg(test)]
+mod own_thread_tests {
+    use super::on_its_own_thread;
+
+    /// What the loader's own thread is for: a runtime dropped on a thread that
+    /// drives one (this test's) is a panic; dropped on the loader's thread it
+    /// is nothing, and the load's result comes back.
+    #[tokio::test]
+    async fn a_load_may_build_and_drop_a_runtime() {
+        let answer = on_its_own_thread(|| {
+            drop(
+                tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .expect("a runtime"),
+            );
+            42
+        })
+        .expect("the loader's thread starts");
+        assert_eq!(answer, 42);
+    }
+}
+
+/// Convert an output's logprobs, read in place on the engine message, to the
+/// OpenAI ChatLogProbs format using Harmony's tokenizer.
+///
+/// `top_logprobs` is the request's; [`utils::requested_alternatives`] turns it
+/// into the candidates the answer carries per token, the rule the regular chat
+/// path reads, and only those are decoded.
+pub(crate) fn convert_harmony_logprobs(
+    encoding: &HarmonyEncoding,
+    proto_logprobs: ProtoOutputLogProbs<'_>,
+    top_logprobs: Option<u32>,
+) -> ChatLogProbs {
+    let tokenizer = encoding.tokenizer();
+    let requested = Some(utils::requested_alternatives(top_logprobs));
+    utils::convert_proto_logprobs(proto_logprobs, requested, |token_id| {
+        tokenizer
+            .decode_utf8([token_id])
+            .unwrap_or_else(|_| format!("<token_{token_id}>"))
+    })
+}
+
+/// Built-in tools that are advertised in the gpt-oss system message.
+///
+/// Scoped to the hosted tools gpt-oss was trained to emit directly as
+/// channel-tagged tool calls (per the openai-harmony spec):
+/// `web_search_preview`, `web_search`, `code_interpreter` / `container`,
+/// `file_search`.
+///
+/// Hosted tools outside this set — notably `image_generation` — were
+/// *not* part of gpt-oss training. Advertising them here would render
+/// them into the builtin-tools preamble, but the model has never been
+/// trained to emit the corresponding `image_generation_call` channel
+/// tag, so the result is undefined behavior (hallucinated malformed
+/// call, ignored advertisement, or garbled output). Instead, the
+/// [`ToolLike`] impl for [`ResponseTool::ImageGeneration`] renders the
+/// hosted tool as a *function tool* in the developer-message
+/// custom-tool section: gpt-oss sees `image_generation` as a callable
+/// function, emits a plain function call with a `prompt` argument, and
+/// the downstream MCP dispatch path — keyed on the exposed function-tool
+/// name — routes the call to the registered `image_generation` MCP
+/// server and materializes the response as an `image_generation_call`
+/// output item.
+const BUILTIN_TOOLS: &[&str] = &[
+    "web_search_preview",
+    "web_search",
+    "code_interpreter",
+    "container",
+    "file_search",
+    "shell",
+];
+
+/// Trait for tool-like objects that can be converted to Harmony ToolDescription
+trait ToolLike {
+    /// Whether this is a built-in tool (one the developer message skips).
+    ///
+    /// Compiled for the tests alone: nothing in the pipeline reads it yet.
+    /// Once per-worker hosted-tool capability flags land, production code
+    /// dispatches on it to gate advertisement per model.
+    #[cfg(test)]
+    fn is_builtin(&self) -> bool;
+
+    /// Check if this is a custom tool (function or MCP)
+    fn is_custom(&self) -> bool;
+
+    /// Convert to ToolDescription
+    fn to_tool_description(&self) -> Option<ToolDescription>;
+
+    /// Expand grouped tools into individual model-visible declarations.
+    fn to_tool_descriptions(&self) -> Vec<ToolDescription> {
+        self.to_tool_description().into_iter().collect()
+    }
+}
+
+/// Implement ToolLike for Chat Completion Tool
+impl ToolLike for Tool {
+    #[cfg(test)]
+    fn is_builtin(&self) -> bool {
+        matches!(
+            self.tool_type.as_str(),
+            "web_search_preview" | "code_interpreter" | "container"
+        )
+    }
+
+    fn is_custom(&self) -> bool {
+        matches!(self.tool_type.as_str(), "function")
+    }
+
+    fn to_tool_description(&self) -> Option<ToolDescription> {
+        Some(ToolDescription::new(
+            self.function.name.clone(),
+            self.function.description.clone().unwrap_or_default(),
+            Some(self.function.parameters_schema().clone()),
+        ))
+    }
+}
+
+/// Implement ToolLike for Responses API Tool
+impl ToolLike for ResponseTool {
+    #[cfg(test)]
+    fn is_builtin(&self) -> bool {
+        matches!(
+            self,
+            ResponseTool::WebSearchPreview(_)
+                | ResponseTool::WebSearch(_)
+                | ResponseTool::CodeInterpreter(_)
+        )
+    }
+
+    fn is_custom(&self) -> bool {
+        // `ImageGeneration` is rendered as a *function tool* because gpt-oss
+        // was not trained to emit `image_generation_call` as a builtin
+        // channel tag; instead, the gateway advertises it in the custom-tool
+        // section and routes the resulting function call through MCP
+        // dispatch. See [`BUILTIN_TOOLS`] above.
+        matches!(
+            self,
+            ResponseTool::Function(_)
+                | ResponseTool::Custom(_)
+                | ResponseTool::Namespace(_)
+                | ResponseTool::ImageGeneration(_)
+        )
+    }
+
+    fn to_tool_descriptions(&self) -> Vec<ToolDescription> {
+        if matches!(self, ResponseTool::Namespace(_)) {
+            extract_tools_from_response_tools(Some(std::slice::from_ref(self)))
+                .iter()
+                .filter_map(ToolLike::to_tool_description)
+                .collect()
+        } else {
+            self.to_tool_description().into_iter().collect()
+        }
+    }
+
+    fn to_tool_description(&self) -> Option<ToolDescription> {
+        match self {
+            ResponseTool::Function(ft) => Some(ToolDescription::new(
+                ft.function.name.clone(),
+                ft.function.description.clone().unwrap_or_default(),
+                Some(ft.function.parameters_schema().clone()),
+            )),
+            ResponseTool::Custom(ct) => {
+                let function = custom_tool_as_function(ct);
+                Some(ToolDescription::new(
+                    function.name,
+                    function.description.unwrap_or_default(),
+                    function.parameters,
+                ))
+            }
+            ResponseTool::ImageGeneration(_) => Some(image_generation_tool_description()),
+            _ => None,
+        }
+    }
+}
+
+/// Synthesize a function-tool description for the hosted `image_generation`
+/// tool when targeting gpt-oss via the harmony pipeline.
+///
+/// gpt-oss was not trained to emit `image_generation_call` as a native
+/// hosted-tool channel tag (see [`BUILTIN_TOOLS`]). This helper produces a
+/// JSON-schema that exposes the same tool surface the OpenAI spec documents
+/// (`prompt`, plus pass-through configuration fields mirrored from
+/// [`openai_protocol::responses::ImageGenerationTool`]) as a plain function
+/// tool. gpt-oss then emits `{"name": "image_generation", "arguments": {…}}`
+/// on the commentary channel, and the shared MCP dispatch path — keyed on
+/// the function name against the registered `image_generation` MCP server —
+/// materializes the response into a proper `image_generation_call` output
+/// item.
+///
+/// The schema deliberately stays a superset of what the spec documents on
+/// the tool-level configuration so the model can choose to override
+/// caller-supplied defaults when the prompt demands it (e.g. switching
+/// `size` for portrait vs. landscape output). The caller's original
+/// tool-level configuration continues to round-trip in
+/// `ResponseTool::ImageGeneration(cfg)` for downstream routing / tests.
+fn image_generation_tool_description() -> ToolDescription {
+    let parameters = json!({
+        "type": "object",
+        "properties": {
+            "prompt": {
+                "type": "string",
+                "description": "Natural-language description of the image to generate. Required."
+            },
+            "background": {
+                "type": "string",
+                "enum": ["transparent", "opaque", "auto"],
+                "description": "Background handling for the generated image."
+            },
+            "model": {
+                "type": "string",
+                "description": "Image-generation model identifier (e.g. gpt-image-1, gpt-image-1-mini, gpt-image-1.5)."
+            },
+            "output_format": {
+                "type": "string",
+                "enum": ["png", "webp", "jpeg"],
+                "description": "Encoding for the returned image."
+            },
+            "quality": {
+                "type": "string",
+                "enum": ["low", "medium", "high", "auto"],
+                "description": "Quality tier requested from the image model."
+            },
+            "size": {
+                "type": "string",
+                "enum": ["1024x1024", "1024x1536", "1536x1024", "auto"],
+                "description": "Output resolution. Use 'auto' to let the model pick."
+            }
+        },
+        "required": ["prompt"],
+        "additionalProperties": false
+    });
+
+    ToolDescription::new(
+        "image_generation",
+        "Generate an image from a natural-language prompt. Use this when the user asks for a picture, illustration, or other visual content. The call is routed through the gateway's image_generation MCP server and the result is returned as a base64-encoded image in an image_generation_call output item.",
+        Some(parameters),
+    )
+}
+
+fn has_custom_tools(tool_types: &[&str]) -> bool {
+    !tool_types.iter().all(|t| BUILTIN_TOOLS.contains(t))
+}
+
+/// The tools a chat request offers, wherever it declares them (at the request
+/// level or on a message: `ChatCompletionRequest::declares_tools`), in the order
+/// the model sees them; `None` when it declares none.
+fn chat_tools(request: &ChatCompletionRequest) -> Option<Vec<Tool>> {
+    request
+        .declares_tools()
+        .then(|| request.effective_tools().cloned().collect())
+}
+
+/// A chat request's instructions and the messages after them. As on vLLM's
+/// chat path, a leading system or developer message holds the instructions,
+/// which Harmony carries in the developer message; an empty one holds none.
+fn split_instructions(messages: &[ChatMessage]) -> (Option<String>, &[ChatMessage]) {
+    match messages.split_first() {
+        Some((
+            ChatMessage::System { content, .. } | ChatMessage::Developer { content, .. },
+            rest,
+        )) => (content.has_text().then(|| content.to_simple_string()), rest),
+        _ => (None, messages),
+    }
+}
+
+/// Harmony request builder
+///
+/// Converts OpenAI-format requests into Harmony-encoded format with input_ids,
+/// stop tokens, and selection text for worker routing. The encoding itself is
+/// fetched per build via [`try_harmony_encoding`] (loaded at gpt-oss worker
+/// registration).
+pub(crate) struct HarmonyBuilder;
+
+/// Harmony knows only low/medium/high; the outer OpenAI tiers clamp inward.
+fn harmony_reasoning_effort(effort: ResponsesReasoningEffort) -> ReasoningEffort {
+    match effort {
+        ResponsesReasoningEffort::None
+        | ResponsesReasoningEffort::Minimal
+        | ResponsesReasoningEffort::Low => ReasoningEffort::Low,
+        ResponsesReasoningEffort::Medium => ReasoningEffort::Medium,
+        ResponsesReasoningEffort::High
+        | ResponsesReasoningEffort::Xhigh
+        | ResponsesReasoningEffort::Max => ReasoningEffort::High,
+    }
+}
+
+/// Chat carries the tier as a free-form string; unknown values keep the
+/// medium default.
+fn harmony_reasoning_effort_from_str(effort: &str) -> ReasoningEffort {
+    ResponsesReasoningEffort::parse(effort)
+        .map_or(ReasoningEffort::Medium, harmony_reasoning_effort)
+}
+
+impl HarmonyBuilder {
+    /// Create a new Harmony builder
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Build Harmony request from Chat Completion request
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - The ChatCompletionRequest to encode
+    ///
+    /// # Returns
+    ///
+    /// HarmonyBuildOutput containing input_ids, stop_token_ids and selection_text
+    pub fn build_from_chat(
+        &self,
+        request: &ChatCompletionRequest,
+    ) -> Result<HarmonyBuildOutput, String> {
+        // Harmony takes media in no role: its own whole-request refusal speaks before
+        // the shared door names a role's rule.
+        reject_chat_media(&request.messages)?;
+        utils::validate_chat_content_parts(&request.messages)?;
+        let encoding = try_harmony_encoding()?;
+
+        let mut all_messages = Vec::new();
+
+        let sys_msg = self.build_system_message_from_chat(request);
+        all_messages.push(sys_msg);
+
+        // As on the Responses path, a developer message only when there are
+        // instructions or tools to carry.
+        let (instructions, messages) = split_instructions(&request.messages);
+        let tools = chat_tools(request).filter(|tools| !tools.is_empty());
+        if instructions.is_some() || tools.is_some() {
+            let dev_msg = self.build_developer_message(tools.as_ref(), instructions.as_deref());
+            all_messages.push(dev_msg);
+        }
+
+        let mut user_messages = self.convert_chat_messages(messages);
+        all_messages.append(&mut user_messages);
+
+        self.encode_prompt(encoding, all_messages)
+    }
+
+    /// Build Harmony request from Responses request
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - The ResponsesRequest to encode
+    ///
+    /// # Returns
+    ///
+    /// HarmonyBuildOutput containing input_ids, stop_token_ids and selection_text
+    pub fn build_from_responses(
+        &self,
+        request: &ResponsesRequest,
+    ) -> Result<HarmonyBuildOutput, String> {
+        let encoding = try_harmony_encoding()?;
+        let all_messages = self.construct_input_messages_with_harmony(request)?;
+        let output = self.encode_prompt(encoding, all_messages)?;
+
+        // What the model receives, decoded back for the trace lines alone:
+        // a pass over every prompt token, so it runs only when they print.
+        if enabled!(Level::TRACE) {
+            let token_ids = &output.input_ids;
+            let decoded_text = encoding
+                .tokenizer()
+                .decode_utf8(token_ids)
+                .unwrap_or_else(|_| "<decode error>".to_string());
+            trace!(
+                token_count = token_ids.len(),
+                token_preview = ?&token_ids[..token_ids.len().min(20)],
+                decoded_length = decoded_text.len(),
+                "Encoded conversation to tokens - decoded text follows:"
+            );
+            trace!("DECODED_TEXT_START\n{}\nDECODED_TEXT_END", decoded_text);
+        }
+
+        Ok(output)
+    }
+
+    /// The prompt of the assistant's next turn over `all_messages`, with the
+    /// stop tokens of the assistant's actions (`<|return|>` and `<|call|>`)
+    /// and the messages' selection text.
+    fn encode_prompt(
+        &self,
+        encoding: &HarmonyEncoding,
+        all_messages: Vec<HarmonyMessage>,
+    ) -> Result<HarmonyBuildOutput, String> {
+        let selection_text = self.extract_selection_text(&all_messages);
+        let conversation = Conversation::from_messages(all_messages);
+        let input_ids = encoding
+            .render_conversation_for_completion(&conversation, Role::Assistant, None)
+            .map_err(|e| format!("Failed to encode Harmony conversation: {e}"))?;
+        let stop_token_ids = encoding
+            .stop_tokens_for_assistant_actions()
+            .into_iter()
+            .flat_map(|set| set.into_iter())
+            .collect();
+        Ok(HarmonyBuildOutput {
+            input_ids,
+            stop_token_ids,
+            selection_text,
+        })
+    }
+
+    /// Build system message with common logic
+    ///
+    /// # Arguments
+    /// * `reasoning_effort` - Optional reasoning effort level
+    /// * `has_tools` - Whether custom tools are present
+    #[expect(
+        clippy::unused_self,
+        reason = "method on HarmonyBuilder for logical grouping"
+    )]
+    fn build_system_message(
+        &self,
+        reasoning_effort: Option<ReasoningEffort>,
+        has_tools: bool,
+    ) -> HarmonyMessage {
+        let mut sys_content = SystemContent::new();
+
+        // Add reasoning_effort if provided
+        if let Some(effort) = reasoning_effort {
+            sys_content = sys_content.with_reasoning_effort(effort);
+        }
+
+        // Set conversation start date (always current date)
+        sys_content =
+            sys_content.with_conversation_start_date(Local::now().format("%Y-%m-%d").to_string());
+
+        // If no tools, remove "commentary" from valid channels
+        if !has_tools {
+            if let Some(channel_config) = &sys_content.channel_config {
+                let valid_channels: Vec<String> = channel_config
+                    .valid_channels
+                    .iter()
+                    .filter(|c| c.as_str() != "commentary")
+                    .cloned()
+                    .collect();
+                sys_content = sys_content
+                    .with_channel_config(ChannelConfig::require_channels(valid_channels));
+            }
+        }
+
+        HarmonyMessage::from_role_and_content(Role::System, sys_content)
+    }
+
+    fn build_system_message_from_chat(&self, request: &ChatCompletionRequest) -> HarmonyMessage {
+        let reasoning_effort = request
+            .reasoning_effort
+            .as_deref()
+            .map(harmony_reasoning_effort_from_str);
+
+        self.build_system_message(reasoning_effort, request.declares_tools())
+    }
+
+    /// Build system message from ResponsesRequest
+    ///
+    /// # Arguments
+    /// * `request` - The ResponsesRequest
+    /// * `with_custom_tools` - Whether custom tools (beyond built-ins) are present
+    fn build_system_message_from_responses(
+        &self,
+        request: &ResponsesRequest,
+        with_custom_tools: bool,
+    ) -> HarmonyMessage {
+        let reasoning_effort = request
+            .reasoning
+            .as_ref()
+            .and_then(|r| r.effort)
+            .map(harmony_reasoning_effort);
+
+        self.build_system_message(reasoning_effort, with_custom_tools)
+    }
+
+    /// Build developer message with common logic
+    ///
+    /// Filters out built-in tools and converts custom tools to ToolDescription
+    ///
+    /// # Arguments
+    /// * `tools` - Optional list of tools
+    /// * `instructions` - Optional instructions (a Responses request's
+    ///   `instructions`, or a chat request's leading system or developer message)
+    #[expect(
+        clippy::unused_self,
+        reason = "method on HarmonyBuilder for logical grouping"
+    )]
+    fn build_developer_message<T: ToolLike>(
+        &self,
+        tools: Option<&Vec<T>>,
+        instructions: Option<&str>,
+    ) -> HarmonyMessage {
+        let mut dev_content = DeveloperContent::new();
+
+        // Add instructions if provided
+        if let Some(instructions) = instructions {
+            dev_content = dev_content.with_instructions(instructions.to_string());
+        }
+
+        // Early return if no tools
+        let Some(tools) = tools else {
+            return HarmonyMessage::from_role_and_content(Role::Developer, dev_content);
+        };
+
+        // Filter to custom tools, convert to ToolDescription, and
+        // deduplicate by name.
+        //
+        // Deduplication matters in the Responses-API path because the
+        // upstream MCP loop extends `request.tools` with a
+        // `ResponseTool::Function` entry for every tool exposed by a
+        // registered MCP server (see `execute_with_mcp_loop` in
+        // `harmony/responses/non_streaming.rs`). When the caller's
+        // original request also declared a hosted tool that the MCP
+        // server resolves by the same name — most notably
+        // `image_generation` via the synthesized schema — we would
+        // otherwise emit two identically-named entries inside
+        // `namespace functions { … }` and confuse gpt-oss about which
+        // signature to follow. Keeping the first occurrence (the
+        // caller's original / synthesized tool) yields a stable
+        // developer-message shape even when the MCP loop injects a
+        // same-name function tool on a later iteration.
+        let mut seen_names = HashSet::<String>::new();
+        let tool_descriptions: Vec<ToolDescription> = tools
+            .iter()
+            .filter(|t| t.is_custom())
+            .flat_map(|t| t.to_tool_descriptions())
+            .filter(|td| seen_names.insert(td.name.clone()))
+            .collect();
+
+        // Add function tools to developer content
+        if !tool_descriptions.is_empty() {
+            dev_content = dev_content.with_function_tools(tool_descriptions);
+        }
+
+        HarmonyMessage::from_role_and_content(Role::Developer, dev_content)
+    }
+
+    /// Construct input messages for Responses API with Harmony
+    ///
+    /// Handles both new conversations and continuations of previous responses.
+    ///
+    /// This handles:
+    /// - New conversation: system message, developer message, and user input
+    /// - Continuing conversation: loads previous messages, cleans up chain-of-thoughts
+    /// - MCP tool allowlisting for special tool types
+    /// - Complex response input parsing with function call tracking
+    ///
+    /// # Arguments
+    /// * `request` - The ResponsesRequest
+    /// * `prev_response` - Optional previous response to continue from
+    fn construct_input_messages_with_harmony(
+        &self,
+        request: &ResponsesRequest,
+    ) -> Result<Vec<HarmonyMessage>, String> {
+        let mut all_messages = Vec::new();
+
+        // Handle new vs continuing conversation
+        if request.previous_response_id.is_none() {
+            // New conversation
+
+            let tool_types: Vec<&str> = request
+                .tools
+                .as_ref()
+                .map(|tools| tools.iter().map(ResponseTool::as_str).collect())
+                .unwrap_or_default();
+
+            let with_custom_tools = has_custom_tools(&tool_types);
+
+            // Add system message
+            let sys_msg = self.build_system_message_from_responses(request, with_custom_tools);
+            all_messages.push(sys_msg);
+
+            // Add developer message if we have custom tools or instructions
+            if with_custom_tools || request.instructions.is_some() {
+                let dev_msg = self.build_developer_message(
+                    request.tools.as_ref(),
+                    request.instructions.as_deref(),
+                );
+                all_messages.push(dev_msg);
+            }
+        } else {
+            // Continue the previous conversation
+            // NOTE: Previous messages are loaded by serve_harmony_responses() before calling this method.
+            // The request.input will already contain the conversation history when previous_response_id was set.
+            // We just proceed with parsing the input items as normal.
+            debug!("Continuing conversation (history already loaded in request.input)");
+        }
+
+        // Append the new input
+        // Responses API supports simple text inputs without chat format
+        match &request.input {
+            ResponseInput::Text(text) => {
+                let user_msg = HarmonyMessage {
+                    author: Author {
+                        role: Role::User,
+                        name: None,
+                    },
+                    recipient: None,
+                    content: vec![Content::Text(TextContent { text: text.clone() })],
+                    channel: None,
+                    content_type: None,
+                };
+                all_messages.push(user_msg);
+            }
+            ResponseInput::Items(items) => {
+                // Track function calls for looking up call_id → name mapping
+                let mut prev_outputs: Vec<&ResponseInputOutputItem> = Vec::new();
+
+                for item in items {
+                    // The gateway's own record of a hosted tool session (the
+                    // tools it listed, the approval it asked for): nothing
+                    // the model said or was told.
+                    if matches!(
+                        item,
+                        ResponseInputOutputItem::McpListTools { .. }
+                            | ResponseInputOutputItem::McpApprovalRequest { .. }
+                            | ResponseInputOutputItem::AdditionalTools { .. }
+                    ) {
+                        continue;
+                    }
+                    let msg = self.parse_response_item_to_harmony_message(item, &prev_outputs)?;
+                    all_messages.push(msg);
+
+                    // Track function tool calls so that function_call_output can find the name
+                    if matches!(
+                        item,
+                        ResponseInputOutputItem::FunctionToolCall { .. }
+                            | ResponseInputOutputItem::CustomToolCall { .. }
+                    ) {
+                        prev_outputs.push(item);
+                    }
+                }
+            }
+        }
+
+        debug!(
+            message_count = all_messages.len(),
+            "Constructed Harmony messages for Responses API"
+        );
+        Ok(all_messages)
+    }
+
+    /// Parse a ResponseInputOutputItem into a HarmonyMessage
+    ///
+    /// Handles conversion of various response item types (messages, function calls, reasoning, etc.)
+    /// to Harmony message format.
+    ///
+    /// # Arguments
+    /// * `item` - The ResponseInputOutputItem to parse
+    /// * `prev_outputs` - Previous items for looking up function call names (for function_call_output)
+    #[expect(
+        clippy::unused_self,
+        reason = "method on HarmonyBuilder for logical grouping"
+    )]
+    fn parse_response_item_to_harmony_message(
+        &self,
+        item: &ResponseInputOutputItem,
+        prev_outputs: &[&ResponseInputOutputItem],
+    ) -> Result<HarmonyMessage, String> {
+        match item {
+            // Regular message (user or assistant)
+            ResponseInputOutputItem::Message { role, content, .. } => {
+                let harmony_role = match role.as_str() {
+                    "user" => Role::User,
+                    "assistant" => Role::Assistant,
+                    "system" => Role::System,
+                    _ => Role::User, // Default to user for unknown roles
+                };
+
+                // The text of the content parts; an image or a file part is
+                // refused (`harmony_text_parts`).
+                let text = harmony_text_parts(content)?.join("\n");
+
+                Ok(HarmonyMessage {
+                    author: Author {
+                        role: harmony_role,
+                        name: None,
+                    },
+                    recipient: None,
+                    content: vec![Content::Text(TextContent { text })],
+                    channel: None,
+                    content_type: None,
+                })
+            }
+
+            // Reasoning content (chain-of-thought)
+            ResponseInputOutputItem::Reasoning { content, .. } => {
+                // Extract reasoning text
+                let reasoning_texts: Vec<String> = content
+                    .iter()
+                    .map(|rc| match rc {
+                        ResponseReasoningContent::ReasoningText { text } => text.clone(),
+                    })
+                    .collect();
+
+                let text = reasoning_texts.join("\n");
+
+                // Reasoning goes in the "analysis" channel for Harmony
+                Ok(HarmonyMessage {
+                    author: Author {
+                        role: Role::Assistant,
+                        name: None,
+                    },
+                    recipient: None,
+                    content: vec![Content::Text(TextContent { text })],
+                    channel: Some("analysis".to_string()),
+                    content_type: None,
+                })
+            }
+
+            // Function tool call (with optional output)
+            ResponseInputOutputItem::FunctionToolCall {
+                name,
+                namespace,
+                arguments,
+                output,
+                ..
+            } => {
+                let name = match namespace {
+                    Some(namespace) => format!("{namespace}.{name}"),
+                    None => name.clone(),
+                };
+                Ok(tool_call_message(name, arguments, output.as_deref()))
+            }
+
+            ResponseInputOutputItem::CustomToolCall {
+                name,
+                namespace,
+                input,
+                ..
+            } => {
+                let name = namespace
+                    .as_ref()
+                    .map_or_else(|| name.clone(), |ns| format!("{ns}.{name}"));
+                Ok(tool_call_message(
+                    name,
+                    &json!({"input": input}).to_string(),
+                    None,
+                ))
+            }
+
+            // A hosted tool call of a stored turn replays the same way, under
+            // the name the model called it by.
+            ResponseInputOutputItem::McpCall {
+                name,
+                arguments,
+                output,
+                error,
+                status,
+                ..
+            } => Ok(tool_call_message(
+                name.clone(),
+                arguments,
+                hosted_call_result(output.as_deref(), error.as_ref(), status.as_deref()).as_deref(),
+            )),
+
+            // Function call output (separate from call) - requires looking up the original call
+            ResponseInputOutputItem::FunctionCallOutput {
+                call_id, output, ..
+            } => replay_tool_result(prev_outputs, call_id, output.to_text_only()?),
+            ResponseInputOutputItem::CustomToolCallOutput {
+                call_id, output, ..
+            } => {
+                let text = match output {
+                    CustomToolCallOutputContent::Text(text) => text.clone(),
+                    CustomToolCallOutputContent::Parts(parts) => parts
+                        .iter()
+                        .map(|part| match part {
+                            CustomToolInputContentPart::InputText { text } => Ok(text.as_str()),
+                            CustomToolInputContentPart::InputImage { .. } => {
+                                Err("Harmony does not support \"input_image\" content parts")
+                            }
+                            CustomToolInputContentPart::InputFile { .. } => {
+                                Err("Harmony does not support \"input_file\" content parts")
+                            }
+                        })
+                        .collect::<Result<Vec<_>, _>>()?
+                        .join("\n"),
+                };
+                replay_tool_result(prev_outputs, call_id, text)
+            }
+
+            // Simple input message (usually user message)
+            ResponseInputOutputItem::SimpleInputMessage { content, role, .. } => {
+                let harmony_role = match role.as_str() {
+                    "user" => Role::User,
+                    "assistant" => Role::Assistant,
+                    "system" => Role::System,
+                    _ => Role::User,
+                };
+
+                let text = match content {
+                    StringOrContentParts::String(s) => s.clone(),
+                    StringOrContentParts::Array(parts) => harmony_text_parts(parts)?.join("\n"),
+                };
+
+                Ok(HarmonyMessage {
+                    author: Author {
+                        role: harmony_role,
+                        name: None,
+                    },
+                    recipient: None,
+                    content: vec![Content::Text(TextContent { text })],
+                    channel: None,
+                    content_type: None,
+                })
+            }
+
+            ResponseInputOutputItem::McpApprovalResponse { .. }
+            | ResponseInputOutputItem::ComputerCall { .. }
+            | ResponseInputOutputItem::ComputerCallOutput { .. } => {
+                warn!(
+                    function = "parse_response_item_to_harmony_message",
+                    "Approval item reached Harmony conversion"
+                );
+                Err("Unsupported input item type".to_string())
+            }
+            // Left out before this conversion (see the item loop of
+            // `construct_input_messages_with_harmony`).
+            ResponseInputOutputItem::McpListTools { .. }
+            | ResponseInputOutputItem::McpApprovalRequest { .. }
+            | ResponseInputOutputItem::AdditionalTools { .. } => {
+                Err("Unsupported input item type".to_string())
+            }
+
+            ResponseInputOutputItem::AgentMessage {
+                author,
+                recipient,
+                content,
+                ..
+            } => {
+                let text =
+                    format_agent_message_text(author, recipient, content).map_err(|part| {
+                        format!(
+                            "Harmony does not support \"{part}\" content parts in an agent_message"
+                        )
+                    })?;
+                Ok(HarmonyMessage {
+                    author: Author {
+                        role: Role::User,
+                        name: None,
+                    },
+                    recipient: None,
+                    content: vec![Content::Text(TextContent { text })],
+                    channel: None,
+                    content_type: None,
+                })
+            }
+
+            ResponseInputOutputItem::ImageGenerationCall { .. } => {
+                warn!(
+                    function = "parse_response_item_to_harmony_message",
+                    "image_generation_call input item reached Harmony conversion"
+                );
+                Err("Unsupported input item type".to_string())
+            }
+
+            ResponseInputOutputItem::Compaction { .. }
+            | ResponseInputOutputItem::ItemReference { .. } => {
+                Err("Unsupported input item type".to_string())
+            }
+
+            ResponseInputOutputItem::ShellCall { .. }
+            | ResponseInputOutputItem::ShellCallOutput { .. } => {
+                warn!(
+                    function = "parse_response_item_to_harmony_message",
+                    "Shell tool item reached Harmony conversion"
+                );
+                Err("Unsupported input item type".to_string())
+            }
+
+            ResponseInputOutputItem::ApplyPatchCall { .. }
+            | ResponseInputOutputItem::ApplyPatchCallOutput { .. } => {
+                warn!(
+                    function = "parse_response_item_to_harmony_message",
+                    "apply_patch item reached Harmony conversion"
+                );
+                Err("Unsupported input item type".to_string())
+            }
+            // T5 schema-only: forced-cascade arm, no behavior.
+            ResponseInputOutputItem::LocalShellCall { .. }
+            | ResponseInputOutputItem::LocalShellCallOutput { .. } => {
+                Err("Unsupported input item type".to_string())
+            }
+        }
+    }
+
+    /// Convert OpenAI ChatMessage format to Harmony messages
+    ///
+    /// - Assistant messages with tool_calls create multiple messages (one per tool call)
+    /// - Tool role messages use Role::Tool with proper author
+    /// - Tool-related messages use channel="commentary"
+    #[expect(
+        clippy::unused_self,
+        reason = "method on HarmonyBuilder for logical grouping"
+    )]
+    fn convert_chat_messages(&self, messages: &[ChatMessage]) -> Vec<HarmonyMessage> {
+        let mut harmony_messages = Vec::new();
+
+        // Build a map of tool_call_id -> function_name for tool responses
+        let mut tool_call_map = std::collections::HashMap::new();
+        for msg in messages {
+            if let ChatMessage::Assistant {
+                tool_calls: Some(calls),
+                ..
+            } = msg
+            {
+                for call in calls {
+                    tool_call_map.insert(call.id.clone(), call.function.name.clone());
+                }
+            }
+        }
+
+        for msg in messages {
+            match msg {
+                ChatMessage::System { content, name, .. } | ChatMessage::Root { content, name } => {
+                    // System messages stay as-is
+                    let harmony_msg = HarmonyMessage {
+                        author: Author {
+                            role: Role::System,
+                            name: name.clone(),
+                        },
+                        recipient: None,
+                        content: vec![Content::Text(TextContent {
+                            text: content.to_simple_string(),
+                        })],
+                        channel: None,
+                        content_type: None,
+                    };
+                    harmony_messages.push(harmony_msg);
+                }
+                ChatMessage::Developer { content, name, .. } => {
+                    // Developer messages stay as-is
+                    let harmony_msg = HarmonyMessage {
+                        author: Author {
+                            role: Role::Developer,
+                            name: name.clone(),
+                        },
+                        recipient: None,
+                        content: vec![Content::Text(TextContent {
+                            text: content.to_simple_string(),
+                        })],
+                        channel: None,
+                        content_type: None,
+                    };
+                    harmony_messages.push(harmony_msg);
+                }
+
+                ChatMessage::User { content, name, .. } => {
+                    // Extract text from user content
+                    let text = match content {
+                        MessageContent::Text(text) => text.clone(),
+                        MessageContent::Parts(parts) => {
+                            // Text parts only: a media part was refused by
+                            // `reject_chat_media` before this arm.
+                            parts
+                                .iter()
+                                .filter_map(|part| {
+                                    if let ContentPart::Text { text } = part {
+                                        Some(text.as_str())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        }
+                    };
+
+                    let harmony_msg = HarmonyMessage {
+                        author: Author {
+                            role: Role::User,
+                            name: name.clone(),
+                        },
+                        recipient: None,
+                        content: vec![Content::Text(TextContent { text })],
+                        channel: None,
+                        content_type: None,
+                    };
+                    harmony_messages.push(harmony_msg);
+                }
+
+                ChatMessage::Assistant {
+                    content,
+                    name,
+                    tool_calls,
+                    reasoning,
+                    ..
+                } => {
+                    if let Some(calls) = tool_calls.as_ref().filter(|c| !c.is_empty()) {
+                        // Per Harmony spec: when tool calls are present, include
+                        // previous reasoning as a separate analysis channel message
+                        // because the model calls tools as part of its chain-of-thought.
+                        if let Some(text) = &reasoning.text {
+                            if !text.is_empty() {
+                                let analysis_msg = HarmonyMessage {
+                                    author: Author {
+                                        role: Role::Assistant,
+                                        name: name.clone(),
+                                    },
+                                    recipient: None,
+                                    content: vec![Content::Text(TextContent {
+                                        text: text.clone(),
+                                    })],
+                                    channel: Some("analysis".to_string()),
+                                    content_type: None,
+                                };
+                                harmony_messages.push(analysis_msg);
+                            }
+                        }
+
+                        // Tool calls go to commentary channel
+                        for call in calls {
+                            let function_name = &call.function.name;
+                            let arguments = call.function.arguments.clone().unwrap_or_default();
+
+                            let tool_call_msg = HarmonyMessage {
+                                author: Author {
+                                    role: Role::Assistant,
+                                    name: name.clone(),
+                                },
+                                recipient: Some(format!("functions.{function_name}")),
+                                content: vec![Content::Text(TextContent { text: arguments })],
+                                channel: Some("commentary".to_string()),
+                                content_type: Some("json".to_string()),
+                            };
+                            harmony_messages.push(tool_call_msg);
+                        }
+                    } else {
+                        // Per Harmony spec: drop previous CoT/analysis content on
+                        // subsequent turns when the response ended with a final
+                        // channel message. Only emit the final content.
+                        let text = content
+                            .as_ref()
+                            .map(|c| c.to_simple_string())
+                            .unwrap_or_default();
+
+                        let harmony_msg = HarmonyMessage {
+                            author: Author {
+                                role: Role::Assistant,
+                                name: name.clone(),
+                            },
+                            recipient: None,
+                            content: vec![Content::Text(TextContent { text })],
+                            channel: Some("final".to_string()),
+                            content_type: None,
+                        };
+                        harmony_messages.push(harmony_msg);
+                    }
+                }
+
+                ChatMessage::Tool {
+                    content,
+                    tool_call_id,
+                } => {
+                    // Look up the function name from the tool_call_id
+                    let function_name = tool_call_map
+                        .get(tool_call_id)
+                        .cloned()
+                        .unwrap_or_else(|| tool_call_id.clone());
+
+                    // Tool result - Must include recipient="assistant" for parser to recognize it.
+                    // We keep channel=None to minimize what the model might copy.
+                    let harmony_msg = HarmonyMessage {
+                        author: Author {
+                            role: Role::Tool,
+                            name: Some(format!("functions.{function_name}")),
+                        },
+                        recipient: Some("assistant".to_string()),
+                        content: vec![Content::Text(TextContent {
+                            text: content.to_simple_string(),
+                        })],
+                        channel: None,
+                        content_type: None,
+                    };
+                    harmony_messages.push(harmony_msg);
+                }
+
+                ChatMessage::Function { content, name } => {
+                    // Function messages also use Role::Tool
+                    // Tool result - Must include recipient="assistant" for parser to recognize it.
+                    // We keep channel=None to minimize what the model might copy.
+                    let harmony_msg = HarmonyMessage {
+                        author: Author {
+                            role: Role::Tool,
+                            name: Some(format!("functions.{name}")),
+                        },
+                        recipient: Some("assistant".to_string()),
+                        content: vec![Content::Text(TextContent {
+                            text: content.clone().unwrap_or_default(),
+                        })],
+                        channel: None,
+                        content_type: None,
+                    };
+                    harmony_messages.push(harmony_msg);
+                }
+            }
+        }
+
+        harmony_messages
+    }
+
+    /// Extract selection text for worker routing
+    ///
+    /// Uses the last user message for load balancing
+    #[expect(
+        clippy::unused_self,
+        reason = "method on HarmonyBuilder for logical grouping"
+    )]
+    fn extract_selection_text(&self, messages: &[HarmonyMessage]) -> String {
+        // Find the last user message
+        if let Some(last_user_msg) = messages.iter().rev().find(|m| m.author.role == Role::User) {
+            // Extract full text from content
+            return last_user_msg
+                .content
+                .iter()
+                .filter_map(|c| match c {
+                    Content::Text(tc) => Some(tc.text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("");
+        }
+
+        // Fallback: concatenate all text
+        messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter_map(|c| match c {
+                Content::Text(tc) => Some(tc.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+impl Default for HarmonyBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn replay_tool_result(
+    prev_outputs: &[&ResponseInputOutputItem],
+    call_id: &str,
+    text: String,
+) -> Result<HarmonyMessage, String> {
+    let name = prev_outputs
+        .iter()
+        .rev()
+        .find_map(|item| match item {
+            ResponseInputOutputItem::FunctionToolCall {
+                call_id: id,
+                name,
+                namespace,
+                ..
+            }
+            | ResponseInputOutputItem::CustomToolCall {
+                call_id: id,
+                name,
+                namespace,
+                ..
+            } if id == call_id => Some(
+                namespace
+                    .as_ref()
+                    .map_or_else(|| name.clone(), |ns| format!("{ns}.{name}")),
+            ),
+            _ => None,
+        })
+        .ok_or_else(|| format!("No function call found for call_id: {call_id}"))?;
+    Ok(tool_result_message(format!("functions.{name}"), text))
+}
+
+fn tool_result_message(author_name: String, text: String) -> HarmonyMessage {
+    HarmonyMessage {
+        author: Author {
+            role: Role::Tool,
+            name: Some(author_name),
+        },
+        recipient: Some("assistant".to_string()),
+        content: vec![Content::Text(TextContent { text })],
+        channel: None,
+        content_type: None,
+    }
+}
+
+/// The harmony message of a tool call the assistant issued, by the name the
+/// model called it by: its result once it ran (a Tool message under
+/// `functions.{name}`, addressed to the assistant), the call itself otherwise
+/// (a commentary message addressed to `functions.{name}`).
+fn tool_call_message(name: String, arguments: &str, output: Option<&str>) -> HarmonyMessage {
+    if let Some(output_str) = output {
+        // Tool result - use Tool role with "functions.{name}" as author name
+        // IMPORTANT: Must include recipient="assistant" for parser to recognize it.
+        // We keep channel=None to minimize what the model might copy.
+        let author_name = format!("functions.{name}");
+        debug!(
+            tool_name = %name,
+            author_name = %author_name,
+            output_preview = %output_str.chars().take(100).collect::<String>(),
+            "Building tool result message with Tool role (recipient=assistant, no channel)"
+        );
+        tool_result_message(author_name, output_str.to_owned())
+    } else {
+        // Tool call - assistant message in commentary channel with recipient
+        // msg.with_channel("commentary").with_recipient(f"functions.{name}")
+        let recipient = format!("functions.{name}");
+        debug!(
+            tool_name = %name,
+            recipient = %recipient,
+            "Building tool call message with recipient"
+        );
+        HarmonyMessage {
+            author: Author {
+                role: Role::Assistant,
+                name: None,
+            },
+            recipient: Some(recipient),
+            content: vec![Content::Text(TextContent {
+                text: arguments.to_string(),
+            })],
+            channel: Some("commentary".to_string()),
+            content_type: Some("json".to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Regression coverage for the `image_generation` → function-tool
+    //! translation gpt-oss needs via the harmony pipeline.
+    //!
+    //! Classifying `ResponseTool::ImageGeneration` as a builtin made the
+    //! harmony builder silently drop it — gpt-oss was never trained to
+    //! emit `image_generation_call` as a builtin channel tag, so the
+    //! model saw no tool at all, emitted a reasoning + message pair, and
+    //! the registered `image_generation` MCP server received zero
+    //! dispatches.
+    //!
+    //! These tests lock in the contract:
+    //!   1. `image_generation` is NOT in `BUILTIN_TOOLS`.
+    //!   2. `ResponseTool::ImageGeneration` is treated as a *custom* tool
+    //!      by the harmony `ToolLike` impl.
+    //!   3. `to_tool_description()` synthesizes a JSON-schema whose
+    //!      `required` set includes `prompt`.
+    //!   4. The encoded harmony conversation contains the function-tool
+    //!      signature (`type image_generation = (_: …) => any;`) that
+    //!      gpt-oss is trained to emit calls against.
+
+    use openai_protocol::{
+        common::{AudioUrl, ChatLogProbsContent, InputAudio},
+        responses::{ImageGenerationTool, ResponseInput, ResponseTool, ResponsesRequest},
+    };
+    use smg_grpc_client::vllm_proto as vllm;
+    use tracing_test::traced_test;
+
+    use super::*;
+    use crate::routers::grpc::common::responses::utils::namespace_test_request;
+
+    #[test]
+    fn function_call_output_rejects_unmatched_resolved_history() {
+        for input in [
+            json!([{"type": "function_call_output", "call_id": "call_weather", "output": "sunny"}]),
+            json!([
+                {"role": "user", "content": "What is the weather?"},
+                {"type": "function_call_output", "call_id": "call_weather", "output": "sunny"}
+            ]),
+            json!([
+                {"type": "function_call", "call_id": "call_other", "name": "weather", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_weather", "output": "sunny"}
+            ]),
+        ] {
+            let request: ResponsesRequest = serde_json::from_value(json!({
+                "model": "test-model", "input": input
+            }))
+            .unwrap();
+            let error = HarmonyBuilder::new()
+                .construct_input_messages_with_harmony(&request)
+                .expect_err("An unmatched tool result must fail after history resolution");
+            assert_eq!(error, "No function call found for call_id: call_weather");
+        }
+    }
+
+    #[test]
+    fn function_call_output_uses_matching_resolved_history() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "input": [
+                {"role": "user", "content": "What is the weather?"},
+                {"type": "function_call", "call_id": "call_weather", "name": "weather", "arguments": "{}"},
+                {"type": "function_call", "call_id": "call_other", "name": "other", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_weather", "output": "sunny"}
+            ]
+        }))
+        .unwrap();
+        let messages = HarmonyBuilder::new()
+            .construct_input_messages_with_harmony(&request)
+            .expect("A matching tool result should convert successfully");
+        let tool = messages.last().unwrap();
+        assert_eq!(tool.author.role, Role::Tool);
+        assert_eq!(tool.author.name.as_deref(), Some("functions.weather"));
+        assert_eq!(tool.recipient.as_deref(), Some("assistant"));
+        assert!(matches!(&tool.content[..], [Content::Text(text)] if text.text == "sunny"));
+    }
+
+    /// A hosted tool call of a stored turn replays as its result under the
+    /// name the model called it by; the tools listing stored next to it is
+    /// left out.
+    #[test]
+    fn stored_hosted_tool_calls_replay_as_their_result() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "input": [
+                {"role": "user", "content": "search it"},
+                {"type": "mcp_list_tools", "id": "mcpl_1", "server_label": "wiki", "tools": []},
+                {"type": "mcp_call", "id": "mcp_1", "name": "search", "server_label": "wiki",
+                 "arguments": "{}", "output": "found", "status": "completed"}
+            ]
+        }))
+        .unwrap();
+        let messages = HarmonyBuilder::new()
+            .construct_input_messages_with_harmony(&request)
+            .expect("a stored hosted tool call converts");
+        let user = messages
+            .iter()
+            .position(|message| message.author.role == Role::User)
+            .expect("the user's message");
+        let tool = messages.last().unwrap();
+        assert!(user < messages.len() - 1);
+        assert_eq!(messages.len() - user, 2, "{messages:?}");
+        assert_eq!(tool.author.role, Role::Tool);
+        assert_eq!(tool.author.name.as_deref(), Some("functions.search"));
+        assert_eq!(tool.recipient.as_deref(), Some("assistant"));
+        assert!(matches!(&tool.content[..], [Content::Text(text)] if text.text == "found"));
+    }
+
+    /// A hosted tool call that failed replays as a result that says so, not
+    /// as a successful empty result.
+    #[test]
+    fn a_failed_stored_hosted_tool_call_replays_its_error_as_the_result() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "input": [
+                {"role": "user", "content": "search it"},
+                {"type": "mcp_call", "id": "mcp_1", "name": "search", "server_label": "wiki",
+                 "arguments": "{}", "output": "", "status": "failed",
+                 "error": {"type": "mcp_protocol_error", "code": -32000, "message": "no such tool"}}
+            ]
+        }))
+        .unwrap();
+        let messages = HarmonyBuilder::new()
+            .construct_input_messages_with_harmony(&request)
+            .expect("a failed hosted tool call converts");
+        let tool = messages.last().unwrap();
+        assert_eq!(tool.author.role, Role::Tool);
+        assert_eq!(tool.author.name.as_deref(), Some("functions.search"));
+        assert!(
+            matches!(&tool.content[..], [Content::Text(text)]
+                if text.text == "The tool call failed (protocol error -32000): no such tool"),
+            "{tool:?}"
+        );
+    }
+
+    #[test]
+    fn build_from_chat_rejects_unknown_content_parts_before_loading_encoding() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "gpt-oss-120b",
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "vendor_media", "payload": "media_1"}]
+            }]
+        }))
+        .unwrap();
+        let error = HarmonyBuilder::new().build_from_chat(&request).unwrap_err();
+        assert!(error.contains("vendor_media"));
+        assert!(error.contains("gRPC"));
+    }
+
+    /// Harmony takes media in no role, so its own whole-request refusal
+    /// speaks before the shared door names a role's rule: a system image is
+    /// refused by name and pointed at the regular multimodal path, not told
+    /// to move to a user message.
+    #[test]
+    fn build_from_chat_refuses_a_system_image_in_harmonys_own_words() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "gpt-oss-120b",
+            "messages": [
+                {"role": "system", "content": [
+                    {"type": "text", "text": "You see the attached image."},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AQ=="}}
+                ]},
+                {"role": "user", "content": "Describe it."}
+            ]
+        }))
+        .unwrap();
+        let error = HarmonyBuilder::new().build_from_chat(&request).unwrap_err();
+        assert_eq!(
+            error,
+            "Harmony does not support image content parts; use the regular multimodal path"
+        );
+    }
+
+    /// A Responses message item's `input_image` or `input_file` part has no
+    /// form in a Harmony prompt: the build refuses it by name, as it refuses
+    /// chat audio, instead of rendering the turn without it; a message item,
+    /// a simple input message and a function output (the tool message's text)
+    /// alike.
+    #[test]
+    fn build_from_responses_refuses_image_and_file_parts() {
+        let builder = HarmonyBuilder::new();
+        let parts = [
+            (
+                json!({"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="}),
+                "\"input_image\"",
+            ),
+            (
+                json!({"type": "input_file", "file_data": "JVBERi0xLjQK", "filename": "a.pdf"}),
+                "\"input_file\"",
+            ),
+        ];
+        for (part, name) in parts {
+            let inputs = [
+                json!([{"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "hi"}, part.clone()
+                ]}]),
+                json!([{"role": "user", "content": [part.clone()]}]),
+                json!([
+                    {"type": "function_call", "call_id": "call_1", "name": "f", "arguments": "{}"},
+                    {"type": "function_call_output", "call_id": "call_1", "output": [part.clone()]}
+                ]),
+            ];
+            for input in inputs {
+                let request: ResponsesRequest =
+                    serde_json::from_value(json!({"model": "gpt-oss-120b", "input": input}))
+                        .unwrap();
+                let error = builder
+                    .build_from_responses(&request)
+                    .expect_err("a media part is refused");
+                assert!(error.contains(name), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn chat_audio_is_explicitly_rejected() {
+        let audio_parts = [
+            ContentPart::AudioUrl {
+                audio_url: AudioUrl {
+                    url: "https://example.com/audio.wav".to_string().into(),
+                },
+            },
+            ContentPart::InputAudio {
+                input_audio: InputAudio {
+                    data: "UklGRg==".to_string().into(),
+                    format: "wav".to_string(),
+                },
+            },
+        ];
+
+        for part in audio_parts {
+            let messages = vec![ChatMessage::User {
+                ext: Default::default(),
+                content: MessageContent::Parts(vec![part]),
+                name: None,
+            }];
+            let error = reject_chat_media(&messages).expect_err("Harmony must reject chat audio");
+            assert!(error.contains("audio content parts"));
+            assert!(error.contains("regular multimodal path"));
+        }
+    }
+
+    /// The Harmony chat path renders text only: an image or a video part
+    /// is refused by name before the encoding loads, as an audio part is,
+    /// never dropped behind an answer that reads as if the model had seen it.
+    #[test]
+    fn chat_image_and_video_parts_are_refused_by_name() {
+        let cases = [
+            (
+                "image",
+                json!({"type": "image_url", "image_url": {"url": "https://example.com/dog.jpg"}}),
+            ),
+            (
+                "video",
+                json!({"type": "video_url", "video_url": {"url": "https://example.com/clip.mp4"}}),
+            ),
+        ];
+        for (kind, part) in cases {
+            let request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": "gpt-oss-120b",
+                "messages": [{
+                    "role": "user",
+                    "content": [{"type": "text", "text": "What is in this?"}, part]
+                }]
+            }))
+            .unwrap();
+            let error = HarmonyBuilder::new()
+                .build_from_chat(&request)
+                .expect_err("a media part the Harmony path has no form for is refused");
+            assert!(
+                error.contains(&format!("{kind} content parts")),
+                "{kind}: the refusal names the part: {error}"
+            );
+            assert!(error.contains("regular multimodal path"), "{kind}: {error}");
+        }
+    }
+
+    /// A user turn given as parts that are all text still renders.
+    #[test]
+    fn a_text_only_parts_turn_still_renders_on_the_harmony_chat_path() {
+        let prompt = rendered_chat_prompt(json!({
+            "model": "gpt-oss-120b",
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "text", "text": "Describe the weather."}]
+            }]
+        }));
+        assert!(
+            prompt.contains("<|start|>user<|message|>Describe the weather.<|end|>"),
+            "the text part renders as the user turn: {prompt}"
+        );
+    }
+
+    /// Invariant: `image_generation` must never be advertised as a
+    /// gpt-oss native builtin tool. If a future change re-adds it,
+    /// gpt-oss's behavior becomes undefined (hallucinated tool call
+    /// shape, ignored advertisement, or garbled output) because the
+    /// model was not trained on that channel tag. Keep this guard until
+    /// per-worker hosted-tool capability flags exist.
+    #[test]
+    fn image_generation_is_not_a_builtin_tool() {
+        assert!(
+            !BUILTIN_TOOLS.contains(&"image_generation"),
+            "image_generation must not be advertised as a gpt-oss builtin; \
+             it is rendered as a function tool instead",
+        );
+    }
+
+    /// The [`ToolLike`] custom-tool classifier drives two pieces of the
+    /// harmony prompt assembly: whether to include the `commentary`
+    /// channel in the system message and whether the developer message
+    /// is emitted with a tools section. Both are required for gpt-oss
+    /// to emit a function call, so `ImageGeneration` must report as
+    /// custom.
+    #[test]
+    fn response_tool_image_generation_is_custom() {
+        let tool = ResponseTool::ImageGeneration(ImageGenerationTool::default());
+        assert!(
+            tool.is_custom(),
+            "ImageGeneration must be is_custom() == true so the harmony \
+             pipeline renders it in the developer-message tools section",
+        );
+        assert!(
+            !tool.is_builtin(),
+            "ImageGeneration must not be classified as a gpt-oss native builtin",
+        );
+    }
+
+    /// Exercise the synthesized JSON-schema the harmony builder hands to
+    /// gpt-oss. `prompt` is the only required field (the rest mirror
+    /// [`ImageGenerationTool`] caller-side configuration knobs). If the
+    /// schema shape drifts, the model either stops emitting valid
+    /// `image_generation` calls or regresses on caller-driven overrides.
+    #[test]
+    fn image_generation_tool_description_exposes_required_prompt() {
+        let tool = ResponseTool::ImageGeneration(ImageGenerationTool::default());
+        let description = tool
+            .to_tool_description()
+            .expect("ImageGeneration must produce a synthesized ToolDescription");
+
+        assert_eq!(
+            description.name, "image_generation",
+            "function-tool name must match what the MCP session exposes so \
+             dispatch routes correctly",
+        );
+        assert!(
+            !description.description.is_empty(),
+            "description should be non-empty so gpt-oss understands when to call",
+        );
+
+        let parameters = description
+            .parameters
+            .as_ref()
+            .expect("parameters JSON-schema must be present");
+        assert_eq!(parameters["type"], "object", "schema must be an object");
+
+        let required = parameters["required"]
+            .as_array()
+            .expect("`required` array must be present");
+        assert!(
+            required.iter().any(|v| v.as_str() == Some("prompt")),
+            "`prompt` must be a required parameter, got: {required:?}",
+        );
+
+        let properties = parameters["properties"]
+            .as_object()
+            .expect("`properties` object must be present");
+        for expected in ["prompt", "size", "quality", "background", "output_format"] {
+            assert!(
+                properties.contains_key(expected),
+                "parameters.properties must include `{expected}`; got: {:?}",
+                properties.keys().collect::<Vec<_>>(),
+            );
+        }
+
+        // `prompt` must be typed as a string so gpt-oss renders a
+        // free-form text slot rather than a structured object.
+        assert_eq!(
+            properties["prompt"]["type"], "string",
+            "`prompt` must be a string parameter",
+        );
+    }
+
+    /// End-to-end assertion on the encoded harmony prompt: for a request
+    /// that declares only an `image_generation` tool, the rendered
+    /// conversation MUST contain the function-tool signature gpt-oss
+    /// looks for on the commentary channel. This catches regressions
+    /// where the tool is silently dropped from the developer message.
+    #[test]
+    fn build_from_responses_renders_image_generation_as_function_tool() {
+        let builder = HarmonyBuilder::new();
+        let request = ResponsesRequest {
+            model: "gpt-oss-120b".to_string(),
+            input: ResponseInput::Text("draw a cat".to_string()),
+            tools: Some(vec![ResponseTool::ImageGeneration(
+                ImageGenerationTool::default(),
+            )]),
+            ..Default::default()
+        };
+
+        let output = builder
+            .build_from_responses(&request)
+            .expect("harmony build must succeed");
+
+        let decoded = try_harmony_encoding()
+            .expect("harmony encoding must load")
+            .tokenizer()
+            .decode_utf8(&output.input_ids)
+            .expect("decode harmony tokens back to UTF-8");
+
+        assert!(
+            decoded.contains("type image_generation = ("),
+            "harmony prompt must advertise image_generation as a function \
+             tool to gpt-oss; decoded prompt: {decoded}",
+        );
+        assert!(
+            decoded.contains("namespace functions"),
+            "function-tool section (namespace functions) must be present; \
+             decoded prompt: {decoded}",
+        );
+        assert!(
+            decoded.contains("prompt"),
+            "synthesized schema must expose `prompt`; decoded prompt: {decoded}",
+        );
+    }
+
+    /// Guard against future regressions where callers attach an
+    /// `image_generation` configuration but `has_custom_tools()` still
+    /// returns false (which would skip the developer-message tools
+    /// section entirely and leave gpt-oss unable to emit the call).
+    #[test]
+    fn has_custom_tools_true_for_image_generation_only_request() {
+        let tool_types = ["image_generation"];
+        assert!(
+            has_custom_tools(&tool_types),
+            "a request whose only tool is image_generation must still \
+             trigger the custom-tool path in the harmony prompt",
+        );
+    }
+
+    /// Simulate the MCP-loop side effect where the router appends a
+    /// `ResponseTool::Function` copy of each MCP-exposed tool onto the
+    /// request (see `execute_with_mcp_loop`). For
+    /// `image_generation` the MCP server's tool name collides with the
+    /// synthesized function-tool name, so the harmony developer
+    /// message would otherwise carry two identically-named entries
+    /// inside `namespace functions { … }` and confuse gpt-oss. The
+    /// builder deduplicates by name, keeping the caller's
+    /// original/synthesized entry.
+    #[test]
+    fn dedupes_duplicate_function_tool_names_from_mcp_loop() {
+        use openai_protocol::{common::Function, responses::FunctionTool};
+
+        let builder = HarmonyBuilder::new();
+        let request = ResponsesRequest {
+            model: "gpt-oss-120b".to_string(),
+            input: ResponseInput::Text("draw a cat".to_string()),
+            tools: Some(vec![
+                ResponseTool::ImageGeneration(ImageGenerationTool::default()),
+                // What `convert_mcp_tools_to_response_tools` would
+                // append after the MCP session exposes
+                // `image_generation` — a function tool with the same
+                // name but a schema reflecting the MCP server's side.
+                ResponseTool::Function(FunctionTool {
+                    function: Function {
+                        name: "image_generation".to_string(),
+                        description: Some("mcp-exposed duplicate".to_string()),
+                        parameters: Some(json!({
+                            "type": "object",
+                            "properties": {
+                                "prompt": {"type": "string"}
+                            },
+                            "required": ["prompt"]
+                        })),
+                        strict: None,
+                        extra: Default::default(),
+                    },
+                }),
+            ]),
+            ..Default::default()
+        };
+
+        let output = builder
+            .build_from_responses(&request)
+            .expect("harmony build must succeed");
+
+        let decoded = try_harmony_encoding()
+            .expect("harmony encoding must load")
+            .tokenizer()
+            .decode_utf8(&output.input_ids)
+            .expect("decode harmony tokens back to UTF-8");
+
+        let occurrences = decoded.matches("type image_generation = (").count();
+        assert_eq!(
+            occurrences, 1,
+            "image_generation must appear exactly once in the rendered \
+             function-tools namespace; found {occurrences} occurrences. \
+             Decoded prompt:\n{decoded}",
+        );
+    }
+
+    #[test]
+    fn harmony_effort_clamps_outer_openai_tiers_inward() {
+        use ResponsesReasoningEffort as Tier;
+
+        for (tier, expected) in [
+            (Tier::None, ReasoningEffort::Low),
+            (Tier::Minimal, ReasoningEffort::Low),
+            (Tier::Low, ReasoningEffort::Low),
+            (Tier::Medium, ReasoningEffort::Medium),
+            (Tier::High, ReasoningEffort::High),
+            (Tier::Xhigh, ReasoningEffort::High),
+            (Tier::Max, ReasoningEffort::High),
+        ] {
+            assert_eq!(harmony_reasoning_effort(tier), expected, "{tier:?}");
+            assert_eq!(
+                harmony_reasoning_effort_from_str(tier.as_str()),
+                expected,
+                "{tier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn harmony_effort_from_unknown_string_stays_medium() {
+        assert_eq!(
+            harmony_reasoning_effort_from_str("bogus"),
+            ReasoningEffort::Medium
+        );
+    }
+    #[test]
+    fn namespace_only_request_advertises_qualified_functions() {
+        let request: ResponsesRequest = namespace_test_request();
+        let output = HarmonyBuilder::new()
+            .build_from_responses(&request)
+            .unwrap();
+        let decoded = try_harmony_encoding()
+            .unwrap()
+            .tokenizer()
+            .decode_utf8(&output.input_ids)
+            .unwrap();
+        assert!(decoded.contains("type weather.lookup = ("), "{decoded}");
+        assert!(decoded.contains("type travel.lookup = ("), "{decoded}");
+    }
+
+    #[test]
+    fn chat_tools_are_read_wherever_the_request_declares_them() {
+        let tool = |name: &str| json!({"type": "function", "function": {"name": name, "parameters": {"type": "object"}}});
+        let user = json!({"role": "user", "content": "weather?"});
+        let declaring = json!({"role": "system", "content": "", "tools": [tool("get_weather")]});
+        let request = |body: serde_json::Value| -> ChatCompletionRequest {
+            serde_json::from_value(body).expect("request deserializes")
+        };
+        let cases = [
+            (
+                "request-level only",
+                request(
+                    json!({"model": "kimi-k3", "messages": [user], "tools": [tool("get_time")]}),
+                ),
+                vec!["get_time"],
+            ),
+            (
+                "message-level only",
+                request(json!({"model": "kimi-k3", "messages": [declaring, user]})),
+                vec!["get_weather"],
+            ),
+            (
+                "both",
+                request(json!({
+                    "model": "kimi-k3",
+                    "messages": [declaring, user],
+                    "tools": [tool("get_time")]
+                })),
+                vec!["get_time", "get_weather"],
+            ),
+            (
+                "a declaration the profile does not read",
+                request(json!({"model": "gpt-oss-120b", "messages": [declaring, user]})),
+                vec![],
+            ),
+        ];
+        let builder = HarmonyBuilder::new();
+        for (case, request, expected) in cases {
+            assert_eq!(request.declares_tools(), !expected.is_empty(), "{case}");
+            let tools = chat_tools(&request);
+            let names: Vec<&str> = tools
+                .iter()
+                .flatten()
+                .map(|tool| tool.function.name.as_str())
+                .collect();
+            assert_eq!(names, expected, "{case}");
+            // The system message opens the commentary channel for a request with tools.
+            let system = builder.build_system_message_from_chat(&request);
+            let commentary = system.content.iter().any(|content| match content {
+                Content::SystemContent(content) => {
+                    content.channel_config.as_ref().is_some_and(|channels| {
+                        channels.valid_channels.iter().any(|c| c == "commentary")
+                    })
+                }
+                _ => false,
+            });
+            assert_eq!(commentary, !expected.is_empty(), "{case}");
+            // The developer message describes the same tools.
+            let developer = builder.build_developer_message(tools.as_ref(), None);
+            assert_eq!(developer.content.len(), 1, "{case}");
+            let described: Vec<String> = developer
+                .content
+                .iter()
+                .filter_map(|content| match content {
+                    Content::DeveloperContent(content) => Some(content),
+                    _ => None,
+                })
+                .flat_map(|content| {
+                    content
+                        .tools
+                        .iter()
+                        .flat_map(|namespaces| namespaces.values())
+                })
+                .flat_map(|namespace| namespace.tools.iter().map(|tool| tool.name.clone()))
+                .collect();
+            assert_eq!(described, expected, "{case}");
+        }
+    }
+
+    /// An engine's answer for two generated tokens, three candidates each:
+    /// the sampled token ranked beside two runners-up, whether or not
+    /// alternatives were asked for.
+    fn three_candidates_per_position() -> vllm::OutputLogProbs {
+        vllm::OutputLogProbs {
+            token_logprobs: vec![-0.1, -0.2],
+            token_ids: vec![1, 2],
+            top_logprobs: vec![
+                vllm::TopLogProbs {
+                    values: vec![-0.1, -1.5, -2.5],
+                    token_ids: vec![1, 3, 5],
+                },
+                vllm::TopLogProbs {
+                    values: vec![-0.2, -1.6, -2.6],
+                    token_ids: vec![2, 4, 6],
+                },
+            ],
+        }
+    }
+
+    /// The per-token entries of a converted answer.
+    fn entries(logprobs: ChatLogProbs) -> Vec<ChatLogProbsContent> {
+        match logprobs {
+            ChatLogProbs::Detailed { content, .. } => content.unwrap_or_default(),
+            ChatLogProbs::Raw(_) => Vec::new(),
+        }
+    }
+
+    /// A chat request on the Harmony path gets the `top_logprobs` candidates
+    /// it asked for per token, none when it asked for none, as it does on
+    /// the regular path: the engine's surplus candidates stay behind.
+    #[test]
+    fn harmony_logprobs_carry_only_the_requested_candidates() {
+        let encoding = try_harmony_encoding().expect("harmony encoding must load");
+        let proto = three_candidates_per_position();
+        for (top_logprobs, expected) in [
+            (None, 0),
+            (Some(0), 0),
+            (Some(1), 1),
+            (Some(2), 2),
+            (Some(3), 3),
+            (Some(5), 3),
+        ] {
+            let answered = entries(convert_harmony_logprobs(
+                encoding,
+                ProtoOutputLogProbs::Vllm(&proto),
+                top_logprobs,
+            ));
+            let per_token: Vec<usize> = answered
+                .iter()
+                .map(|entry| entry.top_logprobs.len())
+                .collect();
+            assert_eq!(
+                per_token,
+                vec![expected; 2],
+                "top_logprobs {top_logprobs:?}"
+            );
+        }
+    }
+
+    /// The candidates kept are the engine's first ones in its order, each
+    /// decoded by Harmony's tokenizer as the sampled token is.
+    #[test]
+    fn harmony_logprobs_keep_the_engines_first_candidates() {
+        let encoding = try_harmony_encoding().expect("harmony encoding must load");
+        let text = |token_id: u32| {
+            encoding
+                .tokenizer()
+                .decode_utf8([token_id])
+                .expect("a token of the vocabulary")
+        };
+        let proto = three_candidates_per_position();
+        let answered = entries(convert_harmony_logprobs(
+            encoding,
+            ProtoOutputLogProbs::Vllm(&proto),
+            Some(2),
+        ));
+        let tokens: Vec<String> = answered.iter().map(|entry| entry.token.clone()).collect();
+        assert_eq!(tokens, vec![text(1), text(2)]);
+        let candidates: Vec<Vec<String>> = answered
+            .iter()
+            .map(|entry| {
+                entry
+                    .top_logprobs
+                    .iter()
+                    .map(|candidate| candidate.token.clone())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            candidates,
+            vec![vec![text(1), text(3)], vec![text(2), text(4)]]
+        );
+    }
+
+    // The prompts vLLM's Harmony renderer tests expect for the same chat
+    // requests (`rust/src/chat/src/renderer/harmony/fixtures/` in
+    // vllm-project/vllm at 7b77ed58).
+    const SIMPLE_USER: &str = concat!(
+        "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\n",
+        "Knowledge cutoff: 2024-06\n",
+        "Current date: 2025-06-28\n",
+        "\n",
+        "Reasoning: medium\n",
+        "\n",
+        "# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|>",
+        "<|start|>user<|message|>Hello, who are you?<|end|>",
+        "<|start|>assistant",
+    );
+    const LEADING_SYSTEM: &str = concat!(
+        "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\n",
+        "Knowledge cutoff: 2024-06\n",
+        "Current date: 2025-06-28\n",
+        "\n",
+        "Reasoning: high\n",
+        "\n",
+        "# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|>",
+        "<|start|>developer<|message|># Instructions\n",
+        "\n",
+        "Answer tersely.<|end|>",
+        "<|start|>user<|message|>What is 2 + 2?<|end|>",
+        "<|start|>assistant",
+    );
+    const DEVELOPER_TOOLS: &str = concat!(
+        "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\n",
+        "Knowledge cutoff: 2024-06\n",
+        "Current date: 2025-06-28\n",
+        "\n",
+        "Reasoning: medium\n",
+        "\n",
+        "# Valid channels: analysis, commentary, final. Channel must be included for every message.\n",
+        "Calls to these tools must go to the commentary channel: 'functions'.<|end|>",
+        "<|start|>developer<|message|># Instructions\n",
+        "\n",
+        "Use tools when needed.\n",
+        "\n",
+        "# Tools\n",
+        "\n",
+        "## functions\n",
+        "\n",
+        "namespace functions {\n",
+        "\n",
+        "// Lookup a record.\n",
+        "type lookup = (_: {\n",
+        "id: string,\n",
+        "}) => any;\n",
+        "\n",
+        "} // namespace functions<|end|>",
+        "<|start|>user<|message|>Find record abc.<|end|>",
+        "<|start|>assistant",
+    );
+    const REQUEST_TOOLS: &str = concat!(
+        "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\n",
+        "Knowledge cutoff: 2024-06\n",
+        "Current date: 2025-06-28\n",
+        "\n",
+        "Reasoning: medium\n",
+        "\n",
+        "# Valid channels: analysis, commentary, final. Channel must be included for every message.\n",
+        "Calls to these tools must go to the commentary channel: 'functions'.<|end|>",
+        "<|start|>developer<|message|># Tools\n",
+        "\n",
+        "## functions\n",
+        "\n",
+        "namespace functions {\n",
+        "\n",
+        "// Get weather for a city.\n",
+        "type get_weather = (_: {\n",
+        "city: string,\n",
+        "}) => any;\n",
+        "\n",
+        "} // namespace functions<|end|>",
+        "<|start|>user<|message|>Check Hangzhou weather.<|end|>",
+        "<|start|>assistant",
+    );
+
+    /// The prompt `request` renders to, dated like vLLM's fixtures.
+    fn rendered_chat_prompt(request: serde_json::Value) -> String {
+        let request: ChatCompletionRequest =
+            serde_json::from_value(request).expect("request deserializes");
+        let output = HarmonyBuilder::new()
+            .build_from_chat(&request)
+            .expect("harmony build must succeed");
+        let mut prompt = try_harmony_encoding()
+            .expect("harmony encoding must load")
+            .tokenizer()
+            .decode_utf8(&output.input_ids)
+            .expect("decode harmony tokens back to UTF-8");
+        // The builder dates the conversation today.
+        let date =
+            prompt.find("Current date: ").expect("a conversation date") + "Current date: ".len();
+        prompt.replace_range(date..date + "2025-06-28".len(), "2025-06-28");
+        prompt
+    }
+
+    /// `prompt` without `commentary` in its valid channels: `build_system_message`
+    /// still drops it for a request without tools, where vLLM keeps it.
+    fn without_commentary(prompt: &str) -> String {
+        prompt.replace("analysis, commentary, final", "analysis, final")
+    }
+
+    /// A chat request with neither instructions nor tools gets no developer
+    /// message, as on the Responses path and vLLM's chat path.
+    #[test]
+    fn a_chat_request_without_instructions_or_tools_has_no_developer_message() {
+        let user = json!({"role": "user", "content": "Hello, who are you?"});
+        let cases = [
+            (
+                "no system message",
+                json!({"model": "gpt-oss-120b", "messages": [user]}),
+                without_commentary(SIMPLE_USER),
+            ),
+            (
+                "an empty system message",
+                json!({"model": "gpt-oss-120b", "messages": [{"role": "system", "content": ""}, user]}),
+                without_commentary(SIMPLE_USER),
+            ),
+            (
+                "a system message of empty text parts",
+                json!({"model": "gpt-oss-120b", "messages": [
+                    {"role": "system", "content": [
+                        {"type": "text", "text": ""},
+                        {"type": "text", "text": ""}
+                    ]},
+                    user
+                ]}),
+                without_commentary(SIMPLE_USER),
+            ),
+            // A tool list, even an empty one, keeps the commentary channel.
+            (
+                "an empty tool list",
+                json!({"model": "gpt-oss-120b", "messages": [user], "tools": []}),
+                SIMPLE_USER.to_string(),
+            ),
+        ];
+        for (case, request, expected) in cases {
+            assert_eq!(rendered_chat_prompt(request), expected, "{case}");
+        }
+    }
+
+    /// A leading system or developer message becomes the developer message's
+    /// instructions, as on vLLM's chat path, instead of a second system message
+    /// after the builder's own.
+    #[test]
+    fn a_leading_system_or_developer_message_becomes_the_developer_instructions() {
+        for role in ["system", "developer"] {
+            let prompt = rendered_chat_prompt(json!({
+                "model": "gpt-oss-120b",
+                "reasoning_effort": "high",
+                "messages": [
+                    {"role": role, "content": "Answer tersely."},
+                    {"role": "user", "content": "What is 2 + 2?"}
+                ]
+            }));
+            assert_eq!(prompt, without_commentary(LEADING_SYSTEM), "{role}");
+        }
+    }
+
+    /// Instructions and tools share the one developer message, instructions
+    /// first. vLLM's fixture declares the tool on the developer message; a
+    /// gpt-oss request declares it at the request level.
+    #[test]
+    fn leading_instructions_come_before_the_tools_in_one_developer_message() {
+        let prompt = rendered_chat_prompt(json!({
+            "model": "gpt-oss-120b",
+            "tools": [{"type": "function", "function": {
+                "name": "lookup",
+                "description": "Lookup a record.",
+                "parameters": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}
+            }}],
+            "messages": [
+                {"role": "developer", "content": "Use tools when needed."},
+                {"role": "user", "content": "Find record abc."}
+            ]
+        }));
+        assert_eq!(prompt, DEVELOPER_TOOLS);
+    }
+
+    /// A request with tools and no instructions keeps its tools-only developer
+    /// message.
+    #[test]
+    fn a_chat_request_with_tools_keeps_its_developer_message() {
+        let prompt = rendered_chat_prompt(json!({
+            "model": "gpt-oss-120b",
+            "tools": [{"type": "function", "function": {
+                "name": "get_weather",
+                "description": "Get weather for a city.",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+                "strict": true
+            }}],
+            "messages": [{"role": "user", "content": "Check Hangzhou weather."}]
+        }));
+        assert_eq!(prompt, REQUEST_TOOLS);
+    }
+
+    /// With trace logging on, a Responses build still writes its two trace
+    /// lines from the prompt decoded back: the decoded length on the first,
+    /// the text under the marker of the second.
+    #[test]
+    #[traced_test]
+    fn build_from_responses_traces_the_decoded_prompt() {
+        let request = ResponsesRequest {
+            model: "gpt-oss-120b".to_string(),
+            input: ResponseInput::Text("draw a cat".to_string()),
+            ..Default::default()
+        };
+        let output = HarmonyBuilder::new()
+            .build_from_responses(&request)
+            .expect("harmony build must succeed");
+        let decoded = try_harmony_encoding()
+            .expect("harmony encoding must load")
+            .tokenizer()
+            .decode_utf8(&output.input_ids)
+            .expect("decode harmony tokens back to UTF-8");
+
+        assert!(logs_contain(&format!("decoded_length={}", decoded.len())));
+        assert!(logs_contain("DECODED_TEXT_START"));
+    }
+
+    #[test]
+    fn build_from_responses_renders_top_level_custom_tool_in_prompt() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "gpt-oss-120b",
+            "tools": [{
+                "type": "custom",
+                "name": "apply_patch",
+                "description": "Apply a unified patch to files."
+            }],
+            "input": [
+                {"role":"user", "content":"Edit main.rs"},
+                {"type":"custom_tool_call", "name":"apply_patch", "call_id":"call_1",
+                 "input":"*** Begin Patch\n*** Add File: main.rs\n+fn main() {}\n*** End Patch"},
+                {"type":"custom_tool_call_output", "call_id":"call_1",
+                 "output":[{"type":"input_text", "text":"Success. Added main.rs."}]}
+            ]
+        }))
+        .unwrap();
+        let output = HarmonyBuilder::new()
+            .build_from_responses(&request)
+            .expect("harmony build must succeed");
+        let decoded = try_harmony_encoding()
+            .expect("harmony encoding must load")
+            .tokenizer()
+            .decode_utf8(&output.input_ids)
+            .expect("decode harmony tokens");
+        assert!(
+            decoded.contains("apply_patch"),
+            "top-level custom tool must be rendered in Harmony prompt: {decoded}"
+        );
+        assert!(
+            decoded.contains(r#"{"input":"*** Begin Patch\n*** Add File: main.rs"#),
+            "{decoded}"
+        );
+        assert!(decoded.contains("Success. Added main.rs."), "{decoded}");
+    }
+}

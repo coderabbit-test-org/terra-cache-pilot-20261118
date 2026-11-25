@@ -1,0 +1,213 @@
+# Standalone services for agentic runner pods.
+# These run as shared Deployments + ClusterIP Services so all runner pods
+# connect to the same instances instead of running per-pod sidecars.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oracle-db
+  namespace: actions-runner-system
+  labels:
+    app: oracle-db
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: oracle-db
+  template:
+    metadata:
+      labels:
+        app: oracle-db
+    spec:
+      containers:
+        - name: oracle-db
+          image: docker.io/gvenzl/oracle-free:23-slim-faststart
+          ports:
+            - containerPort: 1521
+          env:
+            - name: ORACLE_PASSWORD
+              value: oracle
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          startupProbe:
+            exec:
+              command: ["healthcheck.sh"]
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 30
+            successThreshold: 1
+          readinessProbe:
+            exec:
+              command: ["healthcheck.sh"]
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 10
+          livenessProbe:
+            exec:
+              command: ["healthcheck.sh"]
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: oracle-db
+  namespace: actions-runner-system
+  labels:
+    app: oracle-db
+spec:
+  selector:
+    app: oracle-db
+  ports:
+    - port: 1521
+      targetPort: 1521
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres-db
+  namespace: actions-runner-system
+  labels:
+    app: postgres-db
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres-db
+  template:
+    metadata:
+      labels:
+        app: postgres-db
+    spec:
+      containers:
+        - name: postgres-db
+          image: docker.io/library/postgres:16
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_PASSWORD
+              value: postgres
+            - name: POSTGRES_DB
+              value: smg_ci_test
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          startupProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres"]
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 30
+            successThreshold: 1
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres"]
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 10
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres"]
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-db
+  namespace: actions-runner-system
+  labels:
+    app: postgres-db
+spec:
+  selector:
+    app: postgres-db
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: brave-search-mcp
+  namespace: actions-runner-system
+  labels:
+    app: brave-search-mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: brave-search-mcp
+  template:
+    metadata:
+      labels:
+        app: brave-search-mcp
+    spec:
+      containers:
+        - name: brave-search-mcp
+          # Pinned by digest so a push of the floating tag cannot change the
+          # server under the e2e rows unannounced: this is the registry's
+          # latest as of 2026-06-25, pinned 2026-11-10. Move the digest on
+          # purpose, with a note of what changed.
+          image: docker.io/mcp/brave-search@sha256:f58a5c22c1196ec7bd1ca586ce216f2334fc298550ddcf652c0e8adb6d256d78
+          ports:
+            - containerPort: 8080
+          env:
+            - name: BRAVE_MCP_TRANSPORT
+              value: http
+            - name: BRAVE_MCP_PORT
+              value: "8080"
+            - name: BRAVE_MCP_ENABLED_TOOLS
+              value: "brave_web_search brave_local_search"
+            - name: BRAVE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: brave-api-key
+                  key: api-key
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /ping
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /ping
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: brave-search-mcp
+  namespace: actions-runner-system
+  labels:
+    app: brave-search-mcp
+spec:
+  selector:
+    app: brave-search-mcp
+  ports:
+    - port: 8080
+      targetPort: 8080

@@ -1,0 +1,54 @@
+[project]
+name = "smg-e2e-tests"
+version = "0.1.0"
+description = "E2E tests for Shepherd Model Gateway"
+requires-python = ">=3.12"
+
+dependencies = [
+  "anthropic",
+  "fastmcp-slim[server]>=3.3,<5",
+  "grpcio",
+  "grpcio-health-checking",
+  "httpx",
+  "jinja2",
+  "mcp>=1.24,<3",
+  "numpy",
+  "openai",
+  "pandas",
+  "pillow",
+  "pytest",
+  "pytest-rerunfailures",
+  # infra.worker imports yaml at module level (the TRT-LLM config dump)
+  "pyyaml",
+  "requests",
+  # fixtures.mock_answers encodes a scripted answer with the model's tokenizer.json
+  "tokenizers",
+  "tqdm",
+  "uvicorn>=0.30",
+  "websockets",
+]
+
+[project.optional-dependencies]
+dev = [
+  "mypy",
+  "ruff",
+]
+
+[tool.setuptools]
+# No Python packages to build — this project is a test suite.
+# Dependencies are declared here so CI can `pip install e2e_test/`.
+py-modules = []
+packages = []
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+markers = [
+  "e2e: mark test as end-to-end test requiring GPU workers",
+  "slow: mark test as slow-running",
+  "external: mark test as dependent on external third-party services (run with -m external)",
+  "kind: mark test as requiring a local kind cluster (run with SMG_KIND_E2E=1)",
+]
+addopts = "-v -s"
+# Explicitly disable live log to avoid "---- live log ----" dividers
+# We configure logging manually in conftest.py
+log_cli = false

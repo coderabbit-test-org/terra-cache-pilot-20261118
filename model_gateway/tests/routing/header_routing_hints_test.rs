@@ -1,0 +1,414 @@
+//! Header routing-hint integration tests.
+//!
+//! `x-smg-routing-tokens` and `x-smg-routing-key` let text-needing policies
+//! route without the body content: a valid token hint wins over body-derived
+//! tokens/text, a valid key hint wins over token/text keying, and anything
+//! malformed or over-cap is ignored so the request routes exactly as it
+//! would without the header.
+
+use std::sync::Arc;
+
+use axum::{
+    body::Body,
+    extract::Request,
+    http::{header::CONTENT_TYPE, StatusCode},
+};
+use openai_protocol::worker::WorkerStatus;
+use serde_json::json;
+use smg::{
+    config::PolicyConfig,
+    policies::{CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy, SelectWorkerInfo},
+    routers::{
+        common::header_utils::parse_routing_tokens_hint, grpc::backend_client::BasicWorkerBuilder,
+    },
+};
+use smg_worker::identity::basic::{Worker, WorkerType};
+use tower::ServiceExt;
+
+use crate::common::{
+    mock_worker::{set_request_recorder, RequestRecorder},
+    AppTestContext, TestRouterConfig, TestWorkerConfig,
+};
+
+#[cfg(test)]
+mod header_routing_hints_tests {
+    use super::*;
+
+    const WORKER_COUNT: u16 = 3;
+
+    /// Start `WORKER_COUNT` recorded workers behind a router with `config`.
+    async fn setup(
+        config: smg::config::RouterConfig,
+        worker_port: u16,
+    ) -> (AppTestContext, Vec<Arc<RequestRecorder>>, String) {
+        let recorders: Vec<Arc<RequestRecorder>> = (0..WORKER_COUNT)
+            .map(|i| {
+                let recorder = RequestRecorder::new();
+                set_request_recorder(worker_port + i, Arc::clone(&recorder));
+                recorder
+            })
+            .collect();
+
+        let ctx = AppTestContext::new_with_config(
+            config,
+            TestWorkerConfig::healthy_workers(worker_port, WORKER_COUNT),
+        )
+        .await;
+
+        let model_id = ctx
+            .app_context
+            .worker_registry
+            .get_all()
+            .first()
+            .expect("workers are registered")
+            .model_id()
+            .to_string();
+
+        (ctx, recorders, model_id)
+    }
+
+    fn chat_request(model: &str, prompt: &str, hints: &[(&str, &str)]) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(CONTENT_TYPE, "application/json");
+        for (name, value) in hints {
+            builder = builder.header(*name, *value);
+        }
+        builder
+            .body(Body::from(
+                json!({
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "stream": false
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    }
+
+    /// 32 comma-separated ids: two full token-tree pages (PAGE_SIZE = 16).
+    fn token_hint() -> String {
+        (100u32..132)
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    #[tokio::test]
+    async fn test_token_hint_pins_cache_aware_worker_across_bodies() {
+        let (ctx, recorders, model_id) = setup(TestRouterConfig::cache_aware(3170), 19450).await;
+        let app = ctx.create_app();
+        let hint = token_hint();
+
+        for i in 0..6 {
+            let response = app
+                .clone()
+                .oneshot(chat_request(
+                    &model_id,
+                    &format!("entirely different prompt {i}"),
+                    &[("x-smg-routing-tokens", &hint)],
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let served: Vec<usize> = recorders.iter().map(|r| r.bodies().len()).collect();
+        assert_eq!(
+            served.iter().filter(|count| **count > 0).count(),
+            1,
+            "one hinted prefix must pin to a single worker, got {served:?}"
+        );
+        assert_eq!(served.iter().sum::<usize>(), 6);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_no_hint_distinct_bodies_spread_cache_aware_workers() {
+        let (ctx, recorders, model_id) = setup(TestRouterConfig::cache_aware(3171), 19453).await;
+        let app = ctx.create_app();
+
+        // Prompts share no prefix (distinct first characters), so the string
+        // tree never produces a cache hit and every pick is a miss, broken
+        // among three idle workers by the scorer's fair tie draw. Twelve of
+        // them: the chance that a fair draw lands all on one worker is 3^-11,
+        // so a pile-up reads as a defect, not as a draw.
+        for prompt in [
+            "alpha wolves hunt at dusk",
+            "borrow a cup of sugar",
+            "cedar boxes hold old maps",
+            "delta flights leave early",
+            "every engine hums a note",
+            "frozen lakes crack loudly",
+            "gentle rivers carve the stone",
+            "harbor lights guide the boats",
+            "iron gates rust in the rain",
+            "jasmine blooms after midnight",
+            "kettles whistle before dawn",
+            "lanterns sway along the pier",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(chat_request(&model_id, prompt, &[]))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let served: Vec<usize> = recorders.iter().map(|r| r.bodies().len()).collect();
+        assert!(
+            served.iter().filter(|count| **count > 0).count() > 1,
+            "without a hint, distinct prompts must not pile onto one worker, got {served:?}"
+        );
+        assert_eq!(served.iter().sum::<usize>(), 12);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_malformed_hints_are_ignored_and_requests_route() {
+        let (ctx, recorders, model_id) = setup(TestRouterConfig::cache_aware(3172), 19456).await;
+        let app = ctx.create_app();
+
+        let over_cap_tokens = vec!["7"; 513].join(",");
+        let over_cap_key = "k".repeat(129);
+        let malformed: Vec<(&str, &str)> = vec![
+            ("x-smg-routing-tokens", "1,not-a-number,3"),
+            ("x-smg-routing-tokens", "-5,3"),
+            ("x-smg-routing-tokens", over_cap_tokens.as_str()),
+            ("x-smg-routing-key", over_cap_key.as_str()),
+        ];
+
+        for (name, value) in &malformed {
+            let response = app
+                .clone()
+                .oneshot(chat_request(
+                    &model_id,
+                    "same prompt every time",
+                    &[(name, value)],
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "a bad hint must never fail the request ({name}: {value:.32})"
+            );
+        }
+
+        let served: usize = recorders.iter().map(|r| r.bodies().len()).sum();
+        assert_eq!(served, malformed.len(), "every request must reach a worker");
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_routing_key_hint_pins_prefix_hash_worker_across_prompts() {
+        let (ctx, recorders, model_id) =
+            setup(TestRouterConfig::prefix_hash(3173, 16), 19459).await;
+        let app = ctx.create_app();
+
+        for i in 0..6 {
+            let response = app
+                .clone()
+                .oneshot(chat_request(
+                    &model_id,
+                    &format!("entirely different prompt {i}"),
+                    &[("x-smg-routing-key", "session-abc")],
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let pinned: Vec<usize> = recorders.iter().map(|r| r.bodies().len()).collect();
+        assert_eq!(
+            pinned.iter().filter(|count| **count > 0).count(),
+            1,
+            "one routing key must pin to a single worker, got {pinned:?}"
+        );
+
+        // Distinct keys with the same prompt must spread.
+        for i in 0..12 {
+            let response = app
+                .clone()
+                .oneshot(chat_request(
+                    &model_id,
+                    "same prompt every time",
+                    &[("x-smg-routing-key", &format!("session-{i}"))],
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let served: Vec<usize> = recorders.iter().map(|r| r.bodies().len()).collect();
+        let spread: Vec<usize> = served
+            .iter()
+            .zip(&pinned)
+            .map(|(total, before)| total - before)
+            .collect();
+        assert!(
+            spread.iter().filter(|count| **count > 0).count() > 1,
+            "distinct keys must not pile onto one worker, got {spread:?}"
+        );
+        assert_eq!(served.iter().sum::<usize>(), 18);
+
+        ctx.shutdown().await;
+    }
+
+    /// `x-smg-target-worker` under consistent hashing counts the workers
+    /// available when the request arrives: with the worker behind index 1
+    /// not ready, index 1 lands on the worker that was behind index 2 and
+    /// index 2 is answered 503 with no worker asked. Ready again, the
+    /// indexes read as before.
+    #[tokio::test]
+    async fn test_target_worker_hint_indexes_the_available_workers() {
+        let mut config = TestRouterConfig::round_robin(3174);
+        config.policy = PolicyConfig::ConsistentHashing;
+        let (ctx, recorders, model_id) = setup(config, 19462).await;
+        let app = ctx.create_app();
+
+        // The worker behind each index, learned from a healthy pool.
+        let served = || -> Vec<usize> { recorders.iter().map(|r| r.bodies().len()).collect() };
+        let mut behind = Vec::new();
+        for index in 0..3u8 {
+            let before = served();
+            let response = app
+                .clone()
+                .oneshot(chat_request(
+                    &model_id,
+                    "prompt",
+                    &[("x-smg-target-worker", &index.to_string())],
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let after = served();
+            let hit: Vec<usize> = (0..recorders.len())
+                .filter(|&r| after[r] == before[r] + 1)
+                .collect();
+            assert_eq!(
+                hit.len(),
+                1,
+                "index {index} lands on one worker, got {hit:?}"
+            );
+            behind.push(hit[0]);
+        }
+        assert_eq!(behind.len(), 3);
+        assert_ne!(behind[0], behind[1]);
+        assert_ne!(behind[1], behind[2]);
+        assert_ne!(behind[0], behind[2]);
+
+        let out = ctx
+            .app_context
+            .worker_registry
+            .get_all()
+            .into_iter()
+            .find(|worker| worker.url() == ctx.worker_urls[behind[1]])
+            .expect("the worker behind index 1 is registered");
+        out.set_status(WorkerStatus::NotReady);
+
+        let expect = |index: u8, status: StatusCode, recorder: Option<usize>| {
+            let app = app.clone();
+            let model_id = model_id.clone();
+            let served = &served;
+            async move {
+                let before = served();
+                let response = app
+                    .oneshot(chat_request(
+                        &model_id,
+                        "prompt",
+                        &[("x-smg-target-worker", &index.to_string())],
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), status, "index {index}");
+                let after = served();
+                let hit: Vec<usize> = (0..before.len())
+                    .filter(|&r| after[r] == before[r] + 1)
+                    .collect();
+                assert_eq!(
+                    hit,
+                    recorder.into_iter().collect::<Vec<_>>(),
+                    "index {index}: the worker asked"
+                );
+            }
+        };
+        expect(1, StatusCode::OK, Some(behind[2])).await;
+        expect(2, StatusCode::SERVICE_UNAVAILABLE, None).await;
+        expect(0, StatusCode::OK, Some(behind[0])).await;
+
+        out.set_status(WorkerStatus::Ready);
+        expect(1, StatusCode::OK, Some(behind[1])).await;
+        expect(2, StatusCode::OK, Some(behind[2])).await;
+
+        ctx.shutdown().await;
+    }
+
+    /// Policy-layer check: hinted tokens flow through cache_aware's token-tree
+    /// selection with no request text at all, exactly as the router builds
+    /// `SelectWorkerInfo` from a parsed `x-smg-routing-tokens` header.
+    #[test]
+    fn test_cache_aware_selects_same_worker_for_same_hinted_prefix() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+
+        let workers: Vec<Arc<dyn Worker>> = ["http://w1:8000", "http://w2:8000", "http://w3:8000"]
+            .iter()
+            .map(|url| {
+                let worker = BasicWorkerBuilder::new(*url)
+                    .worker_type(WorkerType::Regular)
+                    .health_config(openai_protocol::worker::HealthCheckConfig {
+                        disable_health_check: true,
+                        ..Default::default()
+                    })
+                    .build();
+                policy.add_worker(&worker);
+                Arc::new(worker) as Arc<dyn Worker>
+            })
+            .collect();
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-smg-routing-tokens", token_hint().parse().unwrap());
+        let hinted = parse_routing_tokens_hint(Some(&headers)).expect("hint is valid");
+        let info = SelectWorkerInfo {
+            tokens: Some(&hinted),
+            request_text: None,
+            ..Default::default()
+        };
+
+        let first = policy
+            .select_worker(&workers, &info)
+            .expect("hinted request must route");
+        for _ in 0..5 {
+            assert_eq!(
+                policy.select_worker(&workers, &info),
+                Some(first),
+                "the same hinted prefix must keep its worker"
+            );
+        }
+
+        // A different hinted prefix is free to learn its own worker. An
+        // unseen prefix has zero overlap with every worker, and equal-score
+        // ties break RANDOMLY by design (anti-herding), so with all loads
+        // equal this pick would land back on `first` one time in three. Give
+        // the first prefix's worker real load so "goes to min-load" is a
+        // deterministic claim instead of a coin flip.
+        workers[first].increment_load();
+        let other: Vec<u32> = (500u32..532).collect();
+        let other_info = SelectWorkerInfo {
+            tokens: Some(&other),
+            request_text: None,
+            ..Default::default()
+        };
+        let other_first = policy
+            .select_worker(&workers, &other_info)
+            .expect("hinted request must route");
+        assert_ne!(other_first, first, "an unseen prefix goes to min-load");
+    }
+}

@@ -1,0 +1,58 @@
+pull_request_rules:
+  - name: Comment on DCO check failure
+    description: Post fix instructions when DCO sign-off is missing
+    conditions:
+      - check-failure = DCO
+      - -closed
+      - -draft
+    actions:
+      comment:
+        message: |
+          Hi @{{author}}, the DCO sign-off check has failed. All commits must include a `Signed-off-by` line.
+
+          **To fix existing commits:**
+          ```bash
+          # Sign off the last N commits (replace N with the number of unsigned commits)
+          git rebase HEAD~N --signoff
+          git push --force-with-lease
+          ```
+
+          **To sign off future commits automatically:**
+          - Use `git commit -s` every time, or
+          - **VSCode**: enable `Git: Always Sign Off` in Settings
+          - **PyCharm**: enable `Sign-off commit` in the Commit tool window
+
+  - name: Add needs-rebase label and comment on merge conflicts
+    description: Label and comment when a PR has merge conflicts
+    conditions:
+      - conflict
+      - -closed
+      - -draft
+    actions:
+      label:
+        add:
+          - needs-rebase
+      comment:
+        message: |
+          Hi @{{author}}, this PR has merge conflicts that must be resolved before it can be merged. Please rebase your branch:
+          ```bash
+          git fetch origin main
+          git rebase origin/main
+          # resolve any conflicts, then:
+          git push --force-with-lease
+          ```
+
+  - name: Remove needs-rebase label when conflict is resolved
+    description: Remove needs-rebase label when PR no longer has conflicts
+    conditions:
+      - -conflict
+      - -closed
+      - label = needs-rebase
+    actions:
+      label:
+        remove:
+          - needs-rebase
+
+  # NOTE: Stale PR detection and auto-close is handled by .github/workflows/stale.yml
+  # using actions/stale, which correctly tracks activity without being affected by
+  # bot comments or GitHub's internal updated-at recalculations.

@@ -1,0 +1,387 @@
+//! Non-streaming response handling for OpenAI-compatible responses
+//!
+//! This module handles non-streaming Responses API requests with MCP tool support.
+
+use axum::{
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    Json,
+};
+use serde_json::Value;
+use smg_mcp::McpToolSession;
+use tracing::warn;
+
+use super::utils::{patch_response_with_request_metadata, restore_original_tools};
+use crate::{
+    error,
+    header_utils::{extract_forwardable_request_headers, ApiProvider},
+    mcp_utils::{ensure_request_mcp_routing, request_uses_mcp_routing},
+    openai::{
+        context::{PayloadState, RequestContext, ResponsesPayloadState},
+        mcp::{execute_tool_loop, prepare_mcp_tools_as_functions, ToolLoopExecutionContext},
+    },
+    openai_bridge,
+    persistence_utils::{persist_conversation_items, PersistStep},
+    tenant::storage_tenant,
+    upstream_body::{
+        read_response_body_limited, ReadBodyResult, ERROR_BODY_TOO_LARGE, MAX_ERROR_RESPONSE_SIZE,
+    },
+    worker::redacted_url,
+};
+
+/// Handle a non-streaming responses request
+pub async fn handle_non_streaming_response(mut ctx: RequestContext) -> Response {
+    let payload_state = match ctx.state.payload.take() {
+        Some(ps) => ps,
+        None => {
+            return error::internal_error("internal_error", "Payload not prepared");
+        }
+    };
+
+    let PayloadState {
+        json: mut payload,
+        url,
+    } = payload_state;
+    let ResponsesPayloadState {
+        previous_response_id,
+        existing_mcp_list_tools_labels,
+    } = ctx.take_responses_payload().unwrap_or_default();
+
+    let original_body = match ctx.responses_request() {
+        Some(r) => r,
+        None => {
+            return error::internal_error("internal_error", "Expected responses request");
+        }
+    };
+    let worker = match ctx.worker() {
+        Some(w) => w.clone(),
+        None => {
+            return error::internal_error("internal_error", "Worker not selected");
+        }
+    };
+    // Only MCP-laden requests need the orchestrator and format registry;
+    // without this narrowing, plain non-MCP requests would 500 in
+    // deployments that run the gateway without MCP wiring. A registry-less
+    // MCP request still hard-fails — silent fallback would mis-route
+    // hosted tools.
+    let mcp_routing = match original_body.tools.as_deref() {
+        Some(tools) if request_uses_mcp_routing(tools) => {
+            let Some(mcp_orchestrator) = ctx.components.mcp_orchestrator() else {
+                return error::internal_error(
+                    "internal_error",
+                    "MCP orchestrator required for requests carrying MCP/builtin tools",
+                );
+            };
+            let Some(registry) = ctx.components.mcp_format_registry() else {
+                return error::internal_error(
+                    "internal_error",
+                    "MCP format registry required for requests carrying MCP/builtin tools",
+                );
+            };
+            match ensure_request_mcp_routing(mcp_orchestrator, registry, tools).await {
+                Ok(servers) => {
+                    servers.map(|servers| (servers, mcp_orchestrator.clone(), registry.clone()))
+                }
+                Err(refusal) => return refusal,
+            }
+        }
+        _ => None,
+    };
+
+    let mut response_json: Value;
+
+    if let Some((mcp_servers, mcp_orchestrator, mcp_format_registry)) = mcp_routing {
+        let session_request_id = original_body
+            .request_id
+            .clone()
+            .unwrap_or_else(|| format!("req_{}", uuid::Uuid::now_v7()));
+        let forwarded_headers = extract_forwardable_request_headers(ctx.headers());
+        let mut session = McpToolSession::new_with_headers(
+            &mcp_orchestrator,
+            mcp_servers,
+            &session_request_id,
+            forwarded_headers,
+        );
+        if let Some(tools) = original_body.tools.as_deref() {
+            openai_bridge::configure_response_tools_approval(&mut session, tools);
+        }
+        prepare_mcp_tools_as_functions(&mut payload, &session);
+
+        match execute_tool_loop(
+            ctx.components.client(),
+            &url,
+            ctx.headers(),
+            worker.api_key(),
+            payload,
+            ToolLoopExecutionContext {
+                original_body,
+                existing_mcp_list_tools_labels: &existing_mcp_list_tools_labels,
+                session: &session,
+                format_registry: &mcp_format_registry,
+            },
+        )
+        .await
+        {
+            Ok(resp) => {
+                worker.record_outcome(200);
+                response_json = resp;
+            }
+            Err(err) => {
+                worker.record_outcome(502);
+                return error::internal_error("upstream_error", err);
+            }
+        }
+
+        restore_original_tools(&mut response_json, original_body, Some(&session));
+    } else {
+        let mut request_builder = ctx.components.client().post(&url).json(&payload);
+        let provider = ApiProvider::from_url(&url);
+        let auth_header = provider.extract_auth_header(ctx.headers(), worker.api_key());
+        request_builder = provider.apply_headers(request_builder, auth_header.as_ref());
+
+        let response = match request_builder.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                worker.record_outcome(502);
+                // The client's text ends with the request URL: the line names the
+                // worker masked, and the answer names no address.
+                let e = e.without_url();
+                tracing::error!(
+                    url = %redacted_url(&url),
+                    error = %e,
+                    "Failed to forward request to OpenAI"
+                );
+                return error::bad_gateway(
+                    "upstream_error",
+                    format!("Failed to forward request to OpenAI: {e}"),
+                );
+            }
+        };
+
+        let status = response.status();
+        worker.record_outcome(status.as_u16());
+
+        if !status.is_success() {
+            return match read_response_body_limited(response, MAX_ERROR_RESPONSE_SIZE).await {
+                ReadBodyResult::Ok(body) => {
+                    (status, error::sanitize_error_body(&body)).into_response()
+                }
+                ReadBodyResult::TooLarge => {
+                    error::create_error(status, "upstream_error", ERROR_BODY_TOO_LARGE)
+                }
+                ReadBodyResult::Error(_) => (status, String::new()).into_response(),
+            };
+        }
+
+        response_json = match response.json::<Value>().await {
+            Ok(r) => r,
+            Err(e) => {
+                return error::internal_error(
+                    "parse_error",
+                    format!("Failed to parse upstream response: {}", e.without_url()),
+                );
+            }
+        };
+
+        restore_original_tools(&mut response_json, original_body, None);
+    }
+    patch_response_with_request_metadata(
+        &mut response_json,
+        original_body,
+        previous_response_id.as_deref(),
+    );
+
+    if let (Some(conv_storage), Some(item_storage), Some(resp_storage)) = (
+        ctx.components.conversation_storage(),
+        ctx.components.conversation_item_storage(),
+        ctx.components.response_storage(),
+    ) {
+        let tenant = ctx.tenant_request_meta.as_ref().and_then(storage_tenant);
+        if let Err(err) = persist_conversation_items(
+            conv_storage.clone(),
+            item_storage.clone(),
+            resp_storage.clone(),
+            &response_json,
+            original_body,
+            tenant.as_deref(),
+            ctx.storage_request_context.clone(),
+        )
+        .await
+        {
+            if matches!(err.step, PersistStep::Input | PersistStep::ResponseRecord) {
+                // Nothing of the response is stored and the client expects it
+                // stored (store: true): the request fails with a store-class
+                // answer instead of a response that can be neither retrieved
+                // nor continued.
+                warn!("Response not stored: {err}");
+                let message = format!("The response was not stored: {err}");
+                return if err.retryable {
+                    error::service_unavailable("storage_unavailable", message)
+                } else {
+                    error::internal_error("store_response_failed", message)
+                };
+            }
+            warn!("Response stored; its items were not linked into the conversation: {err}");
+        }
+    } else {
+        warn!("Storage not configured, skipping conversation persistence");
+    }
+
+    (StatusCode::OK, Json(response_json)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use axum::http::StatusCode;
+    use openai_protocol::responses::ResponsesRequest;
+    use serde_json::json;
+    use smg_data_connector::{
+        MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+    };
+    use smg_mcp::{McpConfig, McpOrchestrator};
+
+    use super::{super::streaming::handle_streaming_response, handle_non_streaming_response};
+    use crate::{
+        openai::{
+            context::{
+                ComponentRefs, PayloadState, RequestContext, ResponsesComponents, SharedComponents,
+                WorkerSelection,
+            },
+            provider::OpenAIProvider,
+        },
+        test_support::{
+            answering, http_client, text_of, RefusedAddress, StubWorker, CREDENTIALED_WORKER_URL,
+            MASKED_WORKER_URL,
+        },
+    };
+
+    /// A request context past worker selection with its payload ready, the
+    /// worker at `worker_url`; the request names no tool, so the plain
+    /// forward is taken.
+    fn context_for(worker_url: &str) -> RequestContext {
+        let request: ResponsesRequest =
+            serde_json::from_value(json!({"model": "m", "input": "hi"})).expect("a request");
+        let mut ctx = RequestContext::for_responses(
+            Arc::new(request),
+            None,
+            Some("m".to_string()),
+            ComponentRefs::Shared(Arc::new(SharedComponents {
+                client: http_client(),
+            })),
+        );
+        ctx.state.worker = Some(WorkerSelection {
+            worker: StubWorker::at(worker_url),
+            provider: Arc::new(OpenAIProvider),
+        });
+        ctx.state.payload = Some(PayloadState {
+            json: json!({}),
+            url: format!("{worker_url}/v1/responses"),
+        });
+        ctx
+    }
+
+    /// A request context past worker selection, the worker at `worker_url`,
+    /// over a router with MCP wiring and no configured server; the request
+    /// names one `mcp` tool with no `server_url` under a label no server is
+    /// held under.
+    async fn mcp_context_for(worker_url: &str) -> RequestContext {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "m",
+            "input": "hi",
+            "tools": [{"type": "mcp", "server_label": "conf"}]
+        }))
+        .expect("a request");
+        let components = ResponsesComponents {
+            shared: Arc::new(SharedComponents {
+                client: http_client(),
+            }),
+            mcp_orchestrator: Arc::new(
+                McpOrchestrator::new(McpConfig::default())
+                    .await
+                    .expect("an orchestrator without servers"),
+            ),
+            mcp_format_registry: Default::default(),
+            response_storage: Arc::new(MemoryResponseStorage::new()),
+            conversation_storage: Arc::new(MemoryConversationStorage::new()),
+            conversation_item_storage: Arc::new(MemoryConversationItemStorage::new()),
+        };
+        let mut ctx = RequestContext::for_responses(
+            Arc::new(request),
+            None,
+            Some("m".to_string()),
+            ComponentRefs::Responses(Arc::new(components)),
+        );
+        ctx.state.worker = Some(WorkerSelection {
+            worker: StubWorker::at(worker_url),
+            provider: Arc::new(OpenAIProvider),
+        });
+        ctx.state.payload = Some(PayloadState {
+            json: json!({}),
+            url: format!("{worker_url}/v1/responses"),
+        });
+        ctx
+    }
+
+    /// An `mcp` tool that binds no server is refused on the missing
+    /// connection before the forward, on both routes: the worker nobody
+    /// listens at is never reached (a forward there fails with 502).
+    #[tokio::test]
+    async fn an_mcp_tool_that_binds_nothing_is_refused_on_both_routes_before_the_forward() {
+        let response =
+            handle_non_streaming_response(mcp_context_for(CREDENTIALED_WORKER_URL).await).await;
+        assert_eq!(response.status(), StatusCode::FAILED_DEPENDENCY);
+
+        let response =
+            handle_streaming_response(mcp_context_for(CREDENTIALED_WORKER_URL).await).await;
+        assert_eq!(response.status(), StatusCode::FAILED_DEPENDENCY);
+    }
+
+    /// The forward's failure line names the worker masked: a worker
+    /// registered with credentials at a port nobody listens on fails the
+    /// send, and the line carries the masked address, never the
+    /// credentials. The capture is the tracing subscriber itself, so the
+    /// rendering is read as a log reader would.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn a_failed_forward_names_the_worker_masked_in_its_line() {
+        let response = handle_non_streaming_response(context_for(CREDENTIALED_WORKER_URL)).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(!logs_contain("secret"));
+        assert!(!logs_contain("user:"));
+        assert!(logs_contain("Failed to forward request to OpenAI"));
+        assert!(logs_contain(&format!("{MASKED_WORKER_URL}/v1/responses")));
+    }
+
+    /// A forward nothing answers: the caller's 502 says why without the
+    /// worker's address. The HTTP client's own error text ends with the
+    /// request URL, which the line names masked.
+    #[tokio::test]
+    async fn a_failed_forward_answers_without_the_workers_address() {
+        let refused = RefusedAddress::reserve();
+        let worker_url = format!("http://{}", refused.addr());
+
+        let response = handle_non_streaming_response(context_for(&worker_url)).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = text_of(response).await;
+        assert!(!body.contains(&refused.addr().to_string()), "{body}");
+    }
+
+    /// An answer that is no JSON: the caller's 500 says why without the
+    /// worker's address. The HTTP client's text of a failed body read ends
+    /// with the request URL.
+    #[tokio::test]
+    async fn an_answer_that_is_no_json_is_answered_without_the_workers_address() {
+        let addr = answering(200, "not json", false).await;
+
+        let response = handle_non_streaming_response(context_for(&format!("http://{addr}"))).await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = text_of(response).await;
+        assert!(body.contains("Failed to parse upstream response"), "{body}");
+        assert!(!body.contains(&addr.to_string()), "{body}");
+    }
+}

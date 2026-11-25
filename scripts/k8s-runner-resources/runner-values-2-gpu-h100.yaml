@@ -1,0 +1,62 @@
+## This runner scale set over runner-values-gpu-base.yaml (helm -f base -f this file):
+## the scale-set name, the runner bounds and the runner container. Helm merges values files
+## by replacing lists whole, so the accelerator limit travels with the entire containers list.
+
+## Runner scaling configuration
+minRunners: 4
+maxRunners: 8
+
+## name of the runner scale set to create.  Defaults to the helm release name
+runnerScaleSetName: "2-gpu-h100"
+
+template:
+  spec:
+    containers:
+      - name: runner
+        image: fra.ocir.io/idqj093njucb/action-runner:2.337.0
+        command:
+          - /home/runner/run.sh
+        securityContext:
+          # Non-root runner (uid 1001) + IPC_LOCK lets RDMA pin completion-queue
+          # memory (ibv_create_cq) without granting full privileged.
+          privileged: false
+          capabilities:
+            add:
+              - IPC_LOCK
+        env:
+          - name: DOCKER_HOST
+            value: unix:///var/run/docker.sock
+          - name: RUNNER_WAIT_FOR_DOCKER_IN_SECONDS
+            value: '120'
+          - name: HF_HOME
+            value: /models
+          - name: HF_TOKEN  # required: ci_download_model.sh runs `hf download` for the gated Llama model
+            valueFrom:
+              secretKeyRef:
+                key: HUGGINGFACE_API_KEY
+                name: huggingface-secret
+          - name: NODE_IP
+            valueFrom:
+              fieldRef:
+                fieldPath: status.hostIP
+        resources:
+          requests:
+            cpu: '32'
+            memory: 128Gi
+            rdma/hca_shared_devices_a: '1'
+          limits:
+            nvidia.com/gpu: 2
+            rdma/hca_shared_devices_a: '1'
+        volumeMounts:
+          - name: model-cache
+            mountPath: /models
+          - name: dshm
+            mountPath: /dev/shm
+          - name: work
+            mountPath: /home/runner/_work
+          - name: dind-sock
+            mountPath: /var/run
+          - name: docker-storage
+            mountPath: /var/lib/docker
+          - name: infiniband
+            mountPath: /dev/infiniband

@@ -1,0 +1,719 @@
+"""Process management utilities for E2E tests."""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import random
+import signal
+import socket
+import subprocess
+import time
+from typing import TYPE_CHECKING
+
+import requests
+
+from .constants import DEFAULT_HOST
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from .worker import Worker
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Port reservation utilities
+# ---------------------------------------------------------------------------
+
+# Port reservation to prevent the OS from returning the same port
+# for sequential get_open_port() calls before the port is actually bound.
+_reserved_ports: set[int] = set()
+
+
+def get_open_port(max_attempts: int = 10, host: str = DEFAULT_HOST) -> int:
+    """Get an available port with reservation tracking.
+
+    Finds an available port from the kernel and reserves it in our tracking set
+    to prevent the OS from returning the same port on subsequent calls.
+
+    Args:
+        max_attempts: Maximum attempts to find an unreserved port.
+        host: The address the port will be bound on; the probe uses its address
+            family (an IPv6 literal probes an IPv6 socket), so the port is free
+            where the gateway or worker binds it.
+
+    Returns:
+        An available port number that is reserved until release_port() is called.
+
+    Raises:
+        RuntimeError: If unable to find an available port after max_attempts.
+    """
+    family, unspecified = (socket.AF_INET6, "::") if ":" in host else (socket.AF_INET, "")
+    for attempt in range(max_attempts):
+        with socket.socket(family, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((unspecified, 0))
+            s.listen(1)
+            port = s.getsockname()[1]
+
+        if port not in _reserved_ports:
+            _reserved_ports.add(port)
+            logger.debug("Reserved port %d (attempt %d)", port, attempt + 1)
+            return port
+
+        logger.debug(
+            "Port %d already reserved, retrying (attempt %d/%d)",
+            port,
+            attempt + 1,
+            max_attempts,
+        )
+
+    raise RuntimeError(f"Failed to find available port after {max_attempts} attempts")
+
+
+def reserve_port(port: int) -> None:
+    """Reserve a port again that this process already chose (a restarted worker's)."""
+    _reserved_ports.add(port)
+
+
+_LOW_PORT_FLOOR = 20000
+# Kubernetes keeps 30000-32767 for its node ports. A runner that shares its
+# node's network namespace binds one without an error, yet the node's service
+# proxy answers every connection to it, on the loopback address too: an engine
+# listened on such a port, its own warm-up client was refused, and the harness
+# waited out the whole start-up bound before it respawned the engine elsewhere.
+_NODE_PORT_RANGE = range(30000, 32768)
+
+
+def _ephemeral_port_floor() -> int:
+    """Lowest port the kernel hands out to bind(0) and outgoing connections."""
+    try:
+        with open("/proc/sys/net/ipv4/ip_local_port_range") as f:
+            return int(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return 32768
+
+
+def get_open_port_block(count: int, max_attempts: int = 50) -> int:
+    """Reserve ``count`` consecutive free ports below the kernel's ephemeral
+    range and below the node-port range; return the first.
+
+    For ports an engine binds long after they are chosen (MoRI-IO's listeners
+    bind once the engine has loaded its model), one per rank from a base. The
+    kernel gives ports in its ephemeral range to any process on the host, so
+    one picked there can be taken before its owner binds it; a node port binds
+    but is never reached (``_NODE_PORT_RANGE``), whichever branch drew it.
+    Release each of the ports with release_port().
+    """
+    ceiling = min(_ephemeral_port_floor(), _NODE_PORT_RANGE.start)
+    for _ in range(max_attempts):
+        if ceiling - _LOW_PORT_FLOOR > count:
+            base = random.randrange(_LOW_PORT_FLOOR, ceiling - count)
+        else:  # no room below the ephemeral range on this host
+            base = get_open_port()
+            release_port(base)
+        block = range(base, base + count)
+        # MoRI-IO's listeners bind every address, so check every address.
+        if all(
+            p < 65536
+            and p not in _NODE_PORT_RANGE
+            and p not in _reserved_ports
+            and port_is_free(p, "")
+            for p in block
+        ):
+            _reserved_ports.update(block)
+            return base
+    raise RuntimeError(
+        f"Failed to find {count} consecutive free ports after {max_attempts} attempts"
+    )
+
+
+def get_engine_port() -> int:
+    """Reserve a port an engine binds long after the harness chose it.
+
+    An engine listens last: it loads its model first, so its ports sit chosen
+    and unbound for a minute or more. A number from :func:`get_open_port` is
+    one the kernel's ephemeral range gave out, and every ``bind(0)`` and
+    outgoing connection on the host draws from that range: a stranger's HTTP
+    server sat on a decode worker's port by the time the engine bound it.
+    The engines' ports come from below that range instead, as the MoRI-IO
+    ports do. Release with :func:`release_port`.
+    """
+    return get_open_port_block(1)
+
+
+def port_is_free(port: int, host: str = DEFAULT_HOST) -> bool:
+    """Whether ``port`` can still be bound on ``host``.
+
+    A reservation from :func:`get_open_port` is a number in a set, not a
+    socket: between the reservation and the launch that binds it, any process
+    that picks its own ports can take it. Callers re-check right before the
+    launch and re-allocate when it is gone.
+    """
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    with socket.socket(family, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind((host, port))
+        except OSError:
+            return False
+    return True
+
+
+def release_port(port: int) -> None:
+    """Release a reserved port back to the available pool.
+
+    Should be called when the process using the port has terminated.
+
+    Args:
+        port: The port number to release.
+    """
+    _reserved_ports.discard(port)
+    logger.debug("Released port %d", port)
+
+
+def kill_process_tree(pid: int, sig: int = signal.SIGTERM) -> None:
+    """Kill a process and all its children.
+
+    Args:
+        pid: Process ID to kill
+        sig: Signal to send (default: SIGTERM)
+    """
+    try:
+        import psutil
+
+        parent = psutil.Process(pid)
+        children = parent.children(recursive=True)
+        for child in children:
+            try:
+                child.send_signal(sig)
+            except psutil.NoSuchProcess:
+                pass
+        parent.send_signal(sig)
+    except ImportError:
+        # Fallback if psutil not available
+        os.kill(pid, sig)
+    except Exception as e:
+        logger.warning("Failed to kill process tree for PID %d: %s", pid, e)
+
+
+def _live_processes(proc_root: str) -> list[tuple[int, int, int]]:
+    """``(pid, ppid, pgrp)`` of every process under ``proc_root`` that is not a
+    zombie awaiting reaping."""
+    live: list[tuple[int, int, int]] = []
+    for name in os.listdir(proc_root):
+        if not name.isdigit():
+            continue
+        try:
+            with open(
+                os.path.join(proc_root, name, "stat"), encoding="utf-8", errors="replace"
+            ) as f:
+                stat = f.read()
+        except OSError:
+            continue
+        # ``pid (comm) state ppid pgrp ...``: comm may contain spaces or
+        # parentheses, so split after the last closing parenthesis.
+        fields = stat.rpartition(")")[2].split()
+        if len(fields) < 3 or fields[0] == "Z":
+            continue
+        try:
+            live.append((int(name), int(fields[1]), int(fields[2])))
+        except ValueError:
+            continue
+    return live
+
+
+def live_process_group_members(pgid: int, proc_root: str = "/proc") -> list[int]:
+    """PIDs still running in ``pgid``, ignoring zombies that await reaping.
+
+    Reads ``proc_root`` (``/proc`` on Linux). Elsewhere it falls back to
+    probing the group with signal 0, which cannot tell a zombie from a live
+    process.
+    """
+    if not os.path.isdir(proc_root):
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return []
+        except PermissionError:
+            pass
+        return [pgid]
+    return [pid for pid, _ppid, pgrp in _live_processes(proc_root) if pgrp == pgid]
+
+
+def live_child_processes(pid: int, proc_root: str = "/proc") -> list[int]:
+    """PIDs of the live direct children of ``pid``, ignoring zombies.
+
+    For a worker's launcher those are the engine's own processes (vLLM's
+    EngineCore, SGLang's scheduler and detokenizer, TokenSpeed's ranks), not
+    the workers those spawn in turn. Reads ``proc_root`` (``/proc`` on Linux);
+    empty where it cannot be read.
+    """
+    if not os.path.isdir(proc_root):
+        return []
+    return [child for child, ppid, _pgrp in _live_processes(proc_root) if ppid == pid]
+
+
+def wait_for_process_group_exit(pgid: int, timeout: float, kill_after: float) -> list[int]:
+    """Block until every live member of ``pgid`` has exited.
+
+    Sends SIGKILL to the whole group once ``kill_after`` seconds pass without
+    it emptying, then keeps waiting until ``timeout``. Returns the PIDs still
+    alive at the deadline (empty on success).
+    """
+    start = time.monotonic()
+    killed = False
+    while True:
+        members = live_process_group_members(pgid)
+        elapsed = time.monotonic() - start
+        if not members or elapsed >= timeout:
+            return members
+        if not killed and elapsed >= kill_after:
+            logger.warning(
+                "Process group %d still has %s alive after %.0fs; sending SIGKILL",
+                pgid,
+                members,
+                elapsed,
+            )
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+            killed = True
+        time.sleep(0.2)
+
+
+def gpu_memory_used_mib(gpu_ids: list[int]) -> dict[int, int] | None:
+    """Used memory per GPU index via ``nvidia-smi``, else ``amd-smi``; ``None`` when neither works."""
+    if not gpu_ids:
+        return {}
+    used = _nvidia_smi_used_mib(gpu_ids)
+    return used if used is not None else _amd_smi_used_mib(gpu_ids)
+
+
+def _amd_smi(*args: str) -> list[dict] | None:
+    """The per-GPU entries of ``amd-smi <args> --json``."""
+    try:
+        out = subprocess.run(
+            ["amd-smi", *args, "--json"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=True,
+        ).stdout
+        data = json.loads(out)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    # ROCm 7 wraps the metric list in {"gpu_data": [...]}; ``list`` prints a bare list.
+    entries = data.get("gpu_data", []) if isinstance(data, dict) else data
+    return entries if isinstance(entries, list) else None
+
+
+def _amd_smi_used_mib(gpu_ids: list[int]) -> dict[int, int] | None:
+    """VRAM in use per GPU from ``amd-smi``, which reports MiB under the unit "MB".
+
+    ``gpu_ids`` are HIP device numbers. amd-smi numbers GPUs by PCI address
+    while HIP numbers them in KFD topology order (on an MI355X node HIP's GPU 0
+    is amd-smi's GPU 3), so the two are matched through each GPU's KFD node id,
+    after the visibility variables a worker would also see.
+    """
+    listed, metrics = _amd_smi("list"), _amd_smi("metric", "--mem-usage")
+    if listed is None or metrics is None:
+        return None
+    try:
+        hip_order = [int(e["gpu"]) for e in sorted(listed, key=lambda e: int(e["node_id"]))]
+        for var in ("ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES"):
+            if os.environ.get(var, "").strip():
+                hip_order = [hip_order[int(i)] for i in os.environ[var].split(",")]
+    except (KeyError, TypeError, ValueError, IndexError):
+        return None
+    used: dict[int, int] = {}
+    for entry in metrics:
+        try:
+            value = entry["mem_usage"]["used_vram"]
+            used[int(entry["gpu"])] = int(value["value"] if isinstance(value, dict) else value)
+        except (KeyError, TypeError, ValueError):
+            continue
+    return {
+        gpu: used[hip_order[gpu]]
+        for gpu in gpu_ids
+        if gpu < len(hip_order) and hip_order[gpu] in used
+    }
+
+
+def _nvidia_smi_used_mib(gpu_ids: list[int]) -> dict[int, int] | None:
+    try:
+        out = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,memory.used",
+                "--format=csv,noheader,nounits",
+                "-i",
+                ",".join(str(g) for g in gpu_ids),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=True,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    used: dict[int, int] = {}
+    for line in out.splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) != 2:
+            continue
+        try:
+            used[int(parts[0])] = int(parts[1])
+        except ValueError:
+            continue
+    return used
+
+
+def gpu_compute_apps(gpu_ids: list[int]) -> dict[int, list[tuple[int, int | None]]] | None:
+    """Compute processes ``nvidia-smi`` lists on each GPU: ``(pid, used MiB)``.
+
+    Only a non-empty list says anything. Inside a job container ``nvidia-smi``
+    can list nothing while workers hold contexts, or list the host's PIDs, so
+    an empty list does not show that the memory belongs to an exited process.
+    ``used`` is ``None`` when the driver withholds the figure. ``None`` overall
+    when ``nvidia-smi`` is unavailable.
+    """
+    apps: dict[int, list[tuple[int, int | None]]] = {}
+    for gpu in gpu_ids:
+        try:
+            out = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-compute-apps=pid,used_memory",
+                    "--format=csv,noheader,nounits",
+                    "-i",
+                    str(gpu),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=True,
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            return None
+        rows: list[tuple[int, int | None]] = []
+        for line in out.splitlines():
+            parts = [part.strip() for part in line.split(",")]
+            if len(parts) != 2:
+                continue
+            try:
+                pid = int(parts[0])
+            except ValueError:
+                continue
+            rows.append((pid, int(parts[1]) if parts[1].isdigit() else None))
+        apps[gpu] = rows
+    return apps
+
+
+def wait_for_gpu_memory_release(
+    gpu_ids: list[int],
+    baseline: dict[int, int],
+    timeout: float,
+    slack_mib: int = 2048,
+) -> dict[int, int] | None:
+    """Wait until each GPU's used memory is back within ``slack_mib`` of ``baseline``.
+
+    An engine's child processes release their CUDA contexts after the launcher
+    exits; a replacement started on the same GPU before that reads the old
+    allocation as its own shortfall and dies on its startup memory check.
+    Returns the GPUs still above the threshold (empty on success), or ``None``
+    when neither ``nvidia-smi`` nor ``amd-smi`` is available. Gives up before
+    ``timeout`` once that set has held the same values for 5 s: a region
+    another live process still maps never drains, so a static figure is the
+    answer, not a wait.
+    """
+    deadline = time.monotonic() + timeout
+    last_over: dict[int, int] | None = None
+    last_change = time.monotonic()
+    while True:
+        used = gpu_memory_used_mib(gpu_ids)
+        if used is None:
+            return None
+        over = {gpu: mib for gpu, mib in used.items() if mib > baseline.get(gpu, 0) + slack_mib}
+        now = time.monotonic()
+        if not over or now >= deadline:
+            return over
+        # A region that another live process still maps (a decode holding a
+        # dead prefill's KV) never drains; a teardown in progress shrinks the
+        # figure every second. Give up once it has sat still for 5 s.
+        if over != last_over:
+            last_over, last_change = over, now
+        elif now - last_change >= 5.0:
+            return over
+        time.sleep(0.5)
+
+
+def terminate_process(proc: subprocess.Popen, timeout: float = 30) -> None:
+    """Gracefully terminate a process, kill if needed.
+
+    Args:
+        proc: Process to terminate
+        timeout: Seconds to wait before force-killing
+    """
+    if proc is None or proc.poll() is not None:
+        return
+    proc.terminate()
+    start = time.perf_counter()
+    while proc.poll() is None:
+        if time.perf_counter() - start > timeout:
+            proc.kill()
+            break
+        time.sleep(1)
+
+
+class ProcessExitedError(RuntimeError):
+    """The process a readiness wait was gating on exited before it became ready.
+
+    Raised instead of running the wait down to its deadline: a server that is
+    gone cannot come up, and its exit is the finding.
+    """
+
+
+def _raise_if_exited(process: subprocess.Popen | None, what: str, url: str, started: float) -> None:
+    if process is None:
+        return
+    code = process.poll()
+    if code is None:
+        return
+    raise ProcessExitedError(
+        f"{what} at {url} exited with code {code} "
+        f"{time.perf_counter() - started:.1f}s after launch, before becoming ready"
+    )
+
+
+def _sleep_watching(
+    process: subprocess.Popen | None, seconds: float, what: str, url: str, started: float
+) -> None:
+    """Sleep ``seconds``, waking early when ``process`` exits."""
+    deadline = time.perf_counter() + seconds
+    while True:
+        _raise_if_exited(process, what, url, started)
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.25, remaining))
+
+
+def wait_for_health(
+    url: str,
+    timeout: float = 60,
+    api_key: str | None = None,
+    check_interval: float = 1.0,
+    process: subprocess.Popen | None = None,
+) -> None:
+    """Wait for a server's /health endpoint to return 200.
+
+    Args:
+        url: Base URL of the server
+        timeout: Seconds to wait before timing out
+        api_key: Optional API key for auth header
+        check_interval: Seconds between health checks
+        process: The server's process, when the caller launched it; its exit
+            ends the wait at once with :class:`ProcessExitedError`.
+    """
+    start = time.perf_counter()
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+
+    with requests.Session() as session:
+        while time.perf_counter() - start < timeout:
+            _raise_if_exited(process, "Server", url, start)
+            try:
+                resp = session.get(f"{url}/health", headers=headers, timeout=5)
+                if resp.status_code == 200:
+                    logger.info("Service healthy at %s", url)
+                    return
+            except requests.RequestException:
+                pass
+            _sleep_watching(process, check_interval, "Server", url, start)
+
+    raise TimeoutError(f"Server at {url} did not become healthy within {timeout}s")
+
+
+def wait_for_workers_ready(
+    router_url: str,
+    expected_workers: int,
+    timeout: float = 300,
+    api_key: str | None = None,
+    process: subprocess.Popen | None = None,
+    expected_urls: list[str] | None = None,
+    workers: Sequence[Worker] | None = None,
+) -> None:
+    """Wait for all workers to connect and for the router to become ready.
+
+    Args:
+        router_url: Base URL of the router
+        expected_workers: Number of workers to wait for
+        timeout: Seconds to wait before timing out
+        api_key: Optional API key for auth header
+        process: The router's process, when the caller launched it; its exit
+            ends the wait at once with :class:`ProcessExitedError`.
+        expected_urls: The worker URLs the router was started with. Given,
+            they are the registration gate: the wait goes on until each is
+            registered, since the router lists and counts rank entries and a
+            data-parallel worker's ranks would satisfy a worker count while
+            another worker is still absent (a worker counts as registered
+            once any of its ranks is: a rank entry names its base in
+            dp_base_url). The ones still missing at the deadline are named in
+            the error. Without them the count is the gate.
+        workers: The workers behind those URLs, when the caller launched them;
+            a worker's exit ends the wait at once with its death report. An
+            engine that dials the router in loads its model inside this wait,
+            so its death would otherwise run the wait to its bound.
+    """
+    start = time.perf_counter()
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    connected_workers = 0
+    registered_urls: list[str] = []
+    absent: list[str] = list(expected_urls or [])
+    readiness_reason = "not checked"
+
+    with requests.Session() as session:
+        while time.perf_counter() - start < timeout:
+            _raise_if_exited(process, "Router", router_url, start)
+            for worker in workers or ():
+                worker.raise_if_exited()
+            try:
+                resp = session.get(f"{router_url}/workers", headers=headers, timeout=5)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    listed = data.get("workers", [])
+                    connected_workers = data.get("total", len(listed))
+                    # A data-parallel worker registers each rank as
+                    # "<base>@<rank>" with the base URL in dp_base_url.
+                    registered_urls = [
+                        w.get("dp_base_url") or w["url"]
+                        for w in listed
+                        if isinstance(w, dict) and "url" in w
+                    ]
+                    registered = {url.rstrip("/") for url in registered_urls}
+                    absent = [
+                        url for url in expected_urls or () if url.rstrip("/") not in registered
+                    ]
+                    all_registered = (
+                        not absent if expected_urls else connected_workers >= expected_workers
+                    )
+                    if all_registered:
+                        readiness_resp = session.get(
+                            f"{router_url}/readiness", headers=headers, timeout=5
+                        )
+                        readiness_reason = f"status {readiness_resp.status_code}"
+                        try:
+                            readiness_data = readiness_resp.json()
+                        except ValueError:
+                            readiness_data = {}
+                        if isinstance(readiness_data, dict):
+                            reason = readiness_data.get("reason") or readiness_data.get("status")
+                            if isinstance(reason, str):
+                                readiness_reason = reason
+                        else:
+                            readiness_data = {}
+                        healthy_workers = readiness_data.get("healthy_workers", 0)
+                        if not isinstance(healthy_workers, int):
+                            healthy_workers = 0
+                        if (
+                            readiness_data.get("status") == "ready"
+                            and healthy_workers < expected_workers
+                        ):
+                            readiness_reason = (
+                                f"healthy workers {healthy_workers}/{expected_workers}"
+                            )
+                        if (
+                            readiness_resp.status_code == 200
+                            and readiness_data.get("status") == "ready"
+                            and healthy_workers >= expected_workers
+                        ):
+                            logger.info(
+                                "All %d workers connected and gateway ready after %.1fs",
+                                expected_workers,
+                                time.perf_counter() - start,
+                            )
+                            return
+                    else:
+                        readiness_reason = "waiting for workers"
+            except (requests.RequestException, ValueError):
+                pass
+            _sleep_watching(process, 2, "Router", router_url, start)
+
+    missing = f", missing: {', '.join(absent)}" if absent else ""
+    connected = len(expected_urls) - len(absent) if expected_urls else connected_workers
+    raise TimeoutError(
+        f"Router at {router_url} did not become ready within {timeout}s "
+        f"(workers: {connected}/{expected_workers}{missing}, "
+        f"readiness: {readiness_reason})"
+    )
+
+
+def detect_rdma_fabric_devices() -> list[str]:
+    """RDMA devices attached to the cluster fabric, as UCX device specs.
+
+    A GPU host exposes two kinds of mlx5 device: the cluster-fabric NICs that
+    carry RDMA traffic, and the ones backing ordinary VM networking. UCX
+    enumerates both and picks whichever sits closest to the GPU, so a worker
+    whose nearest device is a VM NIC fails: either at enumeration, when that
+    NIC has no RoCE GIDs, or later on the first transfer, when it has GIDs but
+    cannot route RDMA. Which workers are hit depends on GPU-to-NIC affinity,
+    so the same job passes on one topology and fails on another.
+
+    The fabric NICs are named ``rdma*`` by the host's network configuration,
+    which is what distinguishes them here. Returns an empty list when no such
+    device exists, so callers leave UCX to its own defaults off-cluster.
+    """
+    ib_root = "/sys/class/infiniband"
+    devices: list[str] = []
+    try:
+        names = sorted(os.listdir(ib_root))
+    except OSError:
+        return devices
+
+    for name in names:
+        net_dir = os.path.join(ib_root, name, "device", "net")
+        try:
+            netdevs = os.listdir(net_dir)
+        except OSError:
+            continue
+        if any(netdev.startswith("rdma") for netdev in netdevs):
+            devices.append(f"{name}:1")
+    return devices
+
+
+def detect_ib_device() -> str | None:
+    """Detect first active InfiniBand device (e.g., mlx5_0).
+
+    Returns:
+        Device name if found (e.g., "mlx5_0"), None otherwise.
+    """
+    try:
+        subprocess.run(
+            ["ibv_devinfo", "-l"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=1,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+
+    for i in range(12):
+        dev = f"mlx5_{i}"
+        try:
+            res = subprocess.run(
+                ["ibv_devinfo", dev],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            if res.returncode == 0 and "state:" in res.stdout:
+                for line in res.stdout.splitlines():
+                    if "state:" in line and "PORT_ACTIVE" in line:
+                        logger.info("Detected IB device: %s", dev)
+                        return dev
+        except Exception:
+            pass
+    return None

@@ -1,0 +1,147 @@
+//! gRPC router implementations
+
+use axum::response::Response;
+use openai_protocol::chat::ChatCompletionRequest;
+
+use crate::routers::error;
+
+pub mod backend_client; // Polymorphism over gRPC vs ZMQ transports
+pub mod client; // Used by core/
+pub(crate) mod common;
+pub(crate) mod context;
+pub(crate) mod harmony;
+pub(crate) mod mode;
+pub(crate) mod multimodal;
+pub(crate) mod pipeline;
+pub(crate) mod proto_wrapper;
+/// The dispatch tickets' benchmark seam: what `benches/dispatch_tickets.rs` drives,
+/// compiled for the crate's test targets only.
+#[cfg(any(test, feature = "test-util"))]
+pub use proto_wrapper::dispatch_ticket_life;
+pub(crate) mod regular;
+pub(crate) mod router; // Used by routers/factory
+pub(crate) mod sequential_pd;
+pub(crate) mod spec;
+#[cfg(test)]
+pub(crate) mod test_engine;
+#[cfg(test)]
+pub(crate) mod testing;
+#[cfg(any(test, feature = "test-util"))]
+pub mod tokenizer_cache;
+pub mod utils; // Used by routers/http and bindings/golang
+/// The stream state machines' benchmark seams: what `benches/stream_state_machines.rs`,
+/// `benches/forced_call_stream.rs` and `benches/symphony_messages_stream.rs` drive, compiled
+/// for the crate's test targets only.
+#[cfg(any(test, feature = "test-util"))]
+pub use regular::streaming::bench::{EngineScript, ForcedChat, StreamBench};
+pub(crate) mod wire;
+#[cfg(test)]
+mod worker_identity_tests;
+/// The worker selection stage's benchmark seam: what
+/// `benches/policy_selection.rs` drives for the stage's own placements,
+/// compiled for the crate's test targets only.
+#[cfg(any(test, feature = "test-util"))]
+pub use common::stages::SelectionBench;
+pub mod zmq_client; // ZMQ backend adapter behind the vLLM client surface
+
+// Re-export for convenience
+pub use harmony::detector::is_harmony_card;
+pub use multimodal::worker as worker_media;
+pub use proto_wrapper::{MultimodalData, TensorBytes};
+
+fn validate_text_only_output(request: &ChatCompletionRequest) -> Result<(), Box<Response>> {
+    match text_only_output_refusal(request) {
+        Some((code, message)) => Err(Box::new(error::bad_request(code, message))),
+        None => Ok(()),
+    }
+}
+
+/// The refusal (error code and message) of a chat request that asks for
+/// output other than text, which the gRPC backend does not produce. `pub` so
+/// that the Python binding's chat rendering refuses what serving refuses.
+pub fn text_only_output_refusal(request: &ChatCompletionRequest) -> Option<(&'static str, String)> {
+    if request.return_audio == Some(true) {
+        return Some((
+            "audio_output_not_supported",
+            "'return_audio' must be false because the gRPC backend only supports text output"
+                .to_string(),
+        ));
+    }
+
+    let modality = request.modalities.as_ref().and_then(|modalities| {
+        modalities
+            .iter()
+            .find(|modality| modality.as_str() != "text")
+    })?;
+    Some((
+        "unsupported_output_modality",
+        format!(
+            "unsupported output modality '{modality}'; the gRPC backend only supports text output"
+        ),
+    ))
+}
+
+/// Processed chat messages ready for gRPC generation.
+///
+/// The multimodal intermediate lives on `ProcessingState`, not here.
+#[derive(Debug)]
+pub struct ProcessedMessages {
+    pub text: String,
+    /// Rendered prompt tokens the provider does not bill.
+    pub unbilled_prompt_tokens: u32,
+    /// The prompt continues the trailing assistant message instead of
+    /// following a generation prompt (see
+    /// `ChatTemplateOutput::continued_final_message`): what the reasoning
+    /// decisions follow, since a template that cannot continue the message
+    /// appends its text after the generation prompt.
+    pub continued_final_message: bool,
+    /// The prompt is rendered for generation, with the renderer's generation
+    /// header after the last turn (`ChatTemplateOutput::generation_prompt`):
+    /// false when the request asked for none and the renderer honoured it,
+    /// and when the final message was continued. What the reasoning
+    /// decisions follow, since a renderer with an encoder of its own writes
+    /// the header whatever the request asked, as the engines' own encoders do.
+    pub generation_prompt: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::routers::error::extract_error_code_from_response;
+
+    #[test]
+    fn validates_grpc_text_only_output() {
+        for modalities in [
+            None,
+            Some(vec![]),
+            Some(vec!["text".to_string()]),
+            Some(vec!["text".to_string(), "text".to_string()]),
+        ] {
+            let request = ChatCompletionRequest {
+                modalities,
+                ..Default::default()
+            };
+            assert!(validate_text_only_output(&request).is_ok());
+        }
+
+        let audio_request = ChatCompletionRequest {
+            return_audio: Some(true),
+            ..Default::default()
+        };
+        let response = validate_text_only_output(&audio_request).unwrap_err();
+        assert_eq!(
+            extract_error_code_from_response(&response),
+            "audio_output_not_supported"
+        );
+
+        let modality_request = ChatCompletionRequest {
+            modalities: Some(vec!["text".to_string(), "audio".to_string()]),
+            ..Default::default()
+        };
+        let response = validate_text_only_output(&modality_request).unwrap_err();
+        assert_eq!(
+            extract_error_code_from_response(&response),
+            "unsupported_output_modality"
+        );
+    }
+}

@@ -1,0 +1,2873 @@
+use std::sync::Arc;
+
+use axum::{
+    body::Body,
+    extract::Request,
+    http::{header::CONTENT_TYPE, StatusCode},
+};
+use serde_json::json;
+use smg::{config::RouterConfig, routers::RouterFactory};
+use tower::ServiceExt;
+
+use crate::common::{
+    mock_worker::{
+        set_request_recorder, HealthStatus, MockWorker, MockWorkerConfig, RequestRecorder,
+        WorkerType,
+    },
+    AppTestContext,
+};
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_liveness_endpoint() {
+        let ctx = AppTestContext::new(vec![]).await;
+        let app = ctx.create_app();
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/liveness")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_readiness_with_healthy_workers() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18001,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app();
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/readiness")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_readiness_with_unhealthy_workers() {
+        let ctx = AppTestContext::new(vec![]).await;
+
+        let app = ctx.create_app();
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/readiness")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        // With no workers, readiness should return SERVICE_UNAVAILABLE
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_health_endpoint_details() {
+        let ctx = AppTestContext::new(vec![
+            MockWorkerConfig {
+                port: 18003,
+                worker_type: WorkerType::Regular,
+                health_status: HealthStatus::Healthy,
+                response_delay_ms: 0,
+                fail_rate: 0.0,
+            },
+            MockWorkerConfig {
+                port: 18004,
+                worker_type: WorkerType::Regular,
+                health_status: HealthStatus::Healthy,
+                response_delay_ms: 0,
+                fail_rate: 0.0,
+            },
+        ])
+        .await;
+
+        let app = ctx.create_app();
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_health_generate_endpoint() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18005,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app();
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/health_generate")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(body_json.is_object());
+
+        ctx.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod generation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_generate_success() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18101,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app();
+
+        let payload = json!({
+            "text": "Hello, world!",
+            "stream": false
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(body_json.get("text").is_some());
+        assert!(body_json.get("meta_info").is_some());
+        let meta_info = &body_json["meta_info"];
+        assert!(meta_info.get("finish_reason").is_some());
+        assert_eq!(meta_info["finish_reason"]["type"], "stop");
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_generate_streaming() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18102,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app();
+
+        let payload = json!({
+            "text": "Stream test",
+            "stream": true
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // For streaming responses, the router might use chunked encoding or other streaming mechanisms
+        // The exact content-type can vary based on the router implementation
+        // Just verify we got a successful response
+        // Note: In a real implementation, we'd check for text/event-stream or appropriate streaming headers
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_generate_with_worker_failure() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18103,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 1.0, // Always fail
+        }])
+        .await;
+
+        let app = ctx.create_app();
+
+        let payload = json!({
+            "text": "This should fail",
+            "stream": false
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_v1_chat_completions_success() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18104,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app();
+
+        let payload = json!({
+            "model": "mock-model",
+            "messages": [
+                {"role": "user", "content": "Hello!"}
+            ],
+            "stream": false
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(body_json.get("choices").is_some());
+
+        ctx.shutdown().await;
+    }
+
+    /// The route reads its body through the gateway's validated extractor, as
+    /// the chat route does: a negative temperature, a `top_p` above one, an
+    /// `n` of zero, an empty `input_ids` and a negative token id in it are
+    /// refused in the error envelope with the chat route's codes before a
+    /// worker sees them, and a body within the rules is served.
+    #[tokio::test]
+    async fn generate_refuses_the_sampling_values_the_chat_route_refuses() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18109,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+        let app = ctx.create_app();
+
+        let post = |body: serde_json::Value| {
+            Request::builder()
+                .method("POST")
+                .uri("/generate")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        for (body, code, param) in [
+            (
+                json!({"text": "hi", "sampling_params": {"temperature": -1, "max_new_tokens": 4}}),
+                "decimal_below_min_value",
+                "sampling_params.temperature",
+            ),
+            (
+                json!({"text": "hi", "sampling_params": {"top_p": 2, "max_new_tokens": 4}}),
+                "decimal_above_max_value",
+                "sampling_params.top_p",
+            ),
+            (
+                json!({"text": "hi", "sampling_params": {"n": 0, "max_new_tokens": 4}}),
+                "integer_below_min_value",
+                "sampling_params.n",
+            ),
+            (
+                json!({"input_ids": [], "sampling_params": {"max_new_tokens": 4}}),
+                "empty_array",
+                "input_ids",
+            ),
+            (
+                json!({"input_ids": [1, -2, 3], "sampling_params": {"max_new_tokens": 4}}),
+                "integer_below_min_value",
+                "input_ids",
+            ),
+        ] {
+            let resp = app.clone().oneshot(post(body.clone())).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{body}");
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                envelope["error"]["type"], "invalid_request_error",
+                "{envelope}"
+            );
+            assert_eq!(envelope["error"]["code"], code, "{envelope}");
+            assert_eq!(envelope["error"]["param"], param, "{envelope}");
+        }
+
+        let served = json!({
+            "text": "hi",
+            "sampling_params": {"temperature": 0.5, "top_p": 0.9, "n": 1, "max_new_tokens": 4}
+        });
+        let resp = app.oneshot(post(served)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a body within the rules is served"
+        );
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_v1_chat_completions_streaming_preserves_worker_json_error_content_type() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18006,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 1.0,
+        }])
+        .await;
+        let app = ctx.create_app();
+        let payload = json!({
+            "model": "mock-model",
+            "messages": [{"role": "user", "content": "Hello!"}],
+            "stream": true
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            resp.headers().get(CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body_json["error"]["type"], "internal_error");
+
+        ctx.shutdown().await;
+    }
+
+    /// `/v1/completions` serves a `max_tokens` of zero: it is the
+    /// prompt-scoring request (`echo` with `logprobs`, nothing generated),
+    /// so the gateway forwards the zero to the worker as written, where the
+    /// chat route refuses its own `max_tokens: 0`.
+    #[tokio::test]
+    async fn test_v1_completions_max_tokens_zero_reaches_the_worker_as_written() {
+        let recorder = RequestRecorder::new();
+        set_request_recorder(18114, Arc::clone(&recorder));
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18114,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app();
+
+        let payload = json!({
+            "model": "mock-model",
+            "prompt": "hello",
+            "max_tokens": 0,
+            "echo": true,
+            "logprobs": 1
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "max_tokens 0 is a request, not a refused value"
+        );
+        let forwarded = recorder.only_body();
+        assert_eq!(
+            forwarded["max_tokens"], 0,
+            "the zero reaches the worker as written: {forwarded}"
+        );
+        assert_eq!(forwarded["echo"], true, "echo rides with it: {forwarded}");
+
+        ctx.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod model_info_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_get_server_info() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18201,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app();
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/get_server_info")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(body_json.is_object());
+        // Check for actual sglang server fields
+        assert!(body_json.get("version").is_some());
+        assert!(body_json.get("model_path").is_some());
+        assert!(body_json.get("tokenizer_path").is_some());
+        assert!(body_json.get("port").is_some());
+        assert!(body_json.get("max_num_batched_tokens").is_some());
+        assert!(body_json.get("schedule_policy").is_some());
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_model_info() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18202,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app();
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/get_model_info")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(body_json.is_object());
+        // Check for actual sglang model info fields
+        assert_eq!(
+            body_json.get("model_path").and_then(|v| v.as_str()),
+            Some("mock-model")
+        );
+        assert_eq!(
+            body_json.get("tokenizer_path").and_then(|v| v.as_str()),
+            Some("mock-tokenizer-path")
+        );
+        assert_eq!(
+            body_json.get("is_generation").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert!(body_json.get("preferred_sampling_params").is_some());
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_v1_models() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18203,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app();
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(body_json.get("object").is_some());
+        assert_eq!(
+            body_json.get("object").and_then(|v| v.as_str()),
+            Some("list")
+        );
+
+        let data = body_json.get("data").and_then(|v| v.as_array());
+        assert!(data.is_some());
+
+        let models = data.unwrap();
+        assert!(!models.is_empty());
+
+        // Model ID comes from worker registry (discovered from /get_model_info model_path)
+        let first_model = &models[0];
+        assert_eq!(
+            first_model.get("id").and_then(|v| v.as_str()),
+            Some("mock-model")
+        );
+        assert_eq!(
+            first_model.get("object").and_then(|v| v.as_str()),
+            Some("model")
+        );
+        assert!(first_model.get("created").is_some());
+        assert_eq!(
+            first_model.get("owned_by").and_then(|v| v.as_str()),
+            Some("self_hosted")
+        );
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_model_info_with_no_workers() {
+        let ctx = AppTestContext::new(vec![]).await;
+        let app = ctx.create_app();
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/get_server_info")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        // Router may return various error codes when no workers
+        assert!(
+            resp.status() == StatusCode::OK
+                || resp.status() == StatusCode::SERVICE_UNAVAILABLE
+                || resp.status() == StatusCode::NOT_FOUND
+                || resp.status() == StatusCode::INTERNAL_SERVER_ERROR,
+            "Unexpected status code: {:?}",
+            resp.status()
+        );
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/get_model_info")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        // Router may return various error codes when no workers
+        assert!(
+            resp.status() == StatusCode::OK
+                || resp.status() == StatusCode::SERVICE_UNAVAILABLE
+                || resp.status() == StatusCode::NOT_FOUND
+                || resp.status() == StatusCode::INTERNAL_SERVER_ERROR,
+            "Unexpected status code: {:?}",
+            resp.status()
+        );
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        // Router may return various error codes when no workers
+        assert!(
+            resp.status() == StatusCode::OK
+                || resp.status() == StatusCode::SERVICE_UNAVAILABLE
+                || resp.status() == StatusCode::NOT_FOUND
+                || resp.status() == StatusCode::INTERNAL_SERVER_ERROR,
+            "Unexpected status code: {:?}",
+            resp.status()
+        );
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_model_info_with_multiple_workers() {
+        let ctx = AppTestContext::new(vec![
+            MockWorkerConfig {
+                port: 18204,
+                worker_type: WorkerType::Regular,
+                health_status: HealthStatus::Healthy,
+                response_delay_ms: 0,
+                fail_rate: 0.0,
+            },
+            MockWorkerConfig {
+                port: 18205,
+                worker_type: WorkerType::Regular,
+                health_status: HealthStatus::Healthy,
+                response_delay_ms: 0,
+                fail_rate: 0.0,
+            },
+        ])
+        .await;
+
+        let app = ctx.create_app();
+
+        for _ in 0..5 {
+            let req = Request::builder()
+                .method("GET")
+                .uri("/get_model_info")
+                .body(Body::empty())
+                .unwrap();
+
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                body_json.get("model_path").and_then(|v| v.as_str()),
+                Some("mock-model")
+            );
+        }
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_model_info_with_unhealthy_worker() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18206,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 1.0, // Always fail
+        }])
+        .await;
+
+        let app = ctx.create_app();
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/get_model_info")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        // Worker with fail_rate: 1.0 should always return an error status
+        assert!(
+            resp.status() == StatusCode::INTERNAL_SERVER_ERROR
+                || resp.status() == StatusCode::SERVICE_UNAVAILABLE,
+            "Expected error status for always-failing worker, got: {:?}",
+            resp.status()
+        );
+
+        ctx.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod router_policy_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_random_policy() {
+        let ctx = AppTestContext::new(vec![
+            MockWorkerConfig {
+                port: 18801,
+                worker_type: WorkerType::Regular,
+                health_status: HealthStatus::Healthy,
+                response_delay_ms: 0,
+                fail_rate: 0.0,
+            },
+            MockWorkerConfig {
+                port: 18802,
+                worker_type: WorkerType::Regular,
+                health_status: HealthStatus::Healthy,
+                response_delay_ms: 0,
+                fail_rate: 0.0,
+            },
+        ])
+        .await;
+
+        // Send multiple requests and verify they succeed
+        let app = ctx.create_app();
+
+        for i in 0..10 {
+            let payload = json!({
+                "text": format!("Request {}", i),
+                "stream": false
+            });
+
+            let req = Request::builder()
+                .method("POST")
+                .uri("/generate")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                .unwrap();
+
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_started_worker_is_in_the_registry_under_the_url_it_bound() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18207,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        assert!(
+            ctx.app_context
+                .worker_registry
+                .get_by_url(&ctx.worker_urls[0])
+                .is_some(),
+            "the started worker is registered under {}",
+            ctx.worker_urls[0]
+        );
+
+        ctx.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod responses_endpoint_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_v1_responses_non_streaming() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18950,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app();
+
+        let payload = json!({
+            "input": "Hello Responses API",
+            "model": "mock-model",
+            "stream": false
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body_json["object"], "response");
+        assert_eq!(body_json["status"], "completed");
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_v1_responses_streaming() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18951,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app();
+
+        let payload = json!({
+            "input": "Hello Responses API",
+            "model": "mock-model",
+            "stream": true
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Check that content-type indicates SSE
+        let headers = resp.headers().clone();
+        let ct = headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(ct.contains("text/event-stream"));
+
+        // We don't fully consume the stream in this test harness.
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_v1_responses_get() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18952,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app();
+
+        let resp_id = "test-get-resp-id-123";
+        use smg_data_connector::{ResponseId, StoredResponse};
+        let mut stored_response = StoredResponse::new(None);
+        stored_response.id = ResponseId::from(resp_id);
+        stored_response.raw_response = json!({
+            "id": resp_id,
+            "object": "response",
+            "created_at": 123,
+            "model": "mock-model",
+            "output": [],
+            "status": "completed"
+        });
+
+        ctx.app_context
+            .response_storage
+            .store_response(stored_response)
+            .await
+            .expect("Failed to store response");
+
+        // Retrieve the response
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/responses/{resp_id}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let get_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(get_json["object"], "response");
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_v1_responses_delete() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18954,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app();
+
+        let resp_id = "resp-test-123";
+        use smg_data_connector::{ResponseId, StoredResponse};
+        let mut stored_response = StoredResponse::new(None);
+        stored_response.id = ResponseId::from(resp_id);
+        stored_response.raw_response = json!({
+            "id": resp_id,
+            "object": "response",
+            "created_at": 123,
+            "model": "mock-model",
+            "output": [],
+            "status": "completed"
+        });
+
+        ctx.app_context
+            .response_storage
+            .store_response(stored_response)
+            .await
+            .expect("Failed to store response");
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri(format!("/v1/responses/{resp_id}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let delete_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(delete_json["id"], resp_id);
+        assert_eq!(delete_json["object"], "response.deleted");
+        assert_eq!(delete_json["deleted"], true);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/responses/{resp_id}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_v1_responses_input_items() {
+        // The input_items endpoint is storage-backed and needs no workers.
+        let mut config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .random_policy()
+            .host("127.0.0.1")
+            .port(3002)
+            .max_payload_size(256 * 1024 * 1024)
+            .request_timeout_secs(600)
+            .worker_startup_timeout_secs(1)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(64)
+            .queue_size(0)
+            .queue_timeout_secs(60)
+            .build_unchecked();
+        config.health_check.disable_health_check = true;
+
+        let ctx = AppTestContext::new_with_config(
+            config,
+            vec![], // No workers needed
+        )
+        .await;
+
+        let app = ctx.create_app();
+
+        // Directly store a response in the storage to test the retrieval endpoint
+        use smg_data_connector::{ResponseId, StoredResponse};
+        let mut stored_response = StoredResponse::new(None);
+        stored_response.id = ResponseId::from("resp_test_input_items");
+        stored_response.input = json!([
+            {"id": "item_1", "content": "hello", "role": "user"},
+            {"id": "item_2", "content": "hi there", "role": "assistant"}
+        ]);
+        stored_response.raw_response = json!({
+            "output": [
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "test response"}]}
+            ]
+        });
+
+        ctx.app_context
+            .response_storage
+            .store_response(stored_response)
+            .await
+            .expect("Failed to store response");
+
+        // Fetch input_items for the created response
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/responses/resp_test_input_items/input_items")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let items_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Verify response structure
+        assert_eq!(items_json["object"], "list");
+        assert!(items_json["data"].is_array());
+
+        // Should have 2 input items
+        let items = items_json["data"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_v1_responses_get_multi_worker_uses_shared_storage() {
+        // Start two mock workers
+        let ctx = AppTestContext::new(vec![
+            MockWorkerConfig {
+                port: 18960,
+                worker_type: WorkerType::Regular,
+                health_status: HealthStatus::Healthy,
+                response_delay_ms: 0,
+                fail_rate: 0.0,
+            },
+            MockWorkerConfig {
+                port: 18961,
+                worker_type: WorkerType::Regular,
+                health_status: HealthStatus::Healthy,
+                response_delay_ms: 0,
+                fail_rate: 0.0,
+            },
+        ])
+        .await;
+
+        let app = ctx.create_app();
+
+        let rid = format!("resp_{}", 18960); // arbitrary unique id
+        use smg_data_connector::{ResponseId, StoredResponse};
+        let mut stored_response = StoredResponse::new(None);
+        stored_response.id = ResponseId::from(rid.as_str());
+        stored_response.raw_response = json!({
+            "id": rid,
+            "object": "response",
+            "created_at": 123,
+            "model": "mock-model",
+            "output": [],
+            "status": "completed"
+        });
+
+        ctx.app_context
+            .response_storage
+            .store_response(stored_response)
+            .await
+            .expect("Failed to store response");
+
+        // Retrieval should succeed regardless of worker count because data layer is authoritative.
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/responses/{rid}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        ctx.shutdown().await;
+    }
+
+    #[cfg(feature = "provider-openai")]
+    async fn create_openai_ctx(port: u16) -> AppTestContext {
+        use smg::config::RouterConfig;
+        let mut config = RouterConfig::builder()
+            .openai_mode(vec![])
+            .random_policy()
+            .host("127.0.0.1")
+            .port(3100)
+            .max_payload_size(256 * 1024 * 1024)
+            .request_timeout_secs(600)
+            .worker_startup_timeout_secs(10)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(64)
+            .queue_size(0)
+            .queue_timeout_secs(60)
+            .build_unchecked();
+        config.health_check.disable_health_check = true;
+
+        AppTestContext::new_with_config(
+            config,
+            vec![MockWorkerConfig {
+                port,
+                worker_type: WorkerType::Regular,
+                health_status: HealthStatus::Healthy,
+                response_delay_ms: 0,
+                fail_rate: 0.0,
+            }],
+        )
+        .await
+    }
+
+    #[cfg(feature = "provider-openai")]
+    async fn create_response(
+        app: &axum::Router,
+        payload: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        (status, json)
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn test_v1_responses_store_false_retrieve_404() {
+        let ctx = create_openai_ctx(18970).await;
+        let app = ctx.create_app();
+
+        let (status, body) = create_response(
+            &app,
+            json!({
+                "input": "Hello",
+                "model": "mock-model",
+                "stream": false,
+                "store": false
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let resp_id = body["id"].as_str().expect("response should have id");
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/responses/{resp_id}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        ctx.shutdown().await;
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn test_v1_responses_store_true_retrieve_200() {
+        let ctx = create_openai_ctx(18971).await;
+        let app = ctx.create_app();
+
+        let (status, body) = create_response(
+            &app,
+            json!({
+                "input": "Hello",
+                "model": "mock-model",
+                "stream": false,
+                "store": true
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let resp_id = body["id"].as_str().expect("response should have id");
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/responses/{resp_id}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let get_body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let get_json: serde_json::Value = serde_json::from_slice(&get_body).unwrap();
+        assert_eq!(get_json["store"], true);
+
+        ctx.shutdown().await;
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn test_v1_responses_store_omitted_retrieve_200() {
+        let ctx = create_openai_ctx(18973).await;
+        let app = ctx.create_app();
+
+        let (status, body) = create_response(
+            &app,
+            json!({
+                "input": "Hello",
+                "model": "mock-model",
+                "stream": false
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let resp_id = body["id"].as_str().expect("response should have id");
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/responses/{resp_id}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let get_body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let get_json: serde_json::Value = serde_json::from_slice(&get_body).unwrap();
+        assert_eq!(get_json["store"], true);
+
+        ctx.shutdown().await;
+    }
+
+    #[cfg(feature = "provider-openai")]
+    #[tokio::test]
+    async fn test_v1_responses_store_false_as_previous_response_id() {
+        let ctx = create_openai_ctx(18972).await;
+        let app = ctx.create_app();
+
+        let (status, body) = create_response(
+            &app,
+            json!({
+                "input": "Hello",
+                "model": "mock-model",
+                "stream": false,
+                "store": false
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let resp_id = body["id"].as_str().expect("response should have id");
+
+        let (status, err_body) = create_response(
+            &app,
+            json!({
+                "input": "Follow up",
+                "model": "mock-model",
+                "stream": false,
+                "previous_response_id": resp_id
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        assert_eq!(
+            err_body["error"]["code"].as_str(),
+            Some("previous_response_not_found"),
+            "Expected error code 'previous_response_not_found', got: {err_body}"
+        );
+
+        ctx.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_404_not_found() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18401,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app();
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/unknown_endpoint")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v2/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_string(&json!({"text": "test"})).unwrap(),
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_method_not_allowed() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18402,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app();
+
+        // GET request to POST-only endpoint
+        let req = Request::builder()
+            .method("GET")
+            .uri("/generate")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        // Note: Axum returns 405 for wrong methods on matched routes
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+        // POST request to GET-only endpoint
+        let req = Request::builder()
+            .method("POST")
+            .uri("/health")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_invalid_json_payload() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18404,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app();
+
+        // Send invalid JSON
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from("{invalid json}"))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Send empty body
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_invalid_model() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18406,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app();
+
+        let payload = json!({
+            "model": "invalid-model-name-that-does-not-exist",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": false
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        // Invalid model should return 404 (no worker serves this model)
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        ctx.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_flush_cache() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18501,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/flush_cache")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The response might be empty or contain a message
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        if !body_bytes.is_empty() {
+            if let Ok(body) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+                // Check that we got a successful response with expected fields
+                assert!(body.is_object());
+                assert!(body.get("message").is_some() || body.get("status").is_some());
+            }
+        }
+
+        ctx.shutdown().await;
+    }
+
+    async fn loads_body(ctx: &AppTestContext, uri: &str) -> serde_json::Value {
+        let req = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+        let resp = ctx.create_app().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    /// The body names the gateway's own package on both routes: the code
+    /// that builds it lives in the worker crate, which has a version of its
+    /// own.
+    #[tokio::test]
+    async fn the_loads_routes_name_the_gateways_own_version() {
+        let ctx = AppTestContext::new(vec![]).await;
+        for uri in ["/loads", "/get_loads"] {
+            let body = loads_body(&ctx, uri).await;
+            assert_eq!(
+                body["version"],
+                concat!("smg-", env!("CARGO_PKG_VERSION")),
+                "{uri}"
+            );
+        }
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_loads() {
+        let ctx = AppTestContext::new(vec![
+            MockWorkerConfig {
+                port: 18502,
+                worker_type: WorkerType::Regular,
+                health_status: HealthStatus::Healthy,
+                response_delay_ms: 0,
+                fail_rate: 0.0,
+            },
+            MockWorkerConfig {
+                port: 18503,
+                worker_type: WorkerType::Regular,
+                health_status: HealthStatus::Healthy,
+                response_delay_ms: 0,
+                fail_rate: 0.0,
+            },
+        ])
+        .await;
+
+        // Both mocks serve `/v1/loads`, and the monitor polls each group as
+        // it is created. Wait for that first tick so the assertions run
+        // against a populated snapshot rather than an empty one.
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+        loop {
+            let body = loads_body(&ctx, "/loads").await;
+            if body["loads"].as_array().is_some_and(|l| l.len() == 2) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for both workers to report load: {body}"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+
+        // `/get_loads` is a deprecated alias and must answer identically.
+        for uri in ["/loads", "/get_loads"] {
+            let body_json = loads_body(&ctx, uri).await;
+
+            let loads = body_json["loads"].as_array().expect("loads array");
+            assert_eq!(body_json["dp_rank_count"], loads.len(), "{uri}");
+            assert!(body_json["version"].as_str().is_some_and(|v| !v.is_empty()));
+            assert!(body_json["timestamp"]
+                .as_str()
+                .is_some_and(|t| !t.is_empty()));
+
+            // Every rank names the worker it came from — the two fields a
+            // fleet view adds to the engine schema.
+            let mut reporters: Vec<&str> = loads
+                .iter()
+                .map(|entry| entry["worker"].as_str().expect("worker"))
+                .collect();
+            reporters.sort_unstable();
+            let mut expected: Vec<&str> = ctx.worker_urls.iter().map(String::as_str).collect();
+            expected.sort_unstable();
+            assert_eq!(reporters, expected, "{uri}");
+            for entry in loads {
+                assert_eq!(entry["worker_type"], "regular", "{uri}");
+                assert_eq!(entry["num_running_reqs"], 2, "{uri}");
+                assert_eq!(entry["num_used_tokens"], 1024, "{uri}");
+            }
+
+            // The aggregate rolls up the fleet, not one engine.
+            assert_eq!(body_json["aggregate"]["total_running_reqs"], 4, "{uri}");
+            assert_eq!(body_json["aggregate"]["total_waiting_reqs"], 2, "{uri}");
+            assert_eq!(body_json["aggregate"]["total_reqs"], 6, "{uri}");
+            assert_eq!(body_json["aggregate"]["avg_token_usage"], 0.125, "{uri}");
+        }
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_flush_cache_no_workers() {
+        let ctx = AppTestContext::new(vec![]).await;
+
+        let app = ctx.create_app();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/flush_cache")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        // Should either succeed (no-op) or return service unavailable
+        assert!(
+            resp.status() == StatusCode::OK || resp.status() == StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        ctx.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod load_balancing_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_request_distribution() {
+        // Create multiple workers
+        let ctx = AppTestContext::new(vec![
+            MockWorkerConfig {
+                port: 18601,
+                worker_type: WorkerType::Regular,
+                health_status: HealthStatus::Healthy,
+                response_delay_ms: 0,
+                fail_rate: 0.0,
+            },
+            MockWorkerConfig {
+                port: 18602,
+                worker_type: WorkerType::Regular,
+                health_status: HealthStatus::Healthy,
+                response_delay_ms: 0,
+                fail_rate: 0.0,
+            },
+        ])
+        .await;
+
+        let app = ctx.create_app();
+
+        // Send multiple requests and track distribution
+        let mut request_count = 0;
+        for i in 0..10 {
+            let payload = json!({
+                "text": format!("Request {}", i),
+                "stream": false
+            });
+
+            let req = Request::builder()
+                .method("POST")
+                .uri("/generate")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                .unwrap();
+
+            let resp = app.clone().oneshot(req).await.unwrap();
+            if resp.status() == StatusCode::OK {
+                request_count += 1;
+            }
+        }
+
+        // With random policy, all requests should succeed
+        assert_eq!(request_count, 10);
+
+        ctx.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod pd_mode_tests {
+    use super::*;
+    use crate::common::create_test_context;
+
+    #[tokio::test]
+    async fn test_pd_mode_routing() {
+        // Create PD mode configuration with prefill and decode workers
+        let mut prefill_worker = MockWorker::new(MockWorkerConfig {
+            port: 18701,
+            worker_type: WorkerType::Prefill,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        });
+
+        let mut decode_worker = MockWorker::new(MockWorkerConfig {
+            port: 18702,
+            worker_type: WorkerType::Decode,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        });
+
+        let prefill_url = prefill_worker.start().await.unwrap();
+        let decode_url = decode_worker.start().await.unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        // Extract port from prefill URL
+        let prefill_port = prefill_url
+            .split(':')
+            .next_back()
+            .and_then(|p| p.trim_end_matches('/').parse::<u16>().ok())
+            .unwrap_or(9000);
+
+        let mut config = RouterConfig::builder()
+            .prefill_decode_mode(vec![(prefill_url, Some(prefill_port))], vec![decode_url])
+            .random_policy()
+            .host("127.0.0.1")
+            .port(3011)
+            .max_payload_size(256 * 1024 * 1024)
+            .request_timeout_secs(600)
+            .worker_startup_timeout_secs(1)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(64)
+            .queue_timeout_secs(60)
+            .build_unchecked();
+        config.health_check.disable_health_check = true;
+
+        // Create app context
+        let app_context = create_test_context(config).await;
+
+        let router_result = RouterFactory::create_router(&app_context).await;
+
+        // Clean up workers
+        prefill_worker.stop().await;
+        decode_worker.stop().await;
+
+        // A prefill-decode configuration over HTTP builds the prefill-decode router; what the
+        // pair then does with a request is pinned by the grpc_pd_tests binary and the
+        // disaggregated e2e classes.
+        let router =
+            router_result.expect("a prefill-decode configuration over HTTP builds its router");
+        assert_eq!(
+            router.router_type(),
+            "pd",
+            "the configuration names two roles, so the factory builds the prefill-decode router"
+        );
+    }
+}
+
+#[cfg(test)]
+mod request_id_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_request_id_generation() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18901,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app();
+
+        let payload = json!({
+            "text": "Test request",
+            "stream": false
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Check that response has x-request-id header
+        let request_id = resp.headers().get("x-request-id");
+        assert!(
+            request_id.is_some(),
+            "Response should have x-request-id header"
+        );
+
+        let id_value = request_id.unwrap().to_str().unwrap();
+        assert!(
+            id_value.starts_with("gnt-"),
+            "Generate endpoint should have gnt- prefix"
+        );
+        assert!(
+            id_value.len() > 4,
+            "Request ID should have content after prefix"
+        );
+
+        let custom_id = "custom-request-id-123";
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .header("x-request-id", custom_id)
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let response_id = resp.headers().get("x-request-id");
+        assert!(response_id.is_some());
+        assert_eq!(response_id.unwrap(), custom_id);
+
+        let chat_payload = json!({
+            "messages": [{"role": "user", "content": "Hello"}],
+            "model": "mock-model"
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&chat_payload).unwrap()))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let request_id = resp.headers().get("x-request-id");
+        assert!(request_id.is_some());
+        assert!(request_id
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("chatcmpl-"));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .header("x-correlation-id", "correlation-123")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let response_id = resp.headers().get("x-request-id");
+        assert!(response_id.is_some());
+        assert_eq!(response_id.unwrap(), "correlation-123");
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_request_id_with_custom_headers() {
+        // Create config with custom request ID headers
+        let mut config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .random_policy()
+            .host("127.0.0.1")
+            .port(3002)
+            .max_payload_size(256 * 1024 * 1024)
+            .request_timeout_secs(600)
+            .worker_startup_timeout_secs(1)
+            .worker_startup_check_interval_secs(1)
+            .request_id_headers(vec!["custom-id".to_string(), "trace-id".to_string()])
+            .max_concurrent_requests(64)
+            .queue_timeout_secs(60)
+            .build_unchecked();
+        config.health_check.disable_health_check = true;
+
+        let ctx = AppTestContext::new_with_config(
+            config,
+            vec![MockWorkerConfig {
+                port: 18902,
+                worker_type: WorkerType::Regular,
+                health_status: HealthStatus::Healthy,
+                response_delay_ms: 0,
+                fail_rate: 0.0,
+            }],
+        )
+        .await;
+
+        let app = ctx.create_app();
+
+        let payload = json!({
+            "text": "Test request",
+            "stream": false
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .header("custom-id", "my-custom-id")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let response_id = resp.headers().get("x-request-id");
+        assert!(response_id.is_some());
+        assert_eq!(response_id.unwrap(), "my-custom-id");
+
+        ctx.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod rerank_tests {
+    use super::*;
+    // Note: RerankRequest and RerankResult are available for future use
+
+    #[tokio::test]
+    async fn test_rerank_success() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18105,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app();
+
+        let payload = json!({
+            "query": "machine learning algorithms",
+            "documents": [
+                "Introduction to machine learning concepts",
+                "Deep learning neural networks tutorial"
+            ],
+            "model": "mock-model",
+            "top_k": 2,
+            "return_documents": true,
+            "rid": "test-request-123"
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/rerank")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert!(body_json.get("results").is_some());
+        assert!(body_json.get("model").is_some());
+        assert_eq!(body_json["model"], "mock-model");
+
+        let results = body_json["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+
+        assert!(results[0]["score"].as_f64().unwrap() >= results[1]["score"].as_f64().unwrap());
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_rerank_with_top_k() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18106,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app();
+
+        let payload = json!({
+            "query": "test query",
+            "documents": [
+                "Document 1",
+                "Document 2",
+                "Document 3"
+            ],
+            "model": "mock-model",
+            "top_k": 1,
+            "return_documents": true
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/rerank")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Should only return top_k results
+        let results = body_json["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_rerank_without_documents() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18107,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app();
+
+        let payload = json!({
+            "query": "test query",
+            "documents": ["Document 1", "Document 2"],
+            "model": "mock-model",
+            "return_documents": false
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/rerank")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Documents should be null when return_documents is false
+        let results = body_json["results"].as_array().unwrap();
+        for result in results {
+            assert!(result.get("document").is_none());
+        }
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_rerank_worker_failure() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18108,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 1.0, // Always fail
+        }])
+        .await;
+
+        let app = ctx.create_app();
+
+        let payload = json!({
+            "query": "test query",
+            "documents": ["Document 1"],
+            "model": "mock-model"
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/rerank")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        // Should return the worker's error response
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_rerank_oversized_worker_body_returns_502() {
+        // Upstream rerank reads are capped at max_payload_size; the mock
+        // worker inflates its response via "PAD:<n>" documents, which echo
+        // back as n-byte strings.
+        let mut config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .random_policy()
+            .host("127.0.0.1")
+            .port(3002)
+            .max_payload_size(16 * 1024)
+            .request_timeout_secs(600)
+            .worker_startup_timeout_secs(1)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(64)
+            .queue_timeout_secs(60)
+            .build_unchecked();
+        config.health_check.disable_health_check = true;
+
+        let ctx = AppTestContext::new_with_config(
+            config,
+            vec![MockWorkerConfig {
+                port: 18112,
+                worker_type: WorkerType::Regular,
+                health_status: HealthStatus::Healthy,
+                response_delay_ms: 0,
+                fail_rate: 0.0,
+            }],
+        )
+        .await;
+
+        let app = ctx.create_app();
+
+        // Worker response (~64KB document) exceeds the 16KB cap.
+        let payload = json!({
+            "query": "test query",
+            "documents": ["PAD:65536"],
+            "model": "mock-model",
+            "return_documents": true
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/rerank")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            resp.headers().get("x-smg-error-code").unwrap(),
+            "upstream_response_too_large"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body_json["error"]["code"], "upstream_response_too_large");
+
+        // A worker response under the cap is rebuilt normally.
+        let payload = json!({
+            "query": "test query",
+            "documents": ["PAD:1024"],
+            "model": "mock-model",
+            "return_documents": true
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/rerank")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body_json["results"].as_array().unwrap().len(), 1);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_v1_rerank_compatibility() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18110,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app();
+
+        // V1 rerank without model field — model defaults to UNKNOWN_MODEL_ID,
+        // routed to any available worker via wildcard
+        let payload_no_model = json!({
+            "query": "machine learning algorithms",
+            "documents": [
+                "Introduction to machine learning concepts",
+                "Deep learning neural networks tutorial",
+                "Statistical learning theory basics"
+            ]
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/rerank")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_string(&payload_no_model).unwrap(),
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        ctx.shutdown().await;
+    }
+
+    /// `/v1/rerank` routes by the body's `model`, as `/v1/embeddings` does:
+    /// the worker receives it, and `top_n` holds on the answer.
+    #[tokio::test]
+    async fn test_v1_rerank_carries_the_model_and_top_n() {
+        let recorder = RequestRecorder::new();
+        set_request_recorder(18113, Arc::clone(&recorder));
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18113,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app();
+
+        let payload = json!({
+            "model": "mock-model",
+            "query": "machine learning algorithms",
+            "documents": [
+                "Introduction to machine learning concepts",
+                "Deep learning neural networks tutorial"
+            ],
+            "top_n": 1
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/rerank")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body_json["model"], "mock-model");
+        assert_eq!(
+            body_json["results"].as_array().unwrap().len(),
+            1,
+            "top_n holds on the answer"
+        );
+        assert_eq!(
+            recorder.only_body()["model"],
+            "mock-model",
+            "the worker receives the body's model"
+        );
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_rerank_invalid_request() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18111,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app();
+
+        let payload = json!({
+            "query": "",
+            "documents": ["Document 1", "Document 2"],
+            "model": "mock-model"
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/rerank")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let payload = json!({
+            "query": "   ",
+            "documents": ["Document 1", "Document 2"],
+            "model": "mock-model"
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/rerank")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let payload = json!({
+            "query": "test query",
+            "documents": [],
+            "model": "mock-model"
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/rerank")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let payload = json!({
+            "query": "test query",
+            "documents": ["Document 1", "Document 2"],
+            "model": "mock-model",
+            "top_k": 0
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/rerank")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        ctx.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod single_model_tests {
+    use super::*;
+
+    /// `GET /v1/models/{id}` takes the whole rest of the path: a served model
+    /// answers 200, and an unknown id with a slash in it (the usual shape of
+    /// a self-hosted id) answers the model_not_found envelope, not the
+    /// unknown-route 404 a one-segment route would fall through to.
+    #[tokio::test]
+    async fn test_single_model_route_takes_a_slashed_id() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18209,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+        let app = ctx.create_app();
+
+        let served = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/models/mock-model")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(served.status(), StatusCode::OK);
+
+        for uri in ["/v1/models/org/model", "/v1/models/org%2Fmodel"] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body)
+                .unwrap_or_else(|_| json!({"error": {"code": "unknown_url"}}));
+            assert_eq!(body["error"]["code"], "model_not_found", "{uri}: {body}");
+        }
+
+        ctx.shutdown().await;
+    }
+}
+
+/// Five routes whose handlers took their body through axum's plain
+/// extractor read it through the gateway's validated extractor: a body that
+/// does not parse, a wrong type and a failed rule answer the gateway's error
+/// envelope with the status and code the chat route answers, before the
+/// router sees the body.
+#[cfg(test)]
+mod validated_body_tests {
+    use super::*;
+
+    /// The status, the content type and the body of `body` posted to `path`;
+    /// a body that is not JSON is kept under `not_json`, so an assertion
+    /// names it.
+    async fn post(
+        app: &axum::Router,
+        path: &str,
+        content_type: &str,
+        body: &str,
+    ) -> (StatusCode, String, serde_json::Value) {
+        let req = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header(CONTENT_TYPE, content_type)
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| json!({"not_json": String::from_utf8_lossy(&bytes)}));
+        (status, content_type, body)
+    }
+
+    /// `body` is the gateway's envelope for a refused request: the type is
+    /// `invalid_request_error`, the code is `code`, the message a string, and
+    /// `param` names the field when the case pins one (a body that is no
+    /// object carries serde's path to the value it stopped at, or none).
+    fn assert_envelope(body: &serde_json::Value, code: &str, param: Option<&str>, context: &str) {
+        assert_eq!(
+            body["error"]["type"], "invalid_request_error",
+            "{context}: {body}"
+        );
+        assert_eq!(body["error"]["code"], code, "{context}: {body}");
+        if let Some(param) = param {
+            assert_eq!(body["error"]["param"], param, "{context}: {body}");
+        }
+        assert!(body["error"]["message"].is_string(), "{context}: {body}");
+    }
+
+    /// A refusal raised while a request body is read and validated names its
+    /// code in the `x-smg-error-code` header, as a route's own refusal does.
+    /// On the Messages door, whose envelope has no code field, the header is
+    /// the only place the code is.
+    #[tokio::test]
+    async fn a_body_reading_refusal_names_its_code_in_the_header() {
+        let ctx = AppTestContext::new(vec![]).await;
+        let app = ctx.create_app();
+
+        for (path, refused, code) in [
+            (
+                "/v1/chat/completions",
+                r#"{"model":"mock-model","messages":"hi"}"#,
+                "invalid_type",
+            ),
+            (
+                "/v1/responses",
+                r#"{"model":"mock-model","input":7}"#,
+                "invalid_type",
+            ),
+            (
+                "/v1/messages",
+                r#"{"model":"mock-model","max_tokens":8,"messages":"hi"}"#,
+                "invalid_type",
+            ),
+            (
+                "/generate",
+                r#"{"model":"mock-model","text":7}"#,
+                "invalid_type",
+            ),
+            // A rule run on the body after it is read.
+            (
+                "/generate",
+                r#"{"model":"mock-model","text":""}"#,
+                "prompt_empty",
+            ),
+        ] {
+            let request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(refused))
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{path}: {refused}"
+            );
+            let header = response
+                .headers()
+                .get("x-smg-error-code")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(header.as_deref(), Some(code), "{path}: {refused}: {body}");
+            if path != "/v1/messages" {
+                assert_eq!(body["error"]["code"], code, "{path}: {refused}: {body}");
+            }
+        }
+        ctx.shutdown().await;
+    }
+
+    /// `/v1/rerank` runs the rules of the native route on its body before the
+    /// worker sees it: a body that passes them is served, an empty `query`
+    /// or `documents` list and a missing `query` are refused in the envelope.
+    #[tokio::test]
+    async fn v1_rerank_runs_the_rules_of_the_native_route_before_the_worker() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18121,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+        let app = ctx.create_app();
+
+        let served = r#"{"model":"mock-model","query":"q","documents":["a","b"]}"#;
+        let (status, _, body) = post(&app, "/v1/rerank", "application/json", served).await;
+        assert_eq!(status, StatusCode::OK, "a valid body is served: {body}");
+
+        for (refused, code, param) in [
+            (
+                r#"{"model":"mock-model","query":"","documents":["a"]}"#,
+                "invalid_value",
+                "query",
+            ),
+            (
+                r#"{"model":"mock-model","query":"q","documents":[]}"#,
+                "invalid_value",
+                "documents",
+            ),
+            (
+                r#"{"model":"mock-model","documents":["a"]}"#,
+                "missing_required_parameter",
+                "query",
+            ),
+        ] {
+            let (status, content_type, body) =
+                post(&app, "/v1/rerank", "application/json", refused).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}: {body}");
+            assert!(
+                content_type.starts_with("application/json"),
+                "{refused}: {content_type}"
+            );
+            assert_envelope(&body, code, Some(param), refused);
+        }
+
+        ctx.shutdown().await;
+    }
+
+    /// `/generate` serves a body with `text` and `input_ids` (the engine takes
+    /// the ids first), an empty `text` beside ids among them, and passes an
+    /// empty `text` beside a media item through the door (the gRPC path then
+    /// refuses the media as before, not the text); an empty `text` alone is
+    /// refused under `text` and a body with no prompt at all as a rule over
+    /// the request, in the envelope before the worker sees it.
+    #[tokio::test]
+    async fn generate_takes_the_ids_over_the_text_and_an_empty_text_with_ids_or_media() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18122,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+        let app = ctx.create_app();
+        // The media-only prompt passes the door and the relay forwards it as the
+        // engine takes it; the gRPC path's media refusal is that stage's own.
+        for served in [
+            r#"{"model":"mock-model","text":"hi","sampling_params":{"max_new_tokens":2}}"#,
+            r#"{"model":"mock-model","text":"hi","input_ids":[1,2],"sampling_params":{"max_new_tokens":2}}"#,
+            r#"{"model":"mock-model","text":"","input_ids":[1,2],"sampling_params":{"max_new_tokens":2}}"#,
+            r#"{"model":"mock-model","text":"","audio_data":"a.wav","sampling_params":{"max_new_tokens":2}}"#,
+        ] {
+            let (status, _, body) = post(&app, "/generate", "application/json", served).await;
+            assert_eq!(status, StatusCode::OK, "{served}: served: {body}");
+        }
+        for (refused, code, param) in [
+            (
+                r#"{"model":"mock-model","text":""}"#,
+                "prompt_empty",
+                Some("text"),
+            ),
+            (
+                r#"{"model":"mock-model","sampling_params":{"max_new_tokens":2}}"#,
+                "missing_required_parameter",
+                None,
+            ),
+        ] {
+            let (status, content_type, body) =
+                post(&app, "/generate", "application/json", refused).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}: {body}");
+            assert!(
+                content_type.starts_with("application/json"),
+                "{refused}: {content_type}"
+            );
+            assert_envelope(&body, code, param, refused);
+        }
+        ctx.shutdown().await;
+    }
+
+    /// `/v1/embeddings` answers a body of the wrong shape, a body under
+    /// another content type and a body that does not parse in the envelope,
+    /// as the chat route does, not with axum's text/plain 422, 415 and 400.
+    #[tokio::test]
+    async fn v1_embeddings_answers_a_malformed_body_in_the_envelope() {
+        let ctx = AppTestContext::new(vec![]).await;
+        let app = ctx.create_app();
+
+        for (content_type, sent, code) in [
+            ("application/json", "[1,2,3]", "invalid_type"),
+            (
+                "text/plain",
+                r#"{"model":"mock-model","input":"hello"}"#,
+                "json_parse_error",
+            ),
+            (
+                "application/json",
+                r#"{"model":"mock-model","input":"#,
+                "invalid_json",
+            ),
+        ] {
+            let (status, answered_type, body) =
+                post(&app, "/v1/embeddings", content_type, sent).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{sent}: {body}");
+            assert!(
+                answered_type.starts_with("application/json"),
+                "{sent}: {answered_type}"
+            );
+            assert_envelope(&body, code, None, sent);
+        }
+
+        ctx.shutdown().await;
+    }
+
+    /// `/v1/classify` names the field a body misses or mistypes in the
+    /// envelope's `param`, as the chat route does.
+    #[tokio::test]
+    async fn v1_classify_names_the_refused_field_in_the_envelope() {
+        let ctx = AppTestContext::new(vec![]).await;
+        let app = ctx.create_app();
+
+        for (sent, code, param) in [
+            (
+                r#"{"model":"mock-model"}"#,
+                "missing_required_parameter",
+                "input",
+            ),
+            (r#"{"model":7,"input":"hello"}"#, "invalid_type", "model"),
+            (
+                r#"{"model":"mock-model","input":[1,-2]}"#,
+                "integer_below_min_value",
+                "input",
+            ),
+        ] {
+            let (status, content_type, body) =
+                post(&app, "/v1/classify", "application/json", sent).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{sent}: {body}");
+            assert!(
+                content_type.starts_with("application/json"),
+                "{sent}: {content_type}"
+            );
+            assert_envelope(&body, code, Some(param), sent);
+        }
+
+        ctx.shutdown().await;
+    }
+
+    /// The body of an embeddings or classify request for `input`, as a client
+    /// sends it.
+    fn input_body(input: serde_json::Value) -> String {
+        json!({"model": "mock-model", "input": input}).to_string()
+    }
+
+    /// An array of `n` one-letter inputs.
+    fn inputs(n: usize) -> serde_json::Value {
+        serde_json::Value::Array(vec![json!("x"); n])
+    }
+
+    /// `/v1/embeddings` runs the public API's shape rules on its body at the
+    /// door both the gRPC path and the HTTP relay read through: every `input`
+    /// shape the API refuses and a `dimensions` under one are refused in the
+    /// envelope under the existing code for the fault, with the field in
+    /// `param`; the shapes the API takes pass the door, a long batch, an encoding
+    /// format the gateway does not read and the serving engine's array of
+    /// objects among them (no worker serves
+    /// the model here, so the gateway's own not-found answer follows, never a
+    /// refusal).
+    #[tokio::test]
+    async fn v1_embeddings_refuses_the_inputs_the_public_api_refuses() {
+        let ctx = AppTestContext::new(vec![]).await;
+        let app = ctx.create_app();
+
+        let with = |input: &str, options: serde_json::Value| {
+            let mut body = json!({"model": "mock-model", "input": input});
+            body.as_object_mut()
+                .unwrap()
+                .extend(options.as_object().unwrap().clone());
+            body.to_string()
+        };
+        for (sent, code, param) in [
+            (input_body(json!([])), "empty_array", "input"),
+            (input_body(json!("")), "empty_input", "input"),
+            (input_body(json!(["a", ""])), "empty_input", "input"),
+            (input_body(json!({"text": "x"})), "invalid_type", "input"),
+            (input_body(json!(null)), "invalid_type", "input"),
+            (input_body(json!(42)), "invalid_type", "input"),
+            (input_body(json!(["a", 1, null])), "invalid_type", "input"),
+            (
+                input_body(json!([{"text": "a"}, "b"])),
+                "invalid_type",
+                "input",
+            ),
+            (input_body(json!([[1, 2], []])), "empty_array", "input"),
+            (
+                input_body(json!([1, -2])),
+                "integer_below_min_value",
+                "input",
+            ),
+            (
+                input_body(json!([[1, 2], [-3]])),
+                "integer_below_min_value",
+                "input",
+            ),
+            (
+                with("x", json!({"dimensions": 0})),
+                "integer_below_min_value",
+                "dimensions",
+            ),
+            (
+                with("x", json!({"dimensions": -1})),
+                "integer_below_min_value",
+                "dimensions",
+            ),
+        ] {
+            let (status, content_type, body) =
+                post(&app, "/v1/embeddings", "application/json", &sent).await;
+            let shown = &sent[..sent.len().min(120)];
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{shown}: {body}");
+            assert!(
+                content_type.starts_with("application/json"),
+                "{shown}: {content_type}"
+            );
+            assert_envelope(&body, code, Some(param), shown);
+        }
+
+        for served in [
+            input_body(json!("hello")),
+            input_body(json!(["a", "b"])),
+            input_body(json!([1, 2, 3])),
+            input_body(json!([[1, 2], [3]])),
+            input_body(json!([{"text": "a"}, {"image": "https://example.com/a.jpg"}])),
+            input_body(inputs(4096)),
+            with("x", json!({"dimensions": 1, "encoding_format": "float"})),
+            with("x", json!({"encoding_format": "base64"})),
+            with("x", json!({"encoding_format": "hex"})),
+        ] {
+            let (status, _, body) = post(&app, "/v1/embeddings", "application/json", &served).await;
+            let shown = &served[..served.len().min(120)];
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "{shown}: the door passes it to routing: {body}"
+            );
+            assert_eq!(body["error"]["code"], "model_not_found", "{shown}: {body}");
+        }
+
+        ctx.shutdown().await;
+    }
+
+    /// `/v1/classify` runs the public API's `input` rule at the same door, the
+    /// embeddings route's without its array of objects: the shapes the public
+    /// API refuses are refused in the envelope under `input`, the shapes it
+    /// takes pass to routing.
+    #[tokio::test]
+    async fn v1_classify_refuses_the_inputs_the_public_api_refuses() {
+        let ctx = AppTestContext::new(vec![]).await;
+        let app = ctx.create_app();
+
+        for (sent, code) in [
+            (input_body(json!([])), "empty_array"),
+            (input_body(json!("")), "empty_input"),
+            (input_body(json!({"a": 1})), "invalid_type"),
+            (input_body(json!([{"text": "a"}])), "invalid_type"),
+            (input_body(json!(null)), "invalid_type"),
+            (input_body(json!(["a", 1])), "invalid_type"),
+        ] {
+            let (status, content_type, body) =
+                post(&app, "/v1/classify", "application/json", &sent).await;
+            let shown = &sent[..sent.len().min(120)];
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{shown}: {body}");
+            assert!(
+                content_type.starts_with("application/json"),
+                "{shown}: {content_type}"
+            );
+            assert_envelope(&body, code, Some("input"), shown);
+        }
+
+        for served in [
+            input_body(json!("hello")),
+            input_body(json!(["a", "b"])),
+            input_body(json!([1, 2, 3])),
+            input_body(inputs(4096)),
+        ] {
+            let (status, _, body) = post(&app, "/v1/classify", "application/json", &served).await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "{served}: the door passes it to routing: {body}"
+            );
+            assert_eq!(body["error"]["code"], "model_not_found", "{served}: {body}");
+        }
+
+        ctx.shutdown().await;
+    }
+}

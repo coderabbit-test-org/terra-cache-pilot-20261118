@@ -1,0 +1,482 @@
+//! Harmony response processor for non-streaming responses
+
+use std::sync::Arc;
+
+use axum::response::Response;
+use openai_protocol::{
+    chat::{ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse},
+    common::{ChatLogProbs, ToolCall, Usage},
+    responses::{
+        ResponseContentPart, ResponseOutputItem, ResponseReasoningContent, ResponseUsage,
+        ResponsesRequest, ResponsesResponse, ResponsesUsage,
+    },
+};
+use tracing::error;
+
+use super::{
+    builder::{convert_harmony_logprobs, try_harmony_encoding},
+    stop::TextStopScanner,
+    types::HarmonyChannelOutput,
+    HarmonyParserAdapter,
+};
+use crate::{
+    observability::metrics::{metrics_labels, Metrics, StreamingMetricsParams},
+    routers::{
+        error,
+        grpc::{
+            common::{
+                response_collection, response_formatting,
+                responses::{
+                    streaming::OutputItemKind,
+                    utils::{generation_failure_error, response_status},
+                },
+            },
+            context::{DispatchMetadata, ExecutionResult},
+            proto_wrapper::ProtoGenerateComplete,
+            regular::processor::generation_start,
+        },
+    },
+};
+
+/// The usage of a Harmony chat completion: the engine's counters through
+/// the chat usage builder the regular path uses, with the reasoning tokens
+/// the Harmony parser counted on the analysis and commentary channels, every
+/// detail counter present. The streamed answer's usage chunk and the
+/// non-streamed answer both build their usage here, so a request's two
+/// usage objects are the same.
+pub(super) fn chat_usage(
+    counts: response_formatting::TokenCounts,
+    parsed_reasoning_tokens: u32,
+) -> Usage {
+    // The Harmony models take no images: no image count to report.
+    response_formatting::chat_usage(counts.usage(), Some(parsed_reasoning_tokens), 0, None)
+}
+
+/// The usage of one Responses API iteration: the engine's counters with the
+/// reasoning tokens the Harmony parser counted, under the chat path's rule
+/// (the details are always reported, zero included; an engine that counts
+/// reasoning itself is not overruled); the same object whether the iteration
+/// streamed or not.
+pub(super) fn iteration_usage(
+    counts: response_formatting::TokenCounts,
+    parsed_reasoning_tokens: u32,
+) -> Usage {
+    response_formatting::with_parsed_reasoning_tokens(counts.usage(), Some(parsed_reasoning_tokens))
+}
+
+/// The router's own enforcement of the string `stop`s its engine cannot
+/// match, on one parsed turn: the channel text is scanned in emission order
+/// (analysis before final) and cut after the first match, which stays as the
+/// suffix, as the token-forwarding gRPC path yields it for these models;
+/// everything the model wrote past the match, calls included, is dropped,
+/// and the turn's finish is `stop`. Answers the stop that matched; none when
+/// no stop did (the turn stands as parsed), and nothing is scanned when the
+/// router has no stops to enforce.
+fn enforce_router_stops(
+    router_stop_strings: &[String],
+    turn: &mut HarmonyChannelOutput,
+) -> Option<String> {
+    if router_stop_strings.is_empty() {
+        return None;
+    }
+    let mut scanner = TextStopScanner::new(router_stop_strings.to_vec());
+    if let Some(text) = turn.analysis.take() {
+        let (out, stopped) = scanner.scan_complete(&text);
+        turn.analysis = (!out.is_empty()).then_some(out);
+        if stopped {
+            turn.final_text.clear();
+            turn.commentary = None;
+        }
+    }
+    if scanner.matched().is_none() && !turn.final_text.is_empty() {
+        let (out, stopped) = scanner.scan_complete(&turn.final_text);
+        turn.final_text = out;
+        if stopped {
+            turn.commentary = None;
+        }
+    }
+    let matched = scanner.matched().map(str::to_string);
+    if matched.is_some() {
+        turn.finish_reason = "stop".to_string();
+    }
+    matched
+}
+
+/// The Harmony channels of one complete response, with the parser that read
+/// them. `function` names the caller in a failure's log line.
+fn parse_complete_response(
+    complete: &ProtoGenerateComplete,
+    function: &'static str,
+) -> Result<(HarmonyParserAdapter, HarmonyChannelOutput), Response> {
+    let mut parser = HarmonyParserAdapter::new().map_err(|e| {
+        error!(function, error = %e, "Failed to create Harmony parser");
+        error::internal_error(
+            "create_harmony_parser_failed",
+            format!("Failed to create Harmony parser: {e}"),
+        )
+    })?;
+    let parsed = parser
+        .parse_complete(complete.output_ids(), complete.finish_reason().to_string())
+        .map_err(|e| {
+            error!(function, error = %e, "Harmony parsing failed on complete response");
+            error::internal_error(
+                "harmony_parsing_failed",
+                format!("Harmony parsing failed: {e}"),
+            )
+        })?;
+    Ok((parser, parsed))
+}
+
+/// Processor for non-streaming Harmony responses
+///
+/// Collects all output tokens from execution and parses them using
+/// HarmonyParserAdapter to extract the complete response.
+pub(crate) struct HarmonyResponseProcessor;
+
+impl HarmonyResponseProcessor {
+    /// Create a new Harmony response processor
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Process a non-streaming Harmony chat response
+    ///
+    /// `router_stop_strings` is non-empty only when the router must enforce
+    /// string `stop` sequences itself (direct-ZMQ backends: the engine sees
+    /// token ids only).
+    ///
+    /// Returns the response with the engine's counters it was built from:
+    /// the response's usage may carry the parser's reasoning count where
+    /// the engine reports none; the settlement takes the counters.
+    pub async fn process_non_streaming_chat_response(
+        &self,
+        execution_result: ExecutionResult,
+        chat_request: Arc<ChatCompletionRequest>,
+        dispatch: DispatchMetadata,
+        router_stop_strings: &[String],
+    ) -> Result<(ChatCompletionResponse, response_formatting::TokenCounts), Response> {
+        let started = generation_start(&execution_result);
+        let request_logprobs = chat_request.logprobs;
+
+        // Collect all completed responses (one per choice)
+        let all_responses =
+            response_collection::collect_responses(execution_result, request_logprobs).await?;
+        if all_responses.is_empty() {
+            return Err(error::internal_error(
+                "no_responses_from_server",
+                "No responses from server",
+            ));
+        }
+
+        // Build choices by parsing output with HarmonyParserAdapter
+        let mut choices: Vec<ChatChoice> = Vec::new();
+        let mut total_reasoning_tokens = 0u32;
+
+        for (index, complete) in all_responses.iter().enumerate() {
+            let matched_stop = complete.matched_stop_json();
+
+            let (_, mut parsed) =
+                parse_complete_response(complete, "process_non_streaming_chat_response")?;
+
+            // Convert output logprobs if present: one entry per generated
+            // token, with the candidates the request's `top_logprobs` asked for.
+            let logprobs: Option<ChatLogProbs> = if request_logprobs {
+                let encoding = try_harmony_encoding()
+                    .map_err(|e| error::internal_error("harmony_encoding_unavailable", e))?;
+                complete
+                    .output_logprobs()
+                    .map(|lp| convert_harmony_logprobs(encoding, lp, chat_request.top_logprobs))
+            } else {
+                None
+            };
+
+            // The router's own stops, where the engine cannot match them: the
+            // turn is cut at the first match, and that stop is the choice's.
+            let matched_stop = match enforce_router_stops(router_stop_strings, &mut parsed) {
+                Some(stop) => Some(serde_json::Value::String(stop)),
+                None => matched_stop,
+            };
+
+            // Build response message (assistant)
+            let message = ChatCompletionMessage {
+                role: "assistant".to_string(),
+                content: (!parsed.final_text.is_empty()).then_some(parsed.final_text),
+                refusal: None,
+                annotations: Vec::new(),
+                tool_calls: parsed.commentary,
+                reasoning_content: parsed.analysis,
+            };
+
+            // Accumulate reasoning tokens across all responses
+            total_reasoning_tokens += parsed.reasoning_token_count;
+
+            choices.push(ChatChoice {
+                index: index as u32,
+                message,
+                logprobs,
+                finish_reason: Some(parsed.finish_reason),
+                matched_stop,
+                hidden_states: None,
+            });
+        }
+
+        // The usage from the engine's counters, built as the streamed answer
+        // builds its usage chunk: with the reasoning tokens the parser
+        // counted and every detail counter present as the OpenAI API sends it.
+        let counts =
+            response_formatting::TokenCounts::of_collected(&all_responses, chat_request.choices());
+        let usage = chat_usage(counts, total_reasoning_tokens);
+
+        // Final ChatCompletionResponse
+        let response = ChatCompletionResponse::builder(&dispatch.request_id, &dispatch.model)
+            .created(dispatch.created)
+            .choices(choices)
+            .usage(usage)
+            .maybe_system_fingerprint(dispatch.weight_version.as_deref())
+            .build();
+        // The records the streamed answer makes at its end; a collected
+        // answer shows no first token.
+        Metrics::record_streaming_metrics(StreamingMetricsParams {
+            router_type: metrics_labels::ROUTER_GRPC,
+            backend_type: metrics_labels::BACKEND_HARMONY,
+            model_id: &chat_request.model,
+            endpoint: metrics_labels::ENDPOINT_CHAT,
+            ttft: None,
+            dispatch_wait: None,
+            generation_duration: started.elapsed(),
+            input_tokens: Some(u64::from(counts.prompt)),
+            cached_tokens: Some(u64::from(counts.cached)),
+            output_tokens: u64::from(counts.completion),
+        });
+        Ok((response, counts))
+    }
+}
+
+impl Default for HarmonyResponseProcessor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Result of processing a single Responses API iteration
+///
+/// Used by the MCP tool loop to determine whether to continue
+/// executing tools or return the final response.
+pub(crate) enum ResponsesIterationResult {
+    /// Tool calls found in commentary channel - continue MCP loop
+    ToolCallsFound {
+        tool_calls: Vec<ToolCall>,
+        analysis: Option<String>, // For streaming emission or reasoning output
+        partial_text: String,     // For streaming emission or message output
+        usage: Usage,             // Token usage from this iteration
+        request_id: String,       // Request ID from dispatch
+        /// The turn's finish reason as the parser reads it (`tool_calls` when
+        /// the turn ended on closed calls, else the engine's); none when a
+        /// stream ended before its terminal frame. The non-streamed response
+        /// reads its status and its calls' from it.
+        finish_reason: Option<String>,
+    },
+    /// No tool calls - return final ResponsesResponse
+    Completed {
+        response: Box<ResponsesResponse>,
+        usage: Usage,
+    },
+}
+
+impl HarmonyResponseProcessor {
+    /// Process a single Responses API iteration
+    ///
+    /// Parses Harmony channels and determines if tool calls are present.
+    /// If tool calls found, returns ToolCallsFound for MCP loop to execute.
+    /// If no tool calls, builds final ResponsesResponse.
+    ///
+    /// # Arguments
+    ///
+    /// * `execution_result` - The execution result from the model
+    /// * `responses_request` - The original Responses API request
+    /// * `dispatch` - Dispatch metadata for request tracking
+    /// * `router_stop_strings` - The string `stop`s the router must enforce
+    ///   itself, non-empty only where the engine sees token ids and cannot
+    ///   match them: the turn is cut at the first match, as a chat turn is
+    ///
+    /// # Returns
+    ///
+    /// ResponsesIterationResult indicating whether to continue loop or return,
+    /// with the engine's counts of the iteration (the usage the result
+    /// carries is built from them; the settlement of the iteration's
+    /// reservation takes them as they are).
+    pub async fn process_responses_iteration(
+        &self,
+        execution_result: ExecutionResult,
+        responses_request: Arc<ResponsesRequest>,
+        dispatch: DispatchMetadata,
+        router_stop_strings: &[String],
+    ) -> Result<(ResponsesIterationResult, response_formatting::TokenCounts), Response> {
+        let request_logprobs = responses_request.top_logprobs.is_some();
+
+        // Collect all completed responses
+        let all_responses =
+            response_collection::collect_responses(execution_result, request_logprobs).await?;
+        if all_responses.is_empty() {
+            return Err(error::internal_error(
+                "no_responses_from_server",
+                "No responses from server",
+            ));
+        }
+
+        // For Responses API, we only process the first response (n=1)
+        let complete = all_responses
+            .first()
+            .ok_or_else(|| error::internal_error("no_complete_response", "No complete response"))?;
+
+        let (parser, mut parsed) =
+            parse_complete_response(complete, "process_responses_iteration")?;
+
+        // VALIDATION: Check if model incorrectly generated Tool role messages
+        // This happens when the model copies the format of tool result messages
+        // instead of continuing as assistant. This is a model hallucination bug.
+        let messages = parser.get_messages();
+        let tool_messages_generated = messages.iter().any(|msg| {
+            msg.author.role == openai_harmony::chat::Role::Tool
+                && msg.recipient.as_deref() == Some("assistant")
+        });
+
+        if tool_messages_generated {
+            tracing::warn!(
+                "Model generated Tool->Assistant message instead of Assistant message. \
+                This is a model hallucination bug where it copies tool result format."
+            );
+        }
+
+        // The router's own stops, where the engine cannot match them: the
+        // turn is cut at the first match, the calls past it dropped.
+        enforce_router_stops(router_stop_strings, &mut parsed);
+
+        // The engine's counts of the iteration and the usage they make, as
+        // the streamed iteration builds it (needed for both ToolCallsFound
+        // and Completed).
+        let counts = response_formatting::TokenCounts::of(std::slice::from_ref(complete));
+        let usage = iteration_usage(counts, parsed.reasoning_token_count);
+
+        // Check for tool calls in commentary channel
+        if let Some(tool_calls) = parsed.commentary {
+            // Tool calls found - return for MCP loop execution
+            return Ok((
+                ResponsesIterationResult::ToolCallsFound {
+                    tool_calls,
+                    analysis: parsed.analysis,
+                    partial_text: parsed.final_text,
+                    usage,
+                    request_id: dispatch.request_id.clone(),
+                    finish_reason: Some(parsed.finish_reason),
+                },
+                counts,
+            ));
+        }
+
+        // No tool calls - build final ResponsesResponse
+        let mut output: Vec<ResponseOutputItem> = Vec::new();
+
+        // Map analysis channel → ResponseOutputItem::Reasoning
+        if let Some(analysis) = parsed.analysis {
+            let reasoning_item = ResponseOutputItem::new_reasoning(
+                OutputItemKind::Reasoning.new_id(),
+                vec![],
+                vec![ResponseReasoningContent::ReasoningText { text: analysis }],
+                Some("completed".to_string()),
+            );
+            output.push(reasoning_item);
+        }
+
+        // TODO: Logprobs for Responses API is not fully supported yet.
+        // The Chat Completions API logprobs work, but Responses API needs more testing.
+        // For now, we disable logprobs in Responses API output.
+        let logprobs: Option<ChatLogProbs> = None;
+        let _ = request_logprobs; // silence unused variable warning
+
+        // Map final channel → ResponseOutputItem::Message
+        if !parsed.final_text.is_empty() {
+            let message_item = ResponseOutputItem::Message {
+                id: OutputItemKind::Message.new_id(),
+                role: "assistant".to_string(),
+                content: vec![ResponseContentPart::OutputText {
+                    text: parsed.final_text,
+                    annotations: vec![],
+                    logprobs,
+                }],
+                status: "completed".to_string(),
+                phase: None,
+            };
+            output.push(message_item);
+        }
+
+        // The status is read where every Responses object reads it: a
+        // `length` finish is incomplete with `max_output_tokens`, a failed
+        // generation is failed with its error. No call was found, so none
+        // was cut.
+        let finish_reason = Some(parsed.finish_reason.as_str());
+        let (status, incomplete_details) = response_status(finish_reason, false);
+        let mut builder =
+            ResponsesResponse::builder(&dispatch.request_id, &responses_request.model)
+                .copy_from_request(&responses_request)
+                .created_at(dispatch.created as i64)
+                .status(status)
+                .output(output)
+                .maybe_text(responses_request.text.clone())
+                .usage(ResponsesUsage::Modern(ResponseUsage::from(&usage)));
+        if let Some(details) = incomplete_details {
+            builder = builder.incomplete_details(details);
+        }
+        if let Some(error) = generation_failure_error(finish_reason) {
+            builder = builder.error(error);
+        }
+        let response = builder.build();
+
+        Ok((
+            ResponsesIterationResult::Completed {
+                response: Box::new(response),
+                usage,
+            },
+            counts,
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn counts(reasoning: u32) -> response_formatting::TokenCounts {
+        response_formatting::TokenCounts {
+            prompt: 10,
+            completion: 5,
+            cached: 0,
+            reasoning,
+            spec_accepted: 0,
+            spec_drafted: Some(0),
+        }
+    }
+
+    fn reasoning_of(usage: &Usage) -> Option<u32> {
+        usage
+            .completion_tokens_details
+            .as_ref()
+            .and_then(|details| details.reasoning_tokens)
+    }
+
+    #[test]
+    fn both_helpers_resolve_the_reasoning_count_the_same_way() {
+        // The engine reported none: the parser's count is used, zero included.
+        for parsed in [0, 3] {
+            assert_eq!(reasoning_of(&chat_usage(counts(0), parsed)), Some(parsed));
+            assert_eq!(
+                reasoning_of(&iteration_usage(counts(0), parsed)),
+                Some(parsed)
+            );
+        }
+        // The engine counted reasoning itself: its count stands on both paths.
+        assert_eq!(reasoning_of(&chat_usage(counts(7), 3)), Some(7));
+        assert_eq!(reasoning_of(&iteration_usage(counts(7), 3)), Some(7));
+        assert_eq!(reasoning_of(&iteration_usage(counts(7), 0)), Some(7));
+    }
+}

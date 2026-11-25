@@ -1,0 +1,1279 @@
+{{/*
+Expand the name of the chart.
+*/}}
+{{- define "smg.name" -}}
+{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
+Create a default fully qualified app name.
+*/}}
+{{- define "smg.fullname" -}}
+{{- if .Values.fullnameOverride }}
+{{- .Values.fullnameOverride | trunc 45 | trimSuffix "-" }}
+{{- else }}
+{{- $name := default .Chart.Name .Values.nameOverride }}
+{{- if contains $name .Release.Name }}
+{{- .Release.Name | trunc 45 | trimSuffix "-" }}
+{{- else }}
+{{- printf "%s-%s" .Release.Name $name | trunc 45 | trimSuffix "-" }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+Create chart name and version as used by the chart label.
+*/}}
+{{- define "smg.chart" -}}
+{{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
+Common labels
+*/}}
+{{- define "smg.labels" -}}
+helm.sh/chart: {{ include "smg.chart" . }}
+{{ include "smg.selectorLabels" . }}
+app.kubernetes.io/version: {{ .Values.global.image.tag | default .Chart.AppVersion | quote }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- end }}
+
+{{/*
+Selector labels
+*/}}
+{{- define "smg.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "smg.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
+
+{{/*
+Router image
+*/}}
+{{- define "smg.routerImage" -}}
+{{- $registry := .Values.global.image.registry -}}
+{{- $repository := .Values.global.image.repository -}}
+{{- $tag := .Values.global.image.tag | default .Chart.AppVersion -}}
+{{- printf "%s/%s:%s" $registry $repository $tag -}}
+{{- end }}
+
+{{/*
+Service account name
+*/}}
+{{- define "smg.serviceAccountName" -}}
+{{- if .Values.serviceAccount.create }}
+{{- default (include "smg.fullname" .) .Values.serviceAccount.name }}
+{{- else }}
+{{- default "default" .Values.serviceAccount.name }}
+{{- end }}
+{{- end }}
+
+{{/*
+Discovery provider -- the worker discovery provider the router runs:
+router.discovery.provider, or "kubernetes" for router.serviceDiscovery.enabled,
+its legacy spelling. Empty when workers are not discovered (mesh router
+discovery is not worker discovery; see smg.meshRouterDiscovery).
+*/}}
+{{- define "smg.discoveryProvider" -}}
+{{- if .Values.router.serviceDiscovery.enabled -}}
+kubernetes
+{{- else -}}
+{{- .Values.router.discovery.provider | default "" -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Mesh router discovery -- "true" when mesh is on without peerUrls, so the
+routers find each other among the release's router pods through the
+Kubernetes API. The gateway runs that only inside Kubernetes discovery.
+*/}}
+{{- define "smg.meshRouterDiscovery" -}}
+{{- if and .Values.router.mesh.enabled (not .Values.router.mesh.peerUrls) -}}true{{- end -}}
+{{- end }}
+
+{{/*
+Kubernetes API -- "true" when the router reads pods through the Kubernetes
+API: Kubernetes worker discovery, by either spelling, or mesh router
+discovery. The Role and RoleBinding are created for it; the file, Slurm and
+Consul providers never call the API, so they get none unless rbac.create.
+*/}}
+{{- define "smg.usesKubernetesApi" -}}
+{{- if or (eq (include "smg.discoveryProvider" .) "kubernetes") (include "smg.meshRouterDiscovery" .) -}}true{{- end -}}
+{{- end }}
+
+{{/*
+Discovery cluster-wide -- "true" when Kubernetes discovery watches every
+namespace, so its RBAC is a ClusterRole and ClusterRoleBinding.
+router.serviceDiscovery.clusterWide counts on its own, as it always has.
+*/}}
+{{- define "smg.discoveryClusterWide" -}}
+{{- $discovery := .Values.router.discovery -}}
+{{- if or .Values.router.serviceDiscovery.clusterWide (and (eq ($discovery.provider | default "") "kubernetes") $discovery.kubernetes.clusterWide) -}}true{{- end -}}
+{{- end }}
+
+{{/*
+Discovery namespace -- the namespace Kubernetes discovery watches when it is
+not cluster-wide: router.discovery.kubernetes.namespace under the provider,
+router.serviceDiscovery.namespace under the legacy spelling, the release's
+otherwise (mesh router discovery alone watches the release's). The Role and
+RoleBinding are created there, so they cover the pods the router reads.
+*/}}
+{{- define "smg.discoveryNamespace" -}}
+{{- if eq (.Values.router.discovery.provider | default "") "kubernetes" -}}
+{{- .Values.router.discovery.kubernetes.namespace | default .Release.Namespace -}}
+{{- else if .Values.router.serviceDiscovery.enabled -}}
+{{- .Values.router.serviceDiscovery.namespace | default .Release.Namespace -}}
+{{- else -}}
+{{- .Release.Namespace -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Discovery file path -- the manifest the file provider reads: file.path, else
+the ConfigMap's key under /etc/smg/discovery, where the router pod mounts it.
+*/}}
+{{- define "smg.discoveryFilePath" -}}
+{{- with .Values.router.discovery.file -}}
+{{- .path | default (printf "/etc/smg/discovery/%s" (.configMap.key | default "workers.json")) -}}
+{{- end -}}
+{{- end }}
+
+{{- /*
+Admission config validation -- the values the gateway would refuse at
+start-up or ignore with a warning: the tenant rate limit enabled without its
+YAML (the gateway requires --tenant-rate-limit-config with the flag), and a
+rate-limit or scheduler ConfigMap without its feature enabled (the gateway
+ignores --tenant-rate-limit-config and --priority-scheduler-config without
+their enabled flags). Renders nothing.
+*/}}
+{{- define "smg.validateAdmission" -}}
+{{- if and (.Values.router.tenantRateLimit).enabled (not ((.Values.router.tenantRateLimit).configMap).name) -}}
+{{- fail "router.tenantRateLimit.enabled needs router.tenantRateLimit.configMap.name: the gateway requires --tenant-rate-limit-config with --tenant-rate-limit-enabled" -}}
+{{- end -}}
+{{- if and ((.Values.router.priorityScheduler).configMap).name (not .Values.router.priorityScheduler.enabled) -}}
+{{- fail "router.priorityScheduler.configMap.name without router.priorityScheduler.enabled: the gateway ignores --priority-scheduler-config without --priority-scheduler-enabled" -}}
+{{- end -}}
+{{- if and ((.Values.router.tenantRateLimit).configMap).name (not .Values.router.tenantRateLimit.enabled) -}}
+{{- fail "router.tenantRateLimit.configMap.name without router.tenantRateLimit.enabled: the gateway ignores --tenant-rate-limit-config without --tenant-rate-limit-enabled" -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Discovery validation -- refuses at render time what the gateway would refuse
+at start-up, or run without telling: two spellings of the worker provider,
+mesh router discovery the provider cannot carry, and a provider without what
+it cannot start without. Renders nothing.
+*/}}
+{{- define "smg.validateDiscovery" -}}
+{{- $discovery := .Values.router.discovery -}}
+{{- $provider := $discovery.provider | default "" -}}
+{{- if and .Values.router.serviceDiscovery.enabled $provider -}}
+{{- fail (printf "router.serviceDiscovery.enabled is the legacy spelling of router.discovery.provider=kubernetes and cannot be combined with router.discovery.provider=%s: set one or the other (router.discovery.kubernetes takes the serviceDiscovery settings)" $provider) -}}
+{{- end -}}
+{{- if include "smg.meshRouterDiscovery" . -}}
+{{- if and $provider (ne $provider "kubernetes") -}}
+{{- fail (printf "router.mesh without router.mesh.peerUrls finds its peers through Kubernetes discovery, which the gateway runs only under the kubernetes worker provider: with router.discovery.provider=%s, set router.mesh.peerUrls" $provider) -}}
+{{- end -}}
+{{- /* Router discovery watches the namespace worker discovery watches, and
+     the router pods are in the release's: another namespace finds no peer,
+     and every namespace finds the routers of other releases. */}}
+{{- if and (eq $provider "kubernetes") (or $discovery.kubernetes.clusterWide (ne ($discovery.kubernetes.namespace | default .Release.Namespace) .Release.Namespace)) -}}
+{{- fail (printf "router.mesh without router.mesh.peerUrls finds its peers in the namespace Kubernetes discovery watches, so router.discovery.kubernetes must watch the release namespace %s (no clusterWide, no other namespace): otherwise set router.mesh.peerUrls" .Release.Namespace) -}}
+{{- end -}}
+{{- end -}}
+{{- if eq $provider "file" -}}
+{{- if not (or $discovery.file.configMap.name $discovery.file.path) -}}
+{{- fail "router.discovery.provider=file needs its manifest: router.discovery.file.configMap.name (an existing ConfigMap) or router.discovery.file.path" -}}
+{{- end -}}
+{{- else if eq $provider "slurm" -}}
+{{- with $discovery.slurm -}}
+{{- if not .port -}}
+{{- fail "router.discovery.provider=slurm needs router.discovery.slurm.port, the inference server's port on every node" -}}
+{{- end -}}
+{{- if not (or .jobNames .encodeJobNames .prefillJobNames .decodeJobNames) -}}
+{{- fail "router.discovery.provider=slurm needs at least one job name: router.discovery.slurm.jobNames, encodeJobNames, prefillJobNames or decodeJobNames" -}}
+{{- end -}}
+{{- end -}}
+{{- else if eq $provider "consul" -}}
+{{- with $discovery.consul -}}
+{{- if not .service -}}
+{{- fail "router.discovery.provider=consul needs router.discovery.consul.service, the Consul service whose instances are the workers" -}}
+{{- end -}}
+{{- if .tls.existingSecret -}}
+{{- $keys := .tls.secretKeys | default dict -}}
+{{- if ne (empty $keys.clientCert) (empty $keys.clientKey) -}}
+{{- fail "router.discovery.consul.tls.secretKeys.clientCert and clientKey go together: set both or neither" -}}
+{{- end -}}
+{{- if not (or $keys.caCert $keys.clientCert) -}}
+{{- fail "router.discovery.consul.tls.existingSecret is mounted for no file: set secretKeys.caCert, or clientCert and clientKey" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Consul TLS files -- the files of router.discovery.consul.tls.existingSecret
+the router pod mounts under /etc/smg/consul-tls, as a JSON list for
+fromJsonArray: each with its key within the Secret (key), its file name in
+the mount (path) and the Consul variable naming it (env). Empty unless the
+consul provider has a TLS Secret.
+*/}}
+{{- define "smg.consulTlsFiles" -}}
+{{- $files := list -}}
+{{- $consul := .Values.router.discovery.consul -}}
+{{- if and (eq (.Values.router.discovery.provider | default "") "consul") $consul.tls.existingSecret -}}
+{{- $keys := $consul.tls.secretKeys | default dict -}}
+{{- range $file := list (dict "key" $keys.caCert "path" "ca.crt" "env" "CONSUL_CACERT") (dict "key" $keys.clientCert "path" "client.crt" "env" "CONSUL_CLIENT_CERT") (dict "key" $keys.clientKey "path" "client.key" "env" "CONSUL_CLIENT_KEY") -}}
+{{- if $file.key -}}
+{{- $files = append $files $file -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- toJson $files -}}
+{{- end }}
+
+{{/*
+Router CLI arguments -- builds the full args list from values.
+Called from the router Deployment template.
+*/}}
+{{- define "smg.routerArgs" -}}
+- "--host"
+- "0.0.0.0"
+- "--port"
+- {{ .Values.router.port | quote }}
+{{- /* The admin listener's values the gateway would refuse at start are
+     refused here: a host without the port, and a port another rendered
+     listener holds (the data and metrics ports; the mesh port when the
+     mesh is on). */}}
+{{- if and .Values.router.adminHost (not .Values.router.adminPort) -}}
+{{- fail "router.adminHost without router.adminPort: the gateway refuses --admin-host without --admin-port" -}}
+{{- end -}}
+{{- if .Values.router.adminPort }}
+{{- $admin := int .Values.router.adminPort -}}
+{{- $taken := "" -}}
+{{- if eq $admin (int .Values.router.port) -}}
+{{- $taken = "router.port" -}}
+{{- else if eq $admin (int .Values.router.metrics.port) -}}
+{{- $taken = "router.metrics.port" -}}
+{{- else if and .Values.router.mesh.enabled (eq $admin (int .Values.router.mesh.port)) -}}
+{{- $taken = "router.mesh.port" -}}
+{{- end -}}
+{{- if $taken -}}
+{{- fail (printf "router.adminPort %d equals %s: the gateway refuses two listeners on one port" $admin $taken) -}}
+{{- end }}
+- "--admin-port"
+- {{ .Values.router.adminPort | quote }}
+{{- with .Values.router.adminHost }}
+- "--admin-host"
+- {{ . | quote }}
+{{- end }}
+{{- end }}
+- "--policy"
+- {{ .Values.router.policy | quote }}
+{{- with .Values.router.disaggregation }}
+{{- $mode := .mode | default "" }}
+{{- /* The role flags of disaggregated serving, typed: a role given without
+     its mode would be ignored by the gateway with a warning, so the chart
+     refuses it at render; the encode role exists only under epd. */}}
+{{- if and (not $mode) (or .prefillPolicy .decodePolicy .encodePolicy .prefill .decode .encode) -}}
+{{- fail "router.disaggregation names a role (a policy or workers) without router.disaggregation.mode: set mode to pd or epd" -}}
+{{- end }}
+{{- if and (ne $mode "epd") (or .encodePolicy .encode) -}}
+{{- fail (printf "router.disaggregation.encodePolicy and router.disaggregation.encode need router.disaggregation.mode=epd (mode is %q)" $mode) -}}
+{{- end }}
+{{- if eq $mode "pd" }}
+- "--pd-disaggregation"
+{{- else if eq $mode "epd" }}
+- "--epd-disaggregation"
+{{- end }}
+{{- if .prefillPolicy }}
+- "--prefill-policy"
+- {{ .prefillPolicy | quote }}
+{{- end }}
+{{- if .decodePolicy }}
+- "--decode-policy"
+- {{ .decodePolicy | quote }}
+{{- end }}
+{{- if .encodePolicy }}
+- "--encode-policy"
+- {{ .encodePolicy | quote }}
+{{- end }}
+{{- range .prefill }}
+- "--prefill"
+- {{ .url | quote }}
+{{- if .bootstrapPort }}
+- {{ .bootstrapPort | quote }}
+{{- end }}
+{{- end }}
+{{- range .decode }}
+- "--decode"
+- {{ .url | quote }}
+{{- end }}
+{{- range .encode }}
+- "--encode"
+- {{ .url | quote }}
+{{- if .bootstrapPort }}
+- {{ .bootstrapPort | quote }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if .Values.router.enableIgw }}
+- "--enable-igw"
+{{- end }}
+{{- if .Values.router.mesh.enabled }}
+- "--enable-mesh"
+- "--mesh-host"
+- "$(POD_IP)"
+- "--mesh-port"
+- {{ .Values.router.mesh.port | quote }}
+- "--mesh-server-name"
+- "$(POD_NAME)"
+{{- if .Values.router.mesh.peerUrls }}
+{{- range .Values.router.mesh.peerUrls }}
+- "--mesh-peer-urls"
+- {{ . | quote }}
+{{- end }}
+{{- else if eq (.Values.router.discovery.provider | default "") "kubernetes" }}
+{{- /* The Kubernetes worker provider is on (below) and router discovery runs
+     inside it, in its namespace (the release's, smg.validateDiscovery), so
+     only the router selector is added; --service-discovery would conflict
+     with --discovery-provider. The selector names the release, so another
+     release's routers in the namespace are not taken for peers. */}}
+- "--router-selector"
+- "app.kubernetes.io/component=router"
+- "app.kubernetes.io/instance={{ .Release.Name }}"
+{{- else }}
+{{/* Use K8s service discovery to find other router pods by label.
+     Each router pod is annotated with the mesh port so peers can connect.
+     This avoids the SocketAddr limitation that prevents DNS hostnames
+     in --mesh-peer-urls. */}}
+- "--service-discovery"
+- "--selector"
+- "app.kubernetes.io/instance={{ .Release.Name }}"
+- "app.kubernetes.io/component=worker"
+- "--router-selector"
+- "app.kubernetes.io/component=router"
+- "--service-discovery-namespace"
+- {{ .Release.Namespace | quote }}
+{{- if .Values.workers }}
+{{- $firstWorker := index .Values.workers 0 }}
+{{- $workerDefaults := index .Values.engineDefaults $firstWorker.engine }}
+- "--service-discovery-port"
+- {{ $firstWorker.port | default $workerDefaults.port | quote }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- $disaggregationMode := (.Values.router.disaggregation).mode | default "" }}
+{{- $roleWorkers := or (.Values.router.disaggregation).prefill (.Values.router.disaggregation).decode (.Values.router.disaggregation).encode }}
+{{- $chartWorkersAreRegular := and .Values.workers (not (include "smg.discoveryProvider" .)) (not (include "smg.meshRouterDiscovery" .)) }}
+{{- /* A disaggregated gateway reads only its role workers and drops regular
+     worker URLs without a word, so the chart refuses them under a mode and
+     passes its own workers only when the roles or a discovery provider
+     address them. */}}
+{{- if and $disaggregationMode .Values.router.workerUrls -}}
+{{- fail "router.workerUrls names regular workers under router.disaggregation.mode: a disaggregated gateway reads only its role workers (router.disaggregation.prefill, decode and encode, or the discovery role selectors)" -}}
+{{- end }}
+{{- if and $disaggregationMode $chartWorkersAreRegular (not $roleWorkers) -}}
+{{- fail "workers deploys engines that router.disaggregation.mode gives no role: list their services under router.disaggregation.prefill, decode or encode, or find them by a discovery role selector" -}}
+{{- end }}
+{{- if .Values.router.workerUrls }}
+- "--worker-urls"
+{{- range .Values.router.workerUrls }}
+- {{ . | quote }}
+{{- end }}
+{{- else if and $chartWorkersAreRegular (not $disaggregationMode) }}
+- "--worker-urls"
+{{- range $i, $worker := .Values.workers }}
+{{- $defaults := index $.Values.engineDefaults $worker.engine }}
+{{- $port := $worker.port | default $defaults.port }}
+{{- $mode := $worker.connectionMode | default "http" }}
+{{- $scheme := "http" }}
+{{- if eq $mode "grpc" }}
+{{- $scheme = "grpc" }}
+{{- end }}
+- "{{ $scheme }}://{{ include "smg.fullname" $ }}-worker-{{ $worker.name }}:{{ $port }}"
+{{- end }}
+{{- end }}
+{{- if .Values.router.serviceDiscovery.enabled }}
+- "--service-discovery"
+{{- if .Values.router.serviceDiscovery.selector }}
+- "--selector"
+- {{ .Values.router.serviceDiscovery.selector | quote }}
+{{- end }}
+- "--service-discovery-port"
+- {{ .Values.router.serviceDiscovery.port | quote }}
+{{- if not .Values.router.serviceDiscovery.clusterWide }}
+- "--service-discovery-namespace"
+- {{ .Values.router.serviceDiscovery.namespace | default .Release.Namespace | quote }}
+{{- end }}
+{{- if .Values.router.serviceDiscovery.modelIdFrom }}
+- "--model-id-from"
+- {{ .Values.router.serviceDiscovery.modelIdFrom | quote }}
+{{- end }}
+{{- end }}
+{{- with .Values.router.discovery }}
+{{- if .provider }}
+- "--discovery-provider"
+- {{ .provider | quote }}
+{{- if eq .provider "kubernetes" }}
+{{- with .kubernetes }}
+{{- if .selector }}
+- "--selector"
+- {{ .selector | quote }}
+{{- end }}
+{{- $mode := ($.Values.router.disaggregation).mode | default "" }}
+{{- if and (not $mode) (or .prefillSelector .decodeSelector .encodeSelector) -}}
+{{- fail "router.discovery.kubernetes names a role selector (prefillSelector, decodeSelector or encodeSelector) without router.disaggregation.mode: set mode to pd or epd" -}}
+{{- end }}
+{{- if and (ne $mode "epd") .encodeSelector -}}
+{{- fail (printf "router.discovery.kubernetes.encodeSelector needs router.disaggregation.mode=epd (mode is %q)" $mode) -}}
+{{- end }}
+{{- if .prefillSelector }}
+- "--prefill-selector"
+- {{ .prefillSelector | quote }}
+{{- end }}
+{{- if .decodeSelector }}
+- "--decode-selector"
+- {{ .decodeSelector | quote }}
+{{- end }}
+{{- if .encodeSelector }}
+- "--encode-selector"
+- {{ .encodeSelector | quote }}
+{{- end }}
+- "--service-discovery-port"
+- {{ .port | quote }}
+{{- if not .clusterWide }}
+- "--service-discovery-namespace"
+- {{ .namespace | default $.Release.Namespace | quote }}
+{{- end }}
+{{- if .modelIdFrom }}
+- "--model-id-from"
+- {{ .modelIdFrom | quote }}
+{{- end }}
+{{- end }}
+{{- else if eq .provider "file" }}
+- "--discovery-file"
+- {{ include "smg.discoveryFilePath" $ | quote }}
+{{- else if eq .provider "slurm" }}
+{{- with .slurm }}
+{{- $mode := ($.Values.router.disaggregation).mode | default "" }}
+{{- if and (not $mode) (or .prefillJobNames .decodeJobNames .encodeJobNames) -}}
+{{- fail "router.discovery.slurm names a role job (prefillJobNames, decodeJobNames or encodeJobNames) without router.disaggregation.mode: set mode to pd or epd" -}}
+{{- end }}
+{{- if and (ne $mode "epd") .encodeJobNames -}}
+{{- fail (printf "router.discovery.slurm.encodeJobNames needs router.disaggregation.mode=epd (mode is %q)" $mode) -}}
+{{- end }}
+{{- if and $mode .jobNames -}}
+{{- fail (printf "router.discovery.slurm.jobNames names regular jobs under router.disaggregation.mode=%s: a disaggregated gateway reads only its role jobs (prefillJobNames, decodeJobNames and, under epd, encodeJobNames)" $mode) -}}
+{{- end }}
+{{- range .jobNames }}
+- "--slurm-job-name"
+- {{ . | quote }}
+{{- end }}
+{{- range .encodeJobNames }}
+- "--slurm-encode-job-name"
+- {{ . | quote }}
+{{- end }}
+{{- range .prefillJobNames }}
+- "--slurm-prefill-job-name"
+- {{ . | quote }}
+{{- end }}
+{{- range .decodeJobNames }}
+- "--slurm-decode-job-name"
+- {{ . | quote }}
+{{- end }}
+- "--slurm-port"
+- {{ .port | quote }}
+{{- if .bootstrapPort }}
+- "--slurm-bootstrap-port"
+- {{ .bootstrapPort | quote }}
+{{- end }}
+{{- if .user }}
+- "--slurm-user"
+- {{ .user | quote }}
+{{- end }}
+{{- if .account }}
+- "--slurm-account"
+- {{ .account | quote }}
+{{- end }}
+{{- if .partition }}
+- "--slurm-partition"
+- {{ .partition | quote }}
+{{- end }}
+{{- end }}
+{{- else if eq .provider "consul" }}
+{{- /* The ACL token and the TLS files are Consul's environment variables,
+     set on the router container from Secrets, never flags. */}}
+{{- with .consul }}
+- "--consul-service"
+- {{ .service | quote }}
+{{- if .address }}
+- "--consul-address"
+- {{ .address | quote }}
+{{- end }}
+{{- if .datacenter }}
+- "--consul-datacenter"
+- {{ .datacenter | quote }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- /* Under either spelling of Kubernetes discovery, as under any provider. */}}
+{{- if and (include "smg.discoveryProvider" .) .Values.router.discovery.checkIntervalSecs }}
+- "--discovery-check-interval-secs"
+- {{ int .Values.router.discovery.checkIntervalSecs | quote }}
+{{- end }}
+{{- if .Values.router.model }}
+- "--model-path"
+- {{ .Values.router.model | quote }}
+{{- end }}
+{{- if .Values.router.tokenizerPath }}
+- "--tokenizer-path"
+- {{ .Values.router.tokenizerPath | quote }}
+{{- end }}
+{{- if .Values.router.chatTemplate }}
+- "--chat-template"
+- {{ .Values.router.chatTemplate | quote }}
+{{- end }}
+- "--cache-threshold"
+- {{ .Values.router.cacheThreshold | quote }}
+- "--balance-abs-threshold"
+- {{ .Values.router.balanceAbsThreshold | quote }}
+- "--balance-rel-threshold"
+- {{ .Values.router.balanceRelThreshold | quote }}
+- "--eviction-interval-secs"
+- {{ .Values.router.evictionIntervalSecs | quote }}
+- "--max-tree-size"
+- {{ int .Values.router.maxTreeSize | quote }}
+- "--block-size"
+- {{ .Values.router.blockSize | quote }}
+- "--max-payload-size"
+- {{ int .Values.router.maxPayloadSize | quote }}
+- "--request-timeout-secs"
+- {{ .Values.router.requestTimeoutSecs | quote }}
+- "--mm-turbojpeg"
+{{- /* Absent when an upgrade reuses the values of a release from before this
+     value: the chart's default then, where the gateway's own is prefer. */}}
+- {{ .Values.router.mmTurbojpeg | default "require" | quote }}
+{{- if .Values.router.grpcRequestTimeoutSecs }}
+- "--grpc-request-timeout-secs"
+- {{ .Values.router.grpcRequestTimeoutSecs | quote }}
+{{- end }}
+- "--shutdown-grace-period-secs"
+- {{ .Values.router.shutdownGracePeriodSeconds | quote }}
+{{- if ne .Values.router.shutdownSettleSeconds nil }}
+- "--shutdown-settle-secs"
+- {{ .Values.router.shutdownSettleSeconds | quote }}
+{{- end }}
+- "--max-concurrent-requests"
+- {{ .Values.router.maxConcurrentRequests | quote }}
+- "--queue-size"
+- {{ .Values.router.queueSize | quote }}
+- "--queue-timeout-secs"
+- {{ .Values.router.queueTimeoutSecs | quote }}
+{{- if not .Values.router.retry.enabled }}
+- "--disable-retries"
+{{- else }}
+- "--retry-max-retries"
+- {{ .Values.router.retry.maxRetries | quote }}
+- "--retry-initial-backoff-ms"
+- {{ .Values.router.retry.initialBackoffMs | quote }}
+- "--retry-max-backoff-ms"
+- {{ .Values.router.retry.maxBackoffMs | quote }}
+- "--retry-backoff-multiplier"
+- {{ .Values.router.retry.backoffMultiplier | quote }}
+- "--retry-jitter-factor"
+- {{ .Values.router.retry.jitterFactor | quote }}
+{{- end }}
+{{- if not .Values.router.circuitBreaker.enabled }}
+- "--disable-circuit-breaker"
+{{- else }}
+- "--cb-failure-threshold"
+- {{ .Values.router.circuitBreaker.failureThreshold | quote }}
+- "--cb-success-threshold"
+- {{ .Values.router.circuitBreaker.successThreshold | quote }}
+- "--cb-timeout-duration-secs"
+- {{ .Values.router.circuitBreaker.timeoutDurationSecs | quote }}
+- "--cb-window-duration-secs"
+- {{ .Values.router.circuitBreaker.windowDurationSecs | quote }}
+{{- end }}
+{{- if not .Values.router.healthCheck.enabled }}
+- "--disable-health-check"
+{{- else }}
+- "--health-failure-threshold"
+- {{ .Values.router.healthCheck.failureThreshold | quote }}
+- "--health-success-threshold"
+- {{ .Values.router.healthCheck.successThreshold | quote }}
+- "--health-check-timeout-secs"
+- {{ .Values.router.healthCheck.timeoutSecs | quote }}
+- "--health-check-interval-secs"
+- {{ .Values.router.healthCheck.intervalSecs | quote }}
+- "--health-check-endpoint"
+- {{ .Values.router.healthCheck.endpoint | quote }}
+{{- end }}
+- "--prometheus-port"
+- {{ .Values.router.metrics.port | quote }}
+- "--log-level"
+- {{ .Values.router.logging.level | quote }}
+{{- if .Values.router.logging.json }}
+- "--log-json"
+{{- end }}
+{{- if .Values.router.logging.dir }}
+- "--log-dir"
+- {{ .Values.router.logging.dir | quote }}
+{{- end }}
+{{- if .Values.router.tracing.enabled }}
+- "--enable-trace"
+- "--otlp-traces-endpoint"
+- {{ .Values.router.tracing.otlpEndpoint | quote }}
+{{- end }}
+{{- if ne .Values.history.backend "memory" }}
+- "--history-backend"
+- {{ .Values.history.backend | quote }}
+{{- end }}
+{{- if eq .Values.history.backend "postgres" }}
+- "--postgres-pool-max"
+- {{ .Values.history.postgres.poolMax | quote }}
+{{- end }}
+{{- if eq .Values.history.backend "redis" }}
+- "--redis-pool-max"
+- {{ .Values.history.redis.poolMax | quote }}
+{{- end }}
+{{- if eq .Values.history.backend "oracle" }}
+- "--oracle-pool-max"
+- {{ .Values.history.oracle.poolMax | quote }}
+{{- end }}
+{{- if ge (int .Values.auth.rateLimitTokensPerSecond) 0 }}
+- "--rate-limit-tokens-per-second"
+- {{ .Values.auth.rateLimitTokensPerSecond | quote }}
+{{- end }}
+{{- if .Values.router.wasm.enabled }}
+- "--enable-wasm"
+{{- end }}
+{{- if .Values.router.wasm.path }}
+- "--storage-hook-wasm-path"
+- {{ .Values.router.wasm.path | quote }}
+{{- end }}
+{{- if .Values.router.mcp.enabled }}
+- "--mcp-config-path"
+- {{ .Values.router.mcp.configPath | quote }}
+{{- end }}
+{{- if .Values.router.reasoningParser }}
+- "--reasoning-parser"
+- {{ .Values.router.reasoningParser | quote }}
+{{- end }}
+{{- if .Values.router.toolCallParser }}
+- "--tool-call-parser"
+- {{ .Values.router.toolCallParser | quote }}
+{{- end }}
+{{- if .Values.router.parser }}
+- "--parser"
+- {{ .Values.router.parser | quote }}
+{{- end }}
+{{- if include "smg.authSecretName" . }}
+- "--api-key-file"
+- {{ printf "/etc/smg/auth/%s" (include "smg.authSecretKey" .) | quote }}
+{{- end }}
+{{- if include "smg.controlPlaneSecretName" . }}
+- "--control-plane-api-keys-file"
+- {{ printf "/etc/smg/control-plane/%s" (include "smg.controlPlaneSecretKey" .) | quote }}
+{{- end }}
+{{- if (.Values.router.tenantRateLimit).enabled }}
+- "--tenant-rate-limit-enabled"
+{{- end }}
+{{- if ((.Values.router.tenantRateLimit).configMap).name }}
+- "--tenant-rate-limit-config"
+{{- /* No key when an upgrade reuses the values of a release from before the
+     block and turns it on, as for the scheduler below: the chart's default. */}}
+- {{ printf "/etc/smg/rate-limit/%s" (.Values.router.tenantRateLimit.configMap.key | default "rate-limit.yaml") | quote }}
+{{- end }}
+{{- if (.Values.router.priorityScheduler).enabled }}
+- "--priority-scheduler-enabled"
+{{- end }}
+{{- if ((.Values.router.priorityScheduler).configMap).name }}
+- "--priority-scheduler-config"
+- {{ printf "/etc/smg/scheduler/%s" (.Values.router.priorityScheduler.configMap.key | default "scheduler.yaml") | quote }}
+{{- end }}
+{{- range .Values.router.extraArgs }}
+- {{ . | quote }}
+{{- end }}
+{{- end }}
+
+{{/*
+Auth secret -- the Secret holding the shared API key, mounted into the router
+pod as a file the gateway reads with --api-key-file; the key itself is never
+in the pod's arguments. `auth.existingSecret` names a Secret the operator
+manages; otherwise `auth.apiKey`, when set, is written into a chart-managed
+Secret. Empty when no key is configured.
+*/}}
+{{- define "smg.authSecretName" -}}
+{{- if .Values.auth.existingSecret -}}
+{{- .Values.auth.existingSecret -}}
+{{- else if .Values.auth.apiKey -}}
+{{- printf "%s-auth" (include "smg.fullname" .) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Auth secret key -- the key within the auth Secret that holds the API key.
+*/}}
+{{- define "smg.authSecretKey" -}}
+{{- .Values.auth.apiKeySecretKey | default "api-key" -}}
+{{- end }}
+
+{{/*
+Control-plane secret -- the Secret holding the control-plane API keys file,
+mounted into the router pod and read with --control-plane-api-keys-file;
+the keys are never in the pod's arguments. `auth.controlPlane.existingSecret`
+names a Secret the operator manages; otherwise `auth.controlPlane.apiKeys`,
+when set, is written into a chart-managed Secret. Empty when neither is set.
+*/}}
+{{- define "smg.controlPlaneSecretName" -}}
+{{- if (.Values.auth.controlPlane).existingSecret -}}
+{{- .Values.auth.controlPlane.existingSecret -}}
+{{- else if (.Values.auth.controlPlane).apiKeys -}}
+{{- printf "%s-control-plane" (include "smg.fullname" .) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Control-plane secret key -- the key within that Secret holding the file.
+*/}}
+{{- define "smg.controlPlaneSecretKey" -}}
+{{- .Values.auth.controlPlane.secretKey | default "control-plane-api-keys" -}}
+{{- end }}
+
+{{/*
+History store -- the store the history backend uses, postgres or redis (its
+values are .Values.history.<store>); empty for the other backends.
+*/}}
+{{- define "smg.historyStore" -}}
+{{- if or (eq .Values.history.backend "postgres") (eq .Values.history.backend "redis") -}}
+{{- .Values.history.backend -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+History secret -- the Secret holding the history store's connection URL,
+which carries the database password. The URL reaches the router pod as the
+environment variable the gateway reads (SMG_POSTGRES_DB_URL or
+SMG_REDIS_URL); it is never in the pod's arguments. The store's
+`existingSecret` names a Secret the operator manages; otherwise its `url`,
+when set, is written into the chart-managed Secret <fullname>-history.
+Empty when no URL is configured or the backend has no store.
+*/}}
+{{- define "smg.historySecretName" -}}
+{{- with include "smg.historyStore" . -}}
+{{- $store := index $.Values.history . -}}
+{{- if $store.existingSecret -}}
+{{- $store.existingSecret -}}
+{{- else if $store.url -}}
+{{- printf "%s-history" (include "smg.fullname" $) -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+History secret key -- the key within the history Secret that holds the URL:
+the store's `secretKey`, else "<store>-url".
+*/}}
+{{- define "smg.historySecretKey" -}}
+{{- with include "smg.historyStore" . -}}
+{{- (index $.Values.history .).secretKey | default (printf "%s-url" .) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+History URL variable -- the environment variable the gateway reads the
+history store's connection URL from.
+*/}}
+{{- define "smg.historyUrlEnv" -}}
+{{- with include "smg.historyStore" . -}}
+{{- if eq . "postgres" }}SMG_POSTGRES_DB_URL{{ else }}SMG_REDIS_URL{{ end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+History secret managed -- "true" when the chart writes the history Secret
+itself (the store's `url` is set and no `existingSecret` replaces it). The
+router pod template carries a checksum of that Secret, so a changed URL
+rolls the pods.
+*/}}
+{{- define "smg.historySecretManaged" -}}
+{{- with include "smg.historyStore" . -}}
+{{- $store := index $.Values.history . -}}
+{{- if and $store.url (not $store.existingSecret) -}}true{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Oracle secret -- the Secret holding the Oracle connect descriptor, database
+user and password. Each reaches the router pod as the environment variable
+the gateway reads (ATP_DSN, ATP_USER, ATP_PASSWORD); none is in the pod's
+arguments. `history.oracle.existingSecret` names a Secret the operator
+manages; otherwise the credentials set under history.oracle are written into
+the chart-managed Secret <fullname>-secrets, the Secret earlier chart
+versions wrote without reading it (same name, same keys). Empty when the
+backend is not oracle or no credential is configured.
+*/}}
+{{- define "smg.oracleSecretName" -}}
+{{- if eq .Values.history.backend "oracle" -}}
+{{- with .Values.history.oracle -}}
+{{- if .existingSecret -}}
+{{- .existingSecret -}}
+{{- else if or .dsn .user .password -}}
+{{- printf "%s-secrets" (include "smg.fullname" $) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Oracle secret managed -- "true" when the chart writes the Oracle Secret
+itself (a credential is set under history.oracle and no `existingSecret`
+replaces them). The router pod template carries a checksum of that Secret,
+so a changed credential rolls the pods.
+*/}}
+{{- define "smg.oracleSecretManaged" -}}
+{{- if eq .Values.history.backend "oracle" -}}
+{{- with .Values.history.oracle -}}
+{{- if and (not .existingSecret) (or .dsn .user .password) -}}true{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Oracle credentials -- the credentials the router pod is wired to, as a JSON
+list for fromJsonArray: each with the environment variable the gateway reads
+it from (env), its key within the Oracle Secret (key) and its value from the
+values (value, used by the chart-managed Secret alone). With `existingSecret`
+all three are wired and that Secret holds their keys; otherwise the ones set
+under history.oracle. Empty when there is no Oracle Secret.
+*/}}
+{{- define "smg.oracleCredentials" -}}
+{{- $credentials := list -}}
+{{- if include "smg.oracleSecretName" . -}}
+{{- $oracle := .Values.history.oracle -}}
+{{- $keys := $oracle.secretKeys | default dict -}}
+{{- $dsn := dict "env" "ATP_DSN" "key" ($keys.dsn | default "oracle-dsn") "value" $oracle.dsn -}}
+{{- $user := dict "env" "ATP_USER" "key" ($keys.user | default "oracle-user") "value" $oracle.user -}}
+{{- $password := dict "env" "ATP_PASSWORD" "key" ($keys.password | default "oracle-password") "value" $oracle.password -}}
+{{- range $credential := list $dsn $user $password -}}
+{{- if or $oracle.existingSecret $credential.value -}}
+{{- $credentials = append $credentials $credential -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- toJson $credentials -}}
+{{- end }}
+
+{{/*
+Worker image -- resolves the full image reference for a worker.
+Expects a dict with keys: worker, global, chart, defaults
+*/}}
+{{- define "smg.workerImage" -}}
+{{- $workerRegistry := "" -}}
+{{- $workerRepository := "" -}}
+{{- $workerTag := "" -}}
+{{- if .worker.image -}}
+{{- $workerRegistry = .worker.image.registry | default "" -}}
+{{- $workerRepository = .worker.image.repository | default "" -}}
+{{- $workerTag = .worker.image.tag | default "" -}}
+{{- end -}}
+{{/* Engine images are published under ghcr.io/smg-project/smg (the gateway image is on docker.io) */}}
+{{- $registry := $workerRegistry | default "ghcr.io" -}}
+{{- $repository := $workerRepository | default "smg-project/smg" -}}
+{{- $tag := $workerTag | default (.global.image.tag | default .chart.AppVersion) -}}
+{{- printf "%s/%s:%s" $registry $repository $tag -}}
+{{- end }}
+
+{{/*
+Worker command -- returns the command array based on engine + connectionMode.
+Expects a dict with keys: worker
+*/}}
+{{- define "smg.workerCommand" -}}
+{{- $engine := .worker.engine -}}
+{{- $mode := .worker.connectionMode | default "http" -}}
+{{- if eq $engine "vllm" -}}
+{{- if eq $mode "grpc" -}}
+["python3", "-m", "vllm.entrypoints.grpc_server"]
+{{- else -}}
+["python3", "-m", "vllm.entrypoints.openai.api_server"]
+{{- end -}}
+{{- else if eq $engine "sglang" -}}
+["python3", "-m", "sglang.launch_server"]
+{{- end -}}
+{{- end }}
+
+{{/*
+Worker args -- returns the args list based on engine.
+Expects a dict with keys: worker, defaults
+*/}}
+{{- define "smg.workerArgs" -}}
+{{- $worker := .worker -}}
+{{- $defaults := index .defaults $worker.engine -}}
+{{- $port := $worker.port | default $defaults.port -}}
+{{- $gpuCount := 1 -}}
+{{- if $worker.gpu -}}
+{{- $gpuCount = $worker.gpu.count | default 1 -}}
+{{- end -}}
+{{- $mode := $worker.connectionMode | default "http" }}
+{{- if eq $worker.engine "vllm" }}
+- "--model"
+- {{ $worker.model | quote }}
+- "--host"
+- "0.0.0.0"
+- "--port"
+- {{ $port | quote }}
+- "--tensor-parallel-size"
+- {{ $gpuCount | quote }}
+{{- else if eq $worker.engine "sglang" }}
+- "--model-path"
+- {{ $worker.model | quote }}
+- "--host"
+- "0.0.0.0"
+- "--port"
+- {{ $port | quote }}
+- "--tp-size"
+- {{ $gpuCount | quote }}
+{{- if eq $mode "grpc" }}
+- "--grpc-mode"
+{{- end }}
+{{- end }}
+{{- if $worker.extraArgs }}
+{{- range $worker.extraArgs }}
+- {{ . | quote }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+Worker metrics port -- the port the engine pod serves Prometheus metrics on,
+or empty when it serves none. A gRPC worker with `metrics.enabled` runs the
+engine behind the Rust servicer, whose own listener answers `GET /metrics`
+with the `smg_servicer_*` families (requests by finish reason, refusals,
+errors, in-flight requests, token totals, the first-token / inter-token /
+end-to-end latency histograms, the servicer's lifecycle state); the Python
+servicer has no endpoint. An HTTP worker runs the engine's own server, which
+the chart leaves as it is.
+Expects a dict with keys: worker
+*/}}
+{{- define "smg.workerMetricsPort" -}}
+{{- $mode := .worker.connectionMode | default "http" -}}
+{{- if and (eq $mode "grpc") (.worker.metrics).enabled -}}
+{{- (.worker.metrics).port | default 29100 -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Auto-generate --worker-urls from worker Services.
+Used by smg.routerArgs when workers are defined but workerUrls is empty.
+*/}}
+{{- define "smg.autoWorkerUrls" -}}
+{{- range $i, $worker := .Values.workers }}
+{{- $defaults := index $.Values.engineDefaults $worker.engine }}
+{{- $port := $worker.port | default $defaults.port }}
+{{- $mode := $worker.connectionMode | default "http" }}
+{{- $scheme := "http" }}
+{{- if eq $mode "grpc" }}
+{{- $scheme = "grpc" }}
+{{- end }}
+- "{{ $scheme }}://{{ include "smg.fullname" $ }}-worker-{{ $worker.name }}:{{ $port }}"
+{{- end }}
+{{- end }}
+
+{{/*
+Policy controller name -- its Deployment, its Service, its budget and its
+ServiceMonitor.
+*/}}
+{{- define "smg.policyControllerName" -}}
+{{- printf "%s-policy-controller" (include "smg.fullname" .) -}}
+{{- end }}
+
+{{/*
+Policy controller election -- "true" when policyController.election.enabled
+is set; empty when it is not, and over values that hold no election block.
+*/}}
+{{- define "smg.policyControllerElection" -}}
+{{- if ((.Values.policyController).election).enabled -}}true{{- end -}}
+{{- end }}
+
+{{/*
+Policy controller Lease name -- policyController.election.leaseName, or the
+controller's full name when it is empty: two releases in one namespace never
+share a Lease. No revision is in it: a name that moved at an upgrade would
+elect a second leader beside the first.
+*/}}
+{{- define "smg.policyControllerLeaseName" -}}
+{{- default (include "smg.policyControllerName" .) ((.Values.policyController).election).leaseName -}}
+{{- end }}
+
+{{/*
+Policy controller replica count -- the count as a reader of the rendered
+manifest takes it, a whole number: a count given as text that reads there
+as a number (2e0, or a 2 after a blank) counts as that number. Zero for a
+null and for a text that reads as no number. Every place that judges the
+count asks here.
+*/}}
+{{- define "smg.policyControllerReplicaCount" -}}
+{{- int (fromYaml (printf "count: %v" .Values.policyController.replicas)).count -}}
+{{- end }}
+
+{{/*
+Policy controller replicas -- more than one only with the election on. With
+it off every replica is a controller of its own, and two would each lead
+alone: the render refuses them. The count is compared as a reader of the
+rendered manifest takes it: a text that reads there as a number above one
+(2e0, or a 2 after a blank) is refused as that number is. It is written as
+the values hold it: a null stays the API's default. Beside a spec store the
+refusal says one way out, not two: a store takes no election.
+*/}}
+{{- define "smg.policyControllerReplicas" -}}
+{{- $replicas := .Values.policyController.replicas -}}
+{{- $read := include "smg.policyControllerReplicaCount" . -}}
+{{- if and (gt (int $read) 1) (not (include "smg.policyControllerElection" .)) -}}
+{{- if include "smg.policyControllerSpecStore" . -}}
+{{- fail (printf "policyController.replicas is %v beside policyController.specStoreClaim: each replica would lead alone, and a spec store holds one controller's generations. Keep one replica" $replicas) -}}
+{{- end -}}
+{{- fail (printf "policyController.replicas is %v with policyController.election.enabled off: each replica would lead alone. Turn the election on, or keep one replica" $replicas) -}}
+{{- end -}}
+{{- $replicas -}}
+{{- end }}
+
+{{/*
+Policy controller selector labels -- the release's selector labels with the
+controller's own component, so no router or worker selector takes its pods.
+*/}}
+{{- define "smg.policyControllerSelectorLabels" -}}
+{{ include "smg.selectorLabels" . }}
+app.kubernetes.io/component: policy-controller
+{{- end }}
+
+{{/*
+Policy controller image -- policyController.image, each part falling back to
+the router's image: the global registry, the global repository, and the
+router's tag with -policy-controller appended, the tag a release publishes
+the controller under. One version names both images: a release publishes one
+controller image, so the router's -slurm or -ol9 variant takes it too, its
+own suffix cut first. The default tag belongs to the router's repository and
+stands on the router's tag, so a repository of the operator's own is refused
+without its tag, and so is a router image named by a digest. No release
+older than the first that publishes a controller image has one, so a tag
+that names such a release is refused too. Only the three numbers a release
+tag starts with are compared, each of nine digits at most, a number the
+comparer can hold: any other tag takes the default.
+*/}}
+{{- define "smg.policyControllerImage" -}}
+{{- $image := .Values.policyController.image -}}
+{{- $routerTag := .Values.global.image.tag | default .Chart.AppVersion -}}
+{{- if and $image.repository (not $image.tag) -}}
+{{- fail "policyController.image.repository needs policyController.image.tag: the default tag is the router's with -policy-controller appended, and it belongs to the router's repository" -}}
+{{- end -}}
+{{- if and (not $image.tag) (contains "@" $routerTag) -}}
+{{- fail "policyController.image.tag is needed: global.image.tag names the router's image by a digest, and the controller's default tag is the router's tag with -policy-controller appended" -}}
+{{- end -}}
+{{- $firstRelease := "1.16.0" -}}
+{{- $release := regexFind "^[0-9]{1,9}\\.[0-9]{1,9}\\.[0-9]{1,9}(-|$)" $routerTag | trimSuffix "-" -}}
+{{- if and (not $image.tag) $release -}}
+{{- if semverCompare (printf "<%s" $firstRelease) $release -}}
+{{- fail (printf "policyController.image.tag is needed: global.image.tag %s is older than %s, the first release that publishes a policy controller image" $routerTag $firstRelease) -}}
+{{- end -}}
+{{- end -}}
+{{- $registry := $image.registry | default .Values.global.image.registry -}}
+{{- $repository := $image.repository | default .Values.global.image.repository -}}
+{{- $tag := $image.tag | default (printf "%s-policy-controller" ($routerTag | trimSuffix "-slurm" | trimSuffix "-ol9")) -}}
+{{- printf "%s/%s:%s" $registry $repository $tag -}}
+{{- end }}
+
+{{/*
+Policy controller spec document -- policyController.spec as the bytes of the
+file the controller reads. The controller refuses a start that names no
+source of its spec, so values that hold no document are refused here, by
+name: a null, an empty map, or values with no such key. A value that is no
+map is refused as written, also one that reads as empty (false, 0, an empty
+text or list). The schema names each first, and the helper does where the
+schema's check is skipped. The chart reads no line of the document and
+writes none: whether it runs is the controller's word, and a generation
+line is the document's own.
+*/}}
+{{- define "smg.policyControllerSpec" -}}
+{{- $spec := (.Values.policyController).spec -}}
+{{- if not (or (kindIs "invalid" $spec) (kindIs "map" $spec)) -}}
+{{- fail (printf "policyController.spec is %s: the policy spec document as a map" (toJson $spec)) -}}
+{{- end -}}
+{{- if not $spec -}}
+{{- fail "policyController.spec holds no document: the controller refuses a start that names no source of its policy spec" -}}
+{{- end -}}
+{{- toYaml $spec -}}
+{{- end }}
+
+{{/*
+Policy controller spec store -- the claim named in
+policyController.specStoreClaim, and empty when none is named: the
+controller then runs the document of policyController.spec from its file. A
+store is the other source of the controller's spec. The controller is
+passed --spec-store on the claim's mount: it starts on the newest
+generation on file, and writes each generation an operator applies there.
+What the controller refuses at start beside a store is refused here, in
+its reasons: a document in policyController.spec, since a start names one
+source of its spec, and the election, since a standby does not follow an
+applied generation yet and the controller takes no store beside a lease
+another replica can take. More than one replica is refused where the count
+is judged. A value that is no text is refused as written, where the
+schema's check is skipped.
+*/}}
+{{- define "smg.policyControllerSpecStore" -}}
+{{- $claim := (.Values.policyController).specStoreClaim -}}
+{{- if not (or (kindIs "invalid" $claim) (kindIs "string" $claim)) -}}
+{{- fail (printf "policyController.specStoreClaim is %s: the name of a PersistentVolumeClaim, as text" (toJson $claim)) -}}
+{{- end -}}
+{{- if $claim -}}
+{{- if (.Values.policyController).spec -}}
+{{- fail (printf "policyController.specStoreClaim names %s and policyController.spec holds a document: the controller refuses a start that names two sources of its policy spec. Set policyController.spec to null and upgrade with --reset-then-reuse-values or --reset-values, which drops the release's other overrides: give them again (an empty map does not clear a reused document, and under --reuse-values a null does not either), or leave the claim unnamed" $claim) -}}
+{{- end -}}
+{{- if include "smg.policyControllerElection" . -}}
+{{- fail (printf "policyController.specStoreClaim names %s with policyController.election.enabled on: another replica can take the controller's lease, and a standby does not follow an applied generation in this build. Turn the election off, or keep the spec document" $claim) -}}
+{{- end -}}
+{{- $claim -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Policy controller CLI arguments -- every argument is a flag of
+smg-policy-controller, each from a value. The controller's id is not here:
+the flag reads HOSTNAME, the pod's name. What the controller refuses at
+start is refused at render: two listeners on one port, a settle window
+over half the grace period (the controller's own default of 5 seconds when
+shutdownSettleSeconds is null) and a listener named to take identities as
+told that is none of the three: the schema names it first, and the helper
+does where the schema's check is skipped. A value that is no list is
+refused there as written, also one that reads as empty (false, 0, an empty
+text or map): null alone is the value left out. Those listeners are a set,
+said in the listeners' own order however the value was written: a reorder
+rolls no pod. With the election on the Lease is named,
+and the pod's own address, which the kubelet writes in place of $(POD_IP):
+the holder of the Lease is named by an address the others can dial. The
+spec file named is the one the Deployment mounts the document as: the one
+key of the document's ConfigMap, under the mount's directory. Where a spec
+store's claim is named the store's directory is passed in the file's
+place: the claim's mount.
+*/}}
+{{- define "smg.policyControllerArgs" -}}
+{{- $controller := .Values.policyController -}}
+{{- $seen := dict -}}
+{{- range $listener := list "gateway" "control" "replication" "admin" -}}
+{{- $port := index $controller.ports $listener | int | toString -}}
+{{- with index $seen $port -}}
+{{- fail (printf "policyController.ports.%s %s equals policyController.ports.%s: the controller refuses two listeners on one port" $listener $port .) -}}
+{{- end -}}
+{{- $_ := set $seen $port $listener -}}
+{{- end -}}
+{{- $grace := int $controller.shutdownGracePeriodSeconds -}}
+{{- $settle := 5 -}}
+{{- if not (kindIs "invalid" $controller.shutdownSettleSeconds) -}}
+{{- $settle = int $controller.shutdownSettleSeconds -}}
+{{- end -}}
+{{- $elected := include "smg.policyControllerElection" . -}}
+{{- $told := list -}}
+{{- $named := list -}}
+{{- if not (kindIs "invalid" $controller.identityAsTold) -}}
+{{- $named = $controller.identityAsTold -}}
+{{- end -}}
+{{- if not (kindIs "slice" $named) -}}
+{{- fail (printf "policyController.identityAsTold is %s: a list of listeners' names (gateway, control, replication)" (toJson $named)) -}}
+{{- end -}}
+{{- range $name := $named -}}
+{{- if not (has $name (list "gateway" "control" "replication")) -}}
+{{- fail (printf "policyController.identityAsTold names %v, none of the chart's listeners (gateway, control, replication)" $name) -}}
+{{- end -}}
+{{- end -}}
+{{- range $listener := list "gateway" "control" "replication" -}}
+{{- if has $listener $named -}}
+{{- $told = append $told $listener -}}
+{{- end -}}
+{{- end -}}
+{{- if gt (mul $settle 2) $grace -}}
+{{- fail (printf "policyController: a settle window of %d s is over half the grace period of %d s (shutdownSettleSeconds, 5 when null, and shutdownGracePeriodSeconds): the controller refuses it" $settle $grace) -}}
+{{- end -}}
+- "--gateway-listen"
+- {{ printf "0.0.0.0:%d" (int $controller.ports.gateway) | quote }}
+- "--control-listen"
+- {{ printf "0.0.0.0:%d" (int $controller.ports.control) | quote }}
+- "--replication-listen"
+- {{ printf "0.0.0.0:%d" (int $controller.ports.replication) | quote }}
+- "--admin-listen"
+- {{ printf "0.0.0.0:%d" (int $controller.ports.admin) | quote }}
+{{- with $told }}
+- "--identity-as-told"
+- {{ join "," . | quote }}
+{{- end }}
+- "--shutdown-grace-period-secs"
+- {{ $grace | quote }}
+{{- if not (kindIs "invalid" $controller.shutdownSettleSeconds) }}
+- "--shutdown-settle-secs"
+- {{ $settle | quote }}
+{{- end }}
+{{- with $controller.runtimeWorkerThreads }}
+- "--runtime-worker-threads"
+- {{ . | quote }}
+{{- end }}
+- "--log-level"
+- {{ $controller.logging.level | quote }}
+{{- if $controller.logging.json }}
+- "--log-json"
+{{- end }}
+{{- if $elected }}
+- "--lease-name"
+- {{ include "smg.policyControllerLeaseName" . | quote }}
+- "--advertise-address"
+- "$(POD_IP)"
+{{- end }}
+{{- if include "smg.policyControllerSpecStore" . }}
+- "--spec-store"
+- "/var/lib/smg/spec"
+{{- else }}
+- "--spec-file"
+- "/etc/smg/policy-spec/spec.yaml"
+{{- end }}
+{{- range $controller.extraArgs }}
+- {{ . | quote }}
+{{- end }}
+{{- end }}
+
+{{/*
+Policy controller replication as told -- "true" when the controller's
+arguments name the replication listener among those that take identities as
+told; empty when they do not. A replica that does not lead follows its
+leader only where they do. The arguments are read whole, as the controller
+reads them: policyController.identityAsTold and an --identity-as-told flag
+of policyController.extraArgs name alike. The flag's value is the next
+argument or stands behind an equals sign, one name or several between
+commas.
+*/}}
+{{- define "smg.policyControllerReplicationAsTold" -}}
+{{- $told := list -}}
+{{- $value := false -}}
+{{- range $argument := include "smg.policyControllerArgs" . | fromYamlArray -}}
+{{- if $value -}}
+{{- $told = concat $told (splitList "," $argument) -}}
+{{- else if hasPrefix "--identity-as-told=" $argument -}}
+{{- $told = concat $told (splitList "," (trimPrefix "--identity-as-told=" $argument)) -}}
+{{- end -}}
+{{- $value = eq $argument "--identity-as-told" -}}
+{{- end -}}
+{{- if has "replication" $told -}}true{{- end -}}
+{{- end }}
+
+{{/*
+Policy controller TLS -- "true" when the controller's arguments hand its
+gRPC listeners a server certificate (--tls-cert, its value the next
+argument or behind an equals sign); empty when they do not. A standby's
+dial has no credential yet, so a replica whose replication listener serves
+TLS follows no leader.
+*/}}
+{{- define "smg.policyControllerServesTls" -}}
+{{- range $argument := include "smg.policyControllerArgs" . | fromYamlArray -}}
+{{- if or (eq $argument "--tls-cert") (hasPrefix "--tls-cert=" $argument) -}}true{{- end -}}
+{{- end -}}
+{{- end }}

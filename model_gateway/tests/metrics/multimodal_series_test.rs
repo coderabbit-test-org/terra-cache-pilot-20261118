@@ -1,0 +1,228 @@
+//! The media pipeline's per-request families: histograms with their own
+//! buckets (not summaries), carrying what the record calls say.
+//!
+//! The recorder is this binary's, installed once for all its tests (see
+//! `recorder()` in the group's `mod.rs`).
+
+use std::time::Duration;
+
+use llm_multimodal::{FetchOutcome, FetchReport, FetchSourceKind, Modality};
+use smg::observability::metrics::Metrics;
+
+use crate::metrics::recorder;
+
+/// The lines of one family.
+fn family<'a>(body: &'a str, name: &str) -> Vec<&'a str> {
+    body.lines().filter(|line| line.contains(name)).collect()
+}
+
+/// The value of the sample whose line carries every one of `labels`.
+#[expect(
+    clippy::expect_used,
+    reason = "a test helper: a missing or non-numeric sample is the test's failure"
+)]
+fn sample(lines: &[&str], labels: &[&str]) -> f64 {
+    let line = lines
+        .iter()
+        .find(|line| !line.starts_with('#') && labels.iter().all(|label| line.contains(label)));
+    assert!(
+        line.is_some(),
+        "no sample with {labels:?} in:\n{}",
+        lines.join("\n")
+    );
+    line.and_then(|line| line.rsplit(' ').next())
+        .and_then(|value| value.parse().ok())
+        .expect("a numeric sample value")
+}
+
+#[test]
+fn the_media_pipeline_families_render_as_histograms_with_their_values() {
+    let handle = recorder();
+    Metrics::record_mm_processing_stage("mm-series-model", "preprocess", 0.004);
+    Metrics::record_mm_processing_stage("mm-series-model", "total", 0.3);
+    Metrics::record_mm_request_media(
+        "mm-series-model",
+        Modality::Image,
+        3,
+        &[("url", 2), ("data_url", 0), ("inline", 1)],
+    );
+    Metrics::record_mm_fetch(
+        "mm-series-model",
+        &FetchReport {
+            modality: Modality::Image,
+            source: FetchSourceKind::Url,
+            outcome: FetchOutcome::Ok,
+            duration: Duration::from_millis(20),
+            bytes: 4096,
+        },
+    );
+    Metrics::record_mm_fetch(
+        "mm-series-model",
+        &FetchReport {
+            modality: Modality::Image,
+            source: FetchSourceKind::DataUrl,
+            outcome: FetchOutcome::TooLarge,
+            duration: Duration::from_millis(1),
+            bytes: 0,
+        },
+    );
+    let body = handle.render();
+
+    for name in [
+        "smg_mm_processing_seconds",
+        "smg_mm_media_per_request",
+        "smg_mm_media_fetch_seconds",
+    ] {
+        let lines = family(&body, name);
+        let type_line = format!("# TYPE {name} histogram");
+        assert!(
+            lines.contains(&type_line.as_str()),
+            "{name} is not a histogram:\n{}",
+            lines.join("\n")
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("quantile=")),
+            "{name} renders as a summary:\n{}",
+            lines.join("\n")
+        );
+    }
+
+    let stages = family(&body, "smg_mm_processing_seconds");
+    let preprocess = ["model=\"mm-series-model\"", "stage=\"preprocess\""];
+    assert_eq!(
+        sample(
+            &stages,
+            &["_bucket", preprocess[0], preprocess[1], "le=\"0.005\""]
+        ),
+        1.0
+    );
+    assert_eq!(
+        sample(
+            &stages,
+            &["_bucket", preprocess[0], preprocess[1], "le=\"0.0025\""]
+        ),
+        0.0
+    );
+    assert_eq!(
+        sample(&stages, &["_count", preprocess[0], "stage=\"total\""]),
+        1.0
+    );
+
+    let per_request = family(&body, "smg_mm_media_per_request");
+    let image = ["model=\"mm-series-model\"", "modality=\"image\""];
+    assert_eq!(sample(&per_request, &["_sum", image[0], image[1]]), 3.0);
+    assert_eq!(
+        sample(&per_request, &["_bucket", image[0], image[1], "le=\"3\""]),
+        1.0
+    );
+    assert_eq!(
+        sample(&per_request, &["_bucket", image[0], image[1], "le=\"2\""]),
+        0.0
+    );
+
+    let items = family(&body, "smg_mm_media_items_total");
+    assert_eq!(sample(&items, &[image[0], image[1], "source=\"url\""]), 2.0);
+    assert_eq!(
+        sample(&items, &[image[0], image[1], "source=\"inline\""]),
+        1.0
+    );
+    assert!(
+        !items
+            .iter()
+            .any(|line| line.contains("source=\"data_url\"")),
+        "a zero count makes no series:\n{}",
+        items.join("\n")
+    );
+
+    let fetches = family(&body, "smg_mm_media_fetch_seconds");
+    assert_eq!(
+        sample(
+            &fetches,
+            &["_count", image[0], "outcome=\"ok\"", "source=\"url\""]
+        ),
+        1.0
+    );
+    assert_eq!(
+        sample(
+            &fetches,
+            &["_bucket", image[0], "outcome=\"ok\"", "le=\"0.025\""]
+        ),
+        1.0
+    );
+    assert_eq!(
+        sample(
+            &fetches,
+            &[
+                "_count",
+                image[0],
+                "outcome=\"too_large\"",
+                "source=\"data_url\""
+            ]
+        ),
+        1.0
+    );
+
+    let bytes = family(&body, "smg_mm_media_fetch_bytes_total");
+    assert_eq!(
+        sample(&bytes, &[image[0], image[1], "source=\"url\""]),
+        4096.0
+    );
+    assert!(
+        !bytes
+            .iter()
+            .any(|line| line.contains("source=\"data_url\"")),
+        "a failed fetch brought no bytes:\n{}",
+        bytes.join("\n")
+    );
+}
+
+/// The images-per-request family renders as a histogram on its own buckets,
+/// not as a summary, with one series per source class; a request without
+/// media is the 0 its first bucket holds.
+#[test]
+fn the_request_images_family_renders_as_a_histogram_by_source_class() {
+    let handle = recorder();
+    Metrics::record_mm_request_images("mm-images-model", "none", 0);
+    Metrics::record_mm_request_images("mm-images-model", "inline", 2);
+    Metrics::record_mm_request_images("mm-images-model", "remote", 3);
+    Metrics::record_mm_request_images("mm-images-model", "hybrid", 5);
+    let body = handle.render();
+
+    let lines = family(&body, "smg_mm_request_images");
+    let type_line = "# TYPE smg_mm_request_images histogram";
+    assert!(
+        lines.contains(&type_line),
+        "smg_mm_request_images is not a histogram:\n{}",
+        lines.join("\n")
+    );
+    assert!(
+        !lines.iter().any(|line| line.contains("quantile=")),
+        "smg_mm_request_images renders as a summary:\n{}",
+        lines.join("\n")
+    );
+
+    let model = "model=\"mm-images-model\"";
+    // A request without media observes 0, which the le="0" bucket carries.
+    assert_eq!(
+        sample(
+            &lines,
+            &["_bucket", model, "source_class=\"none\"", "le=\"0\""]
+        ),
+        1.0
+    );
+    assert_eq!(
+        sample(
+            &lines,
+            &["_bucket", model, "source_class=\"inline\"", "le=\"2\""]
+        ),
+        1.0
+    );
+    assert_eq!(
+        sample(&lines, &["_count", model, "source_class=\"remote\""]),
+        1.0
+    );
+    assert_eq!(
+        sample(&lines, &["_sum", model, "source_class=\"hybrid\""]),
+        5.0
+    );
+}

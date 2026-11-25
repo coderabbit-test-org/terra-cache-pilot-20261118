@@ -1,0 +1,121 @@
+//! Generate request building stage: Build proto GenerateRequest for generate requests
+
+use axum::response::Response;
+use tracing::error;
+
+use crate::routers::{
+    error,
+    grpc::{
+        common::stages::helpers,
+        context::{
+            stage_output, AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan, PlanSettings,
+            RequestContext,
+        },
+        spec::{GenerateResponseSpec, ResponseSpec},
+    },
+};
+
+/// Generate request building stage
+///
+/// Extracts generate-specific request building logic from the old unified RequestBuildingStage.
+pub(crate) struct GenerateRequestBuildingStage {
+    settings: PlanSettings,
+}
+
+const FUNCTION: &str = "GenerateRequestBuildingStage::build_plan";
+
+impl GenerateRequestBuildingStage {
+    pub fn new(settings: PlanSettings) -> Self {
+        Self { settings }
+    }
+}
+
+impl GenerateRequestBuildingStage {
+    /// The stage's work, a plain function (nothing in it awaits); the
+    /// chat+generate dispatcher calls it directly.
+    pub(crate) fn build_plan(&self, ctx: &mut RequestContext) -> Result<BuildOutput, Response> {
+        let prep = stage_output(ctx.state.preparation.as_ref(), FUNCTION)?;
+
+        let clients = stage_output(ctx.state.clients.as_ref(), FUNCTION)?;
+
+        let generate_request = ctx.generate_request_arc();
+
+        // Get client for building request (use prefill client in disaggregated mode)
+        let builder_client = match clients {
+            ClientSelection::Single { client } => client,
+            ClientSelection::Disaggregated { prefill, .. } => prefill,
+        };
+
+        let disaggregated = matches!(clients, ClientSelection::Disaggregated { .. });
+        let (request_id, id_stamp) = helpers::resolve_request_id_stamp(
+            &ctx.input.request_type,
+            ctx.input.tenant_request_meta.as_ref(),
+            "gen-",
+            disaggregated,
+        );
+
+        // Build proto request using centralized dispatch. A generate request
+        // carries no media: the ids are the prompt and the text stays off the
+        // wire (see `helpers::wire_prompt_text`).
+        let mut proto_request = builder_client
+            .build_generate_request(
+                request_id,
+                &generate_request,
+                None,
+                prep.token_ids().to_vec(),
+            )
+            .map_err(|e| {
+                error!(function = FUNCTION, error = %e, "Failed to build generate request");
+                error::bad_request("build_request_failed", e)
+            })?;
+
+        let sampling_mask =
+            helpers::SamplingDefaultsMask::from_request_type(&ctx.input.request_type);
+        let sampling_baseline = helpers::apply_sampling_defaults(
+            &mut proto_request,
+            sampling_mask,
+            ctx.state.workers.as_ref(),
+        );
+
+        // The client resolves string `stop`s its engine can't match and
+        // reports the router's residual trim obligation; no transport
+        // knowledge needed here.
+        ctx.state.response.router_stop_obligations = builder_client
+            .finalize_generate_request(&mut proto_request, ctx.tokenizer_arc().as_ref());
+
+        if self.settings.inject_pd_metadata {
+            if let Some(workers) = ctx.state.workers.as_ref() {
+                helpers::maybe_inject_pd_metadata(&mut proto_request, workers);
+            }
+        }
+
+        // EPD: inject the prefill->decode KV rendezvous for backends that carry it
+        // in the request. No-op unless the selected workers are TokenSpeed EPD.
+        if let Some(workers) = ctx.state.workers.as_ref() {
+            helpers::maybe_inject_pd_rendezvous(&mut proto_request, workers);
+        }
+
+        Ok(BuildOutput {
+            plan: ExecutionPlan::generate(self.settings.plan_kind, proto_request),
+            spec: ResponseSpec::Generate(GenerateResponseSpec::from(generate_request.as_ref())),
+            stamp: AttemptStamp {
+                id: id_stamp,
+                sampling_mask,
+                sampling_baseline,
+                inject_pd_metadata: self.settings.inject_pd_metadata,
+                tool_constraint: None,
+            },
+        })
+    }
+
+    /// Stable descriptor of the stage plus its mode-bearing args, compared
+    /// against golden literals in the pipeline parity test (through the
+    /// chat+generate dispatcher's own `signature`).
+    #[cfg(test)]
+    pub(crate) fn signature(&self) -> String {
+        format!(
+            "GenerateRequestBuildingStage({})",
+            self.settings.signature()
+        )
+    }
+}

@@ -1,0 +1,305 @@
+//! Response processing stage for classify requests.
+//!
+//! Key responsibilities:
+//! 1. Extract embedding (logits) from EmbedComplete response
+//! 2. Apply softmax to convert logits to probabilities
+//! 3. Find predicted class (argmax)
+//! 4. Map class index to label (from id2label or generic LABEL_N)
+//! 5. Build ClassifyResponse
+
+use std::collections::HashMap;
+
+use async_trait::async_trait;
+use axum::response::Response;
+use openai_protocol::{
+    classify::{ClassifyData, ClassifyResponse},
+    common::UsageInfo,
+};
+use tracing::error;
+
+use crate::routers::{
+    error,
+    grpc::{
+        common::stages::ProcessStage,
+        context::{
+            wrong_response_spec, DispatchContext, ExecutionResult, FinalResponse, WorkerSelection,
+        },
+        spec::ResponseSpec,
+    },
+};
+
+/// Response processing stage for classify requests.
+///
+/// Takes the logits from the embedding response and converts them to
+/// classification results with probabilities and labels.
+///
+/// The stage is stateless - id2label mapping is obtained from the
+/// selected worker's model card at runtime.
+pub(crate) struct ClassifyResponseProcessingStage;
+
+impl ClassifyResponseProcessingStage {
+    /// Create a new classify response processing stage.
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Apply softmax to logits to get probability distribution.
+    ///
+    /// Uses the numerically stable formula: softmax(x)_i = exp(x_i - max(x)) / sum(exp(x - max(x)))
+    fn softmax(logits: &[f32]) -> Vec<f32> {
+        if logits.is_empty() {
+            return vec![];
+        }
+
+        // Find max for numerical stability
+        let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+
+        // Compute exp(x - max) for each element
+        let exp_vals: Vec<f32> = logits.iter().map(|&x| (x - max_logit).exp()).collect();
+
+        // Sum of exponentials
+        let sum: f32 = exp_vals.iter().sum();
+
+        // Normalize to get probabilities
+        if sum == 0.0 {
+            // Avoid division by zero - return uniform distribution
+            let n = exp_vals.len();
+            return vec![1.0 / n as f32; n];
+        }
+
+        exp_vals.iter().map(|&x| x / sum).collect()
+    }
+
+    /// Find the index of the maximum value (argmax).
+    fn argmax(probs: &[f32]) -> u32 {
+        probs
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(idx, _)| idx as u32)
+            .unwrap_or(0)
+    }
+
+    /// Get label for a class index.
+    ///
+    /// Returns the label from id2label if available, otherwise returns generic "LABEL_N".
+    fn get_label(id2label: Option<&HashMap<u32, String>>, class_idx: u32) -> String {
+        id2label
+            .and_then(|id2label| id2label.get(&class_idx))
+            .cloned()
+            .unwrap_or_else(|| format!("LABEL_{class_idx}"))
+    }
+
+    /// The id2label mapping of the selected worker's model card, borrowed
+    /// for the lookup; `None` without a worker or a primary card.
+    fn id2label_from_context(ctx: &DispatchContext) -> Option<&HashMap<u32, String>> {
+        // Get the selected worker
+        let worker = match ctx.workers.as_ref()? {
+            WorkerSelection::Single { worker } => worker.worker(),
+            WorkerSelection::Disaggregated { prefill, .. } => prefill, // Use prefill worker for model info
+        };
+
+        // Get id2label from the primary model card
+        worker
+            .metadata()
+            .spec
+            .models
+            .primary()
+            .map(|model| &model.id2label)
+    }
+}
+
+#[async_trait]
+impl ProcessStage for ClassifyResponseProcessingStage {
+    async fn process(
+        &self,
+        ctx: &mut DispatchContext,
+        spec: ResponseSpec,
+    ) -> Result<Option<Response>, Response> {
+        if !matches!(spec, ResponseSpec::Classify) {
+            return Err(wrong_response_spec(
+                "ClassifyResponseProcessingStage::process",
+            ));
+        }
+
+        // Extract execution result
+        let execution_result = ctx.response.execution_result.take().ok_or_else(|| {
+            error!(
+                function = "ClassifyResponseProcessingStage::process",
+                "Execution result missing"
+            );
+            error::internal_error("execution_result_missing", "Execution result missing")
+        })?;
+
+        // Expect Embedding result variant (classify uses embed backend): one
+        // answer per input of the batch, in the request's order.
+        let ExecutionResult::Embedding { responses } = execution_result else {
+            error!(
+                function = "ClassifyResponseProcessingStage::process",
+                "Invalid execution result: expected Embedding"
+            );
+            return Err(error::internal_error(
+                "invalid_execution_result",
+                "Expected Embedding result for classify",
+            ));
+        };
+
+        // The id2label mapping of the worker's model card, borrowed once for
+        // every input of the batch.
+        let id2label = Self::id2label_from_context(ctx);
+
+        // Each input's logits to its class: softmax, argmax, the label.
+        let mut prompt_tokens = 0u32;
+        let mut data = Vec::with_capacity(responses.len());
+        for (index, proto_response) in responses.iter().enumerate() {
+            let logits = proto_response.embedding();
+            if logits.is_empty() {
+                error!(
+                    function = "ClassifyResponseProcessingStage::process",
+                    index, "Empty logits received from scheduler"
+                );
+                return Err(error::internal_error(
+                    "empty_logits",
+                    "Empty logits received from scheduler",
+                ));
+            }
+            let probs = Self::softmax(logits);
+            let predicted_class = Self::argmax(&probs);
+            let label = Self::get_label(id2label, predicted_class);
+            prompt_tokens = prompt_tokens.saturating_add(proto_response.prompt_tokens());
+            data.push(ClassifyData {
+                index: index as u32,
+                label,
+                num_classes: probs.len() as u32,
+                probs,
+            });
+        }
+
+        // Get dispatch metadata
+        let dispatch = ctx.dispatch.take().ok_or_else(|| {
+            error!(
+                function = "ClassifyResponseProcessingStage::process",
+                "Dispatch metadata missing"
+            );
+            error::internal_error("dispatch_missing", "Dispatch metadata missing")
+        })?;
+
+        // Build usage info: the inputs' prompt tokens summed, no completion.
+        let usage = UsageInfo {
+            prompt_tokens,
+            total_tokens: prompt_tokens,
+            completion_tokens: 0,
+            prompt_tokens_details: None,
+            reasoning_tokens: None,
+        };
+
+        // Build response
+        let response = ClassifyResponse::new(
+            dispatch.request_id,
+            dispatch.model,
+            dispatch.created,
+            data,
+            usage,
+        );
+
+        // Store in context for pipeline to extract
+        ctx.response.final_response = Some(FinalResponse::Classify(response));
+
+        Ok(None)
+    }
+
+    fn name(&self) -> &'static str {
+        "ClassifyResponseProcessing"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_softmax_basic() {
+        let logits = vec![1.0, 2.0, 3.0];
+        let probs = ClassifyResponseProcessingStage::softmax(&logits);
+
+        // Probabilities should sum to 1
+        let sum: f32 = probs.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6);
+
+        // Highest logit should have highest probability
+        assert!(probs[2] > probs[1]);
+        assert!(probs[1] > probs[0]);
+    }
+
+    #[test]
+    fn test_softmax_empty() {
+        let probs = ClassifyResponseProcessingStage::softmax(&[]);
+        assert!(probs.is_empty());
+    }
+
+    #[test]
+    fn test_softmax_single() {
+        let probs = ClassifyResponseProcessingStage::softmax(&[5.0]);
+        assert_eq!(probs.len(), 1);
+        assert!((probs[0] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_softmax_numerical_stability() {
+        // Large values that would overflow without max subtraction
+        let logits = vec![1000.0, 1001.0, 1002.0];
+        let probs = ClassifyResponseProcessingStage::softmax(&logits);
+
+        let sum: f32 = probs.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6);
+        assert!(probs[2] > probs[1]);
+    }
+
+    #[test]
+    fn test_argmax() {
+        assert_eq!(ClassifyResponseProcessingStage::argmax(&[0.1, 0.7, 0.2]), 1);
+        assert_eq!(
+            ClassifyResponseProcessingStage::argmax(&[0.9, 0.05, 0.05]),
+            0
+        );
+        assert_eq!(ClassifyResponseProcessingStage::argmax(&[0.1, 0.1, 0.8]), 2);
+    }
+
+    #[test]
+    fn test_get_label_with_mapping() {
+        let mut id2label = HashMap::new();
+        id2label.insert(0, "negative".to_string());
+        id2label.insert(1, "positive".to_string());
+
+        assert_eq!(
+            ClassifyResponseProcessingStage::get_label(Some(&id2label), 0),
+            "negative"
+        );
+        assert_eq!(
+            ClassifyResponseProcessingStage::get_label(Some(&id2label), 1),
+            "positive"
+        );
+        assert_eq!(
+            ClassifyResponseProcessingStage::get_label(Some(&id2label), 2),
+            "LABEL_2"
+        ); // Fallback for unknown
+    }
+
+    #[test]
+    fn test_get_label_without_mapping() {
+        let id2label = HashMap::new();
+        assert_eq!(
+            ClassifyResponseProcessingStage::get_label(Some(&id2label), 0),
+            "LABEL_0"
+        );
+        assert_eq!(
+            ClassifyResponseProcessingStage::get_label(Some(&id2label), 5),
+            "LABEL_5"
+        );
+        // No worker / no primary card
+        assert_eq!(
+            ClassifyResponseProcessingStage::get_label(None, 0),
+            "LABEL_0"
+        );
+    }
+}

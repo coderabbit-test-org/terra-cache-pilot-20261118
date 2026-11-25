@@ -1,0 +1,1263 @@
+use std::{collections::HashMap, future::Future, pin::Pin};
+
+use openai_protocol::{
+    chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
+    messages::CreateMessageRequest, responses::ResponsesRequest,
+};
+use tonic::Request;
+use tracing::{debug, warn};
+
+use crate::{
+    channel::Channel,
+    request_fields::{
+        body_format, completion_constraint, plain_constraint, seed_bits, stop_strings,
+        ConstraintKind, OutputConstraint, PlainSampling,
+    },
+    AbortOnDropClient, BoxedTraceInjector,
+};
+
+// Include the generated protobuf code
+#[expect(
+    clippy::allow_attributes,
+    reason = "the generator decides which lints fire, so these allows cannot be expects"
+)]
+pub mod proto {
+    #![allow(
+        clippy::all,
+        clippy::absolute_paths,
+        clippy::trivially_copy_pass_by_ref,
+        unused_qualifications
+    )]
+    tonic::include_proto!("trtllm");
+}
+
+/// Streaming `generate()` response that auto-aborts on drop. Concrete
+/// alias for the generic `crate::AbortOnDropStream`.
+pub type AbortOnDropStream =
+    crate::AbortOnDropStream<Box<proto::GenerateResponse>, TrtllmServiceClient>;
+
+/// gRPC client for TensorRT-LLM service
+#[derive(Clone)]
+pub struct TrtllmServiceClient {
+    client: proto::trtllm_service_client::TrtllmServiceClient<Channel>,
+    trace_injector: BoxedTraceInjector,
+    /// The client's own channel, the one its generated stub rides.
+    channel: Channel,
+}
+
+impl AbortOnDropClient for TrtllmServiceClient {
+    fn abort_for_drop(
+        self,
+        request_id: String,
+    ) -> Pin<Box<dyn Future<Output = Result<(), tonic::Status>> + Send>> {
+        Box::pin(async move {
+            // trtllm's abort returns an `AbortResponse`; collapse to `()`
+            // so the wrapper matches the trait signature.
+            self.abort_request(request_id).await.map(|_| ())
+        })
+    }
+}
+
+impl TrtllmServiceClient {
+    crate::impl_engine_client_basics!(
+        proto,
+        proto::trtllm_service_client::TrtllmServiceClient<Channel>,
+        "TensorRT-LLM",
+        "trtllm.TrtllmService",
+        proto::trtllm_service_server::SERVICE_NAME
+    );
+
+    /// Abort a request
+    pub async fn abort_request(
+        &self,
+        request_id: String,
+    ) -> Result<proto::AbortResponse, tonic::Status> {
+        debug!("Sending abort request for {}", request_id);
+        let request = Request::new(proto::AbortRequest {
+            request_id: request_id.clone(),
+        });
+
+        let mut client = self.client.clone();
+        let response = client.abort(request).await?;
+        debug!(
+            "Abort response for {}: success={}, message={}",
+            request_id,
+            response.get_ref().success,
+            response.get_ref().message
+        );
+        Ok(response.into_inner())
+    }
+
+    crate::impl_get_tokenizer!();
+    /// `GetLoads`: the engine's load per data-parallel rank, the router's
+    /// fallback poll for the records it takes over `SubscribeKvEvents`.
+    pub async fn get_loads(
+        &self,
+        include: Vec<String>,
+    ) -> Result<proto::GetLoadsResponse, tonic::Status> {
+        debug!("Requesting TensorRT-LLM load metrics");
+        let request = Request::new(proto::GetLoadsRequest {
+            dp_rank: None,
+            include,
+        });
+        let mut client = self.client.clone();
+        let response = client.get_loads(request).await?;
+        debug!("TensorRT-LLM load metrics response received");
+        Ok(response.into_inner())
+    }
+
+    crate::impl_subscribe_kv_events!();
+
+    /// Build a TensorRT-LLM GenerateRequest from OpenAI ChatCompletionRequest
+    #[expect(
+        clippy::unused_self,
+        reason = "method receiver kept for consistent public API across gRPC backends"
+    )]
+    pub fn build_generate_request_from_chat(
+        &self,
+        request_id: String,
+        body: &ChatCompletionRequest,
+        processed_text: String,
+        token_ids: Vec<u32>,
+        multimodal_input: Option<proto::MultimodalInput>,
+        constraint: OutputConstraint,
+    ) -> Result<proto::GenerateRequest, String> {
+        Self::build_generate_request_from_chat_parts(
+            request_id,
+            body,
+            processed_text,
+            token_ids,
+            multimodal_input,
+            constraint,
+        )
+    }
+
+    /// [`Self::build_generate_request_from_chat`] without a receiver.
+    pub fn build_generate_request_from_chat_parts(
+        request_id: String,
+        body: &ChatCompletionRequest,
+        processed_text: String,
+        token_ids: Vec<u32>,
+        multimodal_input: Option<proto::MultimodalInput>,
+        constraint: OutputConstraint,
+    ) -> Result<proto::GenerateRequest, String> {
+        refuse_logit_bias(body.logit_bias.as_ref())?;
+        // Build sampling config
+        let sampling_config = Self::build_sampling_config_from_chat(body);
+
+        // Build output config
+        let output_config = Self::build_output_config_from_chat(body);
+
+        // Build guided decoding params if needed
+        let guided_decoding = Self::build_guided_decoding_from_chat(body, constraint)?;
+
+        let stop = stop_strings(body.stop.as_ref());
+
+        let max_tokens = body.output_token_cap().unwrap_or(2048);
+
+        let grpc_request = proto::GenerateRequest {
+            request_id,
+            tokenized: Some(proto::TokenizedInput {
+                original_text: processed_text,
+                input_token_ids: token_ids,
+                query_token_ids: vec![],
+            }),
+            sampling_config: Some(sampling_config),
+            output_config: Some(output_config),
+            max_tokens,
+            streaming: body.stream,
+            stop,
+            stop_token_ids: vec![],
+            ignore_eos: body.ignore_eos,
+            guided_decoding,
+            multimodal_input,
+            include_stop_token_in_output: body.no_stop_trim,
+            ..Default::default()
+        };
+
+        Ok(grpc_request)
+    }
+
+    /// Build a basic GenerateRequest from the GenerateRequest spec
+    #[expect(
+        clippy::unused_self,
+        reason = "method receiver kept for consistent public API across gRPC backends"
+    )]
+    pub fn build_plain_generate_request(
+        &self,
+        request_id: String,
+        body: &GenerateRequest,
+        original_text: Option<String>,
+        token_ids: Vec<u32>,
+    ) -> Result<proto::GenerateRequest, String> {
+        Self::build_plain_generate_request_parts(request_id, body, original_text, token_ids)
+    }
+
+    /// [`Self::build_plain_generate_request`] without a receiver.
+    pub fn build_plain_generate_request_parts(
+        request_id: String,
+        body: &GenerateRequest,
+        original_text: Option<String>,
+        token_ids: Vec<u32>,
+    ) -> Result<proto::GenerateRequest, String> {
+        let plain = PlainSampling::read(body.sampling_params.as_ref());
+        let sampling_config = Self::build_sampling_config_from_plain(&plain);
+        let output_config = proto::OutputConfig {
+            logprobs: if body.return_logprob.unwrap_or(false) {
+                Some(body.top_logprobs_num.unwrap_or(0))
+            } else {
+                None
+            },
+            prompt_logprobs: None,
+            return_context_logits: false,
+            return_generation_logits: false,
+            exclude_input_from_output: true,
+            return_encoder_output: false,
+            return_perf_metrics: false,
+        };
+
+        let guided_decoding = match &body.sampling_params {
+            Some(params) => Self::guide_of(plain_constraint(params)?),
+            None => None,
+        };
+
+        let max_tokens = plain.max_new_tokens.unwrap_or(2048);
+
+        let grpc_request = proto::GenerateRequest {
+            request_id,
+            tokenized: Some(proto::TokenizedInput {
+                original_text: original_text.unwrap_or_default(),
+                input_token_ids: token_ids,
+                query_token_ids: vec![],
+            }),
+            sampling_config: Some(sampling_config),
+            output_config: Some(output_config),
+            max_tokens,
+            streaming: body.stream,
+            stop: plain.stop,
+            stop_token_ids: plain.stop_token_ids,
+            ignore_eos: plain.ignore_eos,
+            guided_decoding,
+            multimodal_input: None,
+            include_stop_token_in_output: plain.no_stop_trim,
+            ..Default::default()
+        };
+
+        Ok(grpc_request)
+    }
+
+    /// Build a GenerateRequest from ResponsesRequest (OpenAI Responses API)
+    #[expect(
+        clippy::unused_self,
+        reason = "method receiver kept for consistent public API"
+    )]
+    pub fn build_generate_request_from_responses(
+        &self,
+        request_id: String,
+        body: &ResponsesRequest,
+        processed_text: String,
+        token_ids: Vec<u32>,
+        constraint: Option<(String, String)>,
+    ) -> Result<proto::GenerateRequest, String> {
+        let sampling_config = Self::build_sampling_config_from_responses(body);
+        let output_config = proto::OutputConfig {
+            logprobs: body.top_logprobs.map(|v| v as i32),
+            prompt_logprobs: None,
+            return_context_logits: false,
+            return_generation_logits: false,
+            exclude_input_from_output: true,
+            return_encoder_output: false,
+            return_perf_metrics: false,
+        };
+
+        let guided_decoding = Self::build_guided_decoding_from_responses(constraint)?;
+
+        let max_tokens = body.max_output_tokens.unwrap_or(2048);
+
+        let grpc_request = proto::GenerateRequest {
+            request_id,
+            tokenized: Some(proto::TokenizedInput {
+                original_text: processed_text,
+                input_token_ids: token_ids,
+                query_token_ids: vec![],
+            }),
+            sampling_config: Some(sampling_config),
+            output_config: Some(output_config),
+            max_tokens,
+            streaming: body.stream.unwrap_or(false),
+            stop: stop_strings(body.stop.as_ref()),
+            stop_token_ids: vec![],
+            ignore_eos: false,
+            guided_decoding,
+            multimodal_input: None,
+            include_stop_token_in_output: false,
+            ..Default::default()
+        };
+
+        Ok(grpc_request)
+    }
+
+    /// Build SamplingConfig from ChatCompletionRequest
+    ///
+    /// Uses sensible defaults when values are not specified:
+    /// - temperature: 1.0 (neutral sampling)
+    /// - top_p: 1.0 (no nucleus filtering)
+    /// - repetition_penalty: 1.0 (no penalty)
+    #[expect(
+        deprecated,
+        reason = "ChatCompletionRequest.seed is marked Legacy by openai-protocol, but the engine still honors it"
+    )]
+    fn build_sampling_config_from_chat(request: &ChatCompletionRequest) -> proto::SamplingConfig {
+        proto::SamplingConfig {
+            beam_width: 1,
+            num_return_sequences: request.n.unwrap_or(1),
+            top_k: request.top_k.map(|v| v.max(0)),
+            top_p: Some(request.top_p.unwrap_or(1.0)),
+            top_p_min: None,
+            top_p_reset_ids: None,
+            top_p_decay: None,
+            seed: request
+                .sampling_seed
+                .or_else(|| request.seed.map(seed_bits)),
+            temperature: Some(request.temperature.unwrap_or(1.0)),
+            min_tokens: request.min_tokens,
+            beam_search_diversity_rate: None,
+            repetition_penalty: Some(request.repetition_penalty.unwrap_or(1.0)),
+            presence_penalty: request.presence_penalty,
+            frequency_penalty: request.frequency_penalty,
+            prompt_ignore_length: None,
+            length_penalty: None,
+            early_stopping: None,
+            no_repeat_ngram_size: None,
+            min_p: request.min_p,
+            beam_width_array: vec![],
+        }
+    }
+
+    /// Build OutputConfig from ChatCompletionRequest
+    fn build_output_config_from_chat(request: &ChatCompletionRequest) -> proto::OutputConfig {
+        proto::OutputConfig {
+            logprobs: if request.logprobs {
+                Some(request.top_logprobs.unwrap_or(0) as i32)
+            } else {
+                None
+            },
+            prompt_logprobs: None,
+            return_context_logits: false,
+            return_generation_logits: false,
+            exclude_input_from_output: true,
+            return_encoder_output: false,
+            return_perf_metrics: false,
+        }
+    }
+
+    /// Build GuidedDecodingParams from ChatCompletionRequest
+    fn build_guided_decoding_from_chat(
+        request: &ChatCompletionRequest,
+        OutputConstraint { tool, set_aside }: OutputConstraint,
+    ) -> Result<Option<proto::GuidedDecodingParams>, String> {
+        // Collect non-tool constraint (response_format, ebnf, regex)
+        let format = body_format(request, set_aside)?;
+        let mut guided = Self::guide_of(format.format);
+
+        if guided.is_none() {
+            if let Some(ebnf) = format.ebnf {
+                guided = Some(proto::GuidedDecodingParams {
+                    guide_type: proto::guided_decoding_params::GuideType::EbnfGrammar as i32,
+                    guide: ebnf.to_string(),
+                });
+            }
+        }
+
+        if guided.is_none() {
+            if let Some(regex) = format.regex {
+                guided = Some(proto::GuidedDecodingParams {
+                    guide_type: proto::guided_decoding_params::GuideType::Regex as i32,
+                    guide: regex.to_string(),
+                });
+            }
+        }
+
+        // Tool call constraint — drop if another constraint already set
+        // (matches TRT-LLM HTTP behavior where response_format takes priority)
+        if let Some((constraint_type, constraint_value)) = tool {
+            if guided.is_some() {
+                warn!("Constrained decoding is not compatible with tool calls, dropping tool constraint");
+            } else {
+                let guide_type = match constraint_type.as_str() {
+                    "structural_tag" => proto::guided_decoding_params::GuideType::StructuralTag,
+                    "json_schema" => proto::guided_decoding_params::GuideType::JsonSchema,
+                    "ebnf" | "grammar" => proto::guided_decoding_params::GuideType::EbnfGrammar,
+                    "regex" => proto::guided_decoding_params::GuideType::Regex,
+                    _ => return Err(format!("Unknown constraint type: {constraint_type}")),
+                };
+                guided = Some(proto::GuidedDecodingParams {
+                    guide_type: guide_type as i32,
+                    guide: constraint_value,
+                });
+            }
+        }
+
+        Ok(guided)
+    }
+
+    /// Build SamplingConfig from ResponsesRequest
+    fn build_sampling_config_from_responses(request: &ResponsesRequest) -> proto::SamplingConfig {
+        proto::SamplingConfig {
+            beam_width: 1,
+            num_return_sequences: 1,
+            top_k: (request.top_k >= 0).then_some(request.top_k),
+            top_p: Some(request.top_p.unwrap_or(1.0)),
+            top_p_min: None,
+            top_p_reset_ids: None,
+            top_p_decay: None,
+            seed: None,
+            temperature: Some(request.temperature.unwrap_or(1.0)),
+            min_tokens: None,
+            beam_search_diversity_rate: None,
+            repetition_penalty: Some(request.repetition_penalty),
+            presence_penalty: request.presence_penalty,
+            frequency_penalty: request.frequency_penalty,
+            prompt_ignore_length: None,
+            length_penalty: None,
+            early_stopping: None,
+            no_repeat_ngram_size: None,
+            min_p: (request.min_p != 0.0).then_some(request.min_p),
+            beam_width_array: vec![],
+        }
+    }
+
+    /// Build GuidedDecodingParams from ResponsesRequest constraint
+    fn build_guided_decoding_from_responses(
+        constraint: Option<(String, String)>,
+    ) -> Result<Option<proto::GuidedDecodingParams>, String> {
+        if let Some((constraint_type, constraint_value)) = constraint {
+            let guide_type = match constraint_type.as_str() {
+                "structural_tag" => proto::guided_decoding_params::GuideType::StructuralTag,
+                "json_schema" => proto::guided_decoding_params::GuideType::JsonSchema,
+                "ebnf" | "grammar" => proto::guided_decoding_params::GuideType::EbnfGrammar,
+                "regex" => proto::guided_decoding_params::GuideType::Regex,
+                _ => return Err(format!("Unknown constraint type: {constraint_type}")),
+            };
+            Ok(Some(proto::GuidedDecodingParams {
+                guide_type: guide_type as i32,
+                guide: constraint_value,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Build a GenerateRequest from CreateMessageRequest (Anthropic Messages API)
+    #[expect(
+        clippy::unused_self,
+        reason = "method receiver kept for consistent public API"
+    )]
+    pub fn build_generate_request_from_messages(
+        &self,
+        request_id: String,
+        body: &CreateMessageRequest,
+        processed_text: String,
+        token_ids: Vec<u32>,
+        multimodal_input: Option<proto::MultimodalInput>,
+        constraint: OutputConstraint,
+    ) -> Result<proto::GenerateRequest, String> {
+        let sampling_config = Self::build_sampling_config_from_messages(body);
+        let output_config = proto::OutputConfig {
+            logprobs: None,
+            prompt_logprobs: None,
+            return_context_logits: false,
+            return_generation_logits: false,
+            exclude_input_from_output: true,
+            return_encoder_output: false,
+            return_perf_metrics: false,
+        };
+
+        let guided_decoding = Self::build_guided_decoding_from_responses(constraint.tool)?;
+
+        let stop = body.stop_sequences.clone().unwrap_or_default();
+        let max_tokens = body.max_tokens;
+
+        let grpc_request = proto::GenerateRequest {
+            request_id,
+            tokenized: Some(proto::TokenizedInput {
+                original_text: processed_text,
+                input_token_ids: token_ids,
+                query_token_ids: vec![],
+            }),
+            sampling_config: Some(sampling_config),
+            output_config: Some(output_config),
+            max_tokens,
+            streaming: body.stream.unwrap_or(false),
+            stop,
+            stop_token_ids: vec![],
+            ignore_eos: false,
+            guided_decoding,
+            multimodal_input,
+            include_stop_token_in_output: false,
+            ..Default::default()
+        };
+
+        Ok(grpc_request)
+    }
+
+    /// Build SamplingConfig from CreateMessageRequest
+    fn build_sampling_config_from_messages(
+        request: &CreateMessageRequest,
+    ) -> proto::SamplingConfig {
+        proto::SamplingConfig {
+            beam_width: 1,
+            num_return_sequences: 1,
+            top_k: request.top_k.map(|v| v as i32),
+            top_p: Some(request.top_p.unwrap_or(1.0) as f32),
+            top_p_min: None,
+            top_p_reset_ids: None,
+            top_p_decay: None,
+            seed: None,
+            temperature: Some(request.temperature.unwrap_or(1.0) as f32),
+            min_tokens: None,
+            beam_search_diversity_rate: None,
+            repetition_penalty: Some(1.0),
+            presence_penalty: None,
+            frequency_penalty: None,
+            prompt_ignore_length: None,
+            length_penalty: None,
+            early_stopping: None,
+            no_repeat_ngram_size: None,
+            min_p: None,
+            beam_width_array: vec![],
+        }
+    }
+
+    /// Build a GenerateRequest from CompletionRequest (`/v1/completions`)
+    #[expect(
+        clippy::unused_self,
+        reason = "method receiver kept for consistent public API"
+    )]
+    pub fn build_generate_request_from_completion(
+        &self,
+        request_id: String,
+        body: &CompletionRequest,
+        original_text: String,
+        token_ids: Vec<u32>,
+    ) -> Result<proto::GenerateRequest, String> {
+        refuse_logit_bias(body.logit_bias.as_ref())?;
+        let sampling_config = Self::build_sampling_config_from_completion(body);
+        let output_config = proto::OutputConfig {
+            logprobs: body.logprobs.map(|v| v.min(20) as i32),
+            prompt_logprobs: None,
+            return_context_logits: false,
+            return_generation_logits: false,
+            exclude_input_from_output: true,
+            return_encoder_output: false,
+            return_perf_metrics: false,
+        };
+
+        let guided_decoding = Self::guide_of(completion_constraint(body)?);
+
+        let stop = stop_strings(body.stop.as_ref());
+
+        let grpc_request = proto::GenerateRequest {
+            request_id,
+            tokenized: Some(proto::TokenizedInput {
+                original_text,
+                input_token_ids: token_ids,
+                query_token_ids: vec![],
+            }),
+            sampling_config: Some(sampling_config),
+            output_config: Some(output_config),
+            max_tokens: body.max_tokens.unwrap_or(16),
+            streaming: body.stream,
+            stop,
+            stop_token_ids: body.stop_token_ids.clone().unwrap_or_default(),
+            ignore_eos: body.ignore_eos,
+            guided_decoding,
+            multimodal_input: None,
+            include_stop_token_in_output: body.no_stop_trim,
+            ..Default::default()
+        };
+
+        Ok(grpc_request)
+    }
+
+    fn build_sampling_config_from_completion(request: &CompletionRequest) -> proto::SamplingConfig {
+        proto::SamplingConfig {
+            beam_width: 1,
+            num_return_sequences: request.n.unwrap_or(1),
+            top_k: request.top_k.map(|v| v.max(0)),
+            top_p: Some(request.top_p.unwrap_or(1.0)),
+            top_p_min: None,
+            top_p_reset_ids: None,
+            top_p_decay: None,
+            seed: request
+                .sampling_seed
+                .or_else(|| request.seed.map(seed_bits)),
+            temperature: Some(request.temperature.unwrap_or(1.0)),
+            min_tokens: request.min_tokens,
+            beam_search_diversity_rate: None,
+            repetition_penalty: Some(request.repetition_penalty.unwrap_or(1.0)),
+            presence_penalty: request.presence_penalty,
+            frequency_penalty: request.frequency_penalty,
+            prompt_ignore_length: None,
+            length_penalty: None,
+            early_stopping: None,
+            no_repeat_ngram_size: None,
+            min_p: request.min_p,
+            beam_width_array: vec![],
+        }
+    }
+
+    /// The engine's guide for the structured constraint a request names.
+    fn guide_of(
+        constraint: Option<(ConstraintKind, String)>,
+    ) -> Option<proto::GuidedDecodingParams> {
+        constraint.map(|(kind, guide)| {
+            let guide_type = match kind {
+                ConstraintKind::JsonSchema => proto::guided_decoding_params::GuideType::JsonSchema,
+                ConstraintKind::Regex => proto::guided_decoding_params::GuideType::Regex,
+                ConstraintKind::Ebnf => proto::guided_decoding_params::GuideType::EbnfGrammar,
+                ConstraintKind::StructuralTag => {
+                    proto::guided_decoding_params::GuideType::StructuralTag
+                }
+            };
+            proto::GuidedDecodingParams {
+                guide_type: guide_type as i32,
+                guide,
+            }
+        })
+    }
+
+    fn build_sampling_config_from_plain(plain: &PlainSampling) -> proto::SamplingConfig {
+        proto::SamplingConfig {
+            beam_width: 1,
+            num_return_sequences: plain.n,
+            top_k: plain.top_k.map(|k| k.max(0)),
+            top_p: Some(plain.top_p),
+            top_p_min: None,
+            top_p_reset_ids: None,
+            top_p_decay: None,
+            seed: plain.sampling_seed,
+            temperature: Some(plain.temperature),
+            min_tokens: plain.min_new_tokens,
+            beam_search_diversity_rate: None,
+            repetition_penalty: Some(plain.repetition_penalty),
+            presence_penalty: plain.presence_penalty,
+            frequency_penalty: plain.frequency_penalty,
+            prompt_ignore_length: None,
+            length_penalty: None,
+            early_stopping: None,
+            no_repeat_ngram_size: None,
+            min_p: plain.min_p,
+            beam_width_array: vec![],
+        }
+    }
+}
+
+/// The engine's wire carries a bias over the whole vocabulary as a dense
+/// vector sized by the engine (`embedding_bias`), not the request's sparse
+/// map, and the gateway does not know that size; a request that carries a
+/// bias is refused rather than served without it.
+fn refuse_logit_bias(bias: Option<&HashMap<String, f32>>) -> Result<(), String> {
+    match bias {
+        Some(bias) if !bias.is_empty() => Err("logit_bias is not supported on this worker: the \
+             engine takes a dense bias over its whole vocabulary, which the gateway does not \
+             build from the request's map"
+            .to_string()),
+        _ => Ok(()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Proto → protocol type conversions (load metrics)
+// ---------------------------------------------------------------------------
+
+// The measured input capacity stays absent when the servicer reports none.
+crate::impl_rank_load_conversions!(proto);
+
+/// TRT-LLM reports liveness via a free-form status string whose only healthy
+/// value is `"OK"` (per `trtllm_service.proto`); anything else is an error
+/// description and must be treated as unhealthy.
+pub fn status_healthy(status: &str) -> bool {
+    status.trim().eq_ignore_ascii_case("ok")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::channel::{testing::refused_endpoint, DEFAULT_CONNECT_TIMEOUT};
+
+    /// A request with a `logit_bias` is refused: the wire has no sparse map.
+    /// (The completion builder keeps a receiver, and a lazy channel needs the
+    /// runtime.)
+    #[tokio::test]
+    async fn a_logit_bias_is_refused_on_this_wire() {
+        let chat: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}], "logit_bias": {"1": -100}
+        }))
+        .expect("a chat request");
+        let error = TrtllmServiceClient::build_generate_request_from_chat_parts(
+            "r".to_string(),
+            &chat,
+            "hi".to_string(),
+            vec![1],
+            None,
+            OutputConstraint::default(),
+        )
+        .expect_err("refused");
+        assert!(error.contains("logit_bias"), "{error}");
+        let completion: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "prompt": "hi", "logit_bias": {"1": -100}
+        }))
+        .expect("a completion request");
+        let channel = Channel::unconnected("http://127.0.0.1:1", DEFAULT_CONNECT_TIMEOUT)
+            .expect("a channel to nowhere");
+        let client = TrtllmServiceClient {
+            client: proto::trtllm_service_client::TrtllmServiceClient::new(channel.clone()),
+            trace_injector: std::sync::Arc::new(crate::NoopTraceInjector),
+            channel,
+        };
+        let error = client
+            .build_generate_request_from_completion(
+                "r".to_string(),
+                &completion,
+                "hi".to_string(),
+                vec![1],
+            )
+            .expect_err("refused");
+        assert!(error.contains("logit_bias"), "{error}");
+        let plain: CompletionRequest =
+            serde_json::from_value(serde_json::json!({"model": "m", "prompt": "hi"}))
+                .expect("a request");
+        assert!(client
+            .build_generate_request_from_completion(
+                "r".to_string(),
+                &plain,
+                "hi".to_string(),
+                vec![1]
+            )
+            .is_ok());
+    }
+
+    /// A poll's answer reaches the worker's report rank for rank, the
+    /// measured capacity included where the servicer reports one.
+    #[test]
+    fn a_get_loads_answer_converts_rank_for_rank() {
+        let response = proto::GetLoadsResponse {
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            version: "1.0".into(),
+            dp_rank_count: 2,
+            loads: vec![
+                proto::SchedulerLoad {
+                    dp_rank: 0,
+                    num_running_reqs: 3,
+                    num_waiting_reqs: 1,
+                    num_total_reqs: 4,
+                    num_used_tokens: 640,
+                    max_total_num_tokens: 6_400,
+                    token_usage: 0.1,
+                    gen_throughput: 800.0,
+                    cache_hit_rate: 0.5,
+                    utilization: 0.1,
+                    max_running_requests: 32,
+                    num_waiting_uncached_tokens: 500,
+                    prefill_throughput: Some(12_000.0),
+                },
+                proto::SchedulerLoad {
+                    dp_rank: 1,
+                    ..Default::default()
+                },
+            ],
+        };
+        let loads = openai_protocol::worker::WorkerLoadResponse::from(response);
+        assert_eq!(
+            (
+                loads.dp_rank_count,
+                loads.loads.len(),
+                loads.version.as_str()
+            ),
+            (2, 2, "1.0")
+        );
+        let rank0 = &loads.loads[0];
+        assert_eq!(
+            (
+                rank0.dp_rank,
+                rank0.num_running_reqs,
+                rank0.num_waiting_reqs,
+                rank0.num_total_reqs
+            ),
+            (0, 3, 1, 4)
+        );
+        assert_eq!(
+            (
+                rank0.num_used_tokens,
+                rank0.max_total_num_tokens,
+                rank0.max_running_requests
+            ),
+            (640, 6_400, 32)
+        );
+        assert_eq!(
+            (
+                rank0.token_usage,
+                rank0.gen_throughput,
+                rank0.cache_hit_rate,
+                rank0.utilization
+            ),
+            (0.1, 800.0, 0.5, 0.1)
+        );
+        assert_eq!(
+            (rank0.num_waiting_uncached_tokens, rank0.prefill_throughput),
+            (500, Some(12_000.0))
+        );
+        assert_eq!(
+            (loads.loads[1].dp_rank, loads.loads[1].prefill_throughput),
+            (1, None)
+        );
+    }
+
+    /// A chat request's `seed` reaches the sampling config, as a completion
+    /// request's does and with the same bits; a request without one sends none.
+    #[test]
+    fn chat_and_completion_sampling_configs_carry_the_seed() {
+        let chat: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}], "seed": 7
+        }))
+        .expect("a chat request");
+        assert_eq!(
+            TrtllmServiceClient::build_sampling_config_from_chat(&chat).seed,
+            Some(7)
+        );
+        let negative: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}], "seed": -1
+        }))
+        .expect("a chat request");
+        assert_eq!(
+            TrtllmServiceClient::build_sampling_config_from_chat(&negative).seed,
+            Some(u64::MAX)
+        );
+        let completion: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "prompt": "hi", "seed": 7
+        }))
+        .expect("a completion request");
+        assert_eq!(
+            TrtllmServiceClient::build_sampling_config_from_completion(&completion).seed,
+            Some(7)
+        );
+        let unset: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .expect("a chat request");
+        assert_eq!(
+            TrtllmServiceClient::build_sampling_config_from_chat(&unset).seed,
+            None
+        );
+    }
+
+    /// A chat or completion request's `sampling_seed` reaches the sampling config whole, as on the
+    /// plain route, and wins over `seed` when a request sets both; `seed` alone still arrives.
+    #[test]
+    fn chat_and_completion_sampling_seed_reaches_the_engine_request() {
+        let chat = |sampling_seed: Option<u64>, seed: Option<i64>| {
+            let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model": "m", "messages": [{"role": "user", "content": "hi"}],
+                "sampling_seed": sampling_seed, "seed": seed
+            }))
+            .expect("a chat request");
+            TrtllmServiceClient::build_sampling_config_from_chat(&request).seed
+        };
+        let completion = |sampling_seed: Option<u64>, seed: Option<i64>| {
+            let request: CompletionRequest = serde_json::from_value(serde_json::json!({
+                "model": "m", "prompt": "hi", "sampling_seed": sampling_seed, "seed": seed
+            }))
+            .expect("a completion request");
+            TrtllmServiceClient::build_sampling_config_from_completion(&request).seed
+        };
+        let both =
+            |sampling_seed, seed| (chat(sampling_seed, seed), completion(sampling_seed, seed));
+        assert_eq!(both(Some(7), None), (Some(7), Some(7)));
+        assert_eq!(both(Some(7), Some(42)), (Some(7), Some(7)));
+        assert_eq!(both(Some(u64::MAX), None), (Some(u64::MAX), Some(u64::MAX)));
+        assert_eq!(both(None, Some(42)), (Some(42), Some(42)));
+        assert_eq!(both(None, None), (None, None));
+    }
+
+    #[test]
+    fn plain_sampling_seed_and_stop_token_ids_reach_the_request() {
+        let body: GenerateRequest = serde_json::from_value(serde_json::json!({
+            "text": "hi",
+            "sampling_params": {"sampling_seed": 7, "stop_token_ids": [1, 2]}
+        }))
+        .unwrap();
+        let request = TrtllmServiceClient::build_plain_generate_request_parts(
+            "r".into(),
+            &body,
+            None,
+            vec![3],
+        )
+        .unwrap();
+        assert_eq!(request.sampling_config.unwrap().seed, Some(7));
+        assert_eq!(request.stop_token_ids, vec![1, 2]);
+    }
+
+    /// A chat request's `min_tokens` reaches the sampling config, as a
+    /// completion request's does; a request without one leaves it unset.
+    #[test]
+    fn chat_and_completion_sampling_configs_carry_min_tokens() {
+        let chat: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}], "min_tokens": 30
+        }))
+        .expect("a chat request");
+        assert_eq!(
+            TrtllmServiceClient::build_sampling_config_from_chat(&chat).min_tokens,
+            Some(30)
+        );
+        let completion: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "prompt": "hi", "min_tokens": 30
+        }))
+        .expect("a completion request");
+        assert_eq!(
+            TrtllmServiceClient::build_sampling_config_from_completion(&completion).min_tokens,
+            Some(30)
+        );
+        let unset: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .expect("a chat request");
+        assert_eq!(
+            TrtllmServiceClient::build_sampling_config_from_chat(&unset).min_tokens,
+            None
+        );
+    }
+
+    /// A `response_format` set aside for the builder reads as absent: the tag
+    /// stays the request's one guide, where the body's schema wins when nothing
+    /// is set aside.
+    #[test]
+    fn a_response_format_set_aside_leaves_the_tag_as_the_one_guide() {
+        use crate::request_fields::FormatSetAside;
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "json_schema", "json_schema": {"name": "a", "schema": {"type": "object"}}}
+        }))
+        .expect("a chat request");
+        let tag = Some(("structural_tag".to_string(), "tag".to_string()));
+        let guide_of = |constraint: OutputConstraint| {
+            TrtllmServiceClient::build_generate_request_from_chat_parts(
+                "id".to_string(),
+                &request,
+                "hi".to_string(),
+                vec![1],
+                None,
+                constraint,
+            )
+            .expect("built")
+            .guided_decoding
+            .map(|guided| (guided.guide_type, guided.guide))
+        };
+
+        // The body's own format wins over a tool constraint on this engine.
+        assert_eq!(
+            guide_of(OutputConstraint::tool(tag.clone())),
+            Some((
+                proto::guided_decoding_params::GuideType::JsonSchema as i32,
+                r#"{"type":"object"}"#.to_string()
+            ))
+        );
+        // Set aside, it is not read, and the tag that answers it is the guide.
+        assert_eq!(
+            guide_of(OutputConstraint {
+                tool: tag,
+                set_aside: FormatSetAside {
+                    response_format: true,
+                    grammar: false,
+                },
+            }),
+            Some((
+                proto::guided_decoding_params::GuideType::StructuralTag as i32,
+                "tag".to_string()
+            ))
+        );
+    }
+
+    /// A plain request names at most one structured constraint, as a completion
+    /// request does: two are refused with the completion path's words, one still
+    /// reaches the request as its guide.
+    #[test]
+    fn a_plain_request_with_two_structured_constraints_is_refused_as_a_completion_is() {
+        let schema = "{\"type\":\"object\"}";
+        let two: GenerateRequest = serde_json::from_value(serde_json::json!({
+            "text": "hi",
+            "sampling_params": {"json_schema": schema, "regex": "[a-z]+"}
+        }))
+        .unwrap();
+        let refused = TrtllmServiceClient::build_plain_generate_request_parts(
+            "r".into(),
+            &two,
+            None,
+            vec![3],
+        )
+        .unwrap_err();
+        let completion: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "prompt": "hi",
+            "json_schema": schema,
+            "regex": "[a-z]+"
+        }))
+        .unwrap();
+        let on_completions = completion_constraint(&completion).unwrap_err();
+        assert_eq!(refused, on_completions);
+        assert_eq!(refused, "Multiple structured constraints are not allowed");
+
+        let one: GenerateRequest = serde_json::from_value(serde_json::json!({
+            "text": "hi",
+            "sampling_params": {"regex": "[a-z]+"}
+        }))
+        .unwrap();
+        let request = TrtllmServiceClient::build_plain_generate_request_parts(
+            "r".into(),
+            &one,
+            None,
+            vec![3],
+        )
+        .unwrap();
+        assert_eq!(
+            request.guided_decoding,
+            Some(proto::GuidedDecodingParams {
+                guide_type: proto::guided_decoding_params::GuideType::Regex as i32,
+                guide: "[a-z]+".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_generate_request_construction() {
+        let sampling_config = proto::SamplingConfig {
+            temperature: Some(0.7),
+            top_p: Some(0.9),
+            top_k: Some(50),
+            beam_width: 1,
+            num_return_sequences: 1,
+            ..Default::default()
+        };
+
+        let output_config = proto::OutputConfig {
+            logprobs: Some(5),
+            exclude_input_from_output: true,
+            ..Default::default()
+        };
+
+        let gen_req = proto::GenerateRequest {
+            request_id: "test-req-123".to_string(),
+            tokenized: Some(proto::TokenizedInput {
+                original_text: "Hello world".to_string(),
+                input_token_ids: vec![9906, 1917],
+                query_token_ids: vec![],
+            }),
+            sampling_config: Some(sampling_config),
+            output_config: Some(output_config),
+            max_tokens: 128,
+            streaming: false,
+            ..Default::default()
+        };
+
+        assert_eq!(gen_req.request_id, "test-req-123");
+        if let Some(ref tokenized) = gen_req.tokenized {
+            assert_eq!(tokenized.original_text, "Hello world");
+            assert_eq!(tokenized.input_token_ids, vec![9906, 1917]);
+        }
+
+        let config = gen_req.sampling_config.unwrap();
+        assert_eq!(config.temperature, Some(0.7));
+        assert_eq!(config.top_p, Some(0.9));
+    }
+
+    #[test]
+    fn test_abort_request_construction() {
+        let abort_req = proto::AbortRequest {
+            request_id: "req-456".to_string(),
+        };
+        assert_eq!(abort_req.request_id, "req-456");
+    }
+
+    #[test]
+    fn test_sampling_config_defaults() {
+        let config = proto::SamplingConfig::default();
+        assert_eq!(config.beam_width, 0);
+        assert_eq!(config.temperature, None);
+        assert_eq!(config.top_p, None);
+        assert_eq!(config.top_k, None);
+    }
+
+    #[test]
+    fn test_responses_sampling_config_is_passed_through() {
+        use openai_protocol::responses::ResponsesRequest;
+
+        let request = ResponsesRequest {
+            top_k: 40,
+            min_p: 0.05,
+            repetition_penalty: 1.2,
+            frequency_penalty: Some(0.3),
+            presence_penalty: Some(-0.4),
+            temperature: Some(0.7),
+            top_p: Some(0.9),
+            max_output_tokens: Some(128),
+            ..Default::default()
+        };
+
+        let cfg = TrtllmServiceClient::build_sampling_config_from_responses(&request);
+
+        assert_eq!(cfg.top_k, Some(40));
+        assert_eq!(cfg.min_p, Some(0.05));
+        assert_eq!(cfg.repetition_penalty, Some(1.2));
+        assert_eq!(cfg.frequency_penalty, Some(0.3));
+        assert_eq!(cfg.presence_penalty, Some(-0.4));
+
+        // Default top_k (-1) maps to None, letting TRT-LLM use its own default.
+        let disabled = ResponsesRequest {
+            top_k: -1,
+            ..Default::default()
+        };
+        let disabled_cfg = TrtllmServiceClient::build_sampling_config_from_responses(&disabled);
+        assert_eq!(disabled_cfg.top_k, None);
+        // Default min_p (0.0) maps to None for the same reason.
+        assert_eq!(disabled_cfg.min_p, None);
+    }
+
+    #[tokio::test]
+    async fn a_responses_request_s_stop_sequences_reach_the_engine_request() {
+        use openai_protocol::responses::ResponsesRequest;
+
+        // A client over a lazy channel nothing listens on (made under the
+        // runtime a channel needs): the builders dial nothing.
+        let channel = Channel::unconnected("http://127.0.0.1:1", DEFAULT_CONNECT_TIMEOUT)
+            .expect("a channel to nowhere");
+        let client = TrtllmServiceClient {
+            client: proto::trtllm_service_client::TrtllmServiceClient::new(channel.clone()),
+            trace_injector: std::sync::Arc::new(crate::NoopTraceInjector),
+            channel,
+        };
+        let build = |request: &ResponsesRequest| {
+            client
+                .build_generate_request_from_responses(
+                    "r".to_string(),
+                    request,
+                    String::new(),
+                    vec![1],
+                    None,
+                )
+                .expect("build request")
+        };
+
+        // The string form, as the chat builder forwards it.
+        let request = ResponsesRequest {
+            stop: Some(openai_protocol::common::StringOrArray::String(
+                "STOP".to_string(),
+            )),
+            ..Default::default()
+        };
+        assert_eq!(build(&request).stop, vec!["STOP"]);
+
+        // A request without `stop` leaves the list empty.
+        assert!(build(&ResponsesRequest::default()).stop.is_empty());
+    }
+
+    #[tokio::test]
+    async fn connect_fails_on_a_malformed_or_refused_endpoint() {
+        let malformed = TrtllmServiceClient::connect("not an endpoint").await;
+        assert!(
+            malformed.is_err(),
+            "a malformed endpoint fails before the dial"
+        );
+        let refused = refused_endpoint();
+        let result = TrtllmServiceClient::connect(&refused.url).await;
+        assert!(result.is_err(), "a refused dial fails the connect");
+    }
+
+    #[test]
+    fn test_tokenized_input() {
+        let tokenized = proto::TokenizedInput {
+            original_text: "Hello world".to_string(),
+            input_token_ids: vec![1, 15043, 1917, 2],
+            query_token_ids: vec![],
+        };
+
+        assert_eq!(tokenized.original_text, "Hello world");
+        assert_eq!(tokenized.input_token_ids, vec![1, 15043, 1917, 2]);
+    }
+
+    #[test]
+    fn test_generate_stream_chunk() {
+        let chunk = proto::GenerateStreamChunk {
+            token_ids: vec![1234, 5678],
+            sequence_index: 0,
+            prompt_tokens: 5,
+            completion_tokens: 2,
+            cached_tokens: 3,
+            logprobs: vec![],
+        };
+
+        assert_eq!(chunk.token_ids, vec![1234, 5678]);
+        assert_eq!(chunk.prompt_tokens, 5);
+        assert_eq!(chunk.completion_tokens, 2);
+        assert_eq!(chunk.cached_tokens, 3);
+    }
+
+    #[test]
+    fn test_guided_decoding_params() {
+        let guided = proto::GuidedDecodingParams {
+            guide_type: proto::guided_decoding_params::GuideType::JsonSchema as i32,
+            guide: r#"{"type": "object"}"#.to_string(),
+        };
+
+        assert_eq!(
+            guided.guide_type,
+            proto::guided_decoding_params::GuideType::JsonSchema as i32
+        );
+        assert_eq!(guided.guide, r#"{"type": "object"}"#);
+    }
+
+    /// Each constraint kind reaches the engine as its guide type; none stays none.
+    #[test]
+    fn guide_of_maps_each_kind_to_the_engines_guide_type() {
+        use crate::request_fields::ConstraintKind;
+        for (kind, guide_type) in [
+            (
+                ConstraintKind::JsonSchema,
+                proto::guided_decoding_params::GuideType::JsonSchema,
+            ),
+            (
+                ConstraintKind::Regex,
+                proto::guided_decoding_params::GuideType::Regex,
+            ),
+            (
+                ConstraintKind::Ebnf,
+                proto::guided_decoding_params::GuideType::EbnfGrammar,
+            ),
+            (
+                ConstraintKind::StructuralTag,
+                proto::guided_decoding_params::GuideType::StructuralTag,
+            ),
+        ] {
+            assert_eq!(
+                TrtllmServiceClient::guide_of(Some((kind, "v".to_string()))),
+                Some(proto::GuidedDecodingParams {
+                    guide_type: guide_type as i32,
+                    guide: "v".to_string(),
+                })
+            );
+        }
+        assert_eq!(TrtllmServiceClient::guide_of(None), None);
+    }
+
+    #[test]
+    fn status_healthy_matches_ok_exactly() {
+        assert!(status_healthy("ok"));
+        assert!(status_healthy("OK"));
+        assert!(status_healthy("  OK  "));
+
+        assert!(!status_healthy("not ok"));
+        assert!(!status_healthy("checking"));
+        assert!(!status_healthy("degraded"));
+        assert!(!status_healthy(""));
+    }
+}

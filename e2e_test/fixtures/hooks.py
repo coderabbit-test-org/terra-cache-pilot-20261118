@@ -1,0 +1,808 @@
+"""Pytest hooks for E2E test collection and marker registration.
+
+This module handles:
+- Marker registration: Defining custom pytest markers
+- Test filtering: Env-var-based filtering by engine, vendor, and GPU tier
+- Test ordering: Cluster items by ``(backend, model)`` so the
+  session-scoped worker pool (``infra.worker_pool``) doesn't have to
+  evict-and-restart between consecutive classes that share a backend.
+- Session teardown: Stop all pooled workers on session finish.
+- Rerun record: name every case pytest-rerunfailures ran again (the terminal
+  summary, the run page's annotations and step summary, ``reruns.txt`` under
+  ``E2E_LOG_DIR``).
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+
+import pytest
+from infra import (
+    ConnectionMode,
+    Gateway,
+    cleanup_pool,
+    get_connection_mode_override,
+    get_runtime,
+    get_servicer_impl,
+    get_zmq_engine_count,
+)
+from infra.worker_pool import get_pool
+
+from .markers import model_id_for_engine, resolve_class_marker
+
+# Local wires a plain (non-PD/EPD) test case can be authored with; these are the
+# only backends a ZMQ lane reuses (mapped onto ZMQ by the ``setup_backend``
+# fixture). Anything else — ``pd_*``/``epd_*``, EPD topology tuples, cloud
+# vendor names — is out of scope for ZMQ.
+_ZMQ_LOCAL_WIRES = frozenset({"grpc", "http"})
+
+# Per-session selection accounting filled in by ``pytest_collection_modifyitems``
+# and printed as one greppable ``e2e selection:`` line after collection.
+_SELECTION_STATS_KEY: pytest.StashKey[dict] = pytest.StashKey()
+
+# Rerun plugins can finalize fixtures before logging the last failed report.
+SERVING_CLASS_FAILED_KEY: pytest.StashKey[bool] = pytest.StashKey()
+FINALIZED_ZMQ_GATEWAY_KEY: pytest.StashKey[Gateway | None] = pytest.StashKey()
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item: pytest.Item, call):
+    """Invalidate failed classes without depending on delayed report logging."""
+    outcome = yield
+    if outcome.get_result().failed:
+        class_node = item.getparent(pytest.Class)
+        if class_node is not None:
+            class_node.stash[SERVING_CLASS_FAILED_KEY] = True
+            # A teardown report can arrive after the class fixture finalized.
+            gateway = class_node.stash.get(FINALIZED_ZMQ_GATEWAY_KEY, None)
+            if gateway is not None:
+                get_pool().discard_zmq(gateway)
+
+
+# ---------------------------------------------------------------------------
+# Marker registration
+# ---------------------------------------------------------------------------
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Register custom markers."""
+    config.addinivalue_line(
+        "markers",
+        "engine(*names): engines this test runs on (sglang, vllm, trtllm)",
+    )
+    config.addinivalue_line(
+        "markers",
+        "vendor(*names): cloud vendors this test runs on (openai, anthropic, xai, gemini)",
+    )
+    config.addinivalue_line(
+        "markers",
+        "gpu(count): number of GPUs required (0, 1, 2, 4)",
+    )
+    config.addinivalue_line(
+        "markers",
+        "model(name): mark test to use a specific model from MODEL_SPECS",
+    )
+    config.addinivalue_line(
+        "markers",
+        "skip_for_runtime(*runtimes, reason=None): skip test for specific runtimes "
+        "(e.g., @pytest.mark.skip_for_runtime('trtllm', reason='no guided decoding'))",
+    )
+    config.addinivalue_line(
+        "markers",
+        "gateway(policy=..., timeout=..., extra_args=..., env=..., reuse=False): gateway/router "
+        "configuration (env: variables added to the gateway process's environment); opt "
+        "reviewed functional classes into identical ZMQ serving reuse",
+    )
+    config.addinivalue_line(
+        "markers",
+        "workers(count=1, prefill=None, decode=None, gpus=None, extra_engine_args=None): "
+        "worker topology configuration",
+    )
+    config.addinivalue_line(
+        "markers",
+        "storage(backend): storage backend for cloud tests (memory, oracle-custom)",
+    )
+    config.addinivalue_line(
+        "markers",
+        "external: mark test as depending on external services",
+    )
+    config.addinivalue_line(
+        "markers",
+        "e2e: mark test as an end-to-end test requiring GPU workers",
+    )
+    config.addinivalue_line(
+        "markers",
+        "slow: mark test as slow-running",
+    )
+    config.addinivalue_line(
+        "markers",
+        "slowtest: mark test as slow-running (alias)",
+    )
+    config.addinivalue_line(
+        "markers",
+        "nightly: mark test as a nightly comprehensive benchmark",
+    )
+
+    # ``hooks.py`` is not itself a conftest — only the functions conftest.py
+    # re-imports act as hooks — so the selection and passing-call reporter and
+    # the rerun reporter are registered here as plugin objects instead.
+    if not config.pluginmanager.has_plugin("e2e_selection_reporter"):
+        config.pluginmanager.register(_SelectionReporter(), "e2e_selection_reporter")
+    if not config.pluginmanager.has_plugin("e2e_rerun_reporter"):
+        config.pluginmanager.register(_RerunReporter(), "e2e_rerun_reporter")
+
+
+# ---------------------------------------------------------------------------
+# Runtime-specific skip handling
+# ---------------------------------------------------------------------------
+
+
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    """Skip tests marked with ``@pytest.mark.skip_for_runtime``.
+
+    A single test item can carry multiple ``skip_for_runtime`` marks — e.g. a
+    method-level ``@pytest.mark.skip_for_runtime("trtllm", ...)`` plus a
+    parametrize-attached ``pytest.param(5, marks=skip_for_runtime("tokenspeed",
+    ...))``. ``get_closest_marker`` only returns one of them, which silently
+    drops the others. Iterate every mark so a runtime that's named in any of
+    them gets skipped, regardless of which is "closest".
+    """
+    current_runtime = get_runtime()
+    for marker in item.iter_markers(name="skip_for_runtime"):
+        if current_runtime in marker.args:
+            reason = marker.kwargs.get("reason", f"Not supported on {current_runtime}")
+            pytest.skip(f"Skipping for {current_runtime}: {reason}")
+
+    # TEMPORARY — remove with the TOKENSPEED_REF bump that picks up the fix
+    # for https://github.com/lightseekorg/tokenspeed/issues/1036: the pinned
+    # tokenspeed has no MXFP4-MoE-with-expert-bias kernel on sm 9.0 (the
+    # triton MoE rewrite dropped bias; marlin/flashinfer/gluon don't cover
+    # H100), so gpt-oss dies at model load on CI's H100 runners.
+    if current_runtime == "tokenspeed":
+        model_marker = resolve_class_marker(item, "model")
+        if "gpt-oss" in str(model_id_for_engine(model_marker, current_runtime, default="")):
+            pytest.skip("tokenspeed cannot load gpt-oss on H100 (tokenspeed#1036)")
+
+
+# ---------------------------------------------------------------------------
+# Environment-variable-based test filtering
+# ---------------------------------------------------------------------------
+
+
+def _get_marker(item: pytest.Item, name: str):
+    """Get the most specific marker, preferring child class over parent.
+
+    Delegates to resolve_class_marker() which walks the class MRO (child-first)
+    so that a child class marker overrides a parent class marker.
+    """
+    return resolve_class_marker(item, name)
+
+
+def _setup_backend_param(item: pytest.Item):
+    """Return the ``setup_backend`` parametrize value for an item, or None."""
+    callspec = getattr(item, "callspec", None)
+    if callspec is None:
+        return None
+    return getattr(callspec, "params", {}).get("setup_backend")
+
+
+def _is_multi_worker(item: pytest.Item) -> bool:
+    """True when the item's ``workers`` marker asks for a PD/multi-worker topology."""
+    marker = resolve_class_marker(item, "workers")
+    if marker is None:
+        return False
+    kwargs = marker.kwargs
+    if (kwargs.get("count") or 1) > 1:
+        return True
+    return bool(kwargs.get("prefill") or kwargs.get("decode"))
+
+
+def _is_epd_worker_set(item: pytest.Item) -> bool:
+    """True when the item's ``workers`` marker asks for encode workers."""
+    marker = resolve_class_marker(item, "workers")
+    return marker is not None and bool(marker.kwargs.get("encode"))
+
+
+def _is_pd_param(param) -> bool:
+    """True for a ``pd_*`` ``setup_backend`` value, bare (``"pd_grpc"``) or as
+    the head of a topology tuple (``("pd_grpc", (p, d))``): a prefill/decode
+    topology."""
+    mode = param[0] if isinstance(param, tuple) and param else param
+    return isinstance(mode, str) and mode.startswith("pd_")
+
+
+def _zmq_dedup_key(item: pytest.Item) -> tuple:
+    """Group key ignoring the ``setup_backend`` value.
+
+    Lets us collapse a case parametrized on both ``grpc`` and ``http`` into a
+    single ZMQ run (they map onto the same wire) while keeping distinct
+    ``api_client`` (or other) parametrizations apart.
+    """
+    callspec = getattr(item, "callspec", None)
+    params = getattr(callspec, "params", {}) or {}
+    others = tuple(sorted((k, repr(v)) for k, v in params.items() if k != "setup_backend"))
+    return (item.nodeid.split("[", 1)[0], others)
+
+
+def _filter_zmq_items(items: list[pytest.Item]) -> tuple[list[pytest.Item], list[pytest.Item]]:
+    """Split items into (kept, deselected) for a ZMQ lane.
+
+    Keeps single-worker local cases (``grpc``/``http`` map onto ZMQ) and drops
+    the gRPC-only families: PD (``pd_*``), EPD (``epd_*`` and topology tuples),
+    and multiple-worker topologies. A case authored for both ``grpc`` and
+    ``http`` is collapsed to one ZMQ run. Items without a ``setup_backend``
+    parametrization are left untouched.
+    """
+    kept: list[pytest.Item] = []
+    deselected: list[pytest.Item] = []
+    groups_with_grpc = {_zmq_dedup_key(it) for it in items if _setup_backend_param(it) == "grpc"}
+    for item in items:
+        param = _setup_backend_param(item)
+        if param is None:
+            kept.append(item)
+            continue
+        if param not in _ZMQ_LOCAL_WIRES or _is_multi_worker(item):
+            deselected.append(item)
+            continue
+        # Collapse the http twin when a grpc one covers the same ZMQ run.
+        if param == "http" and _zmq_dedup_key(item) in groups_with_grpc:
+            deselected.append(item)
+            continue
+        kept.append(item)
+    return kept, deselected
+
+
+_SGLANG_ZMQ_SKIPPED_MODULES = ("test_error_shapes.py",)
+
+
+def _filter_sglang_zmq_items(
+    items: list[pytest.Item],
+) -> tuple[list[pytest.Item], list[pytest.Item]]:
+    """Split items into (kept, deselected) for the SGLang ZMQ lane: the
+    error-shape module tests SGLang's HTTP server's own validation, which this
+    wire has no counterpart of. The multimodal module runs: the wire carries
+    the preprocessed media to the scheduler as the Rust servicer's does."""
+    kept: list[pytest.Item] = []
+    deselected: list[pytest.Item] = []
+    for item in items:
+        module = item.nodeid.split("::", 1)[0]
+        skipped = module.endswith(_SGLANG_ZMQ_SKIPPED_MODULES)
+        (deselected if skipped else kept).append(item)
+    return kept, deselected
+
+
+# Models whose TokenSpeed forward crashes on the 0-token idle batch a DP rank
+# runs to stay in the group's collectives (flashinfer silu_and_mul cannot
+# launch over an empty grid). Fixed upstream by
+# https://github.com/lightseekorg/tokenspeed/pull/1077; delete this skip when
+# the tokenspeed pin advances past it.
+_TOKENSPEED_DP_BROKEN_MODELS = frozenset({"Qwen/Qwen3-4B-Instruct-2507"})
+
+
+def _filter_tokenspeed_dp_items(
+    items: list[pytest.Item],
+) -> tuple[list[pytest.Item], list[pytest.Item]]:
+    """Split items into (kept, deselected) for a grouped TokenSpeed ZMQ lane."""
+    kept: list[pytest.Item] = []
+    deselected: list[pytest.Item] = []
+    for item in items:
+        marker = resolve_class_marker(item, "model")
+        model = str(model_id_for_engine(marker, "tokenspeed", default=""))
+        (deselected if model in _TOKENSPEED_DP_BROKEN_MODELS else kept).append(item)
+    return kept, deselected
+
+
+def _topology_mode(param) -> str | None:
+    """The backend mode a ``setup_backend`` param names: the string itself, or
+    the head of a topology tuple such as ``("pd_grpc", (p, d))``."""
+    mode = param[0] if isinstance(param, tuple) and param else param
+    return mode if isinstance(mode, str) else None
+
+
+def _is_epd_topology(param) -> bool:
+    """True when a ``setup_backend`` param asks for an encode-prefill-decode
+    fleet (``("epd_grpc", (e, p, d))``, or a bare ``epd_*`` mode)."""
+    return (_topology_mode(param) or "").startswith("epd")
+
+
+def _is_pd_topology(param) -> bool:
+    """True when a ``setup_backend`` param asks for a prefill/decode fleet
+    (``("pd_grpc", (p, d))``, or a bare ``pd_*`` mode)."""
+    return (_topology_mode(param) or "").startswith("pd")
+
+
+def _workers_marker_kwargs(item: pytest.Item) -> dict:
+    """The item's ``workers`` marker arguments, empty without the marker."""
+    marker = resolve_class_marker(item, "workers")
+    return dict(marker.kwargs) if marker is not None else {}
+
+
+def _filter_tokenspeed_rust_items(
+    items: list[pytest.Item],
+) -> tuple[list[pytest.Item], list[pytest.Item]]:
+    """Split items into (kept, deselected) for a TokenSpeed lane whose gRPC
+    workers run the Rust servicer (by the lane's setting or by the servicer
+    package's default: ``infra.constants.get_servicer_impl``).
+
+    The Rust servicer reaches the scheduler over the engine's msgpack wire,
+    whose handshake declares the control messages (flush cache, profiling),
+    the encode role and the logprob columns, so the admin operations, the
+    prefill/decode topologies and the encode-prefill-decode topologies all run
+    on it. Dropped here rather than failing on a known gap: the wires this
+    lane does not serve, and the multi-worker fleets of plain workers.
+    """
+    kept: list[pytest.Item] = []
+    deselected: list[pytest.Item] = []
+    for item in items:
+        param = _setup_backend_param(item)
+        workers = _workers_marker_kwargs(item)
+        # A wire this lane does not serve: anything but the local wires and
+        # the prefill/decode and encode-prefill-decode topologies. The wire is
+        # the param's mode: a topology tuple may carry per-pool dicts, which
+        # no set membership can hash.
+        unserved_wire = (
+            param is not None
+            and _topology_mode(param) not in _ZMQ_LOCAL_WIRES
+            and not (_is_pd_topology(param) or _is_epd_topology(param))
+        )
+        pd_workers = bool(workers.get("prefill") or workers.get("decode"))
+        plain_fleet = (workers.get("count") or 1) > 1 and not pd_workers
+        if unserved_wire or plain_fleet:
+            deselected.append(item)
+        else:
+            kept.append(item)
+    return kept, deselected
+
+
+def _filter_sglang_rust_items(
+    items: list[pytest.Item],
+) -> tuple[list[pytest.Item], list[pytest.Item]]:
+    """Split items into (kept, deselected) for an SGLang lane whose gRPC
+    workers run the Rust servicer (by the lane's setting or by the servicer
+    package's default: ``infra.constants.get_servicer_impl``).
+
+    The Rust servicer reaches the scheduler over the msgpack wire, which
+    runs no encode dispatch. The EPD topologies stay with the Python servicer,
+    so they are dropped here rather than failing on a known gap; everything
+    else (multimodal payloads, the prefill/decode topologies, admin ops,
+    embeddings, data-parallel workers) runs.
+    """
+    kept: list[pytest.Item] = []
+    deselected: list[pytest.Item] = []
+    for item in items:
+        param = _setup_backend_param(item)
+        # The wires this servicer serves: the local ones and the
+        # prefill/decode topologies; EPD and anything else stay with Python.
+        # The wire is the param's mode (a topology tuple may carry per-pool
+        # dicts, which no set membership can hash).
+        unserved_wire = (
+            param is not None
+            and _topology_mode(param) not in _ZMQ_LOCAL_WIRES
+            and not _is_pd_param(param)
+        )
+        if unserved_wire or _is_epd_worker_set(item):
+            deselected.append(item)
+        else:
+            kept.append(item)
+    return kept, deselected
+
+
+def _filter_env_items(
+    items: list[pytest.Item],
+    engine: str | None,
+    vendor: str | None,
+    gpu_tier: str | None,
+) -> tuple[list[pytest.Item], dict[str, list[pytest.Item]]]:
+    """Split items into (selected, deselected-by-reason) for the env filter.
+
+    Each dropped item is attributed to the first filter that rejects it, in
+    ``engine`` → ``vendor`` → ``tier`` order.
+    """
+    selected: list[pytest.Item] = []
+    deselected_by: dict[str, list[pytest.Item]] = {"engine": [], "vendor": [], "tier": []}
+    for item in items:
+        # Filter by engine
+        if engine:
+            engine_marker = _get_marker(item, "engine")
+            if not engine_marker or engine not in engine_marker.args:
+                deselected_by["engine"].append(item)
+                continue
+        # Filter by vendor
+        if vendor:
+            vendor_marker = _get_marker(item, "vendor")
+            if not vendor_marker or vendor not in vendor_marker.args:
+                deselected_by["vendor"].append(item)
+                continue
+        # Filter by GPU tier
+        if gpu_tier is not None:
+            gpu_marker = _get_marker(item, "gpu")
+            gpu_count = gpu_marker.args[0] if gpu_marker else 1
+            if str(gpu_count) != gpu_tier:
+                deselected_by["tier"].append(item)
+                continue
+        selected.append(item)
+    return selected, deselected_by
+
+
+def _enforce_selection_floor(selected_count: int) -> None:
+    """Fail the session when fewer tests survived selection than the floor.
+
+    ``E2E_MIN_SELECTED`` (non-negative integer) arms the check; unset or blank
+    disables it. A non-integer or negative value is rejected loudly rather than
+    treated as "no floor", so a lane typo cannot quietly drop the guardrail.
+    A violation aborts the run via ``pytest.exit`` so the CI log shows a
+    loud ``!!! Exit !!!`` banner instead of a quietly shrunken suite.
+    """
+    raw = (os.environ.get("E2E_MIN_SELECTED") or "").strip()
+    if not raw:
+        return
+    try:
+        floor = int(raw)
+    except ValueError:
+        pytest.exit(
+            f"e2e selection: E2E_MIN_SELECTED={raw!r} is not an integer",
+            returncode=1,
+        )
+    if floor < 0:
+        pytest.exit(
+            f"e2e selection: E2E_MIN_SELECTED={raw!r} must be non-negative; a "
+            f"negative floor would silently disable the check",
+            returncode=1,
+        )
+    if selected_count < floor:
+        pytest.exit(
+            f"e2e selection: only {selected_count} "
+            f"{'test' if selected_count == 1 else 'tests'} selected, below the "
+            f"E2E_MIN_SELECTED floor of {floor}. The count is what runs after "
+            f"the E2E_ENGINE/E2E_VENDOR/E2E_GPU_TIER env filter in "
+            f"e2e_test/fixtures/hooks.py and the command line's -k/-m filter; "
+            f"a filter that matches too little (marker drift, a lane env-var "
+            f"typo, a renamed test id) is the likely cause.",
+            returncode=1,
+        )
+
+
+def _format_selection_line(stats: dict) -> str:
+    """Render the one-line, greppable ``e2e selection:`` summary."""
+    header = f"e2e selection: engine={stats['engine'] or '-'}"
+    if stats.get("vendor"):
+        header += f" vendor={stats['vendor']}"
+    header += f" tier={stats['tier'] or '-'}"
+    parts = [f"{stats['by_engine']} deselected by engine"]
+    if stats.get("vendor") or stats["by_vendor"]:
+        parts.append(f"{stats['by_vendor']} by vendor")
+    parts.append(f"{stats['by_tier']} by tier")
+    parts.append(f"{stats['by_zmq']} by zmq-dedup")
+    if stats["by_tokenspeed_dp"]:
+        parts.append(f"{stats['by_tokenspeed_dp']} by tokenspeed-dp")
+    if stats.get("by_tokenspeed_rust"):
+        parts.append(f"{stats['by_tokenspeed_rust']} by tokenspeed-rust-servicer")
+    if stats.get("by_sglang_rust"):
+        parts.append(f"{stats['by_sglang_rust']} by sglang-rust-servicer")
+    if stats.get("by_sglang_zmq"):
+        parts.append(f"{stats['by_sglang_zmq']} by sglang-zmq-wire")
+    return (
+        f"{header}: selected {stats['selected']} of {stats['collected']} collected "
+        f"({', '.join(parts)})"
+    )
+
+
+class _SelectionReporter:
+    """Report selection, apply the ``E2E_MIN_SELECTED`` floor at collection
+    finish and enforce ``E2E_AMD_REQUIRE_PASSING_CALL`` at exit.
+
+    Lives on the plugin manager (registered in ``pytest_configure``) because
+    ``hooks.py`` is not a conftest, so a module-level
+    ``pytest_report_collectionfinish`` here would never be discovered.
+    """
+
+    def __init__(self) -> None:
+        self.require_passing_call = os.environ.get("E2E_AMD_REQUIRE_PASSING_CALL") == "1"
+        self.passing_calls = 0
+
+    def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
+        if report.when == "call" and report.passed:
+            self.passing_calls += 1
+
+    @pytest.hookimpl(trylast=True)
+    def pytest_sessionfinish(self, session: pytest.Session) -> None:
+        if (
+            self.require_passing_call
+            and self.passing_calls == 0
+            and session.exitstatus == pytest.ExitCode.OK
+        ):
+            session.exitstatus = pytest.ExitCode.TESTS_FAILED
+            reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+            if reporter is not None:
+                reporter.write_line(
+                    "AMD_E2E_NO_PASSING_CALL: qualification incomplete; "
+                    "no test call passed (check prerequisite/infra skips)"
+                )
+
+    def pytest_report_collectionfinish(self, config: pytest.Config) -> str | None:
+        stats = config.stash.get(_SELECTION_STATS_KEY, None)
+        if not stats:
+            return None
+        return _format_selection_line(stats)
+
+    def pytest_collection_finish(self, session: pytest.Session) -> None:
+        """Apply the ``E2E_MIN_SELECTED`` floor to what will run.
+
+        ``session.items`` is the selection after every
+        ``pytest_collection_modifyitems`` hook, the env filter above and
+        pytest's own ``-k``/``-m`` deselection included. A count taken in
+        the env filter's hook saw the set before ``-k``: a lane whose filter
+        selects 26 of 133 compared its floor with 133.
+        """
+        if sys.exc_info()[0] is not None or session.testsfailed:
+            # pytest calls this hook from the ``finally`` of
+            # ``Session.perform_collect``, so it also runs while collection is
+            # unwinding from its own error (a missing path, a failing hook, an
+            # interrupt), and a module that fails to import is a recorded
+            # collection error that pytest reports after this hook. A floor
+            # exit here would replace that error's own message and exit code.
+            return
+        _enforce_selection_floor(len(session.items))
+
+
+# The most of a failure's first line a rerun record keeps: an assertion that
+# quotes a response body can run to kilobytes, and the record is one line.
+_REASON_CHARS = 200
+
+
+def _first_failure_line(report: pytest.TestReport) -> str:
+    """The first line of a failed report's reason, at most ``_REASON_CHARS``
+    long: the crash message of its traceback (``AssertionError: ...``), else
+    the first line of its text."""
+    crash = getattr(report.longrepr, "reprcrash", None)
+    text = crash.message if crash is not None else report.longreprtext
+    for line in text.splitlines():
+        if line.strip():
+            return line.strip()[:_REASON_CHARS]
+    return "(no failure text)"
+
+
+def _annotation(record: str) -> str:
+    """The GitHub Actions warning command carrying one rerun record: the
+    runner reads it from the step's output and lists it on the run page."""
+    message = record.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    return f"::warning title=e2e rerun::{message}"
+
+
+# The run page shows ten warning annotations per step and drops the rest
+# without a word. The reporter is the test step's only warning annotator on
+# a well-configured run: the memory guard script that opens the step
+# (scripts/ci_killall_sglang.sh) warns once when its wait or poll variable
+# is not a whole number of seconds, and the job sets neither.
+_ANNOTATIONS_PER_STEP = 10
+
+
+def _annotations(records: list[str]) -> list[str]:
+    """The warning commands for the run page: every record when they fit the
+    step's ten, else the first nine and one carrying the count of the rest, so
+    the page always shows how many reruns there were."""
+    if len(records) <= _ANNOTATIONS_PER_STEP:
+        return [_annotation(record) for record in records]
+    shown = records[: _ANNOTATIONS_PER_STEP - 1]
+    rest = len(records) - len(shown)
+    return [_annotation(record) for record in shown] + [
+        _annotation(f"{rest} more reruns, see the step summary")
+    ]
+
+
+class _RerunReporter:
+    """Record the reruns of a session.
+
+    pytest-rerunfailures logs a failed attempt it will run again with the
+    outcome ``rerun``. A case that passes on its rerun is green on the row,
+    and the ``RERUN`` mark inside the step log is its only trace. This plugin
+    keeps every rerun (the case, the attempt, the first line of its failure)
+    and puts it where a green row is read: an ``e2e reruns: N`` count and one
+    ``e2e rerun:`` line per rerun in the terminal summary, a warning
+    annotation per rerun on the run page under GitHub Actions (ten at most,
+    the last one counting the rest), and
+    ``reruns.txt`` under ``E2E_LOG_DIR``, the directory a row's worker logs
+    are uploaded from. The rows upload that directory on failure alone, so
+    the same lines go into the step summary (``GITHUB_STEP_SUMMARY``), the
+    record of a green row's reruns that outlives the runner.
+    """
+
+    def __init__(self) -> None:
+        # Keyed by case and attempt: a call failure and a teardown failure of
+        # one attempt are two rerun reports of one rerun, and the first names it.
+        self.reruns: dict[tuple[str, int], str] = {}
+
+    def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
+        if report.outcome != "rerun":
+            return
+        # The plugin counts the attempts before this one on the report.
+        attempt = getattr(report, "rerun", 0) + 1
+        self.reruns.setdefault((report.nodeid, attempt), _first_failure_line(report))
+
+    def records(self) -> list[str]:
+        """One record per rerun: the case, the attempt and its first failure line."""
+        return [
+            f"{nodeid} attempt {attempt} failed: {reason}"
+            for (nodeid, attempt), reason in self.reruns.items()
+        ]
+
+    def pytest_terminal_summary(self, terminalreporter: pytest.TerminalReporter) -> None:
+        records = self.records()
+        lines = [f"e2e rerun: {record}" for record in records]
+        terminalreporter.write_line(f"e2e reruns: {len(records)}")
+        for line in lines:
+            terminalreporter.write_line(line)
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            for command in _annotations(records):
+                terminalreporter.write_line(command)
+        text = "\n".join(lines) + "\n"
+        log_dir = os.environ.get("E2E_LOG_DIR")
+        if lines and log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+            with open(os.path.join(log_dir, "reruns.txt"), "w", encoding="utf-8") as file:
+                file.write(text)
+        step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+        if lines and step_summary:
+            # A line break first: the step's earlier summary may end without
+            # one, and a heading renders only at the start of a line.
+            with open(step_summary, "a", encoding="utf-8") as file:
+                file.write(f"\n### e2e reruns: {len(records)}\n\n```text\n{text}```\n")
+
+
+def pytest_collection_modifyitems(
+    config: pytest.Config,
+    items: list[pytest.Item],
+) -> None:
+    """Filter + order collected tests.
+
+    Filtering: env vars ``E2E_ENGINE``, ``E2E_VENDOR``, ``E2E_GPU_TIER``
+    select the matching slice when set. When ``E2E_CONNECTION_MODE=zmq`` the
+    lane additionally drops the gRPC-only families (PD, EPD, multi-worker) and
+    collapses ``grpc``/``http`` twins onto a single ZMQ run.
+
+    Every dropped item is reported through ``pytest_deselected`` (so terminal
+    output shows ``N deselected`` instead of silently running fewer tests than
+    collected) and tallied into the ``e2e selection:`` summary line. The
+    ``E2E_MIN_SELECTED`` floor is applied by ``_SelectionReporter`` at
+    collection finish, after pytest's own ``-k``/``-m`` deselection.
+
+    Ordering: items are sorted by ``(backend, model)`` so consecutive
+    classes that share a backend cluster together. This is what lets
+    ``infra.worker_pool`` reuse a single worker across many test classes
+    instead of evicting on every boundary.
+    """
+    engine = os.environ.get("E2E_ENGINE") or None
+    vendor = os.environ.get("E2E_VENDOR") or None
+    gpu_tier = os.environ.get("E2E_GPU_TIER") or None
+
+    stats = {
+        "engine": engine,
+        "vendor": vendor,
+        "tier": gpu_tier,
+        "collected": len(items),
+        "by_engine": 0,
+        "by_vendor": 0,
+        "by_tier": 0,
+        "by_zmq": 0,
+        "by_tokenspeed_dp": 0,
+        "by_tokenspeed_rust": 0,
+        "by_sglang_rust": 0,
+        "by_sglang_zmq": 0,
+    }
+
+    if any([engine, vendor, gpu_tier]):
+        selected, deselected_by = _filter_env_items(items, engine, vendor, gpu_tier)
+        stats["by_engine"] = len(deselected_by["engine"])
+        stats["by_vendor"] = len(deselected_by["vendor"])
+        stats["by_tier"] = len(deselected_by["tier"])
+        deselected = deselected_by["engine"] + deselected_by["vendor"] + deselected_by["tier"]
+        if deselected:
+            config.hook.pytest_deselected(items=deselected)
+        items[:] = selected
+
+    # The Rust-path filters key on the implementation the lane's workers run,
+    # whether the lane named it or the servicer package's default selects it.
+    if get_runtime() == "tokenspeed" and get_servicer_impl("tokenspeed") == "rust":
+        kept, deselected = _filter_tokenspeed_rust_items(items)
+        stats["by_tokenspeed_rust"] = len(deselected)
+        if deselected:
+            config.hook.pytest_deselected(items=deselected)
+            items[:] = kept
+
+    if get_runtime() == "sglang" and get_servicer_impl("sglang") == "rust":
+        kept, deselected = _filter_sglang_rust_items(items)
+        stats["by_sglang_rust"] = len(deselected)
+        if deselected:
+            config.hook.pytest_deselected(items=deselected)
+            items[:] = kept
+
+    if get_connection_mode_override() == ConnectionMode.ZMQ:
+        kept, deselected = _filter_zmq_items(items)
+        stats["by_zmq"] = len(deselected)
+        if deselected:
+            config.hook.pytest_deselected(items=deselected)
+            items[:] = kept
+
+        # The error-shape cases exercise SGLang's own HTTP server, which this
+        # wire has no counterpart of; the gRPC and HTTP lanes keep covering
+        # that module. The multimodal module runs here: the adapter carries
+        # the preprocessed media to the scheduler over this wire.
+        if get_runtime() == "sglang":
+            kept, deselected = _filter_sglang_zmq_items(items)
+            stats["by_sglang_zmq"] = len(deselected)
+            if deselected:
+                config.hook.pytest_deselected(items=deselected)
+                items[:] = kept
+
+        # Grouped TokenSpeed lane: drop the models the pinned engine cannot
+        # run under DP (see _TOKENSPEED_DP_BROKEN_MODELS).
+        if get_runtime() == "tokenspeed" and get_zmq_engine_count() > 1:
+            kept, deselected = _filter_tokenspeed_dp_items(items)
+            stats["by_tokenspeed_dp"] = len(deselected)
+            if deselected:
+                config.hook.pytest_deselected(items=deselected)
+                items[:] = kept
+
+    stats["selected"] = len(items)
+    config.stash[_SELECTION_STATS_KEY] = stats
+
+    items.sort(key=_pool_sort_key)
+    # The E2E_MIN_SELECTED floor is applied by _SelectionReporter at
+    # collection finish, after pytest's own -k and -m deselection: this hook
+    # runs before the mark plugin's, so a count taken here would miss the
+    # filter a lane passes on its command line.
+
+
+def _pool_sort_key(item: pytest.Item) -> tuple:
+    """Sort key clustering items that would share a pool entry.
+
+    Primary: backend parametrize value — ``setup_backend`` for class-scope
+    fixtures, falling back to ``backend_router`` for function-scope ones.
+    Different backends mean different pool keys.
+    Secondary: ``@pytest.mark.model`` value if set, else empty — same
+    backend with the same model is the cache-hit case.
+    Tertiary: ``item.nodeid`` for stability across collections.
+    """
+    backend = ""
+    callspec = getattr(item, "callspec", None)
+    if callspec is not None:
+        params = getattr(callspec, "params", {}) or {}
+        backend = str(params.get("setup_backend", params.get("backend_router", "")))
+
+    model_marker = resolve_class_marker(item, "model")
+    model = str(model_id_for_engine(model_marker, get_runtime(), default=""))
+
+    gateway = resolve_class_marker(item, "gateway")
+    serving_config = ("", "")
+    if (
+        get_connection_mode_override() == ConnectionMode.ZMQ
+        and gateway is not None
+        and gateway.kwargs.get("reuse")
+    ):
+        workers = resolve_class_marker(item, "workers")
+        # Literal marker configuration only: do not fold defaults or reorder
+        # CLI arguments to declare two serving instances compatible.
+        serving_config = (
+            repr(sorted(workers.kwargs.items())) if workers is not None else "",
+            repr(sorted(gateway.kwargs.items())),
+        )
+    return (backend, model, *serving_config, item.nodeid)
+
+
+# ---------------------------------------------------------------------------
+# Session teardown — stop pooled workers
+# ---------------------------------------------------------------------------
+
+
+def pytest_sessionfinish(
+    session: pytest.Session,  # noqa: ARG001
+    exitstatus: int,  # noqa: ARG001
+) -> None:
+    """Tear down any workers held by the session-scoped pool.
+
+    The pool also has an ``atexit`` handler for cases where pytest exits
+    abnormally before this hook runs (SIGINT, ``pytest.exit``), but the
+    explicit hook is cheaper and gives clean log output during normal runs.
+    """
+    cleanup_pool()

@@ -1,0 +1,136 @@
+//! gRPC client for the TokenSpeed EPD encode service.
+//!
+//! The gateway calls `encode()` to hand a vision-tower-only worker the
+//! preprocessed multimodal tensors for one request; the worker runs the tower
+//! and ships the embedding to the paired prefill worker over Mooncake (keyed by
+//! `bootstrap_room`). The response only confirms the request was accepted — the
+//! embedding transfer happens out of band.
+
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, OnceLock,
+    },
+};
+
+use tonic::Request;
+use tracing::{debug, warn};
+
+use crate::{
+    channel::{Channel, DEFAULT_CONNECT_TIMEOUT},
+    BoxedTraceInjector, NoopTraceInjector,
+};
+
+/// Process-global cache of channels, keyed by encode-worker endpoint.
+///
+/// The EPD encode stage dispatches one `Encode` RPC per image per request, so
+/// without pooling every call paid a fresh TCP + HTTP/2 (+ TLS) handshake on the
+/// request's critical path. A [`Channel`] is cheap to clone and multiplexes
+/// concurrent RPCs over a single HTTP/2 connection, so we reuse one channel per
+/// endpoint — the same connection reuse the prefill/decode sides already get from
+/// their cached per-worker client.
+/// A single body is large; several concurrent images to the SAME worker would
+/// head-of-line-block on one HTTP/2 connection's write buffer + flow-control
+/// credit. So hold a small POOL of independent connections per endpoint and
+/// round-robin RPCs across them (independent sockets = independent windows).
+fn channel_cache() -> &'static Mutex<HashMap<String, Vec<Channel>>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Vec<Channel>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// How many independent HTTP/2 connections to keep per encode endpoint.
+const ENCODE_CONNS_PER_ENDPOINT: usize = 4;
+
+/// Round-robin cursor over an endpoint's connection pool.
+static ENCODE_CONN_CURSOR: AtomicUsize = AtomicUsize::new(0);
+
+#[expect(
+    clippy::allow_attributes,
+    reason = "the generator decides which lints fire, so these allows cannot be expects"
+)]
+pub mod tokenspeed_encoder_proto {
+    #![allow(clippy::all, clippy::absolute_paths, unused_qualifications)]
+    tonic::include_proto!("tokenspeed.grpc.encoder");
+}
+
+/// gRPC client for the TokenSpeed encode worker.
+#[derive(Clone)]
+pub struct TokenSpeedEncoderClient {
+    client: tokenspeed_encoder_proto::token_speed_encoder_client::TokenSpeedEncoderClient<Channel>,
+    trace_injector: BoxedTraceInjector,
+}
+
+impl TokenSpeedEncoderClient {
+    /// A client over a channel of `endpoint`'s cached pool (see `channel_cache`).
+    /// A new endpoint's pool is built under the cache lock, of channels that
+    /// dial on their first call: built with the lock released, every request
+    /// of a burst dialled a pool of its own and dropped it.
+    #[expect(
+        clippy::unused_async,
+        reason = "a published signature: the body no longer waits"
+    )]
+    pub async fn connect_cached(
+        endpoint: &str,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        // Round-robin, so concurrent images spread across the pool's sockets.
+        let pick = |pool: &[Channel]| {
+            pool[ENCODE_CONN_CURSOR.fetch_add(1, Ordering::Relaxed) % pool.len()].clone()
+        };
+        let mut cache = channel_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(pool) = cache.get(endpoint) {
+            return Ok(Self::from_channel(pick(pool)));
+        }
+        let pool = (0..ENCODE_CONNS_PER_ENDPOINT)
+            .map(|_| Channel::unconnected(endpoint, DEFAULT_CONNECT_TIMEOUT))
+            .collect::<Result<Vec<_>, _>>()?;
+        debug!(
+            "pooling {ENCODE_CONNS_PER_ENDPOINT} connections to the TokenSpeed encoder at {}, each dialled on its first call",
+            pool[0].peer()
+        );
+        let client = Self::from_channel(pick(&pool));
+        cache.insert(endpoint.to_string(), pool);
+        Ok(client)
+    }
+
+    /// Drops `endpoint`'s cached pool, for a worker that left: its
+    /// connections close once the calls in flight on them end. Nothing else
+    /// removes an entry, so a pool outlived its worker until the process
+    /// ended.
+    pub fn forget_cached(endpoint: &str) {
+        channel_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(endpoint);
+    }
+
+    fn from_channel(channel: Channel) -> Self {
+        Self {
+            client:
+                tokenspeed_encoder_proto::token_speed_encoder_client::TokenSpeedEncoderClient::new(
+                    channel,
+                ),
+            trace_injector: Arc::new(NoopTraceInjector),
+        }
+    }
+
+    /// Trigger the vision tower on a request's multimodal inputs. Returns once
+    /// the worker has accepted (enqueued) the request; the embedding then ships
+    /// to the prefill peer asynchronously over Mooncake.
+    pub async fn encode(
+        &self,
+        req: tokenspeed_encoder_proto::EncodeRequest,
+    ) -> Result<tokenspeed_encoder_proto::EncodeResponse, tonic::Status> {
+        let mut client = self.client.clone();
+        let mut request = Request::new(req);
+
+        if let Err(e) = self.trace_injector.inject(request.metadata_mut()) {
+            warn!("Failed to inject trace context: {}", e);
+        }
+
+        let response = client.encode(request).await?;
+        Ok(response.into_inner())
+    }
+}

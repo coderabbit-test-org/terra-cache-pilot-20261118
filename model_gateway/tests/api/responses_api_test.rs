@@ -1,0 +1,4260 @@
+// Integration test for Responses API
+
+use axum::http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode};
+use openai_protocol::{
+    common::{GenerationRequest, UsageInfo},
+    responses::{
+        CodeInterpreterTool, McpAllowedTools, McpTool, ReasoningEffort, RequireApproval,
+        RequireApprovalMode, ResponseContentPart, ResponseInput, ResponseReasoningParam,
+        ResponseTool, ResponsesRequest, ResponsesToolChoice, ServiceTier, ToolChoiceOptions,
+        Truncation, WebSearchPreviewTool,
+    },
+};
+use smg::{
+    config::{RouterConfig, RouterConfigBuilder},
+    endpoints::conversations,
+    routers::RouterFactory,
+    tenant::{RouteRequestMeta, TenantKey},
+};
+use smg_worker::test_support::RefusedAddress;
+
+use crate::common::{
+    create_test_context, create_test_context_with_mcp_config,
+    mock_mcp_server::{MockFailingMCPServer, MockMCPServer},
+    mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType},
+};
+
+const TEST_INTERNAL_MCP_SERVER_LABEL: &str = "internal-mock";
+const TEST_INTERNAL_MCP_ERROR_MARKER: &str = "internal-mcp-failure-marker";
+
+fn test_tenant_meta() -> smg::middleware::TenantRequestMeta {
+    RouteRequestMeta::new(TenantKey::from("test-tenant"))
+}
+
+/// What every router of these tests shares: OpenAI mode over `worker_urls`,
+/// the random policy, the loopback host on an ephemeral port, an 8 MiB
+/// payload cap, a one-minute request timeout, a one-second startup check
+/// interval and a five-second queue timeout.
+fn router_builder(worker_urls: Vec<String>) -> RouterConfigBuilder {
+    RouterConfig::builder()
+        .openai_mode(worker_urls)
+        .random_policy()
+        .host("127.0.0.1")
+        .port(0)
+        .max_payload_size(8 * 1024 * 1024)
+        .request_timeout_secs(60)
+        .worker_startup_check_interval_secs(1)
+        .log_level("warn")
+        .queue_timeout_secs(5)
+}
+
+/// The router of a test that drives a mock worker at `worker_url`: five
+/// seconds for the worker to come up, 32 requests in flight.
+fn worker_router_config(worker_url: String) -> RouterConfig {
+    router_builder(vec![worker_url])
+        .worker_startup_timeout_secs(5)
+        .max_concurrent_requests(32)
+        .build_unchecked()
+}
+
+/// The router of the conversation tests: a worker address nothing calls, one
+/// second for it to come up, 8 requests in flight.
+fn conversation_router_config() -> RouterConfig {
+    router_builder(vec!["http://localhost".to_string()])
+        .worker_startup_timeout_secs(1)
+        .max_concurrent_requests(8)
+        .build_unchecked()
+}
+
+#[tokio::test]
+async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
+    // Start mock MCP server
+    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+
+    // Write a temp MCP config file
+    let mcp_yaml = format!(
+        "servers:\n  - name: mock\n    protocol: streamable\n    url: {}\n",
+        mcp.url()
+    );
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg_path = dir.path().join("mcp.yaml");
+    std::fs::write(&cfg_path, mcp_yaml).expect("write mcp cfg");
+
+    // Start mock OpenAI worker
+    let mut worker = MockWorker::new(MockWorkerConfig {
+        port: 0,
+        worker_type: WorkerType::Regular,
+        health_status: HealthStatus::Healthy,
+        response_delay_ms: 0,
+        fail_rate: 0.0,
+    });
+    let worker_url = worker.start().await.expect("start worker");
+
+    let router_cfg = worker_router_config(worker_url);
+
+    // Create router and context with MCP config from file
+    let ctx = create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap()).await;
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
+
+    // Build a simple ResponsesRequest that will trigger the tool call
+    let req = ResponsesRequest {
+        include: None,
+        background: None,
+        input: ResponseInput::Text("search something".to_string()),
+        instructions: Some("Be brief".to_string()),
+        max_output_tokens: Some(64),
+        max_tool_calls: None,
+        metadata: None,
+        model: "mock-model".to_string(),
+        parallel_tool_calls: Some(true),
+        previous_response_id: None,
+        reasoning: None,
+        service_tier: Some(ServiceTier::Auto),
+        store: Some(true),
+        stream: Some(false),
+        temperature: Some(0.2),
+        tool_choice: Some(ResponsesToolChoice::default()),
+        tools: Some(vec![ResponseTool::Mcp(McpTool {
+            server_url: Some(mcp.url()),
+            authorization: None,
+            headers: None,
+            server_label: "mock".to_string(),
+            server_description: None,
+            require_approval: None,
+            allowed_tools: None,
+            connector_id: None,
+            defer_loading: None,
+        })]),
+        top_logprobs: Some(0),
+        top_p: None,
+        truncation: Some(Truncation::Disabled),
+        text: None,
+        user: None,
+        request_id: Some("resp_test_mcp_e2e".to_string()),
+        priority: 0,
+        frequency_penalty: Some(0.0),
+        presence_penalty: Some(0.0),
+        stop: None,
+        prompt: None,
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+        safety_identifier: None,
+        stream_options: None,
+        context_management: None,
+        client_metadata: None,
+        top_k: -1,
+        min_p: 0.0,
+        repetition_penalty: 1.0,
+        conversation: None,
+    };
+
+    let tenant_meta = test_tenant_meta();
+    let resp = router
+        .route_responses(None, &tenant_meta, req.clone(), req.model.as_str())
+        .await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("Failed to read response body");
+    let body_json: serde_json::Value =
+        serde_json::from_slice(&body_bytes).expect("Failed to parse response JSON");
+
+    let output = body_json
+        .get("output")
+        .and_then(|v| v.as_array())
+        .expect("response output missing");
+    assert!(!output.is_empty(), "expected at least one output item");
+
+    // Verify mcp_list_tools item is present
+    let list_tools_item = output
+        .iter()
+        .find(|entry| {
+            entry.get("type") == Some(&serde_json::Value::String("mcp_list_tools".into()))
+        })
+        .expect("missing mcp_list_tools output item");
+
+    assert_eq!(
+        list_tools_item.get("server_label").and_then(|v| v.as_str()),
+        Some("mock"),
+        "server_label should match"
+    );
+    let tools_list = list_tools_item
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .expect("tools array missing in mcp_list_tools");
+    assert!(
+        !tools_list.is_empty(),
+        "mcp_list_tools should contain at least one tool"
+    );
+
+    // Verify mcp_call item is present
+    let mcp_call_item = output
+        .iter()
+        .find(|entry| entry.get("type") == Some(&serde_json::Value::String("mcp_call".into())))
+        .expect("missing mcp_call output item");
+
+    assert_eq!(
+        mcp_call_item.get("status").and_then(|v| v.as_str()),
+        Some("completed"),
+        "mcp_call status should be completed"
+    );
+    assert_eq!(
+        mcp_call_item.get("server_label").and_then(|v| v.as_str()),
+        Some("mock"),
+        "server_label should match"
+    );
+    assert!(
+        mcp_call_item.get("name").is_some(),
+        "mcp_call should have a tool name"
+    );
+    assert!(
+        mcp_call_item.get("arguments").is_some(),
+        "mcp_call should have arguments"
+    );
+    assert!(
+        mcp_call_item.get("output").is_some(),
+        "mcp_call should have output"
+    );
+
+    let final_text = output
+        .iter()
+        .rev()
+        .filter_map(|entry| entry.get("content"))
+        .filter_map(|content| content.as_array())
+        .flat_map(|parts| parts.iter())
+        .filter_map(|part| part.get("text"))
+        .filter_map(|v| v.as_str())
+        .next();
+
+    if let Some(text) = final_text {
+        assert_eq!(text, "Tool result consumed; here is the final answer.");
+    } else {
+        let call_entry = output.iter().find(|entry| {
+            entry.get("type") == Some(&serde_json::Value::String("function_call".into()))
+        });
+        assert!(call_entry.is_some(), "missing function call entry");
+        if let Some(entry) = call_entry {
+            assert_eq!(
+                entry.get("status").and_then(|v| v.as_str()),
+                Some("in_progress"),
+                "function call should be in progress when no content is returned"
+            );
+        }
+    }
+
+    let tools = body_json
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .expect("tools array missing");
+    assert_eq!(tools.len(), 1);
+    let tool = tools.first().unwrap();
+    assert_eq!(tool.get("type").and_then(|v| v.as_str()), Some("mcp"));
+    assert_eq!(
+        tool.get("server_label").and_then(|v| v.as_str()),
+        Some("mock")
+    );
+
+    // Cleanup
+    worker.stop().await;
+    mcp.stop().await;
+}
+
+#[tokio::test]
+async fn test_non_streaming_mcp_e2e_accepts_forwardable_request_headers() {
+    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+
+    let mcp_yaml = format!(
+        "servers:\n  - name: mock\n    protocol: streamable\n    url: {}\n",
+        mcp.url()
+    );
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg_path = dir.path().join("mcp.yaml");
+    std::fs::write(&cfg_path, mcp_yaml).expect("write mcp cfg");
+
+    let mut worker = MockWorker::new(MockWorkerConfig {
+        port: 0,
+        worker_type: WorkerType::Regular,
+        health_status: HealthStatus::Healthy,
+        response_delay_ms: 0,
+        fail_rate: 0.0,
+    });
+    let worker_url = worker.start().await.expect("start worker");
+
+    let router_cfg = worker_router_config(worker_url);
+
+    let ctx = create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap()).await;
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
+
+    let req = ResponsesRequest {
+        include: None,
+        background: None,
+        input: ResponseInput::Text("search something".to_string()),
+        instructions: Some("Be brief".to_string()),
+        max_output_tokens: Some(64),
+        max_tool_calls: None,
+        metadata: None,
+        model: "mock-model".to_string(),
+        parallel_tool_calls: Some(true),
+        previous_response_id: None,
+        reasoning: None,
+        service_tier: Some(ServiceTier::Auto),
+        store: Some(true),
+        stream: Some(false),
+        temperature: Some(0.2),
+        tool_choice: Some(ResponsesToolChoice::default()),
+        tools: Some(vec![ResponseTool::Mcp(McpTool {
+            server_url: Some(mcp.url()),
+            authorization: None,
+            headers: None,
+            server_label: "mock".to_string(),
+            server_description: None,
+            require_approval: None,
+            allowed_tools: None,
+            connector_id: None,
+            defer_loading: None,
+        })]),
+        top_logprobs: Some(0),
+        top_p: None,
+        truncation: Some(Truncation::Disabled),
+        text: None,
+        user: None,
+        request_id: Some("resp_test_mcp_forwardable_headers".to_string()),
+        priority: 0,
+        frequency_penalty: Some(0.0),
+        presence_penalty: Some(0.0),
+        stop: None,
+        prompt: None,
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+        safety_identifier: None,
+        stream_options: None,
+        context_management: None,
+        client_metadata: None,
+        top_k: -1,
+        min_p: 0.0,
+        repetition_penalty: 1.0,
+        conversation: None,
+    };
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "authorization",
+        HeaderValue::from_static("Bearer test-forwarded-token"),
+    );
+    headers.insert(
+        "x-request-id",
+        HeaderValue::from_static("req-forwarded-123"),
+    );
+    headers.insert(
+        "x-correlation-id",
+        HeaderValue::from_static("corr-forwarded-456"),
+    );
+    headers.insert(
+        "traceparent",
+        HeaderValue::from_static("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00"),
+    );
+    headers.insert("x-custom-header", HeaderValue::from_static("blocked-value"));
+
+    let tenant_meta = test_tenant_meta();
+    let resp = router
+        .route_responses(
+            Some(&headers),
+            &tenant_meta,
+            req.clone(),
+            req.model.as_str(),
+        )
+        .await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("Failed to read response body");
+    let body_json: serde_json::Value =
+        serde_json::from_slice(&body_bytes).expect("Failed to parse response JSON");
+
+    let output = body_json
+        .get("output")
+        .and_then(|v| v.as_array())
+        .expect("response output missing");
+
+    assert!(
+        output.iter().any(|entry| {
+            entry.get("type") == Some(&serde_json::Value::String("mcp_list_tools".into()))
+        }),
+        "expected mcp_list_tools output item",
+    );
+    assert!(
+        output.iter().any(|entry| {
+            entry.get("type") == Some(&serde_json::Value::String("mcp_call".into()))
+        }),
+        "expected mcp_call output item",
+    );
+
+    worker.stop().await;
+    mcp.stop().await;
+}
+
+#[tokio::test]
+async fn test_non_streaming_mcp_returns_approval_request_when_required() {
+    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+
+    let mcp_yaml = format!(
+        "servers:\n  - name: mock\n    protocol: streamable\n    url: {}\n",
+        mcp.url()
+    );
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg_path = dir.path().join("mcp.yaml");
+    std::fs::write(&cfg_path, mcp_yaml).expect("write mcp cfg");
+
+    let mut worker = MockWorker::new(MockWorkerConfig {
+        port: 0,
+        worker_type: WorkerType::Regular,
+        health_status: HealthStatus::Healthy,
+        response_delay_ms: 0,
+        fail_rate: 0.0,
+    });
+    let worker_url = worker.start().await.expect("start worker");
+
+    let router_cfg = worker_router_config(worker_url);
+
+    let ctx = create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap()).await;
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
+
+    let req = ResponsesRequest {
+        include: None,
+        background: None,
+        input: ResponseInput::Text("search something".to_string()),
+        instructions: Some("Be brief".to_string()),
+        max_output_tokens: Some(64),
+        max_tool_calls: None,
+        metadata: None,
+        model: "mock-model".to_string(),
+        parallel_tool_calls: Some(true),
+        previous_response_id: None,
+        reasoning: None,
+        service_tier: Some(ServiceTier::Auto),
+        store: Some(true),
+        stream: Some(false),
+        temperature: Some(0.2),
+        tool_choice: Some(ResponsesToolChoice::default()),
+        tools: Some(vec![ResponseTool::Mcp(McpTool {
+            server_url: Some(mcp.url()),
+            authorization: None,
+            headers: None,
+            server_label: "mock".to_string(),
+            server_description: None,
+            require_approval: Some(RequireApproval::Mode(RequireApprovalMode::Always)),
+            allowed_tools: None,
+            connector_id: None,
+            defer_loading: None,
+        })]),
+        top_logprobs: Some(0),
+        top_p: None,
+        truncation: Some(Truncation::Disabled),
+        text: None,
+        user: None,
+        request_id: Some("resp_test_mcp_approval_interrupt".to_string()),
+        priority: 0,
+        frequency_penalty: Some(0.0),
+        presence_penalty: Some(0.0),
+        stop: None,
+        prompt: None,
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+        safety_identifier: None,
+        stream_options: None,
+        context_management: None,
+        client_metadata: None,
+        top_k: -1,
+        min_p: 0.0,
+        repetition_penalty: 1.0,
+        conversation: None,
+    };
+
+    let tenant_meta = test_tenant_meta();
+    let resp = router
+        .route_responses(None, &tenant_meta, req.clone(), req.model.as_str())
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("Failed to read response body");
+    let body_json: serde_json::Value =
+        serde_json::from_slice(&body_bytes).expect("Failed to parse response JSON");
+
+    assert_eq!(body_json["status"], "completed");
+
+    let output = body_json["output"]
+        .as_array()
+        .expect("response output missing");
+
+    let approval_item = output
+        .iter()
+        .find(|entry| {
+            entry.get("type") == Some(&serde_json::Value::String("mcp_approval_request".into()))
+        })
+        .expect("missing mcp_approval_request output item");
+
+    assert_eq!(
+        approval_item.get("server_label").and_then(|v| v.as_str()),
+        Some("mock")
+    );
+    assert_eq!(
+        approval_item.get("name").and_then(|v| v.as_str()),
+        Some("brave_web_search")
+    );
+    assert!(approval_item.get("arguments").is_some());
+    assert!(
+        output
+            .iter()
+            .all(|entry| entry.get("type") != Some(&serde_json::Value::String("mcp_call".into()))),
+        "response should interrupt before emitting mcp_call"
+    );
+
+    worker.stop().await;
+    mcp.stop().await;
+}
+
+/// One server under two labels: each tool is attributed to one of them, and
+/// the approval the other label asks for still holds the call.
+#[tokio::test]
+async fn test_non_streaming_mcp_approval_holds_for_a_tool_listed_under_another_label() {
+    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+    let url = mcp.url();
+    let mcp_yaml = format!("servers:\n  - name: mock\n    protocol: streamable\n    url: {url}\n");
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg_path = dir.path().join("mcp.yaml");
+    std::fs::write(&cfg_path, mcp_yaml).expect("write mcp cfg");
+
+    let mut worker = MockWorker::new(MockWorkerConfig {
+        port: 0,
+        worker_type: WorkerType::Regular,
+        health_status: HealthStatus::Healthy,
+        response_delay_ms: 0,
+        fail_rate: 0.0,
+    });
+    let worker_url = worker.start().await.expect("start worker");
+    let router_cfg = worker_router_config(worker_url);
+    let ctx = create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap()).await;
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
+
+    let label = |server_label: &str, narrow: bool, asks: bool| {
+        ResponseTool::Mcp(McpTool {
+            server_url: Some(url.clone()),
+            authorization: None,
+            headers: None,
+            server_label: server_label.to_string(),
+            server_description: None,
+            require_approval: asks.then_some(RequireApproval::Mode(RequireApprovalMode::Always)),
+            allowed_tools: narrow
+                .then(|| McpAllowedTools::List(vec!["brave_web_search".to_string()])),
+            connector_id: None,
+            defer_loading: None,
+        })
+    };
+    let mut seen = Vec::new();
+    for tools in [
+        vec![label("conf", false, false), label("conf-b", true, true)],
+        vec![label("conf-b", true, false), label("conf", false, true)],
+    ] {
+        let req = ResponsesRequest {
+            input: ResponseInput::Text("search something".to_string()),
+            model: "mock-model".to_string(),
+            store: Some(true),
+            stream: Some(false),
+            tools: Some(tools),
+            ..Default::default()
+        };
+        let resp = router
+            .route_responses(None, &test_tenant_meta(), req.clone(), req.model.as_str())
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("the response body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("a JSON body");
+        let types: Vec<String> = body["output"]
+            .as_array()
+            .expect("the output items")
+            .iter()
+            .filter_map(|item| item["type"].as_str().map(str::to_string))
+            .collect();
+        seen.push(types);
+    }
+    for types in &seen {
+        assert!(
+            types.iter().any(|t| t == "mcp_approval_request")
+                && !types.iter().any(|t| t == "mcp_call"),
+            "each order waits for the approval before the call: {seen:?}"
+        );
+    }
+
+    worker.stop().await;
+    mcp.stop().await;
+}
+
+#[tokio::test]
+async fn test_final_response_hides_internal_mcp_trace_items() {
+    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+
+    let mcp_yaml = format!(
+        "servers:\n  - name: {TEST_INTERNAL_MCP_SERVER_LABEL}\n    protocol: streamable\n    internal: true\n    url: {}\n",
+        mcp.url()
+    );
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg_path = dir.path().join("mcp.yaml");
+    std::fs::write(&cfg_path, mcp_yaml).expect("write mcp cfg");
+
+    let mut worker = MockWorker::new(MockWorkerConfig {
+        port: 0,
+        worker_type: WorkerType::Regular,
+        health_status: HealthStatus::Healthy,
+        response_delay_ms: 0,
+        fail_rate: 0.0,
+    });
+    let worker_url = worker.start().await.expect("start worker");
+
+    let router_cfg = worker_router_config(worker_url);
+
+    let ctx = create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap()).await;
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
+
+    let req = ResponsesRequest {
+        include: None,
+        background: None,
+        input: ResponseInput::Text("search something private".to_string()),
+        instructions: Some("Use tools when relevant.".to_string()),
+        max_output_tokens: Some(64),
+        max_tool_calls: None,
+        metadata: None,
+        model: "mock-model".to_string(),
+        parallel_tool_calls: Some(true),
+        previous_response_id: None,
+        reasoning: None,
+        service_tier: Some(ServiceTier::Auto),
+        store: Some(true),
+        stream: Some(false),
+        temperature: Some(0.2),
+        tool_choice: Some(ResponsesToolChoice::default()),
+        tools: Some(vec![ResponseTool::Mcp(McpTool {
+            server_url: None,
+            authorization: None,
+            headers: None,
+            server_label: TEST_INTERNAL_MCP_SERVER_LABEL.to_string(),
+            server_description: None,
+            require_approval: None,
+            allowed_tools: None,
+            connector_id: None,
+            defer_loading: None,
+        })]),
+        top_logprobs: Some(0),
+        top_p: None,
+        truncation: Some(Truncation::Disabled),
+        text: None,
+        user: None,
+        request_id: Some("resp_test_internal_mcp_trace_hiding".to_string()),
+        priority: 0,
+        frequency_penalty: Some(0.0),
+        presence_penalty: Some(0.0),
+        stop: None,
+        prompt: None,
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+        safety_identifier: None,
+        stream_options: None,
+        context_management: None,
+        client_metadata: None,
+        top_k: -1,
+        min_p: 0.0,
+        repetition_penalty: 1.0,
+        conversation: None,
+    };
+
+    let tenant_meta = test_tenant_meta();
+    let resp = router
+        .route_responses(None, &tenant_meta, req.clone(), req.model.as_str())
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("Failed to read response body");
+    let body_text = String::from_utf8_lossy(&body_bytes);
+    let body_json: serde_json::Value =
+        serde_json::from_slice(&body_bytes).expect("Failed to parse response JSON");
+
+    assert!(
+        !body_text.contains(TEST_INTERNAL_MCP_SERVER_LABEL),
+        "internal MCP server label should not appear in final response"
+    );
+    assert!(
+        !body_text.contains("brave_web_search"),
+        "internal MCP tool name should not appear in final response"
+    );
+
+    let output = body_json["output"]
+        .as_array()
+        .expect("response output missing");
+    assert!(
+        output.iter().all(|item| {
+            let item_type = item.get("type").and_then(|value| value.as_str());
+            !matches!(
+                item_type,
+                Some("function_tool_call" | "function_call" | "mcp_list_tools" | "mcp_call")
+            )
+        }),
+        "internal MCP tool usage should not appear in final output: {body_json}"
+    );
+    assert!(
+        body_json.get("tools").is_none(),
+        "internal MCP tool should not be restored into final tools"
+    );
+
+    worker.stop().await;
+    mcp.stop().await;
+}
+
+#[tokio::test]
+async fn test_previous_response_id_does_not_repeat_mcp_list_tools_for_existing_binding() {
+    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+
+    let mcp_yaml = format!(
+        "servers:\n  - name: mock\n    protocol: streamable\n    url: {}\n",
+        mcp.url()
+    );
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg_path = dir.path().join("mcp.yaml");
+    std::fs::write(&cfg_path, mcp_yaml).expect("write mcp cfg");
+
+    let mut worker = MockWorker::new(MockWorkerConfig {
+        port: 0,
+        worker_type: WorkerType::Regular,
+        health_status: HealthStatus::Healthy,
+        response_delay_ms: 0,
+        fail_rate: 0.0,
+    });
+    let worker_url = worker.start().await.expect("start worker");
+
+    let router_cfg = worker_router_config(worker_url);
+
+    let ctx = create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap()).await;
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
+
+    let mcp_tool = ResponseTool::Mcp(McpTool {
+        server_url: Some(mcp.url()),
+        authorization: None,
+        headers: None,
+        server_label: "mock".to_string(),
+        server_description: None,
+        require_approval: Some(RequireApproval::Mode(RequireApprovalMode::Never)),
+        allowed_tools: None,
+        connector_id: None,
+        defer_loading: None,
+    });
+
+    let req1 = ResponsesRequest {
+        background: None,
+        include: None,
+        input: ResponseInput::Text("search something".to_string()),
+        instructions: Some("Be brief".to_string()),
+        max_output_tokens: Some(64),
+        max_tool_calls: None,
+        metadata: None,
+        model: "mock-model".to_string(),
+        parallel_tool_calls: Some(true),
+        previous_response_id: None,
+        reasoning: None,
+        service_tier: Some(ServiceTier::Auto),
+        store: Some(true),
+        stream: Some(false),
+        temperature: Some(0.2),
+        tool_choice: Some(ResponsesToolChoice::default()),
+        tools: Some(vec![mcp_tool.clone()]),
+        top_logprobs: Some(0),
+        top_p: None,
+        truncation: Some(Truncation::Disabled),
+        text: None,
+        user: None,
+        request_id: Some("resp_prev_id_turn_1".to_string()),
+        priority: 0,
+        frequency_penalty: Some(0.0),
+        presence_penalty: Some(0.0),
+        stop: None,
+        prompt: None,
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+        safety_identifier: None,
+        stream_options: None,
+        context_management: None,
+        client_metadata: None,
+        top_k: -1,
+        min_p: 0.0,
+        repetition_penalty: 1.0,
+        conversation: None,
+    };
+
+    let tenant_meta = test_tenant_meta();
+    let resp1 = router
+        .route_responses(None, &tenant_meta, req1.clone(), req1.model.as_str())
+        .await;
+    assert_eq!(resp1.status(), StatusCode::OK);
+
+    let body1 = axum::body::to_bytes(resp1.into_body(), usize::MAX)
+        .await
+        .expect("Failed to read response body");
+    let body1_json: serde_json::Value =
+        serde_json::from_slice(&body1).expect("Failed to parse response JSON");
+    let first_response_id = body1_json["id"]
+        .as_str()
+        .expect("first response should have id")
+        .to_string();
+
+    let req2 = ResponsesRequest {
+        background: None,
+        include: None,
+        input: ResponseInput::Text("Summarize that in five words".to_string()),
+        instructions: Some("Be brief".to_string()),
+        max_output_tokens: Some(64),
+        max_tool_calls: None,
+        metadata: None,
+        model: "mock-model".to_string(),
+        parallel_tool_calls: Some(true),
+        previous_response_id: Some(first_response_id),
+        reasoning: None,
+        service_tier: Some(ServiceTier::Auto),
+        store: Some(true),
+        stream: Some(false),
+        temperature: Some(0.2),
+        tool_choice: Some(ResponsesToolChoice::default()),
+        tools: Some(vec![mcp_tool]),
+        top_logprobs: Some(0),
+        top_p: None,
+        truncation: Some(Truncation::Disabled),
+        text: None,
+        user: None,
+        request_id: Some("resp_prev_id_turn_2".to_string()),
+        priority: 0,
+        frequency_penalty: Some(0.0),
+        presence_penalty: Some(0.0),
+        stop: None,
+        prompt: None,
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+        safety_identifier: None,
+        stream_options: None,
+        context_management: None,
+        client_metadata: None,
+        top_k: -1,
+        min_p: 0.0,
+        repetition_penalty: 1.0,
+        conversation: None,
+    };
+
+    let tenant_meta = test_tenant_meta();
+    let resp2 = router
+        .route_responses(None, &tenant_meta, req2.clone(), req2.model.as_str())
+        .await;
+    assert_eq!(resp2.status(), StatusCode::OK);
+
+    let body2 = axum::body::to_bytes(resp2.into_body(), usize::MAX)
+        .await
+        .expect("Failed to read response body");
+    let body2_json: serde_json::Value =
+        serde_json::from_slice(&body2).expect("Failed to parse response JSON");
+
+    let output = body2_json["output"]
+        .as_array()
+        .expect("response output missing");
+    assert_eq!(
+        output.len(),
+        2,
+        "resume turn should return only current-turn MCP activity plus the final message: {body2_json}",
+    );
+    assert_eq!(output[0]["type"], "mcp_call");
+    assert_eq!(output[1]["type"], "message");
+    assert!(
+        output
+            .iter()
+            .all(|item| item.get("type").and_then(|v| v.as_str()) != Some("mcp_list_tools")),
+        "existing bindings should not repeat mcp_list_tools on previous_response_id turns"
+    );
+
+    worker.stop().await;
+    mcp.stop().await;
+}
+
+#[tokio::test]
+async fn test_final_response_hides_internal_mcp_error_details() {
+    let mut mcp = MockFailingMCPServer::start(TEST_INTERNAL_MCP_ERROR_MARKER)
+        .await
+        .expect("start failing mcp");
+
+    let mcp_yaml = format!(
+        "servers:\n  - name: {TEST_INTERNAL_MCP_SERVER_LABEL}\n    protocol: streamable\n    internal: true\n    url: {}\n",
+        mcp.url()
+    );
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg_path = dir.path().join("mcp.yaml");
+    std::fs::write(&cfg_path, mcp_yaml).expect("write mcp cfg");
+
+    let mut worker = MockWorker::new(MockWorkerConfig {
+        port: 0,
+        worker_type: WorkerType::Regular,
+        health_status: HealthStatus::Healthy,
+        response_delay_ms: 0,
+        fail_rate: 0.0,
+    });
+    let worker_url = worker.start().await.expect("start worker");
+
+    let router_cfg = worker_router_config(worker_url);
+
+    let ctx = create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap()).await;
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
+
+    let req = ResponsesRequest {
+        include: None,
+        background: None,
+        input: ResponseInput::Text("search something private".to_string()),
+        instructions: Some("Use tools when relevant.".to_string()),
+        max_output_tokens: Some(64),
+        max_tool_calls: None,
+        metadata: None,
+        model: "mock-model".to_string(),
+        parallel_tool_calls: Some(true),
+        previous_response_id: None,
+        reasoning: None,
+        service_tier: Some(ServiceTier::Auto),
+        store: Some(true),
+        stream: Some(false),
+        temperature: Some(0.2),
+        tool_choice: Some(ResponsesToolChoice::default()),
+        tools: Some(vec![ResponseTool::Mcp(McpTool {
+            server_url: None,
+            authorization: None,
+            headers: None,
+            server_label: TEST_INTERNAL_MCP_SERVER_LABEL.to_string(),
+            server_description: None,
+            require_approval: None,
+            allowed_tools: None,
+            connector_id: None,
+            defer_loading: None,
+        })]),
+        top_logprobs: Some(0),
+        top_p: None,
+        truncation: Some(Truncation::Disabled),
+        text: None,
+        user: None,
+        request_id: Some("resp_test_internal_mcp_error_hiding".to_string()),
+        priority: 0,
+        frequency_penalty: Some(0.0),
+        presence_penalty: Some(0.0),
+        stop: None,
+        prompt: None,
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+        safety_identifier: None,
+        stream_options: None,
+        context_management: None,
+        client_metadata: None,
+        top_k: -1,
+        min_p: 0.0,
+        repetition_penalty: 1.0,
+        conversation: None,
+    };
+
+    let tenant_meta = test_tenant_meta();
+    let resp = router
+        .route_responses(None, &tenant_meta, req.clone(), req.model.as_str())
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("Failed to read response body");
+    let body_text = String::from_utf8_lossy(&body_bytes);
+
+    assert!(
+        !body_text.contains(TEST_INTERNAL_MCP_SERVER_LABEL),
+        "internal MCP server label should not appear in final response"
+    );
+    assert!(
+        !body_text.contains("brave_web_search"),
+        "internal MCP tool name should not appear in final response"
+    );
+    assert!(
+        !body_text.contains(TEST_INTERNAL_MCP_ERROR_MARKER),
+        "internal MCP error details should not appear in final response"
+    );
+
+    worker.stop().await;
+    mcp.stop().await;
+}
+
+#[tokio::test]
+async fn test_conversations_crud_basic() {
+    // Router in OpenAI mode (no actual upstream calls in these tests)
+    let router_cfg = conversation_router_config();
+
+    let ctx = create_test_context(router_cfg).await;
+    let _router = RouterFactory::create_router(&ctx).await.expect("router");
+
+    // Create
+    let create_body = serde_json::json!({ "metadata": { "project": "alpha" } });
+    let create_resp = conversations::create_conversation(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        create_body.clone(),
+    )
+    .await;
+    assert_eq!(create_resp.status(), StatusCode::OK);
+    let create_bytes = axum::body::to_bytes(create_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let create_json: serde_json::Value = serde_json::from_slice(&create_bytes).unwrap();
+    let conv_id = create_json["id"].as_str().expect("id missing");
+    assert!(conv_id.starts_with("conv_"));
+    assert_eq!(create_json["object"], "conversation");
+
+    // Get
+    let get_resp = conversations::get_conversation(&ctx.conversation_storage, None, conv_id).await;
+    assert_eq!(get_resp.status(), StatusCode::OK);
+    let get_bytes = axum::body::to_bytes(get_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let get_json: serde_json::Value = serde_json::from_slice(&get_bytes).unwrap();
+    assert_eq!(get_json["metadata"]["project"], serde_json::json!("alpha"));
+
+    // Update (merge)
+    let update_body = serde_json::json!({ "metadata": { "owner": "alice" } });
+    let upd_resp = conversations::update_conversation(
+        &ctx.conversation_storage,
+        None,
+        conv_id,
+        update_body.clone(),
+    )
+    .await;
+    assert_eq!(upd_resp.status(), StatusCode::OK);
+    let upd_bytes = axum::body::to_bytes(upd_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let upd_json: serde_json::Value = serde_json::from_slice(&upd_bytes).unwrap();
+    assert_eq!(upd_json["metadata"]["project"], serde_json::json!("alpha"));
+    assert_eq!(upd_json["metadata"]["owner"], serde_json::json!("alice"));
+
+    // Delete
+    let del_resp =
+        conversations::delete_conversation(&ctx.conversation_storage, None, conv_id).await;
+    assert_eq!(del_resp.status(), StatusCode::OK);
+    let del_bytes = axum::body::to_bytes(del_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let del_json: serde_json::Value = serde_json::from_slice(&del_bytes).unwrap();
+    assert_eq!(del_json["deleted"], serde_json::json!(true));
+
+    // Get again -> 404
+    let not_found = conversations::get_conversation(&ctx.conversation_storage, None, conv_id).await;
+    assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
+}
+
+/// The JSON body of a response that must be a 200.
+async fn ok_json(
+    response: axum::response::Response,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+/// The public API answers a conversation created without metadata with
+/// `"metadata": {}` on creation and on retrieval; the field is never omitted.
+#[tokio::test]
+async fn a_conversation_without_metadata_answers_an_empty_metadata_object(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ctx = create_test_context(conversation_router_config()).await;
+
+    let created = ok_json(
+        conversations::create_conversation(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            None,
+            serde_json::json!({}),
+        )
+        .await,
+    )
+    .await?;
+    assert_eq!(created["metadata"], serde_json::json!({}), "{created}");
+
+    let conv_id = created["id"].as_str().expect("id missing");
+    let fetched =
+        ok_json(conversations::get_conversation(&ctx.conversation_storage, None, conv_id).await)
+            .await?;
+    assert_eq!(fetched["metadata"], serde_json::json!({}), "{fetched}");
+    Ok(())
+}
+
+/// A message added with a plain string content is stored, answered and
+/// listed with the typed `input_text` part the public API makes of it, the
+/// same shape a message added with typed parts has; the list carries the item
+/// objects alone, without a gateway-only `created_at` on them.
+#[tokio::test]
+async fn items_added_with_string_content_are_listed_as_typed_parts(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ctx = create_test_context(conversation_router_config()).await;
+
+    let created = ok_json(
+        conversations::create_conversation(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            None,
+            serde_json::json!({}),
+        )
+        .await,
+    )
+    .await?;
+    let conv_id = created["id"].as_str().expect("id missing");
+    let typed_first = serde_json::json!([{"type": "input_text", "text": "first"}]);
+    let typed_second = serde_json::json!([{"type": "input_text", "text": "second"}]);
+
+    let added = ok_json(
+        conversations::create_conversation_items(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            None,
+            conv_id,
+            serde_json::json!({"items": [
+                {"type": "message", "role": "user", "content": "first"},
+                {"type": "message", "role": "user", "content": typed_second},
+            ]}),
+        )
+        .await,
+    )
+    .await?;
+    assert_eq!(added["data"][0]["content"], typed_first, "{added}");
+    assert_eq!(added["data"][1]["content"], typed_second, "{added}");
+
+    let first_id = added["data"][0]["id"].as_str().expect("item id missing");
+    let second_id = added["data"][1]["id"].as_str().expect("item id missing");
+
+    let listed = ok_json(
+        conversations::list_conversation_items(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            None,
+            conv_id,
+            None,
+            Some("asc"),
+            None,
+        )
+        .await,
+    )
+    .await?;
+    let listed_items = listed["data"].as_array().expect("data");
+    assert_eq!(listed_items.len(), 2, "{listed}");
+    // The two items of one add call share their `added_at`, and the stores
+    // order such ties by the item id, so the list may answer them in either
+    // order: each item is looked up by its id.
+    let listed_content = |id: &str| {
+        listed_items
+            .iter()
+            .find(|item| item["id"] == id)
+            .map(|item| item["content"].clone())
+    };
+    assert_eq!(
+        listed_content(first_id).as_ref(),
+        Some(&typed_first),
+        "{listed}"
+    );
+    assert_eq!(
+        listed_content(second_id).as_ref(),
+        Some(&typed_second),
+        "{listed}"
+    );
+    for item in listed_items {
+        assert!(
+            item.get("created_at").is_none(),
+            "a listed item carries a field the public API's items do not: {item}"
+        );
+        assert_eq!(item["status"], "completed", "{item}");
+    }
+
+    let fetched = ok_json(
+        conversations::get_conversation_item(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            None,
+            conv_id,
+            first_id,
+            None,
+        )
+        .await,
+    )
+    .await?;
+    assert_eq!(fetched["content"], typed_first, "{fetched}");
+    Ok(())
+}
+
+/// An assistant message added with a plain string content becomes the one
+/// `output_text` part (empty `annotations`) the public API makes of it, not
+/// an `input_text` part, which the public API refuses on an assistant message
+/// when the conversation's history is replayed; the add, the item GET and the
+/// list answer that part, and it deserializes as the typed content parts the
+/// history loaders replay upstream.
+#[tokio::test]
+async fn an_assistant_message_added_as_a_string_is_stored_as_an_output_text_part(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ctx = create_test_context(conversation_router_config()).await;
+
+    let created = ok_json(
+        conversations::create_conversation(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            None,
+            serde_json::json!({}),
+        )
+        .await,
+    )
+    .await?;
+    let conv_id = created["id"].as_str().expect("id missing");
+    let output_part =
+        serde_json::json!([{"type": "output_text", "text": "Hi there!", "annotations": []}]);
+
+    let added = ok_json(
+        conversations::create_conversation_items(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            None,
+            conv_id,
+            serde_json::json!({"items": [
+                {"type": "message", "role": "assistant", "content": "Hi there!"},
+            ]}),
+        )
+        .await,
+    )
+    .await?;
+    assert_eq!(added["data"][0]["role"], "assistant", "{added}");
+    assert_eq!(added["data"][0]["content"], output_part, "{added}");
+    let item_id = added["data"][0]["id"].as_str().expect("item id missing");
+
+    let fetched = ok_json(
+        conversations::get_conversation_item(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            None,
+            conv_id,
+            item_id,
+            None,
+        )
+        .await,
+    )
+    .await?;
+    assert_eq!(fetched["content"], output_part, "{fetched}");
+
+    let listed = ok_json(
+        conversations::list_conversation_items(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            None,
+            conv_id,
+            None,
+            Some("asc"),
+            None,
+        )
+        .await,
+    )
+    .await?;
+    assert_eq!(listed["data"].as_array().map(Vec::len), Some(1), "{listed}");
+    assert_eq!(listed["data"][0]["content"], output_part, "{listed}");
+
+    // The parse both history loaders apply to a stored message before they
+    // replay it upstream: the typed parts, an `output_text` one here.
+    let parts: Vec<ResponseContentPart> = serde_json::from_value(fetched["content"].clone())?;
+    assert!(
+        matches!(
+            parts.as_slice(),
+            [ResponseContentPart::OutputText { text, annotations, .. }]
+                if text == "Hi there!" && annotations.is_empty()
+        ),
+        "{parts:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_responses_request_creation() {
+    let request = ResponsesRequest {
+        background: None,
+        include: None,
+        input: ResponseInput::Text("Hello, world!".to_string()),
+        instructions: Some("Be helpful".to_string()),
+        max_output_tokens: Some(100),
+        max_tool_calls: None,
+        metadata: None,
+        model: "test-model".to_string(),
+        parallel_tool_calls: Some(true),
+        previous_response_id: None,
+        reasoning: Some(ResponseReasoningParam {
+            effort: Some(ReasoningEffort::Medium),
+            summary: None,
+            mode: None,
+            context: None,
+            generate_summary: None,
+        }),
+        service_tier: Some(ServiceTier::Auto),
+        store: Some(true),
+        stream: Some(false),
+        temperature: Some(0.7),
+        tool_choice: Some(ResponsesToolChoice::Options(ToolChoiceOptions::Auto)),
+        tools: Some(vec![ResponseTool::WebSearchPreview(
+            WebSearchPreviewTool::default(),
+        )]),
+        top_logprobs: Some(5),
+        top_p: Some(0.9),
+        truncation: Some(Truncation::Disabled),
+        text: None,
+        user: Some("test-user".to_string()),
+        request_id: Some("resp_test123".to_string()),
+        priority: 0,
+        frequency_penalty: Some(0.0),
+        presence_penalty: Some(0.0),
+        stop: None,
+        prompt: None,
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+        safety_identifier: None,
+        stream_options: None,
+        context_management: None,
+        client_metadata: None,
+        top_k: -1,
+        min_p: 0.0,
+        repetition_penalty: 1.0,
+        conversation: None,
+    };
+
+    assert!(!request.is_stream());
+    assert_eq!(request.get_model(), Some("test-model"));
+    let routing_text = request.extract_text_for_routing();
+    assert_eq!(routing_text, "Hello, world!");
+}
+
+#[test]
+fn test_responses_request_sglang_extensions() {
+    // Test that SGLang-specific sampling parameters are present and serializable
+    let request = ResponsesRequest {
+        background: None,
+        include: None,
+        input: ResponseInput::Text("Test".to_string()),
+        instructions: None,
+        max_output_tokens: Some(50),
+        max_tool_calls: None,
+        metadata: None,
+        model: "test-model".to_string(),
+        parallel_tool_calls: Some(true),
+        previous_response_id: None,
+        reasoning: None,
+        service_tier: Some(ServiceTier::Auto),
+        store: Some(true),
+        stream: Some(false),
+        temperature: Some(0.8),
+        tool_choice: Some(ResponsesToolChoice::Options(ToolChoiceOptions::Auto)),
+        tools: Some(vec![]),
+        top_logprobs: Some(0),
+        top_p: Some(0.95),
+        truncation: Some(Truncation::Auto),
+        text: None,
+        user: None,
+        request_id: Some("resp_test456".to_string()),
+        priority: 0,
+        frequency_penalty: Some(0.1),
+        presence_penalty: Some(0.2),
+        stop: None,
+        prompt: None,
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+        safety_identifier: None,
+        stream_options: None,
+        context_management: None,
+        client_metadata: None,
+        // SGLang-specific extensions:
+        top_k: 10,
+        min_p: 0.05,
+        repetition_penalty: 1.1,
+        conversation: None,
+    };
+
+    // Verify SGLang extensions are present
+    assert_eq!(request.top_k, 10);
+    assert_eq!(request.min_p, 0.05);
+    assert_eq!(request.repetition_penalty, 1.1);
+
+    // Verify serialization works with SGLang extensions
+    let json = serde_json::to_string(&request).expect("Serialization should work");
+    let parsed: ResponsesRequest =
+        serde_json::from_str(&json).expect("Deserialization should work");
+
+    assert_eq!(parsed.top_k, 10);
+    assert_eq!(parsed.min_p, 0.05);
+    assert_eq!(parsed.repetition_penalty, 1.1);
+}
+
+#[test]
+fn test_usage_conversion() {
+    // Construct UsageInfo directly with cached token details
+    let usage_info = UsageInfo {
+        prompt_tokens: 15,
+        completion_tokens: 25,
+        total_tokens: 40,
+        reasoning_tokens: Some(8),
+        prompt_tokens_details: Some(openai_protocol::common::PromptTokenUsageInfo {
+            cached_tokens: 3,
+            audio_tokens: None,
+            text_tokens: None,
+            image_tokens: None,
+            cache_write_tokens: None,
+        }),
+    };
+    let response_usage = usage_info.to_response_usage();
+
+    assert_eq!(response_usage.input_tokens, 15);
+    assert_eq!(response_usage.output_tokens, 25);
+    assert_eq!(response_usage.total_tokens, 40);
+
+    // Check details are converted correctly (both blocks are always present)
+    assert_eq!(response_usage.input_tokens_details.cached_tokens, 3);
+    assert_eq!(response_usage.output_tokens_details.reasoning_tokens, 8);
+
+    let back_to_usage = response_usage.to_usage_info();
+    assert_eq!(back_to_usage.prompt_tokens, 15);
+    assert_eq!(back_to_usage.completion_tokens, 25);
+    assert_eq!(back_to_usage.reasoning_tokens, Some(8));
+}
+
+#[test]
+fn test_harmony_usage_cached_tokens_propagated() {
+    use openai_protocol::responses::InputTokensDetails;
+
+    // Simulate the Harmony path: Usage (not UsageInfo) -> InputTokensDetails via From trait
+    let usage = openai_protocol::common::Usage::from_counts(100, 50).with_cached_tokens(30);
+    let details = usage
+        .prompt_tokens_details
+        .as_ref()
+        .map(InputTokensDetails::from)
+        .expect("input_tokens_details should be Some when cached tokens are set");
+    assert_eq!(details.cached_tokens, 30);
+}
+
+#[test]
+fn test_harmony_usage_no_cached_tokens() {
+    use openai_protocol::responses::InputTokensDetails;
+
+    let usage = openai_protocol::common::Usage::from_counts(100, 50);
+    let details = usage
+        .prompt_tokens_details
+        .as_ref()
+        .map(InputTokensDetails::from);
+    assert!(details.is_none());
+}
+
+#[test]
+fn test_reasoning_param_default() {
+    let param = ResponseReasoningParam {
+        effort: Some(ReasoningEffort::Medium),
+        summary: None,
+        mode: None,
+        context: None,
+        generate_summary: None,
+    };
+
+    let json = serde_json::to_string(&param).unwrap();
+    let parsed: ResponseReasoningParam = serde_json::from_str(&json).unwrap();
+
+    assert!(matches!(parsed.effort, Some(ReasoningEffort::Medium)));
+}
+
+/// Every OpenAI `reasoning.effort` tier deserializes at the request boundary.
+#[test]
+fn test_reasoning_effort_accepts_every_openai_tier() {
+    for tier in ["none", "minimal", "low", "medium", "high", "xhigh", "max"] {
+        let request: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-5",
+            "input": "hi",
+            "reasoning": { "effort": tier }
+        }))
+        .unwrap();
+        let effort = request.reasoning.and_then(|r| r.effort);
+        assert_eq!(effort.map(ReasoningEffort::as_str), Some(tier));
+    }
+}
+
+#[test]
+fn test_json_serialization() {
+    let request = ResponsesRequest {
+        background: None,
+        include: None,
+        input: ResponseInput::Text("Test input".to_string()),
+        instructions: Some("Test instructions".to_string()),
+        max_output_tokens: Some(200),
+        max_tool_calls: Some(5),
+        metadata: None,
+        model: "gpt-4".to_string(),
+        parallel_tool_calls: Some(false),
+        previous_response_id: None,
+        reasoning: Some(ResponseReasoningParam {
+            effort: Some(ReasoningEffort::High),
+            summary: None,
+            mode: None,
+            context: None,
+            generate_summary: None,
+        }),
+        service_tier: Some(ServiceTier::Priority),
+        store: Some(false),
+        stream: Some(true),
+        temperature: Some(0.9),
+        tool_choice: Some(ResponsesToolChoice::Options(ToolChoiceOptions::Required)),
+        tools: Some(vec![ResponseTool::CodeInterpreter(
+            CodeInterpreterTool::default(),
+        )]),
+        top_logprobs: Some(10),
+        top_p: Some(0.8),
+        truncation: Some(Truncation::Auto),
+        text: None,
+        user: Some("test_user".to_string()),
+        request_id: Some("resp_comprehensive_test".to_string()),
+        priority: 1,
+        frequency_penalty: Some(0.3),
+        presence_penalty: Some(0.4),
+        stop: None,
+        prompt: None,
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+        safety_identifier: None,
+        stream_options: None,
+        context_management: None,
+        client_metadata: None,
+        top_k: 50,
+        min_p: 0.1,
+        repetition_penalty: 1.2,
+        conversation: None,
+    };
+
+    let json = serde_json::to_string(&request).expect("Serialization should work");
+    let parsed: ResponsesRequest =
+        serde_json::from_str(&json).expect("Deserialization should work");
+
+    assert_eq!(
+        parsed.request_id,
+        Some("resp_comprehensive_test".to_string())
+    );
+    assert_eq!(parsed.model, "gpt-4");
+    assert_eq!(parsed.stream, Some(true));
+    assert_eq!(parsed.tools.as_ref().map(|t| t.len()), Some(1));
+}
+
+#[expect(clippy::print_stdout, reason = "test diagnostic output")]
+#[tokio::test]
+async fn test_multi_turn_loop_with_mcp() {
+    // This test verifies the multi-turn loop functionality:
+    // 1. Initial request with MCP tools
+    // 2. Mock worker returns function_call
+    // 3. Router executes MCP tool and resumes
+    // 4. Mock worker returns final answer
+    // 5. Verify the complete flow worked
+
+    // Start mock MCP server
+    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+
+    // Write a temp MCP config file
+    let mcp_yaml = format!(
+        "servers:\n  - name: mock\n    protocol: streamable\n    url: {}\n",
+        mcp.url()
+    );
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg_path = dir.path().join("mcp.yaml");
+    std::fs::write(&cfg_path, mcp_yaml).expect("write mcp cfg");
+    std::env::set_var("SGLANG_MCP_CONFIG", cfg_path.to_str().unwrap());
+
+    // Start mock OpenAI worker
+    let mut worker = MockWorker::new(MockWorkerConfig {
+        port: 0,
+        worker_type: WorkerType::Regular,
+        health_status: HealthStatus::Healthy,
+        response_delay_ms: 0,
+        fail_rate: 0.0,
+    });
+    let worker_url = worker.start().await.expect("start worker");
+
+    let router_cfg = worker_router_config(worker_url);
+
+    let ctx = create_test_context(router_cfg).await;
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
+
+    // Build request with MCP tools
+    let req = ResponsesRequest {
+        include: None,
+        background: None,
+        input: ResponseInput::Text("search for SGLang".to_string()),
+        instructions: Some("Be helpful".to_string()),
+        max_output_tokens: Some(128),
+        max_tool_calls: None, // No limit - test unlimited
+        metadata: None,
+        model: "mock-model".to_string(),
+        parallel_tool_calls: Some(true),
+        previous_response_id: None,
+        reasoning: None,
+        service_tier: Some(ServiceTier::Auto),
+        store: Some(true),
+        stream: Some(false),
+        temperature: Some(0.7),
+        tool_choice: Some(ResponsesToolChoice::Options(ToolChoiceOptions::Auto)),
+        tools: Some(vec![ResponseTool::Mcp(McpTool {
+            server_url: Some(mcp.url()),
+            authorization: None,
+            headers: None,
+            server_label: "mock".to_string(),
+            server_description: Some("Mock MCP server for testing".to_string()),
+            require_approval: Some(RequireApproval::Mode(RequireApprovalMode::Never)),
+            allowed_tools: None,
+            connector_id: None,
+            defer_loading: None,
+        })]),
+        top_logprobs: Some(0),
+        top_p: Some(1.0),
+        truncation: Some(Truncation::Disabled),
+        text: None,
+        user: None,
+        request_id: Some("resp_multi_turn_test".to_string()),
+        priority: 0,
+        frequency_penalty: Some(0.0),
+        presence_penalty: Some(0.0),
+        stop: None,
+        prompt: None,
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+        safety_identifier: None,
+        stream_options: None,
+        context_management: None,
+        client_metadata: None,
+        top_k: 50,
+        min_p: 0.0,
+        repetition_penalty: 1.0,
+        conversation: None,
+    };
+
+    // Execute the request (this should trigger the multi-turn loop)
+    let tenant_meta = test_tenant_meta();
+    let response = router
+        .route_responses(None, &tenant_meta, req.clone(), req.model.as_str())
+        .await;
+
+    // Check status
+    assert_eq!(response.status(), StatusCode::OK, "Request should succeed");
+
+    // Read the response body
+    use axum::body::to_bytes;
+    let response_body = response.into_body();
+    let body_bytes = to_bytes(response_body, usize::MAX).await.unwrap();
+    let response_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+    println!(
+        "Multi-turn response: {}",
+        serde_json::to_string_pretty(&response_json).unwrap()
+    );
+
+    // Verify the response structure
+    assert_eq!(response_json["object"], "response");
+    assert_eq!(response_json["status"], "completed");
+    // Note: mock worker generates its own ID, so we just verify it exists
+    assert!(
+        response_json["id"].is_string(),
+        "Response should have an id"
+    );
+
+    // Check that output contains final message
+    let output = response_json["output"]
+        .as_array()
+        .expect("output should be array");
+    assert!(!output.is_empty(), "output should not be empty");
+
+    // Find the final message with text
+    let has_final_text = output.iter().any(|item| {
+        item.get("type")
+            .and_then(|t| t.as_str())
+            .map(|t| t == "message")
+            .unwrap_or(false)
+            && item
+                .get("content")
+                .and_then(|c| c.as_array())
+                .map(|arr| {
+                    arr.iter().any(|part| {
+                        part.get("type")
+                            .and_then(|t| t.as_str())
+                            .map(|t| t == "output_text")
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false)
+    });
+
+    assert!(has_final_text, "Should have final text output");
+
+    // Verify tools are masked back to MCP format
+    let tools = response_json["tools"]
+        .as_array()
+        .expect("tools should be array");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["type"], "mcp");
+    assert_eq!(tools[0]["server_label"], "mock");
+
+    // Clean up
+    std::env::remove_var("SGLANG_MCP_CONFIG");
+    worker.stop().await;
+    mcp.stop().await;
+}
+
+#[expect(clippy::print_stdout, reason = "test diagnostic output")]
+#[tokio::test]
+async fn test_max_tool_calls_limit() {
+    // This test verifies that max_tool_calls is respected
+    // Note: The mock worker returns a final answer after one tool call,
+    // so with max_tool_calls=1, it completes normally (doesn't exceed the limit)
+
+    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+    let mcp_yaml = format!(
+        "servers:\n  - name: mock\n    protocol: streamable\n    url: {}\n",
+        mcp.url()
+    );
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg_path = dir.path().join("mcp.yaml");
+    std::fs::write(&cfg_path, mcp_yaml).expect("write mcp cfg");
+    std::env::set_var("SGLANG_MCP_CONFIG", cfg_path.to_str().unwrap());
+
+    let mut worker = MockWorker::new(MockWorkerConfig {
+        port: 0,
+        worker_type: WorkerType::Regular,
+        health_status: HealthStatus::Healthy,
+        response_delay_ms: 0,
+        fail_rate: 0.0,
+    });
+    let worker_url = worker.start().await.expect("start worker");
+
+    let router_cfg = worker_router_config(worker_url);
+
+    let ctx = create_test_context(router_cfg).await;
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
+
+    let req = ResponsesRequest {
+        include: None,
+        background: None,
+        input: ResponseInput::Text("test max calls".to_string()),
+        instructions: None,
+        max_output_tokens: Some(128),
+        max_tool_calls: Some(1), // Limit to 1 call
+        metadata: None,
+        model: "mock-model".to_string(),
+        parallel_tool_calls: Some(true),
+        previous_response_id: None,
+        reasoning: None,
+        service_tier: Some(ServiceTier::Auto),
+        store: Some(false),
+        stream: Some(false),
+        temperature: Some(0.7),
+        tool_choice: Some(ResponsesToolChoice::Options(ToolChoiceOptions::Auto)),
+        tools: Some(vec![ResponseTool::Mcp(McpTool {
+            server_url: Some(mcp.url()),
+            authorization: None,
+            headers: None,
+            server_label: "mock".to_string(),
+            server_description: None,
+            require_approval: None,
+            allowed_tools: None,
+            connector_id: None,
+            defer_loading: None,
+        })]),
+        top_logprobs: Some(0),
+        top_p: Some(1.0),
+        truncation: Some(Truncation::Disabled),
+        text: None,
+        user: None,
+        request_id: Some("resp_max_calls_test".to_string()),
+        priority: 0,
+        frequency_penalty: Some(0.0),
+        presence_penalty: Some(0.0),
+        stop: None,
+        prompt: None,
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+        safety_identifier: None,
+        stream_options: None,
+        context_management: None,
+        client_metadata: None,
+        top_k: 50,
+        min_p: 0.0,
+        repetition_penalty: 1.0,
+        conversation: None,
+    };
+
+    let tenant_meta = test_tenant_meta();
+    let response = router
+        .route_responses(None, &tenant_meta, req.clone(), req.model.as_str())
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    use axum::body::to_bytes;
+    let response_body = response.into_body();
+    let body_bytes = to_bytes(response_body, usize::MAX).await.unwrap();
+    let response_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+    println!(
+        "Max calls response: {}",
+        serde_json::to_string_pretty(&response_json).unwrap()
+    );
+
+    // With max_tool_calls=1, the mock returns a final answer after 1 call
+    // So it completes normally without exceeding the limit
+    assert_eq!(response_json["status"], "completed");
+
+    // Verify the basic response structure
+    assert!(response_json["id"].is_string());
+    assert_eq!(response_json["object"], "response");
+
+    // The response should have tools masked back to MCP format
+    let tools = response_json["tools"]
+        .as_array()
+        .expect("tools should be array");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["type"], "mcp");
+
+    // Note: To test actual limit exceeding, we would need a mock that keeps
+    // calling tools indefinitely, which would hit max_iterations (safety limit)
+
+    std::env::remove_var("SGLANG_MCP_CONFIG");
+    worker.stop().await;
+    mcp.stop().await;
+}
+
+/// Helper function to set up common test infrastructure for streaming MCP tests
+/// Returns (mcp_server, worker, router, temp_dir)
+#[expect(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+async fn setup_streaming_mcp_test() -> (
+    MockMCPServer,
+    MockWorker,
+    Box<dyn smg::routers::RouterTrait>,
+    tempfile::TempDir,
+) {
+    let mcp = MockMCPServer::start().await.expect("start mcp");
+    let mcp_yaml = format!(
+        "servers:\n  - name: mock\n    protocol: streamable\n    url: {}\n",
+        mcp.url()
+    );
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg_path = dir.path().join("mcp.yaml");
+    std::fs::write(&cfg_path, mcp_yaml).expect("write mcp cfg");
+
+    let mut worker = MockWorker::new(MockWorkerConfig {
+        port: 0,
+        worker_type: WorkerType::Regular,
+        health_status: HealthStatus::Healthy,
+        response_delay_ms: 0,
+        fail_rate: 0.0,
+    });
+    let worker_url = worker.start().await.expect("start worker");
+
+    let router_cfg = worker_router_config(worker_url);
+
+    let ctx = create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap()).await;
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
+
+    (mcp, worker, router, dir)
+}
+
+/// Parse SSE (Server-Sent Events) stream into structured events
+fn parse_sse_events(body: &str) -> Vec<(Option<String>, serde_json::Value)> {
+    let mut events = Vec::new();
+    let blocks: Vec<&str> = body
+        .split("\n\n")
+        .filter(|s| !s.trim().is_empty())
+        .collect();
+
+    for block in blocks {
+        let mut event_name: Option<String> = None;
+        let mut data_lines: Vec<String> = Vec::new();
+
+        for line in block.lines() {
+            if let Some(rest) = line.strip_prefix("event:") {
+                event_name = Some(rest.trim().to_string());
+            } else if let Some(rest) = line.strip_prefix("data:") {
+                let data = rest.trim_start();
+                // Skip [DONE] marker
+                if data != "[DONE]" {
+                    data_lines.push(data.to_string());
+                }
+            }
+        }
+
+        if !data_lines.is_empty() {
+            let data = data_lines.join("\n");
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&data) {
+                events.push((event_name, parsed));
+            }
+        }
+    }
+
+    events
+}
+
+#[expect(clippy::print_stdout, reason = "test diagnostic output")]
+#[tokio::test]
+async fn test_streaming_with_mcp_tool_calls() {
+    // This test verifies that streaming works with MCP tool calls:
+    // 1. Initial streaming request with MCP tools
+    // 2. Mock worker streams text, then function_call deltas
+    // 3. Router buffers function call, executes MCP tool
+    // 4. Router resumes streaming with tool results
+    // 5. Mock worker streams final answer
+    // 6. Verify SSE events are properly formatted
+
+    let (mut mcp, mut worker, router, _dir) = setup_streaming_mcp_test().await;
+
+    // Build streaming request with MCP tools
+    let req = ResponsesRequest {
+        include: None,
+        background: None,
+        input: ResponseInput::Text("search for something interesting".to_string()),
+        instructions: Some("Use tools when needed".to_string()),
+        max_output_tokens: Some(256),
+        max_tool_calls: Some(3),
+        metadata: None,
+        model: "mock-model".to_string(),
+        parallel_tool_calls: Some(true),
+        previous_response_id: None,
+        reasoning: None,
+        service_tier: Some(ServiceTier::Auto),
+        store: Some(true),
+        stream: Some(true), // KEY: Enable streaming
+        temperature: Some(0.7),
+        tool_choice: Some(ResponsesToolChoice::Options(ToolChoiceOptions::Auto)),
+        tools: Some(vec![ResponseTool::Mcp(McpTool {
+            server_url: Some(mcp.url()),
+            authorization: None,
+            headers: None,
+            server_label: "mock".to_string(),
+            server_description: Some("Mock MCP for streaming test".to_string()),
+            require_approval: Some(RequireApproval::Mode(RequireApprovalMode::Never)),
+            allowed_tools: None,
+            connector_id: None,
+            defer_loading: None,
+        })]),
+        top_logprobs: Some(0),
+        top_p: Some(1.0),
+        truncation: Some(Truncation::Disabled),
+        text: None,
+        user: None,
+        request_id: Some("resp_streaming_mcp_test".to_string()),
+        priority: 0,
+        frequency_penalty: Some(0.0),
+        presence_penalty: Some(0.0),
+        stop: None,
+        prompt: None,
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+        safety_identifier: None,
+        stream_options: None,
+        context_management: None,
+        client_metadata: None,
+        top_k: 50,
+        min_p: 0.0,
+        repetition_penalty: 1.0,
+        conversation: None,
+    };
+
+    let tenant_meta = test_tenant_meta();
+    let response = router
+        .route_responses(None, &tenant_meta, req.clone(), req.model.as_str())
+        .await;
+
+    // Verify streaming response
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "Streaming request should succeed"
+    );
+
+    // Check Content-Type is text/event-stream
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok());
+    assert_eq!(
+        content_type,
+        Some("text/event-stream"),
+        "Should have SSE content type"
+    );
+
+    // Read the streaming body
+    use axum::body::to_bytes;
+    let response_body = response.into_body();
+    let body_bytes = to_bytes(response_body, usize::MAX).await.unwrap();
+    let body_text = String::from_utf8_lossy(&body_bytes);
+
+    println!("Streaming SSE response:\n{body_text}");
+
+    // Parse all SSE events into structured format
+    let events = parse_sse_events(&body_text);
+
+    assert!(!events.is_empty(), "Should have at least one SSE event");
+    println!("Total parsed SSE events: {}", events.len());
+
+    // Check for [DONE] marker
+    let has_done_marker = body_text.contains("data: [DONE]");
+    assert!(has_done_marker, "Stream should end with [DONE] marker");
+
+    // Track which events we've seen
+    let mut found_mcp_list_tools = false;
+    let mut found_mcp_list_tools_in_progress = false;
+    let mut found_mcp_list_tools_completed = false;
+    let mut found_response_created = false;
+    let mut found_mcp_call_added = false;
+    let mut found_mcp_call_in_progress = false;
+    let mut found_mcp_call_arguments = false;
+    let mut found_mcp_call_arguments_done = false;
+    let mut found_mcp_call_done = false;
+    let mut found_response_completed = false;
+    // The one change a client sees from the kept items: the `mcp_list_tools`
+    // item the stream announces and the item in the final response are the
+    // same item, with the same id.
+    let mut announced_list_tools_ids: Vec<String> = Vec::new();
+    let mut completed_list_tools_ids: Vec<String> = Vec::new();
+
+    for (event_name, data) in &events {
+        let event_type = data.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        match event_type {
+            "response.output_item.added" => {
+                // Check if it's an mcp_list_tools item
+                if let Some(item) = data.get("item") {
+                    if item.get("type").and_then(|v| v.as_str()) == Some("mcp_list_tools") {
+                        found_mcp_list_tools = true;
+                        println!("✓ Found mcp_list_tools added event");
+                        announced_list_tools_ids.push(
+                            item["id"]
+                                .as_str()
+                                .expect("the announced mcp_list_tools item carries its id")
+                                .to_string(),
+                        );
+
+                        // Verify tools array is present (should be empty in added event)
+                        assert!(
+                            item.get("tools").is_some(),
+                            "mcp_list_tools should have tools array"
+                        );
+                    } else if item.get("type").and_then(|v| v.as_str()) == Some("mcp_call") {
+                        found_mcp_call_added = true;
+                        println!("✓ Found mcp_call added event");
+
+                        // Verify mcp_call has required fields
+                        assert!(item.get("name").is_some(), "mcp_call should have name");
+                        assert_eq!(
+                            item.get("server_label").and_then(|v| v.as_str()),
+                            Some("mock"),
+                            "mcp_call should have server_label"
+                        );
+                    }
+                }
+            }
+            "response.mcp_list_tools.in_progress" => {
+                found_mcp_list_tools_in_progress = true;
+                println!("✓ Found mcp_list_tools.in_progress event");
+
+                // Verify it has output_index and item_id
+                assert!(
+                    data.get("output_index").is_some(),
+                    "mcp_list_tools.in_progress should have output_index"
+                );
+                assert!(
+                    data.get("item_id").is_some(),
+                    "mcp_list_tools.in_progress should have item_id"
+                );
+            }
+            "response.mcp_list_tools.completed" => {
+                found_mcp_list_tools_completed = true;
+                println!("✓ Found mcp_list_tools.completed event");
+
+                // Verify it has output_index and item_id
+                assert!(
+                    data.get("output_index").is_some(),
+                    "mcp_list_tools.completed should have output_index"
+                );
+                assert!(
+                    data.get("item_id").is_some(),
+                    "mcp_list_tools.completed should have item_id"
+                );
+            }
+            "response.mcp_call.in_progress" => {
+                found_mcp_call_in_progress = true;
+                println!("✓ Found mcp_call.in_progress event");
+
+                // Verify it has output_index and item_id
+                assert!(
+                    data.get("output_index").is_some(),
+                    "mcp_call.in_progress should have output_index"
+                );
+                assert!(
+                    data.get("item_id").is_some(),
+                    "mcp_call.in_progress should have item_id"
+                );
+            }
+            "response.mcp_call_arguments.delta" => {
+                found_mcp_call_arguments = true;
+                println!("✓ Found mcp_call_arguments.delta event");
+
+                // Delta should include arguments payload
+                assert!(
+                    data.get("delta").is_some(),
+                    "mcp_call_arguments.delta should include delta text"
+                );
+            }
+            "response.mcp_call_arguments.done" => {
+                found_mcp_call_arguments_done = true;
+                println!("✓ Found mcp_call_arguments.done event");
+
+                assert!(
+                    data.get("arguments").is_some(),
+                    "mcp_call_arguments.done should include full arguments"
+                );
+            }
+            "response.output_item.done" => {
+                if let Some(item) = data.get("item") {
+                    if item.get("type").and_then(|v| v.as_str()) == Some("mcp_call") {
+                        found_mcp_call_done = true;
+                        println!("✓ Found mcp_call done event");
+
+                        // Verify mcp_call.done has output
+                        assert!(
+                            item.get("output").is_some(),
+                            "mcp_call done should have output"
+                        );
+                    }
+                }
+            }
+            "response.created" => {
+                found_response_created = true;
+                println!("✓ Found response.created event");
+
+                // Verify response has required fields
+                assert!(
+                    data.get("response").is_some(),
+                    "response.created should have response object"
+                );
+            }
+            "response.completed" => {
+                found_response_completed = true;
+                println!("✓ Found response.completed event");
+                if let Some(output) = data["response"]["output"].as_array() {
+                    completed_list_tools_ids.extend(
+                        output
+                            .iter()
+                            .filter(|item| item["type"] == "mcp_list_tools")
+                            .filter_map(|item| item["id"].as_str().map(str::to_string)),
+                    );
+                }
+            }
+            _ => {
+                println!("  Other event: {event_type}");
+            }
+        }
+
+        if let Some(name) = event_name {
+            println!("  Event name: {name}");
+        }
+    }
+
+    // Verify key events were present
+    println!("\n=== Event Summary ===");
+    println!("MCP list_tools added: {found_mcp_list_tools}");
+    println!("MCP list_tools in_progress: {found_mcp_list_tools_in_progress}");
+    println!("MCP list_tools completed: {found_mcp_list_tools_completed}");
+    println!("Response created: {found_response_created}");
+    println!("MCP call added: {found_mcp_call_added}");
+    println!("MCP call in_progress: {found_mcp_call_in_progress}");
+    println!("MCP call arguments delta: {found_mcp_call_arguments}");
+    println!("MCP call arguments done: {found_mcp_call_arguments_done}");
+    println!("MCP call done: {found_mcp_call_done}");
+    println!("Response completed: {found_response_completed}");
+
+    assert!(
+        !announced_list_tools_ids.is_empty(),
+        "the stream announces an mcp_list_tools item with an id"
+    );
+    assert_eq!(
+        completed_list_tools_ids, announced_list_tools_ids,
+        "the mcp_list_tools item in response.completed carries the id the stream announced"
+    );
+
+    // Assert critical events are present
+    assert!(
+        found_mcp_list_tools,
+        "Should send mcp_list_tools added event at the start"
+    );
+    assert!(
+        found_mcp_list_tools_in_progress,
+        "Should send mcp_list_tools.in_progress event"
+    );
+    assert!(
+        found_mcp_list_tools_completed,
+        "Should send mcp_list_tools.completed event"
+    );
+    assert!(found_response_created, "Should send response.created event");
+    assert!(found_mcp_call_added, "Should send mcp_call added event");
+    assert!(
+        found_mcp_call_in_progress,
+        "Should send mcp_call.in_progress event"
+    );
+    assert!(found_mcp_call_done, "Should send mcp_call done event");
+
+    assert!(
+        found_mcp_call_arguments,
+        "Should send mcp_call_arguments.delta event"
+    );
+    assert!(
+        found_mcp_call_arguments_done,
+        "Should send mcp_call_arguments.done event"
+    );
+
+    // Verify no error events
+    let has_error = body_text.contains("event: error");
+    assert!(!has_error, "Should not have error events");
+
+    worker.stop().await;
+    mcp.stop().await;
+}
+
+#[expect(clippy::print_stdout, reason = "test diagnostic output")]
+#[tokio::test]
+async fn test_streaming_multi_turn_with_mcp() {
+    // Test streaming with multiple tool call rounds
+    let (mut mcp, mut worker, router, _dir) = setup_streaming_mcp_test().await;
+
+    let req = ResponsesRequest {
+        include: None,
+        background: None,
+        input: ResponseInput::Text("complex query requiring multiple tool calls".to_string()),
+        instructions: Some("Be thorough".to_string()),
+        max_output_tokens: Some(512),
+        max_tool_calls: Some(5), // Allow multiple rounds
+        metadata: None,
+        model: "mock-model".to_string(),
+        parallel_tool_calls: Some(true),
+        previous_response_id: None,
+        reasoning: None,
+        service_tier: Some(ServiceTier::Auto),
+        store: Some(true),
+        stream: Some(true),
+        temperature: Some(0.8),
+        tool_choice: Some(ResponsesToolChoice::Options(ToolChoiceOptions::Auto)),
+        tools: Some(vec![ResponseTool::Mcp(McpTool {
+            server_url: Some(mcp.url()),
+            authorization: None,
+            headers: None,
+            server_label: "mock".to_string(),
+            server_description: None,
+            require_approval: None,
+            allowed_tools: None,
+            connector_id: None,
+            defer_loading: None,
+        })]),
+        top_logprobs: Some(0),
+        top_p: Some(1.0),
+        truncation: Some(Truncation::Disabled),
+        text: None,
+        user: None,
+        request_id: Some("resp_streaming_multiturn_test".to_string()),
+        priority: 0,
+        frequency_penalty: Some(0.0),
+        presence_penalty: Some(0.0),
+        stop: None,
+        prompt: None,
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+        safety_identifier: None,
+        stream_options: None,
+        context_management: None,
+        client_metadata: None,
+        top_k: 50,
+        min_p: 0.0,
+        repetition_penalty: 1.0,
+        conversation: None,
+    };
+
+    let tenant_meta = test_tenant_meta();
+    let response = router
+        .route_responses(None, &tenant_meta, req.clone(), req.model.as_str())
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    use axum::body::to_bytes;
+    let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body_text = String::from_utf8_lossy(&body_bytes);
+
+    println!("Multi-turn streaming response:\n{body_text}");
+
+    // Verify streaming completed successfully
+    assert!(body_text.contains("data: [DONE]"));
+    assert!(!body_text.contains("event: error"));
+
+    // Count events
+    let event_count = body_text
+        .split("\n\n")
+        .filter(|s| !s.trim().is_empty())
+        .count();
+    println!("Total events in multi-turn stream: {event_count}");
+
+    assert!(event_count > 0, "Should have received streaming events");
+
+    worker.stop().await;
+    mcp.stop().await;
+}
+
+#[tokio::test]
+async fn test_conversation_items_create_and_get() {
+    // Test creating items and getting a specific item
+    let router_cfg = conversation_router_config();
+
+    let ctx = create_test_context(router_cfg).await;
+    let _router = RouterFactory::create_router(&ctx).await.expect("router");
+
+    // Create conversation
+    let create_conv = serde_json::json!({});
+    let conv_resp = conversations::create_conversation(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        create_conv,
+    )
+    .await;
+    assert_eq!(conv_resp.status(), StatusCode::OK);
+    let conv_bytes = axum::body::to_bytes(conv_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let conv_json: serde_json::Value = serde_json::from_slice(&conv_bytes).unwrap();
+    let conv_id = conv_json["id"].as_str().unwrap();
+
+    // Create items
+    let create_items = serde_json::json!({
+        "items": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Hello"}]
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Hi there!"}]
+            }
+        ]
+    });
+
+    let items_resp = conversations::create_conversation_items(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        conv_id,
+        create_items,
+    )
+    .await;
+    assert_eq!(items_resp.status(), StatusCode::OK);
+    let items_bytes = axum::body::to_bytes(items_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let items_json: serde_json::Value = serde_json::from_slice(&items_bytes).unwrap();
+
+    // Verify response structure
+    assert_eq!(items_json["object"], "list");
+    assert!(items_json["data"].is_array());
+
+    // Get first item
+    let item_id = items_json["data"][0]["id"].as_str().unwrap();
+    let get_resp = conversations::get_conversation_item(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        conv_id,
+        item_id,
+        None,
+    )
+    .await;
+    assert_eq!(get_resp.status(), StatusCode::OK);
+    let get_bytes = axum::body::to_bytes(get_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let get_json: serde_json::Value = serde_json::from_slice(&get_bytes).unwrap();
+
+    // Verify item structure
+    assert_eq!(get_json["id"], item_id);
+    assert_eq!(get_json["type"], "message");
+    assert_eq!(get_json["role"], "user");
+}
+
+/// The JSON body of a handler's 200 response.
+async fn conversation_json(
+    resp: axum::response::Response,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+/// The ids of a list response's `data[]`, in the order answered.
+fn conversation_item_ids(list: &serde_json::Value) -> Vec<String> {
+    list["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item["id"].as_str().map(String::from))
+        .collect()
+}
+
+fn user_message(text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": text}]
+    })
+}
+
+#[tokio::test]
+async fn items_of_one_add_call_are_listed_in_request_order(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Items that share a stamp are listed by their random ids, which is request order about
+    // half of the time: twenty rounds, each with two items in one call and a third in the next.
+    let router_cfg = conversation_router_config();
+    let ctx = create_test_context(router_cfg).await;
+    let _router = RouterFactory::create_router(&ctx).await.expect("router");
+
+    for round in 0..20 {
+        let conv = conversation_json(
+            conversations::create_conversation(
+                &ctx.conversation_storage,
+                &ctx.conversation_item_storage,
+                None,
+                serde_json::json!({}),
+            )
+            .await,
+        )
+        .await?;
+        let conv_id = conv["id"].as_str().ok_or("conversation id")?;
+
+        let added = conversation_json(
+            conversations::create_conversation_items(
+                &ctx.conversation_storage,
+                &ctx.conversation_item_storage,
+                None,
+                conv_id,
+                serde_json::json!({"items": [user_message("first"), user_message("second")]}),
+            )
+            .await,
+        )
+        .await?;
+        let mut expected = conversation_item_ids(&added);
+        assert_eq!(
+            expected.len(),
+            2,
+            "round {round}: the add answers both items"
+        );
+
+        // A second call right after the first: its item follows the first call's items.
+        let third = conversation_json(
+            conversations::create_conversation_items(
+                &ctx.conversation_storage,
+                &ctx.conversation_item_storage,
+                None,
+                conv_id,
+                serde_json::json!({"items": [user_message("third")]}),
+            )
+            .await,
+        )
+        .await?;
+        expected.extend(conversation_item_ids(&third));
+        assert_eq!(
+            expected.len(),
+            3,
+            "round {round}: the second add answers its item"
+        );
+
+        let asc = conversation_json(
+            conversations::list_conversation_items(
+                &ctx.conversation_storage,
+                &ctx.conversation_item_storage,
+                None,
+                conv_id,
+                None,
+                Some("asc"),
+                None,
+            )
+            .await,
+        )
+        .await?;
+        assert_eq!(
+            conversation_item_ids(&asc),
+            expected,
+            "round {round}: order=asc lists the items as they were added"
+        );
+
+        let desc = conversation_json(
+            conversations::list_conversation_items(
+                &ctx.conversation_storage,
+                &ctx.conversation_item_storage,
+                None,
+                conv_id,
+                None,
+                Some("desc"),
+                None,
+            )
+            .await,
+        )
+        .await?;
+        let mut reversed = expected.clone();
+        reversed.reverse();
+        assert_eq!(
+            conversation_item_ids(&desc),
+            reversed,
+            "round {round}: order=desc is the reverse"
+        );
+
+        let after_first = conversation_json(
+            conversations::list_conversation_items(
+                &ctx.conversation_storage,
+                &ctx.conversation_item_storage,
+                None,
+                conv_id,
+                None,
+                Some("asc"),
+                Some(&expected[0]),
+            )
+            .await,
+        )
+        .await?;
+        assert_eq!(
+            conversation_item_ids(&after_first),
+            expected[1..],
+            "round {round}: after the first item come the others, in order"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_reference_to_an_item_already_in_the_conversation_is_refused(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let router_cfg = conversation_router_config();
+    let ctx = create_test_context(router_cfg).await;
+    let _router = RouterFactory::create_router(&ctx).await.expect("router");
+
+    let add_items = |conv_id: String, items: serde_json::Value| {
+        let conversation_storage = ctx.conversation_storage.clone();
+        let item_storage = ctx.conversation_item_storage.clone();
+        async move {
+            conversations::create_conversation_items(
+                &conversation_storage,
+                &item_storage,
+                None,
+                &conv_id,
+                serde_json::json!({ "items": items }),
+            )
+            .await
+        }
+    };
+    let list_asc = |conv_id: String| {
+        let conversation_storage = ctx.conversation_storage.clone();
+        let item_storage = ctx.conversation_item_storage.clone();
+        async move {
+            let listed = conversations::list_conversation_items(
+                &conversation_storage,
+                &item_storage,
+                None,
+                &conv_id,
+                None,
+                Some("asc"),
+                None,
+            )
+            .await;
+            conversation_json(listed)
+                .await
+                .map(|list| conversation_item_ids(&list))
+        }
+    };
+
+    let conv = conversation_json(
+        conversations::create_conversation(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            None,
+            serde_json::json!({}),
+        )
+        .await,
+    )
+    .await?;
+    let conv_id = conv["id"].as_str().ok_or("conversation id")?.to_string();
+    let added = conversation_json(
+        add_items(
+            conv_id.clone(),
+            serde_json::json!([user_message("first"), user_message("second")]),
+        )
+        .await,
+    )
+    .await?;
+    let ids = conversation_item_ids(&added);
+    assert_eq!(ids.len(), 2, "the add answers both items");
+    let reference = serde_json::json!([{ "type": "item_reference", "id": ids[0] }]);
+
+    // A reference to an item the conversation already has is refused, like an item arriving
+    // under an id the conversation already has, and the conversation is left as it was.
+    let refused = add_items(conv_id.clone(), reference.clone()).await;
+    assert_eq!(
+        refused.status(),
+        StatusCode::BAD_REQUEST,
+        "a reference to an item already in the conversation is refused"
+    );
+    let body = axum::body::to_bytes(refused.into_body(), usize::MAX).await?;
+    let error: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(error["error"]["code"], "item_already_in_conversation");
+    assert_eq!(error["error"]["param"], "items");
+    assert_eq!(
+        list_asc(conv_id.clone()).await?,
+        ids,
+        "the refused reference changes nothing: each item once, in order"
+    );
+
+    // The same reference into another conversation links the item there, once.
+    let other = conversation_json(
+        conversations::create_conversation(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            None,
+            serde_json::json!({}),
+        )
+        .await,
+    )
+    .await?;
+    let other_id = other["id"].as_str().ok_or("conversation id")?.to_string();
+    let linked = conversation_json(add_items(other_id.clone(), reference.clone()).await).await?;
+    assert_eq!(conversation_item_ids(&linked), ids[..1]);
+    assert_eq!(list_asc(other_id.clone()).await?, ids[..1]);
+    assert_eq!(
+        add_items(other_id.clone(), reference).await.status(),
+        StatusCode::BAD_REQUEST,
+        "the second reference into the other conversation is refused too"
+    );
+
+    // One link per item: deleting the item takes it out of the conversation.
+    let deleted = conversations::delete_conversation_item(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        &conv_id,
+        &ids[0],
+    )
+    .await;
+    assert_eq!(deleted.status(), StatusCode::OK);
+    assert_eq!(list_asc(conv_id).await?, ids[1..]);
+    assert_eq!(
+        list_asc(other_id).await?,
+        ids[..1],
+        "the other conversation keeps its link"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_conversation_items_delete() {
+    // Test deleting an item from a conversation
+    let router_cfg = conversation_router_config();
+
+    let ctx = create_test_context(router_cfg).await;
+    let _router = RouterFactory::create_router(&ctx).await.expect("router");
+
+    // Create conversation
+    let create_conv = serde_json::json!({});
+    let conv_resp = conversations::create_conversation(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        create_conv,
+    )
+    .await;
+    let conv_bytes = axum::body::to_bytes(conv_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let conv_json: serde_json::Value = serde_json::from_slice(&conv_bytes).unwrap();
+    let conv_id = conv_json["id"].as_str().unwrap();
+
+    // Create item
+    let create_items = serde_json::json!({
+        "items": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Test"}]
+            }
+        ]
+    });
+
+    let items_resp = conversations::create_conversation_items(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        conv_id,
+        create_items,
+    )
+    .await;
+    let items_bytes = axum::body::to_bytes(items_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let items_json: serde_json::Value = serde_json::from_slice(&items_bytes).unwrap();
+    let item_id = items_json["data"][0]["id"].as_str().unwrap();
+
+    // List items (should have 1)
+    let list_resp = conversations::list_conversation_items(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        conv_id,
+        None,
+        None,
+        None,
+    )
+    .await;
+    let list_bytes = axum::body::to_bytes(list_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_json: serde_json::Value = serde_json::from_slice(&list_bytes).unwrap();
+    assert_eq!(list_json["data"].as_array().unwrap().len(), 1);
+
+    // Delete item
+    let del_resp = conversations::delete_conversation_item(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        conv_id,
+        item_id,
+    )
+    .await;
+    assert_eq!(del_resp.status(), StatusCode::OK);
+
+    // List items again (should have 0)
+    let list_resp2 = conversations::list_conversation_items(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        conv_id,
+        None,
+        None,
+        None,
+    )
+    .await;
+    let list_bytes2 = axum::body::to_bytes(list_resp2.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_json2: serde_json::Value = serde_json::from_slice(&list_bytes2).unwrap();
+    assert_eq!(list_json2["data"].as_array().unwrap().len(), 0);
+
+    // Item should NOT be gettable from this conversation after deletion (link removed)
+    let get_resp = conversations::get_conversation_item(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        conv_id,
+        item_id,
+        None,
+    )
+    .await;
+    assert_eq!(get_resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_conversation_items_max_limit() {
+    // Test that creating > 20 items returns error
+    let router_cfg = conversation_router_config();
+
+    let ctx = create_test_context(router_cfg).await;
+    let _router = RouterFactory::create_router(&ctx).await.expect("router");
+
+    // Create conversation
+    let create_conv = serde_json::json!({});
+    let conv_resp = conversations::create_conversation(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        create_conv,
+    )
+    .await;
+    let conv_bytes = axum::body::to_bytes(conv_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let conv_json: serde_json::Value = serde_json::from_slice(&conv_bytes).unwrap();
+    let conv_id = conv_json["id"].as_str().unwrap();
+
+    // Try to create 21 items (over limit)
+    let mut items = Vec::new();
+    for i in 0..21 {
+        items.push(serde_json::json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": format!("Message {}", i)}]
+        }));
+    }
+    let create_items = serde_json::json!({ "items": items });
+
+    let items_resp = conversations::create_conversation_items(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        conv_id,
+        create_items,
+    )
+    .await;
+    assert_eq!(items_resp.status(), StatusCode::BAD_REQUEST);
+
+    let items_bytes = axum::body::to_bytes(items_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let items_text = String::from_utf8_lossy(&items_bytes);
+    assert!(items_text.contains("Cannot add more than 20 items"));
+}
+
+#[tokio::test]
+async fn test_conversation_items_unsupported_type() {
+    // Test that unsupported item types return error
+    let router_cfg = conversation_router_config();
+
+    let ctx = create_test_context(router_cfg).await;
+    let _router = RouterFactory::create_router(&ctx).await.expect("router");
+
+    // Create conversation
+    let create_conv = serde_json::json!({});
+    let conv_resp = conversations::create_conversation(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        create_conv,
+    )
+    .await;
+    let conv_bytes = axum::body::to_bytes(conv_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let conv_json: serde_json::Value = serde_json::from_slice(&conv_bytes).unwrap();
+    let conv_id = conv_json["id"].as_str().unwrap();
+
+    // Try to create item with completely unsupported type
+    let create_items = serde_json::json!({
+        "items": [
+            {
+                "type": "totally_invalid_type",
+                "content": []
+            }
+        ]
+    });
+
+    let items_resp = conversations::create_conversation_items(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        conv_id,
+        create_items,
+    )
+    .await;
+    assert_eq!(items_resp.status(), StatusCode::BAD_REQUEST);
+
+    let items_bytes = axum::body::to_bytes(items_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let items_text = String::from_utf8_lossy(&items_bytes);
+    assert!(items_text.contains("Unsupported item type"));
+}
+
+#[tokio::test]
+async fn test_conversation_items_multi_conversation_sharing() {
+    // Test that items can be shared across conversations via soft delete
+    let router_cfg = conversation_router_config();
+
+    let ctx = create_test_context(router_cfg).await;
+    let _router = RouterFactory::create_router(&ctx).await.expect("router");
+
+    // Create two conversations
+    let conv_a_resp = conversations::create_conversation(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        serde_json::json!({}),
+    )
+    .await;
+    let conv_a_bytes = axum::body::to_bytes(conv_a_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let conv_a_json: serde_json::Value = serde_json::from_slice(&conv_a_bytes).unwrap();
+    let conv_a_id = conv_a_json["id"].as_str().unwrap();
+
+    let conv_b_resp = conversations::create_conversation(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        serde_json::json!({}),
+    )
+    .await;
+    let conv_b_bytes = axum::body::to_bytes(conv_b_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let conv_b_json: serde_json::Value = serde_json::from_slice(&conv_b_bytes).unwrap();
+    let conv_b_id = conv_b_json["id"].as_str().unwrap();
+
+    // Create item in conversation A
+    let create_items = serde_json::json!({
+        "items": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Shared message"}]
+            }
+        ]
+    });
+
+    let items_a_resp = conversations::create_conversation_items(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        conv_a_id,
+        create_items,
+    )
+    .await;
+    let items_a_bytes = axum::body::to_bytes(items_a_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let items_a_json: serde_json::Value = serde_json::from_slice(&items_a_bytes).unwrap();
+    let item_id = items_a_json["data"][0]["id"].as_str().unwrap();
+
+    // Reference the same item in conversation B
+    let reference_items = serde_json::json!({
+        "items": [
+            {
+                "type": "item_reference",
+                "id": item_id
+            }
+        ]
+    });
+
+    let items_b_resp = conversations::create_conversation_items(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        conv_b_id,
+        reference_items,
+    )
+    .await;
+    assert_eq!(items_b_resp.status(), StatusCode::OK);
+
+    // Verify item appears in both conversations
+    let list_a = conversations::list_conversation_items(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        conv_a_id,
+        None,
+        None,
+        None,
+    )
+    .await;
+    let list_a_bytes = axum::body::to_bytes(list_a.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_a_json: serde_json::Value = serde_json::from_slice(&list_a_bytes).unwrap();
+    assert_eq!(list_a_json["data"].as_array().unwrap().len(), 1);
+
+    let list_b = conversations::list_conversation_items(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        conv_b_id,
+        None,
+        None,
+        None,
+    )
+    .await;
+    let list_b_bytes = axum::body::to_bytes(list_b.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_b_json: serde_json::Value = serde_json::from_slice(&list_b_bytes).unwrap();
+    assert_eq!(list_b_json["data"].as_array().unwrap().len(), 1);
+
+    // Delete from conversation A
+    conversations::delete_conversation_item(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        conv_a_id,
+        item_id,
+    )
+    .await;
+
+    // Should be removed from A
+    let list_a2 = conversations::list_conversation_items(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        conv_a_id,
+        None,
+        None,
+        None,
+    )
+    .await;
+    let list_a2_bytes = axum::body::to_bytes(list_a2.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_a2_json: serde_json::Value = serde_json::from_slice(&list_a2_bytes).unwrap();
+    assert_eq!(list_a2_json["data"].as_array().unwrap().len(), 0);
+
+    // Should still exist in B (soft delete)
+    let list_b2 = conversations::list_conversation_items(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        conv_b_id,
+        None,
+        None,
+        None,
+    )
+    .await;
+    let list_b2_bytes = axum::body::to_bytes(list_b2.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_b2_json: serde_json::Value = serde_json::from_slice(&list_b2_bytes).unwrap();
+    assert_eq!(list_b2_json["data"].as_array().unwrap().len(), 1);
+
+    // Item should still be directly gettable
+    let get_resp = conversations::get_conversation_item(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        conv_b_id,
+        item_id,
+        None,
+    )
+    .await;
+    assert_eq!(get_resp.status(), StatusCode::OK);
+}
+
+// ============================================================================
+// A failed Responses stream on the external router ends with the one error
+// event every router writes: the API's typed event on a data line alone.
+// ============================================================================
+
+/// The frames of an SSE body, each with its trailing blank line removed.
+fn sse_frames(body: &str) -> Vec<&str> {
+    body.split("\n\n").filter(|f| !f.is_empty()).collect()
+}
+
+/// A streaming request through the tool loop, its response not stored.
+fn streaming_mcp_request(mcp_url: &str, max_tool_calls: Option<u32>) -> ResponsesRequest {
+    mcp_request(mcp_url, max_tool_calls, true, false)
+}
+
+/// A request that routes through the tool loop: one MCP tool at `mcp_url`,
+/// the mock server's `brave_web_search` behind it.
+fn mcp_request(
+    mcp_url: &str,
+    max_tool_calls: Option<u32>,
+    stream: bool,
+    store: bool,
+) -> ResponsesRequest {
+    ResponsesRequest {
+        input: ResponseInput::Text("search for something".to_string()),
+        model: "mock-model".to_string(),
+        max_tool_calls,
+        store: Some(store),
+        stream: Some(stream),
+        tools: Some(vec![ResponseTool::Mcp(McpTool {
+            server_url: Some(mcp_url.to_string()),
+            authorization: None,
+            headers: None,
+            server_label: "mock".to_string(),
+            server_description: None,
+            require_approval: Some(RequireApproval::Mode(RequireApprovalMode::Never)),
+            allowed_tools: None,
+            connector_id: None,
+            defer_loading: None,
+        })]),
+        ..Default::default()
+    }
+}
+
+/// An upstream that answers `/v1/responses` with `responses`, and the model
+/// list and health probes a worker needs; returns its base URL.
+#[expect(
+    clippy::disallowed_methods,
+    clippy::expect_used,
+    reason = "test infrastructure"
+)]
+async fn stub_upstream(
+    responses: axum::routing::MethodRouter,
+) -> (String, tokio::task::JoinHandle<()>) {
+    use axum::{routing::get, Json, Router};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let models = || async {
+        Json(
+            serde_json::json!({"object": "list", "data": [{"id": "mock-model", "object": "model"}]}),
+        )
+    };
+    let app = Router::new()
+        .route("/v1/responses", responses)
+        .route("/v1/models", get(models))
+        .route(
+            "/health",
+            get(|| async { Json(serde_json::json!({"status": "ok"})) }),
+        );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    (format!("http://{addr}"), server)
+}
+
+/// The `function_call` item of turn `turn`: the model asks for
+/// `brave_web_search`; the ids carry the turn's number.
+fn function_call_turn_item(turn: usize) -> serde_json::Value {
+    serde_json::json!({
+        "id": format!("fc_stub_{turn}"), "type": "function_call",
+        "call_id": format!("call_stub_{turn}"), "name": "brave_web_search",
+        "arguments": "{\"query\":\"smg\"}", "status": "completed"
+    })
+}
+
+/// The response object of function-call turn `turn`, as an upstream of the
+/// Responses API answers it unstreamed. An upstream that answers every turn
+/// with it asks again after the call's output comes back, so with
+/// `max_tool_calls` 1 the second turn's call is one over the limit.
+fn function_call_turn_response(turn: usize) -> serde_json::Value {
+    serde_json::json!({
+        "id": format!("resp_stub_{turn}"), "object": "response", "created_at": 1_700_000_000,
+        "model": "mock-model", "status": "completed", "output": [function_call_turn_item(turn)]
+    })
+}
+
+/// The SSE body of function-call turn `turn`, as an upstream of the
+/// Responses API streams it.
+fn function_call_turn_events(turn: usize) -> String {
+    let response = serde_json::json!({
+        "id": format!("resp_stub_{turn}"), "object": "response", "created_at": 1_700_000_000,
+        "model": "mock-model", "status": "in_progress", "output": []
+    });
+    let call = function_call_turn_item(turn);
+    let item_id = format!("fc_stub_{turn}");
+    let events = [
+        (
+            "response.created",
+            serde_json::json!({"type": "response.created", "sequence_number": 0, "response": response}),
+        ),
+        (
+            "response.in_progress",
+            serde_json::json!({"type": "response.in_progress", "sequence_number": 1, "response": response}),
+        ),
+        (
+            "response.output_item.added",
+            serde_json::json!({"type": "response.output_item.added", "sequence_number": 2, "output_index": 0, "item": call}),
+        ),
+        (
+            "response.function_call_arguments.delta",
+            serde_json::json!({"type": "response.function_call_arguments.delta", "sequence_number": 3, "output_index": 0, "item_id": item_id, "delta": "{\"query\":\"smg\"}"}),
+        ),
+        (
+            "response.function_call_arguments.done",
+            serde_json::json!({"type": "response.function_call_arguments.done", "sequence_number": 4, "output_index": 0, "item_id": item_id, "arguments": "{\"query\":\"smg\"}"}),
+        ),
+        (
+            "response.output_item.done",
+            serde_json::json!({"type": "response.output_item.done", "sequence_number": 5, "output_index": 0, "item": call}),
+        ),
+        (
+            "response.completed",
+            serde_json::json!({"type": "response.completed", "sequence_number": 6, "response": function_call_turn_response(turn)}),
+        ),
+    ];
+    events
+        .iter()
+        .map(|(name, data)| format!("event: {name}\ndata: {data}\n\n"))
+        .collect()
+}
+
+/// An upstream that asks for the tool on every turn, streamed or not: the
+/// turn's SSE body for a streaming request, its response object otherwise,
+/// the turns numbered in order.
+fn always_calling_upstream() -> axum::routing::MethodRouter {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use axum::response::IntoResponse;
+    let turns = Arc::new(AtomicUsize::new(0));
+    axum::routing::post(move |body: String| {
+        let turns = Arc::clone(&turns);
+        async move {
+            let turn = turns.fetch_add(1, Ordering::SeqCst) + 1;
+            let streaming = serde_json::from_str::<serde_json::Value>(&body)
+                .is_ok_and(|request| request["stream"] == true);
+            if streaming {
+                (
+                    [(CONTENT_TYPE, "text/event-stream")],
+                    function_call_turn_events(turn),
+                )
+                    .into_response()
+            } else {
+                axum::Json(function_call_turn_response(turn)).into_response()
+            }
+        }
+    })
+}
+
+/// An upstream that asks for two calls in one turn, unstreamed: the two
+/// `function_call` items in one response object.
+fn two_call_turn_upstream() -> axum::routing::MethodRouter {
+    axum::routing::post(|| async {
+        axum::Json(serde_json::json!({
+            "id": "resp_stub_two", "object": "response", "created_at": 1_700_000_000,
+            "model": "mock-model", "status": "completed",
+            "output": [
+                {"id": "fc_stub_a", "type": "function_call", "call_id": "call_stub_a",
+                 "name": "brave_web_search", "arguments": "{\"query\":\"smg a\"}", "status": "completed"},
+                {"id": "fc_stub_b", "type": "function_call", "call_id": "call_stub_b",
+                 "name": "brave_web_search", "arguments": "{\"query\":\"smg b\"}", "status": "completed"}
+            ]
+        }))
+    })
+}
+
+/// The frames' data as JSON, in order; the sentinel is no JSON and is left
+/// out.
+fn frame_events(body: &str) -> Vec<serde_json::Value> {
+    sse_frames(body)
+        .iter()
+        .filter_map(|frame| frame.lines().find_map(|line| line.strip_prefix("data: ")))
+        .filter_map(|data| serde_json::from_str(data).ok())
+        .collect()
+}
+
+/// What a response's items say: type, status and name, in order.
+fn item_shapes(response: &serde_json::Value) -> Vec<(String, String, String)> {
+    let field =
+        |item: &serde_json::Value, name: &str| item[name].as_str().unwrap_or_default().to_string();
+    response["output"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|item| {
+            (
+                field(item, "type"),
+                field(item, "status"),
+                field(item, "name"),
+            )
+        })
+        .collect()
+}
+
+/// The items' errors, in order.
+fn item_errors(response: &serde_json::Value) -> Vec<serde_json::Value> {
+    response["output"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|item| item["error"].clone())
+        .collect()
+}
+
+/// The router of an OpenAI-mode gateway over `upstream`, with the mock MCP
+/// server in its MCP configuration, and the context it was built from (its
+/// storage, for the records a request leaves).
+async fn external_router_with_mcp(
+    upstream: &str,
+    mcp: &MockMCPServer,
+    startup_timeout_secs: u64,
+) -> (
+    Box<dyn smg::routers::RouterTrait>,
+    std::sync::Arc<smg::app_context::AppContext>,
+    tempfile::TempDir,
+) {
+    let mcp_yaml = format!(
+        "servers:\n  - name: mock\n    protocol: streamable\n    url: {}\n",
+        mcp.url()
+    );
+    external_router_with_mcp_yaml(upstream, &mcp_yaml, startup_timeout_secs).await
+}
+
+/// The router of an OpenAI-mode gateway over `upstream`, with `mcp_yaml` as
+/// its MCP configuration, and the context it was built from.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+async fn external_router_with_mcp_yaml(
+    upstream: &str,
+    mcp_yaml: &str,
+    startup_timeout_secs: u64,
+) -> (
+    Box<dyn smg::routers::RouterTrait>,
+    std::sync::Arc<smg::app_context::AppContext>,
+    tempfile::TempDir,
+) {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg_path = dir.path().join("mcp.yaml");
+    std::fs::write(&cfg_path, mcp_yaml).expect("write mcp cfg");
+    let router_cfg = router_builder(vec![upstream.to_string()])
+        .worker_startup_timeout_secs(startup_timeout_secs)
+        .max_concurrent_requests(8)
+        .build_unchecked();
+    let cfg_path = cfg_path.to_str().expect("a utf-8 path");
+    let ctx = create_test_context_with_mcp_config(router_cfg, cfg_path).await;
+    // A running gateway's registration job populates the format registry as
+    // it connects each configured server; the test context connects them
+    // itself, so the registry is populated here the same way.
+    let mcp_config = smg_mcp::McpConfig::from_file(cfg_path)
+        .await
+        .expect("the mcp config");
+    for server in &mcp_config.servers {
+        ctx.mcp_format_registry.populate_from_server_config(server);
+    }
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
+    (router, ctx, dir)
+}
+
+/// The body of a streaming request through `router`, as the client reads it.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+async fn stream_body(router: &dyn smg::routers::RouterTrait, req: ResponsesRequest) -> String {
+    let response = router
+        .route_responses(None, &test_tenant_meta(), req.clone(), &req.model)
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("text/event-stream")
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    String::from_utf8(bytes.to_vec()).expect("utf-8")
+}
+
+/// An upstream status answered before the first byte of the first turn: the
+/// stream is the one typed error event, the upstream's own code and message,
+/// at sequence number 0; no event name, no sentinel.
+#[tokio::test]
+async fn a_failed_upstream_status_ends_the_stream_with_the_typed_error_event() {
+    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+    let (upstream, server) = stub_upstream(axum::routing::post(|| async {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"error": {
+                "code": "overloaded", "type": "server_error", "message": "busy, try again"
+            }})),
+        )
+    }))
+    .await;
+    let (router, _ctx, _dir) = external_router_with_mcp(&upstream, &mcp, 5).await;
+
+    let body = stream_body(router.as_ref(), streaming_mcp_request(&mcp.url(), None)).await;
+
+    assert_eq!(
+        body,
+        "data: {\"type\":\"error\",\"code\":\"overloaded\",\"message\":\"busy, try again\",\
+         \"param\":null,\"sequence_number\":0}\n\n"
+    );
+    server.abort();
+    mcp.stop().await;
+}
+
+/// A tool call that fails, streamed (the tool server that always fails behind
+/// an upstream that asks for the tool on every turn, a limit of one): the
+/// call that ran and failed and the call past the limit close alike, each
+/// under `response.mcp_call.failed` and then its `response.output_item.done`
+/// with a `failed` item. No `response.mcp_call.completed` is sent for a call
+/// that failed. The gateway's own tool loop closes a failed call under the
+/// same event (`a_failed_mcp_call_closes_under_the_failed_event` in the
+/// Responses stream contract tests).
+#[tokio::test]
+async fn a_streamed_mcp_call_that_failed_closes_under_the_failed_event() {
+    let mut mcp = MockFailingMCPServer::start("the tool is down")
+        .await
+        .expect("start failing mcp");
+    let (upstream, server) = stub_upstream(always_calling_upstream()).await;
+    let mcp_yaml = format!(
+        "servers:\n  - name: mock\n    protocol: streamable\n    url: {}\n",
+        mcp.url()
+    );
+    let (router, _ctx, _dir) = external_router_with_mcp_yaml(&upstream, &mcp_yaml, 5).await;
+
+    let body = stream_body(
+        router.as_ref(),
+        mcp_request(&mcp.url(), Some(1), true, false),
+    )
+    .await;
+
+    let events = frame_events(&body);
+    // Each call's close: its sub-event, and the status of the item behind it.
+    let closes: Vec<(&str, &str)> = events
+        .windows(2)
+        .filter(|pair| {
+            pair[1]["type"] == "response.output_item.done" && pair[1]["item"]["type"] == "mcp_call"
+        })
+        .map(|pair| {
+            (
+                pair[0]["type"].as_str().unwrap_or_default(),
+                pair[1]["item"]["status"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        closes,
+        [
+            ("response.mcp_call.failed", "failed"),
+            ("response.mcp_call.failed", "failed")
+        ],
+        "the call that ran and failed, then the call past the limit: {body}"
+    );
+    assert!(!body.contains("response.mcp_call.completed"), "{body}");
+    server.abort();
+    mcp.stop().await;
+}
+
+/// The tool-call limit reached mid-stream (an upstream that asks for the
+/// tool on every turn, a limit of one, the response stored): the stream
+/// ends the way the non-streamed loop ends the same stop. The call that fit
+/// ran; the one over the limit is closed as not executed
+/// (`response.mcp_call.failed`, then its `response.output_item.done`, so no
+/// item the stream announced stays open); then `response.completed`, the
+/// response `completed` with `incomplete_details.reason` `max_tool_calls`
+/// and both calls among its items; no error event, no `response.failed`;
+/// and the record says what the terminal said.
+#[tokio::test]
+async fn the_tool_call_limit_ends_the_stream_as_the_non_streamed_loop_ends_its_response() {
+    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+    let (upstream, server) = stub_upstream(always_calling_upstream()).await;
+    let (router, ctx, _dir) = external_router_with_mcp(&upstream, &mcp, 5).await;
+
+    let body = stream_body(
+        router.as_ref(),
+        mcp_request(&mcp.url(), Some(1), true, true),
+    )
+    .await;
+
+    assert!(!body.contains("event: error\n"), "{body}");
+    let events = frame_events(&body);
+    let types: Vec<&str> = events
+        .iter()
+        .map(|event| event["type"].as_str().unwrap_or_default())
+        .collect();
+    assert!(
+        !types
+            .iter()
+            .any(|kind| matches!(*kind, "error" | "response.failed")),
+        "{body}"
+    );
+    let failed_at = types
+        .iter()
+        .position(|kind| *kind == "response.mcp_call.failed")
+        .expect("the skipped call's failed event");
+    assert_eq!(
+        &types[failed_at..],
+        [
+            "response.mcp_call.failed",
+            "response.output_item.done",
+            "response.completed"
+        ],
+        "the skipped call is closed, then the terminal, then nothing but the sentinel: {body}"
+    );
+    assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
+    assert!(
+        events.windows(2).all(|pair| {
+            pair[0]["sequence_number"].as_u64() < pair[1]["sequence_number"].as_u64()
+        }),
+        "{body}"
+    );
+    let announced: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|event| event["type"] == "response.output_item.added")
+        .map(|event| &event["output_index"])
+        .collect();
+    let closed: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|event| event["type"] == "response.output_item.done")
+        .map(|event| &event["output_index"])
+        .collect();
+    assert_eq!(announced, closed, "every item announced is closed: {body}");
+
+    let skipped = &events[failed_at + 1]["item"];
+    assert_eq!(skipped["type"], "mcp_call", "{skipped}");
+    assert_eq!(skipped["status"], "failed", "{skipped}");
+    assert!(
+        skipped["error"]
+            .to_string()
+            .contains("Not executed - response stopped due to limit"),
+        "{skipped}"
+    );
+    assert_eq!(skipped["id"], events[failed_at]["item_id"], "{body}");
+
+    let response = &events[failed_at + 2]["response"];
+    assert_eq!(response["status"], "completed", "{response}");
+    assert_eq!(
+        response["incomplete_details"],
+        serde_json::json!({ "reason": "max_tool_calls" }),
+        "{response}"
+    );
+    assert!(response["error"].is_null(), "{response}");
+    let shape = |kind: &str, status: &str, name: &str| {
+        (kind.to_string(), status.to_string(), name.to_string())
+    };
+    assert_eq!(
+        item_shapes(response),
+        vec![
+            shape("mcp_list_tools", "", ""),
+            shape("mcp_call", "completed", "brave_web_search"),
+            shape("mcp_call", "failed", "brave_web_search"),
+        ],
+        "{response}"
+    );
+
+    let stored = ctx
+        .response_storage
+        .get_response(&smg_data_connector::ResponseId::from(
+            response["id"].as_str().expect("an id"),
+        ))
+        .await
+        .expect("storage")
+        .expect("the record is stored")
+        .raw_response;
+    assert_eq!(stored["status"], response["status"], "{stored}");
+    assert_eq!(
+        stored["incomplete_details"], response["incomplete_details"],
+        "{stored}"
+    );
+    assert_eq!(item_shapes(&stored), item_shapes(response), "{stored}");
+    assert_eq!(item_errors(&stored), item_errors(response), "{stored}");
+    server.abort();
+    mcp.stop().await;
+}
+
+/// The same stop, streamed and not (the same upstream, the same limit, both
+/// stored): the terminal's response and the non-streamed response say the
+/// same thing (status, `incomplete_details`, the items in order with their
+/// statuses and errors), and so do their records.
+#[tokio::test]
+async fn a_streamed_and_a_non_streamed_tool_call_limit_leave_the_same_record() {
+    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+    let (upstream, server) = stub_upstream(always_calling_upstream()).await;
+    let (router, ctx, _dir) = external_router_with_mcp(&upstream, &mcp, 5).await;
+
+    let body = stream_body(
+        router.as_ref(),
+        mcp_request(&mcp.url(), Some(1), true, true),
+    )
+    .await;
+    let streamed = frame_events(&body)
+        .last()
+        .map(|terminal| terminal["response"].clone())
+        .expect("a terminal");
+
+    let request = mcp_request(&mcp.url(), Some(1), false, true);
+    let plain = router
+        .route_responses(None, &test_tenant_meta(), request.clone(), &request.model)
+        .await;
+    assert_eq!(plain.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(plain.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let plain: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+
+    let stored = |response: &serde_json::Value| {
+        let id = response["id"].as_str().expect("an id").to_string();
+        let storage = ctx.response_storage.clone();
+        async move {
+            storage
+                .get_response(&smg_data_connector::ResponseId::from(id.as_str()))
+                .await
+                .expect("storage")
+                .expect("the record is stored")
+                .raw_response
+        }
+    };
+    let (streamed_record, plain_record) = (stored(&streamed).await, stored(&plain).await);
+
+    for (streamed, plain) in [(&streamed, &plain), (&streamed_record, &plain_record)] {
+        assert_eq!(streamed["status"], "completed", "{streamed}");
+        assert_eq!(streamed["status"], plain["status"], "{streamed}\n{plain}");
+        assert_eq!(
+            streamed["incomplete_details"], plain["incomplete_details"],
+            "{streamed}\n{plain}"
+        );
+        assert_eq!(
+            item_shapes(streamed),
+            item_shapes(plain),
+            "{streamed}\n{plain}"
+        );
+        assert_eq!(
+            item_errors(streamed),
+            item_errors(plain),
+            "{streamed}\n{plain}"
+        );
+    }
+    server.abort();
+    mcp.stop().await;
+}
+
+/// The same stop for a tool answered in a hosted format (the request's
+/// `web_search_preview` tool, routed to the mock server's `brave_web_search`
+/// by its `builtin_type`): the stream announces the call as a
+/// `web_search_call`, so the call over the limit closes as one too: its
+/// `response.output_item.done` carries a `web_search_call` with the status
+/// `failed`, no `mcp_call` event names its index, and every item announced
+/// is closed under the type it was announced with; the terminal's items and
+/// the record say the same.
+#[tokio::test]
+async fn a_hosted_format_call_over_the_limit_closes_as_the_item_the_stream_announced() {
+    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+    let (upstream, server) = stub_upstream(always_calling_upstream()).await;
+    let mcp_yaml = format!(
+        "servers:\n  - name: mock\n    protocol: streamable\n    url: {}\n    \
+         builtin_type: web_search_preview\n    builtin_tool_name: brave_web_search\n",
+        mcp.url()
+    );
+    let (router, ctx, _dir) = external_router_with_mcp_yaml(&upstream, &mcp_yaml, 5).await;
+    let request = ResponsesRequest {
+        tools: Some(vec![ResponseTool::WebSearchPreview(
+            WebSearchPreviewTool::default(),
+        )]),
+        ..mcp_request(&mcp.url(), Some(1), true, true)
+    };
+
+    let body = stream_body(router.as_ref(), request).await;
+
+    let events = frame_events(&body);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event["type"].as_str(), Some("error" | "response.failed"))),
+        "{body}"
+    );
+    assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
+    let items_by_type = |kind: &str| -> Vec<(u64, String)> {
+        events
+            .iter()
+            .filter(|event| event["type"] == kind)
+            .map(|event| {
+                (
+                    event["output_index"].as_u64().unwrap_or_default(),
+                    event["item"]["type"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                )
+            })
+            .collect()
+    };
+    let announced = items_by_type("response.output_item.added");
+    let closed = items_by_type("response.output_item.done");
+    assert_eq!(
+        announced, closed,
+        "every item is closed under the type it was announced with: {body}"
+    );
+    assert!(
+        announced.iter().any(|(_, kind)| kind == "web_search_call"),
+        "{body}"
+    );
+
+    let skipped = events
+        .iter()
+        .rev()
+        .find(|event| event["type"] == "response.output_item.done")
+        .expect("the last item closed");
+    assert_eq!(skipped["item"]["type"], "web_search_call", "{skipped}");
+    assert_eq!(skipped["item"]["status"], "failed", "{skipped}");
+    let skipped_index = &skipped["output_index"];
+    assert!(
+        !events.iter().any(|event| {
+            event["type"]
+                .as_str()
+                .is_some_and(|kind| kind.starts_with("response.mcp_call."))
+                && &event["output_index"] == skipped_index
+        }),
+        "no mcp_call sub-event closes the hosted item: {body}"
+    );
+
+    let response = &events.last().expect("the terminal")["response"];
+    assert_eq!(response["status"], "completed", "{response}");
+    assert_eq!(
+        response["incomplete_details"],
+        serde_json::json!({ "reason": "max_tool_calls" }),
+        "{response}"
+    );
+    let shape = |kind: &str, status: &str| (kind.to_string(), status.to_string(), String::new());
+    assert_eq!(
+        item_shapes(response),
+        vec![
+            shape("web_search_call", "completed"),
+            shape("web_search_call", "failed"),
+        ],
+        "{response}"
+    );
+    let stored = ctx
+        .response_storage
+        .get_response(&smg_data_connector::ResponseId::from(
+            response["id"].as_str().expect("an id"),
+        ))
+        .await
+        .expect("storage")
+        .expect("the record is stored")
+        .raw_response;
+    assert_eq!(item_shapes(&stored), item_shapes(response), "{stored}");
+    server.abort();
+    mcp.stop().await;
+}
+
+/// An unstreamed turn of two calls over an allowance of one: the first call
+/// runs, the second is the stop. Each call is rendered once, under its own
+/// id: the one that ran `completed`, the other not executed.
+#[tokio::test]
+async fn an_unstreamed_turn_the_allowance_cuts_renders_each_call_once() {
+    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+    let (upstream, server) = stub_upstream(two_call_turn_upstream()).await;
+    let (router, _ctx, _dir) = external_router_with_mcp(&upstream, &mcp, 5).await;
+
+    let request = mcp_request(&mcp.url(), Some(1), false, false);
+    let response = router
+        .route_responses(None, &test_tenant_meta(), request.clone(), &request.model)
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let response: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+
+    assert_eq!(
+        response["incomplete_details"],
+        serde_json::json!({ "reason": "max_tool_calls" }),
+        "{response}"
+    );
+    let shape = |kind: &str, status: &str, name: &str| {
+        (kind.to_string(), status.to_string(), name.to_string())
+    };
+    assert_eq!(
+        item_shapes(&response),
+        vec![
+            shape("mcp_list_tools", "", ""),
+            shape("mcp_call", "completed", "brave_web_search"),
+            shape("mcp_call", "failed", "brave_web_search"),
+        ],
+        "{response}"
+    );
+    let ids: Vec<&str> = response["output"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item["id"].as_str())
+        .collect();
+    let unique: std::collections::HashSet<&str> = ids.iter().copied().collect();
+    assert_eq!(
+        ids.len(),
+        unique.len(),
+        "every item under its own id: {response}"
+    );
+    server.abort();
+    mcp.stop().await;
+}
+
+/// A streamed request holds a call under `require_approval: always` as a
+/// non-streamed request does: the tool does not run, and the call the stream
+/// announced closes as failed.
+#[tokio::test]
+async fn a_streamed_call_that_waits_for_approval_does_not_run() {
+    let (mut mcp, mut worker, router, _dir) = setup_streaming_mcp_test().await;
+    let mut req = streaming_mcp_request(&mcp.url(), None);
+    if let Some(ResponseTool::Mcp(tool)) = req.tools.as_mut().and_then(|tools| tools.first_mut()) {
+        tool.require_approval = Some(RequireApproval::Mode(RequireApprovalMode::Always));
+    }
+
+    let body = stream_body(router.as_ref(), req).await;
+
+    assert_eq!(mcp.call_count(), 0, "the tool ran without its approval");
+    let events = frame_events(&body);
+    let closed_calls: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|event| {
+            event["type"] == "response.output_item.done" && event["item"]["type"] == "mcp_call"
+        })
+        .collect();
+    assert_eq!(
+        closed_calls.len(),
+        1,
+        "one call announced and closed: {body}"
+    );
+    assert_eq!(closed_calls[0]["item"]["status"], "failed");
+    assert!(
+        closed_calls[0]["item"]["error"]
+            .to_string()
+            .contains("requires approval"),
+        "the call failed for its approval: {body}"
+    );
+    assert_eq!(
+        events.last().and_then(|event| event["type"].as_str()),
+        Some("response.completed")
+    );
+
+    worker.stop().await;
+    mcp.stop().await;
+}
+
+/// An upstream nothing listens on: the stream is the one typed error event
+/// with the request's failure, at sequence number 0.
+#[tokio::test]
+async fn an_unreachable_upstream_ends_the_stream_with_the_typed_error_event() {
+    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+    let closed = RefusedAddress::reserve();
+    let (router, _ctx, _dir) = external_router_with_mcp(&closed.http_url(), &mcp, 1).await;
+
+    let body = stream_body(router.as_ref(), streaming_mcp_request(&mcp.url(), None)).await;
+
+    let frames = sse_frames(&body);
+    assert_eq!(frames.len(), 1, "{body}");
+    let event: serde_json::Value =
+        serde_json::from_str(frames[0].strip_prefix("data: ").expect("a data line")).expect("json");
+    assert_eq!(event["type"], "error", "{body}");
+    assert_eq!(event["code"], "upstream_request_failed", "{body}");
+    assert_eq!(event["sequence_number"], 0, "{body}");
+    assert!(
+        event["message"]
+            .as_str()
+            .is_some_and(|m| m.starts_with("Upstream request failed: ")),
+        "{body}"
+    );
+    assert!(event["param"].is_null(), "{body}");
+    mcp.stop().await;
+}
+
+/// The most the gateway reads of an upstream's error body.
+const ERROR_BODY_BOUND: usize = smg_external_router::upstream_body::MAX_ERROR_RESPONSE_SIZE;
+
+/// The API's error envelope as an upstream writes it, its message `len` bytes
+/// long.
+fn refusal_with_a_message_of(len: usize) -> String {
+    format!(
+        r#"{{"error":{{"message":"{}","type":"invalid_request_error","code":"invalid_prompt"}}}}"#,
+        "x".repeat(len)
+    )
+}
+
+/// What a client reads of one request through an OpenAI-mode gateway whose
+/// upstream answers every request with status 400 and `refusal`: the status,
+/// the content type and the whole body. The request carries an MCP tool (the
+/// tool loop) or none (the plain path), and is streamed or not.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+async fn answer_to_a_refusal(
+    refusal: String,
+    tools: bool,
+    stream: bool,
+) -> (StatusCode, String, String) {
+    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+    let (upstream, server) = stub_upstream(axum::routing::post(move || {
+        let refusal = refusal.clone();
+        async move {
+            (
+                StatusCode::BAD_REQUEST,
+                [(CONTENT_TYPE, "application/json")],
+                refusal,
+            )
+        }
+    }))
+    .await;
+    let (router, _ctx, _dir) = external_router_with_mcp(&upstream, &mcp, 5).await;
+    let request = if tools {
+        mcp_request(&mcp.url(), None, stream, false)
+    } else {
+        ResponsesRequest {
+            input: ResponseInput::Text("say something".to_string()),
+            model: "mock-model".to_string(),
+            store: Some(false),
+            stream: Some(stream),
+            ..Default::default()
+        }
+    };
+    let response = router
+        .route_responses(None, &test_tenant_meta(), request.clone(), &request.model)
+        .await;
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    server.abort();
+    mcp.stop().await;
+    (
+        status,
+        content_type,
+        String::from_utf8(bytes.to_vec()).expect("utf-8"),
+    )
+}
+
+/// The gateway's own error envelope in `body`: its type, code and message.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+fn envelope_of(body: &str) -> (String, String, String) {
+    let envelope: serde_json::Value = serde_json::from_str(body).expect("an error envelope");
+    let field = |name: &str| {
+        envelope["error"][name]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    };
+    (field("type"), field("code"), field("message"))
+}
+
+/// The gateway's own envelope where an upstream error body past the bound
+/// would have stood, under the upstream's status 400.
+fn too_large_envelope() -> (String, String, String) {
+    (
+        "invalid_request_error".to_string(),
+        "upstream_error".to_string(),
+        "Upstream error response too large".to_string(),
+    )
+}
+
+/// The plain non-streamed path passes an upstream's error body on under the
+/// upstream's status, as it came. A body past the bound is not passed on: the
+/// client reads the upstream's status with the gateway's own error envelope.
+#[tokio::test]
+async fn the_plain_path_passes_on_an_upstream_error_body_within_the_bound_only() {
+    let within = refusal_with_a_message_of(16);
+    let (status, content_type, body) = answer_to_a_refusal(within.clone(), false, false).await;
+    assert_eq!(
+        (status, content_type.as_str(), body.as_str()),
+        (
+            StatusCode::BAD_REQUEST,
+            "text/plain; charset=utf-8",
+            within.as_str()
+        ),
+        "under the bound"
+    );
+
+    let past = refusal_with_a_message_of(ERROR_BODY_BOUND);
+    let (status, content_type, body) = answer_to_a_refusal(past, false, false).await;
+    assert!(
+        body.len() < 1024,
+        "past the bound: {} bytes are passed on",
+        body.len()
+    );
+    assert_eq!(
+        (status, content_type.as_str(), envelope_of(&body)),
+        (
+            StatusCode::BAD_REQUEST,
+            "application/json",
+            too_large_envelope()
+        ),
+        "past the bound"
+    );
+}
+
+/// The plain streamed path answers an upstream's refusal before any stream
+/// begins, the same way: the body as it came within the bound, the gateway's
+/// own error envelope past it.
+#[tokio::test]
+async fn the_plain_streamed_path_passes_on_an_upstream_error_body_within_the_bound_only() {
+    let within = refusal_with_a_message_of(16);
+    let (status, content_type, body) = answer_to_a_refusal(within.clone(), false, true).await;
+    assert_eq!(
+        (status, content_type.as_str(), body.as_str()),
+        (
+            StatusCode::BAD_REQUEST,
+            "text/plain; charset=utf-8",
+            within.as_str()
+        ),
+        "under the bound"
+    );
+
+    let past = refusal_with_a_message_of(ERROR_BODY_BOUND);
+    let (status, content_type, body) = answer_to_a_refusal(past, false, true).await;
+    assert!(
+        body.len() < 1024,
+        "past the bound: {} bytes are passed on",
+        body.len()
+    );
+    assert_eq!(
+        (status, content_type.as_str(), envelope_of(&body)),
+        (
+            StatusCode::BAD_REQUEST,
+            "application/json",
+            too_large_envelope()
+        ),
+        "past the bound"
+    );
+}
+
+/// The non-streamed tool loop fails on an upstream error status with a
+/// message that names the status and carries the body. Past the bound the
+/// message says the error body was too large, where the body stood.
+#[tokio::test]
+async fn the_tool_loop_carries_an_upstream_error_body_within_the_bound_only() {
+    let within = refusal_with_a_message_of(16);
+    let (status, _, body) = answer_to_a_refusal(within.clone(), true, false).await;
+    assert_eq!(
+        (status, envelope_of(&body)),
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            (
+                "server_error".to_string(),
+                "upstream_error".to_string(),
+                format!("upstream error 400 Bad Request: {within}")
+            )
+        ),
+        "under the bound"
+    );
+
+    let past = refusal_with_a_message_of(ERROR_BODY_BOUND);
+    let (status, _, body) = answer_to_a_refusal(past, true, false).await;
+    assert!(
+        body.len() < 1024,
+        "past the bound: {} bytes are passed on",
+        body.len()
+    );
+    assert_eq!(
+        (status, envelope_of(&body)),
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            (
+                "server_error".to_string(),
+                "upstream_error".to_string(),
+                "upstream error 400 Bad Request: Upstream error response too large".to_string()
+            )
+        ),
+        "past the bound"
+    );
+}
+
+/// The streamed tool loop ends the stream with the one typed error event on
+/// an upstream error status: the upstream's own code and message when the
+/// body carries them. Past the bound the event names the status and says the
+/// error body was too large, where the body stood.
+#[tokio::test]
+async fn the_streamed_tool_loop_carries_an_upstream_error_body_within_the_bound_only() {
+    let (status, _, body) = answer_to_a_refusal(refusal_with_a_message_of(16), true, true).await;
+    assert_eq!(
+        (status, body.as_str()),
+        (
+            StatusCode::OK,
+            "data: {\"type\":\"error\",\"code\":\"invalid_prompt\",\"message\":\"xxxxxxxxxxxxxxxx\",\
+             \"param\":null,\"sequence_number\":0}\n\n"
+        ),
+        "under the bound"
+    );
+
+    let past = refusal_with_a_message_of(ERROR_BODY_BOUND);
+    let (status, _, body) = answer_to_a_refusal(past, true, true).await;
+    assert!(
+        body.len() < 1024,
+        "past the bound: {} bytes are passed on",
+        body.len()
+    );
+    assert_eq!(
+        (status, body.as_str()),
+        (
+            StatusCode::OK,
+            "data: {\"type\":\"error\",\"code\":\"invalid_request_error\",\"message\":\"Upstream error 400 \
+             Bad Request: Upstream error response too large\",\"param\":null,\"sequence_number\":0}\n\n"
+        ),
+        "past the bound"
+    );
+}
+
+/// The Conversations routes refuse a body the way the typed routes do: in
+/// the gateway's envelope with a code, not with the framework's text/plain
+/// answer.
+mod conversation_body_refusals {
+    use axum::{
+        body::Body,
+        http::{header::CONTENT_TYPE, Request, StatusCode},
+    };
+    use tower::ServiceExt;
+
+    use crate::common::{
+        mock_worker::{HealthStatus, MockWorkerConfig, WorkerType},
+        AppTestContext,
+    };
+
+    /// The status, the content type and the body of `body` posted to `path`
+    /// under `content_type` (no header when `None`); a body that is not JSON
+    /// is kept under `not_json`, so an assertion names it. A request that
+    /// cannot be built or a body that cannot be read is the caller's error.
+    async fn post(
+        app: &axum::Router,
+        path: &str,
+        content_type: Option<&str>,
+        body: &[u8],
+    ) -> Result<(StatusCode, String, serde_json::Value), Box<dyn std::error::Error>> {
+        let mut req = Request::builder().method("POST").uri(path);
+        if let Some(content_type) = content_type {
+            req = req.header(CONTENT_TYPE, content_type);
+        }
+        let resp = app
+            .clone()
+            .oneshot(req.body(Body::from(body.to_vec()))?)
+            .await?;
+        let status = resp.status();
+        let response_type = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await?;
+        let answer = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| serde_json::json!({"not_json": String::from_utf8_lossy(&bytes)}));
+        Ok((status, response_type, answer))
+    }
+
+    /// Create, update and create-items each refuse a truncated object, an
+    /// empty body, a body that is not UTF-8 and a body under another or no
+    /// content type with 400 in the envelope: `invalid_json` for a body that
+    /// does not parse, `json_parse_error` for the content type, the codes
+    /// the typed routes carry.
+    #[tokio::test]
+    async fn the_posting_routes_refuse_a_malformed_body_in_the_envelope() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18131,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+        let app = ctx.create_app();
+        let cases: [(Option<&str>, &[u8], &str); 5] = [
+            (Some("application/json"), br#"{"metadata":"#, "invalid_json"),
+            (Some("application/json"), b"", "invalid_json"),
+            (
+                Some("application/json"),
+                b"{\"metadata\":\"\xff\"}",
+                "invalid_json",
+            ),
+            (None, br#"{"metadata":{}}"#, "json_parse_error"),
+            (
+                Some("text/plain"),
+                br#"{"metadata":{}}"#,
+                "json_parse_error",
+            ),
+        ];
+        for path in [
+            "/v1/conversations",
+            "/v1/conversations/conv_missing",
+            "/v1/conversations/conv_missing/items",
+        ] {
+            for (content_type, body, code) in cases.iter().copied() {
+                let case = format!(
+                    "{path} {content_type:?} {:?}",
+                    String::from_utf8_lossy(body)
+                );
+                let (status, response_type, answer) = post(&app, path, content_type, body)
+                    .await
+                    .expect("an answer from the route");
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{case}: {answer}");
+                assert!(
+                    response_type.starts_with("application/json"),
+                    "{case}: {response_type} {answer}"
+                );
+                assert_eq!(
+                    answer["error"]["type"], "invalid_request_error",
+                    "{case}: {answer}"
+                );
+                assert_eq!(answer["error"]["code"], code, "{case}: {answer}");
+            }
+        }
+        ctx.shutdown().await;
+    }
+
+    /// Create, update and create-items refuse a body with a repeated key at
+    /// the door, before a conversation is looked up: 400 `json_parse_error`
+    /// with serde's `duplicate field` words and the place as `param`. The
+    /// keys of `metadata` keep the last value.
+    #[tokio::test]
+    async fn the_posting_routes_refuse_a_repeated_key_outside_metadata() {
+        let ctx = AppTestContext::new(vec![]).await;
+        let app = ctx.create_app();
+        let json = Some("application/json");
+        let twice = r#"{"metadata":{"a":"1"},"metadata":{"a":"2"}}"#;
+        let cases = [
+            ("/v1/conversations", twice, serde_json::Value::Null),
+            (
+                "/v1/conversations/conv_missing",
+                twice,
+                serde_json::Value::Null,
+            ),
+            (
+                "/v1/conversations/conv_missing/items",
+                r#"{"items":[{"type":"message","role":"user","content":[{"type":"input_text","text":"a","text":"b"}]}]}"#,
+                serde_json::json!("items[0].content[0]"),
+            ),
+        ];
+        for (path, body, param) in cases {
+            let (status, _, answer) = post(&app, path, json, body.as_bytes())
+                .await
+                .expect("an answer from the route");
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path} {body}: {answer}");
+            assert_eq!(
+                answer["error"]["code"], "json_parse_error",
+                "{path} {body}: {answer}"
+            );
+            assert_eq!(answer["error"]["param"], param, "{path} {body}: {answer}");
+            assert!(
+                answer["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("duplicate field `")),
+                "{path} {body}: {answer}"
+            );
+        }
+        let (status, _, created) = post(
+            &app,
+            "/v1/conversations",
+            json,
+            br#"{"metadata":{"a":"1","a":"2"}}"#,
+        )
+        .await
+        .expect("an answer from the route");
+        assert_eq!(status, StatusCode::OK, "{created}");
+        assert_eq!(created["metadata"]["a"], "2", "{created}");
+        ctx.shutdown().await;
+    }
+}

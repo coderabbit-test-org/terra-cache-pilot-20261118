@@ -1,0 +1,3858 @@
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+    sync::{Arc, LazyLock},
+};
+
+use serde::{
+    de::{
+        self,
+        value::{MapDeserializer, SeqAccessDeserializer},
+        DeserializeSeed, SeqAccess, Visitor,
+    },
+    Deserialize, Deserializer, Serialize,
+};
+use serde_json::{Map, Value};
+use validator;
+
+use crate::strict_value::StrictValue;
+
+// ============================================================================
+// Default value helpers
+// ============================================================================
+
+/// A typed request as a `Value` whose `f32` fields print as the shortest
+/// decimal that round-trips the parsed value. `serde_json::to_value` stores
+/// an `f32` widened to `f64`, so a client's `"top_p": 0.95` would go
+/// upstream as `0.949999988079071`; the writer prints the `f32` itself, so
+/// encode with it and parse that back. This restores what the parsed `f32`
+/// holds, not the client's original token: precision the parse discarded
+/// (`0.950000001` is the same `f32` as `0.95`) is gone, and numbers kept
+/// as `Value` (an `other` map, nested values) were normalized at parse time
+/// (`1e2` is `100.0`, `-0` is `-0.0`).
+pub fn to_value_exact<T: Serialize>(value: &T) -> serde_json::Result<Value> {
+    serde_json::from_slice(&serde_json::to_vec(value)?)
+}
+
+/// The routing text of a JSON `input`: the string itself, an array's string
+/// members joined on spaces, nothing for any other shape.
+pub(crate) fn routing_text_of_input(input: &Value) -> String {
+    match input {
+        Value::String(s) => s.clone(),
+        Value::Array(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => String::new(),
+    }
+}
+
+/// Default model for endpoints where model is optional (e.g., /generate).
+/// Uses UNKNOWN_MODEL_ID so routers treat it as "any available worker."
+pub fn default_unknown_model() -> String {
+    super::UNKNOWN_MODEL_ID.to_string()
+}
+
+/// Serde skip predicate: the wildcard model id is a gateway-internal
+/// placeholder for "the request named no model", never a value to forward.
+/// A model-less SGLang-native `/generate` (slime, verl) must reach the
+/// engine without a `model` key, exactly as the client sent it; a
+/// model-aware upstream (a sidecar in front of another gateway) would
+/// otherwise look up a model called "unknown" and answer 404.
+pub fn is_unknown_model(model: &str) -> bool {
+    model == super::UNKNOWN_MODEL_ID
+}
+
+/// Helper function for serde default value (returns true)
+pub fn default_true() -> bool {
+    true
+}
+
+/// Helper for `#[serde(skip_serializing_if = "is_false")]` on default-`false` flags.
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes &T"
+)]
+pub fn is_false(v: &bool) -> bool {
+    !*v
+}
+
+/// Helper for `#[serde(skip_serializing_if = "is_true")]` on default-`true` flags.
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if passes &T"
+)]
+pub fn is_true(v: &bool) -> bool {
+    *v
+}
+
+/// Serializes a request's map with its keys sorted. A standard map iterates in an order of its
+/// own for every map built, so two equal requests would go upstream as two different bodies.
+/// Every `HashMap` field of a request type the typed route writes upstream must name this.
+#[expect(
+    clippy::ref_option,
+    reason = "serde's `serialize_with` hands the field to its serializer by reference"
+)]
+pub(crate) fn serialize_with_sorted_keys<K, V, S>(
+    map: &Option<HashMap<K, V>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    K: Ord + Serialize,
+    V: Serialize,
+    S: serde::Serializer,
+{
+    let Some(map) = map else {
+        return serializer.serialize_none();
+    };
+    let mut entries: Vec<(&K, &V)> = map.iter().collect();
+    entries.sort_unstable_by_key(|&(key, _)| key);
+    serializer.collect_map(entries)
+}
+
+/// Deserialize a bool that also accepts JSON `null` (mapped to `false`).
+///
+/// Use with `#[serde(default, deserialize_with = "deserialize_null_as_false")]`
+/// on fields that the OpenAI spec defines as `Optional[bool]` defaulting to `false`.
+pub fn deserialize_null_as_false<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<bool>::deserialize(deserializer).map(|opt| opt.unwrap_or(false))
+}
+
+/// Deserialize a list that also accepts JSON `null` (mapped to the empty list).
+///
+/// Use with `#[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]`
+/// on always-present lists an upstream may write as `null`.
+pub fn deserialize_null_as_empty_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<Vec<T>>::deserialize(deserializer).map(Option::unwrap_or_default)
+}
+
+/// Deserialize a map that also accepts JSON `null` (mapped to the empty map).
+///
+/// Use with `#[serde(default, deserialize_with = "deserialize_null_as_empty_map")]`
+/// on always-present maps an upstream may write as `null`.
+pub fn deserialize_null_as_empty_map<'de, D, K, V>(
+    deserializer: D,
+) -> Result<HashMap<K, V>, D::Error>
+where
+    D: Deserializer<'de>,
+    K: Deserialize<'de> + Eq + std::hash::Hash,
+    V: Deserialize<'de>,
+{
+    Option::<HashMap<K, V>>::deserialize(deserializer).map(Option::unwrap_or_default)
+}
+
+/// Deserialize an `Option<bool>` where JSON `null` means the default `true`.
+///
+/// Use with `#[serde(default = "default_true", deserialize_with = "deserialize_null_as_true")]`
+/// on extension fields that default to `true`, so a client that serializes an
+/// unset option as `null` gets the default instead of a rejected request.
+pub fn deserialize_null_as_true<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<bool>::deserialize(deserializer).map(|opt| opt.unwrap_or(true))
+}
+
+// ============================================================================
+// GenerationRequest Trait
+// ============================================================================
+
+/// The request fields that partition a backend's prefix cache.
+///
+/// Engines namespace their prefix (KV) caches by client-supplied values: a
+/// cache salt, an extra classification key, and the LoRA adapter. Two
+/// requests that share a prompt but differ in any of these can never share
+/// cached blocks on the engine, so routing derives its cache namespace from
+/// this projection. All fields absent means the request is unpartitioned.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CachePartition<'a> {
+    pub cache_salt: Option<&'a str>,
+    pub extra_key: Option<&'a str>,
+    pub lora_path: Option<&'a str>,
+}
+
+impl CachePartition<'_> {
+    /// True when no partitioning field is set. An empty string is "unset":
+    /// engines treat an empty salt or adapter as absent, so it must not
+    /// split the request off from the shared unpartitioned cache.
+    pub fn is_empty(&self) -> bool {
+        [self.cache_salt, self.extra_key, self.lora_path]
+            .iter()
+            .all(|field| field.is_none_or(str::is_empty))
+    }
+}
+
+/// Trait for unified access to generation request properties
+/// Implemented by ChatCompletionRequest, CompletionRequest, GenerateRequest,
+/// EmbeddingRequest, RerankRequest, and ResponsesRequest
+pub trait GenerationRequest: Send + Sync {
+    /// Check if the request is for streaming
+    fn is_stream(&self) -> bool;
+
+    /// Get the model name if specified
+    fn get_model(&self) -> Option<&str>;
+
+    /// Extract text content for routing decisions
+    fn extract_text_for_routing(&self) -> String;
+
+    /// Token IDs for routing when the request is already tokenized.
+    /// Some(_) routes on the token radix tree instead of the decimal-string
+    /// rendering of the same IDs.
+    fn routing_tokens(&self) -> Option<&[i32]> {
+        None
+    }
+
+    /// Client-provided request id, when the protocol carries one. Routing may
+    /// derive a session-affinity key from it; a batch reports its first id.
+    fn rid(&self) -> Option<&str> {
+        None
+    }
+
+    /// The most tokens the answer may hold, as the request states the
+    /// limit. `None` where the body states none, and for a protocol that
+    /// generates no text. A request states one limit, whatever its count of
+    /// samples or prompts: the limit of one answer.
+    fn max_output_tokens(&self) -> Option<u32> {
+        None
+    }
+
+    /// The fields that partition the backend's prefix cache for this request.
+    /// Protocols without such fields are unpartitioned.
+    fn cache_partition(&self) -> CachePartition<'_> {
+        CachePartition::default()
+    }
+}
+
+// ============================================================================
+// String/Array Utilities
+// ============================================================================
+
+/// A type that can be either a single string or an array of strings
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum StringOrArray {
+    String(String),
+    Array(Vec<String>),
+}
+
+impl StringOrArray {
+    /// Get the number of items in the StringOrArray
+    pub fn len(&self) -> usize {
+        match self {
+            StringOrArray::String(_) => 1,
+            StringOrArray::Array(arr) => arr.len(),
+        }
+    }
+
+    /// Check if the StringOrArray is empty
+    pub fn is_empty(&self) -> bool {
+        match self {
+            StringOrArray::String(s) => s.is_empty(),
+            StringOrArray::Array(arr) => arr.is_empty(),
+        }
+    }
+
+    /// Convert to a vector of strings (clones the data)
+    pub fn to_vec(&self) -> Vec<String> {
+        match self {
+            StringOrArray::String(s) => vec![s.clone()],
+            StringOrArray::Array(arr) => arr.clone(),
+        }
+    }
+
+    /// Returns an iterator over string references without cloning.
+    /// Use this instead of `to_vec()` when you only need to iterate.
+    pub fn iter(&self) -> StringOrArrayIter<'_> {
+        StringOrArrayIter {
+            inner: self,
+            index: 0,
+        }
+    }
+
+    /// Returns the first string, or None if empty
+    pub fn first(&self) -> Option<&str> {
+        match self {
+            StringOrArray::String(s) => {
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s)
+                }
+            }
+            StringOrArray::Array(arr) => arr.first().map(|s| s.as_str()),
+        }
+    }
+}
+
+/// Iterator over StringOrArray that yields string references without cloning
+pub struct StringOrArrayIter<'a> {
+    inner: &'a StringOrArray,
+    index: usize,
+}
+
+impl<'a> Iterator for StringOrArrayIter<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.inner {
+            StringOrArray::String(s) => {
+                if self.index == 0 {
+                    self.index = 1;
+                    Some(s.as_str())
+                } else {
+                    None
+                }
+            }
+            StringOrArray::Array(arr) => {
+                if self.index < arr.len() {
+                    let item = &arr[self.index];
+                    self.index += 1;
+                    Some(item.as_str())
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = match self.inner {
+            StringOrArray::String(_) => 1 - self.index,
+            StringOrArray::Array(arr) => arr.len() - self.index,
+        };
+        (remaining, Some(remaining))
+    }
+}
+
+impl<'a> ExactSizeIterator for StringOrArrayIter<'a> {}
+
+// ============================================================================
+// Validation helpers
+// ============================================================================
+
+/// A validation error with the public API's `code` and message.
+pub(crate) fn invalid(
+    code: &'static str,
+    message: impl Into<Cow<'static, str>>,
+) -> validator::ValidationError {
+    let mut e = validator::ValidationError::new(code);
+    e.message = Some(message.into());
+    e
+}
+
+/// The parameter under which a validation error of a rule checked across
+/// fields names the field the refusal is about: the error envelope's
+/// `param`. The validator crate files such a rule's error under the whole
+/// request (`__all__`), a key that names no field.
+pub(crate) const FIELD_PARAM: &str = "field";
+
+/// [`invalid`] for a rule checked across fields, naming the field the
+/// refusal is about (the envelope's `param`); the message names it too, in
+/// the public API's words.
+pub(crate) fn invalid_at(
+    field: impl Into<String>,
+    code: &'static str,
+    message: impl Into<Cow<'static, str>>,
+) -> validator::ValidationError {
+    on_field(invalid(code, message), field)
+}
+
+/// `error`, naming `field` as the field it is about (see [`invalid_at`]).
+pub(crate) fn on_field(
+    mut error: validator::ValidationError,
+    field: impl Into<String>,
+) -> validator::ValidationError {
+    error.add_param(Cow::Borrowed(FIELD_PARAM), &field.into());
+    error
+}
+
+/// The refusal of a tool the model calls by name (a function, a custom tool,
+/// a namespace or one of its members) declared with an empty name at `field`,
+/// in the public API's words: the model can be made to call such a tool, and
+/// the client cannot dispatch a call that names nothing.
+pub(crate) fn empty_tool_name(field: &str) -> validator::ValidationError {
+    invalid(
+        "empty_string",
+        format!(
+            "Invalid '{field}': empty string. Expected a string with minimum length 1, but got \
+             an empty string instead."
+        ),
+    )
+}
+
+/// The JSON type of a value, for validation messages (`a string`, `an array`, ...).
+pub fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
+/// Validates `logit_bias` as the public API bounds it: every key a
+/// non-negative integer token id, no two keys spelling one id (`"5"` and
+/// `"05"` would reach an engine as one entry with either bias), every bias
+/// within -100..=100 (a bias of -100 bans the token, 100 forces it). Used by
+/// the chat and the completion request; the serving path bounds the ids by
+/// the model's vocabulary before the map reaches an engine.
+pub fn validate_logit_bias(bias: &HashMap<String, f32>) -> Result<(), validator::ValidationError> {
+    // The key first seen for each token id.
+    let mut keys_by_id = HashMap::with_capacity(bias.len());
+    for (key, bias) in bias {
+        let Some(id) = key.parse::<i32>().ok().filter(|id| *id >= 0) else {
+            return Err(invalid(
+                "logit_bias_invalid_key",
+                format!(
+                    "Invalid key in 'logit_bias': '{key}'; keys must be non-negative integer token \
+                     ids"
+                ),
+            ));
+        };
+        if let Some(other) = keys_by_id.insert(id, key.as_str()) {
+            let (first, second) = if other < key.as_str() {
+                (other, key.as_str())
+            } else {
+                (key.as_str(), other)
+            };
+            return Err(invalid(
+                "logit_bias_duplicate_key",
+                format!(
+                    "Invalid key in 'logit_bias': '{first}' and '{second}' both name token {id}; \
+                     each token takes one bias"
+                ),
+            ));
+        }
+        let code = match *bias {
+            b if b > 100.0 => "integer_above_max_value",
+            b if b < -100.0 => "integer_below_min_value",
+            _ => continue,
+        };
+        return Err(invalid(
+            code,
+            format!(
+                "Invalid value for 'logit_bias': token '{key}' has bias {bias}; each bias must be \
+                 between -100 and 100."
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Validates stop sequences (max 4, non-empty strings)
+/// Used by both ChatCompletionRequest and ResponsesRequest
+pub fn validate_stop(stop: &StringOrArray) -> Result<(), validator::ValidationError> {
+    match stop {
+        StringOrArray::String(s) => {
+            if s.is_empty() {
+                return Err(validator::ValidationError::new(
+                    "stop sequences cannot be empty",
+                ));
+            }
+        }
+        StringOrArray::Array(arr) => {
+            if arr.len() > 4 {
+                return Err(invalid(
+                    "array_above_max_length",
+                    format!(
+                        "Invalid 'stop': array too long. Expected an array with maximum length 4, but got an array with length {} instead.",
+                        arr.len()
+                    ),
+                ));
+            }
+            for s in arr {
+                if s.is_empty() {
+                    return Err(validator::ValidationError::new(
+                        "stop sequences cannot be empty",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// ============================================================================
+// Content Parts (for multimodal messages)
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, PartialEq, schemars::JsonSchema)]
+#[serde(tag = "type")]
+pub enum ContentPart {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image_url")]
+    ImageUrl { image_url: ImageUrl },
+    #[serde(rename = "audio_url")]
+    AudioUrl { audio_url: AudioUrl },
+    #[serde(rename = "input_audio")]
+    InputAudio { input_audio: InputAudio },
+    #[serde(rename = "video_url")]
+    VideoUrl { video_url: VideoUrl },
+    /// An assistant turn's refusal, as the public API returns one and a client
+    /// replays it in the history; the renderers read it as the turn's text.
+    #[serde(rename = "refusal")]
+    Refusal { refusal: String },
+    /// Pass through unknown content objects to HTTP backends; gRPC backends
+    /// reject this variant. A known `type` whose body does not fit it is no
+    /// unknown part: it refuses with serde's reason for the field.
+    #[serde(untagged)]
+    Unknown(Map<String, Value>),
+}
+
+/// The parts the gateway knows, read by their `type` as serde reads a tagged
+/// enum, so a malformed one carries serde's reason for the field.
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum KnownContentPart {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image_url")]
+    ImageUrl { image_url: ImageUrl },
+    #[serde(rename = "audio_url")]
+    AudioUrl { audio_url: AudioUrl },
+    #[serde(rename = "input_audio")]
+    InputAudio { input_audio: InputAudio },
+    #[serde(rename = "video_url")]
+    VideoUrl { video_url: VideoUrl },
+    #[serde(rename = "refusal")]
+    Refusal { refusal: String },
+}
+
+impl KnownContentPart {
+    /// The `type` names a kind the gateway knows.
+    fn names(kind: &str) -> bool {
+        matches!(
+            kind,
+            "text" | "image_url" | "audio_url" | "input_audio" | "video_url" | "refusal"
+        )
+    }
+}
+
+impl From<KnownContentPart> for ContentPart {
+    fn from(part: KnownContentPart) -> Self {
+        match part {
+            KnownContentPart::Text { text } => Self::Text { text },
+            KnownContentPart::ImageUrl { image_url } => Self::ImageUrl { image_url },
+            KnownContentPart::AudioUrl { audio_url } => Self::AudioUrl { audio_url },
+            KnownContentPart::InputAudio { input_audio } => Self::InputAudio { input_audio },
+            KnownContentPart::VideoUrl { video_url } => Self::VideoUrl { video_url },
+            KnownContentPart::Refusal { refusal } => Self::Refusal { refusal },
+        }
+    }
+}
+
+/// A part is an object; one whose `type` the gateway knows must fit that
+/// kind (its refusal is serde's, naming the field's reason), any other is
+/// kept whole for the backends that read it.
+impl<'de> Deserialize<'de> for ContentPart {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let fields = Map::<String, Value>::deserialize(deserializer)?;
+        Self::from_fields(fields).map_err(de::Error::custom)
+    }
+}
+
+/// Serde's reason for a known part's refusal, opening with serde's words so
+/// a reader keeps its code: a field missing from the kind's body is named
+/// under the kind (`missing field `image_url.url``), any other reason names
+/// the body after itself (`..., in `image_url``), since serde's own path
+/// stops at the message a tagged enum buffers.
+fn known_part_reason(kind: &str, error: &serde_json::Error) -> String {
+    let reason = error.to_string();
+    let missing = reason
+        .strip_prefix("missing field `")
+        .and_then(|rest| rest.strip_suffix('`'));
+    match missing {
+        Some(field) if field != kind => format!("missing field `{kind}.{field}`"),
+        Some(_) => reason,
+        None => format!("{reason}, in `{kind}`"),
+    }
+}
+
+impl ContentPart {
+    /// The part an object's fields make, for a reader that holds them already.
+    pub(crate) fn from_fields(fields: Map<String, Value>) -> Result<Self, serde_json::Error> {
+        let kind = match fields.get("type").and_then(Value::as_str) {
+            Some(kind) if KnownContentPart::names(kind) => kind.to_string(),
+            _ => return Ok(Self::Unknown(fields)),
+        };
+        serde_json::from_value::<KnownContentPart>(Value::Object(fields))
+            .map(Self::from)
+            .map_err(|error| de::Error::custom(known_part_reason(&kind, &error)))
+    }
+
+    /// The text a renderer reads from the part: a text part's text, a
+    /// refusal's text (the engines' own servers render a refusal part as the
+    /// turn's text); none for a media or an unknown part.
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            ContentPart::Text { text } | ContentPart::Refusal { refusal: text } => Some(text),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
+pub struct ImageUrl {
+    /// The image's URL or `data:` URL, shared with every reader of the
+    /// request (the media plan among them) instead of copied.
+    pub url: Arc<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>, // "auto", "low", or "high"
+    /// MiniMax-M3 extension: cap the image's long side before preprocessing.
+    ///
+    /// For M3 router preprocessing, any positive cap is accepted (default 2016).
+    /// Branch on the source size: shrink if its long side exceeds the cap;
+    /// otherwise raise a short side below 112. Then round both sides to the
+    /// nearest multiple of 28, so the aligned long side can exceed the cap.
+    /// Outputs above 12,845,056 pixels are rejected; the legacy `max_pixels`
+    /// area shrink is not applied a second time. Other families retain their
+    /// connector's positive-multiple-of-28 restriction.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_long_side_pixel: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
+pub struct AudioUrl {
+    /// The clip's URL or `data:` URL, shared with its readers.
+    pub url: Arc<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
+pub struct InputAudio {
+    /// Base64-encoded audio bytes, shared with the readers that decode them.
+    pub data: Arc<String>,
+    /// Encoded audio format. The OpenAI Chat API supports `wav` and `mp3`.
+    pub format: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
+pub struct VideoUrl {
+    /// The clip's URL or `data:` URL, shared with its readers.
+    pub url: Arc<String>,
+    /// MiniMax-M3 extension: frames per second to sample the clip at.
+    ///
+    /// Valid range is 0.2 to 5.0 inclusive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fps: Option<f64>,
+    /// MiniMax-M3 extension: cap each sampled frame's long side.
+    ///
+    /// Must be a multiple of the vision patch factor (28) within 150..=3584.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_long_side_pixel: Option<u32>,
+}
+
+// ============================================================================
+// Response Format (for structured outputs)
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type")]
+pub enum ResponseFormat {
+    #[serde(rename = "text")]
+    Text,
+    #[serde(rename = "json_object")]
+    JsonObject,
+    // The schema rides behind a pointer, as the tag's object below does: a
+    // format is then two words wherever a request or a route task holds one.
+    // Inline, the schema's 128 bytes had put the Gateway's chat route task,
+    // which holds a request's format three times over its awaits, over the
+    // allocator's 3,584-byte class edge on every chat request. A text or
+    // json_object format allocates nothing. No `///` here: the variant's doc
+    // would become its description in the generated OpenAPI document.
+    #[serde(rename = "json_schema")]
+    JsonSchema { json_schema: Box<JsonSchemaFormat> },
+    /// A structural tag: JSON held to a schema between the tags it names, free
+    /// text around them. The engines' grammar compilers read the object itself,
+    /// in more than one spelling (`structures` with `triggers`, or a `format`),
+    /// so it is carried as it arrived and nothing in it is judged here.
+    #[serde(rename = "structural_tag")]
+    StructuralTag {
+        /// Every key but `type`, in the order they arrived; written back the
+        /// same.
+        // Behind a pointer, as the schema above is.
+        #[serde(flatten)]
+        spec: Box<Map<String, Value>>,
+    },
+}
+
+/// The kind a `response_format` object names under `type`, read with the
+/// words serde uses for a tag: an unknown name lists the four.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseFormatKind {
+    Text,
+    JsonObject,
+    JsonSchema,
+    StructuralTag,
+}
+
+impl ResponseFormatKind {
+    const ALL: [ResponseFormatKind; 4] = [
+        ResponseFormatKind::Text,
+        ResponseFormatKind::JsonObject,
+        ResponseFormatKind::JsonSchema,
+        ResponseFormatKind::StructuralTag,
+    ];
+
+    /// The name under `type`: the variant's rename on [`ResponseFormat`].
+    const fn name(self) -> &'static str {
+        match self {
+            ResponseFormatKind::Text => "text",
+            ResponseFormatKind::JsonObject => "json_object",
+            ResponseFormatKind::JsonSchema => "json_schema",
+            ResponseFormatKind::StructuralTag => "structural_tag",
+        }
+    }
+}
+
+/// The names an unknown kind's error lists, in the variants' order.
+const RESPONSE_FORMAT_KINDS: &[&str] = &[
+    ResponseFormatKind::Text.name(),
+    ResponseFormatKind::JsonObject.name(),
+    ResponseFormatKind::JsonSchema.name(),
+    ResponseFormatKind::StructuralTag.name(),
+];
+
+impl<'de> Deserialize<'de> for ResponseFormatKind {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct KindVisitor;
+
+        impl Visitor<'_> for KindVisitor {
+            type Value = ResponseFormatKind;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("variant identifier")
+            }
+
+            fn visit_str<E: de::Error>(self, name: &str) -> Result<Self::Value, E> {
+                ResponseFormatKind::ALL
+                    .into_iter()
+                    .find(|kind| kind.name() == name)
+                    .ok_or_else(|| E::unknown_variant(name, RESPONSE_FORMAT_KINDS))
+            }
+        }
+
+        deserializer.deserialize_identifier(KindVisitor)
+    }
+}
+
+/// The object is read field by field. serde's derive for an internally
+/// tagged enum buffers the whole object before it picks the variant, so a
+/// JSON schema would be built twice (the buffer, then the `Value`); this
+/// reads `type` and `json_schema` in whatever order they arrive and builds
+/// the schema once: straight into its struct once the kind is known to want
+/// it, skipped once the kind is known not to, and kept as it arrived only
+/// when it arrives before the kind (a `KeptSchema`: an object as its entries
+/// in order, any other shape as a `Value`, for the schema's own derive to
+/// read at the end, so a repeated or malformed field is the derive's error
+/// in either order and ignored by the two kinds that carry no schema). A
+/// structural tag is every other key, so those are kept as `Value`s while
+/// the kind is unknown, dropped once it is known not to be a tag, and read
+/// into the tag's object once it is (a `json_schema` kept before the kind
+/// joins the object as the value it was). The
+/// accepted shapes and the errors are the derive's: a missing `type`, an
+/// unknown kind, a missing or malformed `json_schema` for the kind that
+/// wants it, a duplicate key; a kind that carries no schema ignores a
+/// `json_schema` field of any shape, and every other key is ignored by the
+/// three kinds that are not a tag. One
+/// corner differs in text alone: with `type` first, a malformed schema
+/// followed by a repeated `type` reads the schema's error here, because the
+/// schema is read the moment the kind is known (the point of this reader),
+/// where the derive, still buffering, reads a duplicate `type`; both refuse
+/// the body.
+impl<'de> Deserialize<'de> for ResponseFormat {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        enum Field {
+            Kind,
+            JsonSchema,
+            /// A key no kind of the three reads, which a structural tag keeps.
+            Other(String),
+        }
+
+        impl<'de> Deserialize<'de> for Field {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                struct FieldVisitor;
+
+                impl Visitor<'_> for FieldVisitor {
+                    type Value = Field;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                        formatter.write_str("field identifier")
+                    }
+
+                    fn visit_str<E: de::Error>(self, name: &str) -> Result<Self::Value, E> {
+                        Ok(match name {
+                            "type" => Field::Kind,
+                            "json_schema" => Field::JsonSchema,
+                            other => Field::Other(other.to_owned()),
+                        })
+                    }
+                }
+
+                deserializer.deserialize_identifier(FieldVisitor)
+            }
+        }
+
+        /// What was read under `json_schema` before the end of the object.
+        enum Schema {
+            /// Read straight into its struct: the kind was known to want it.
+            Read(JsonSchemaFormat),
+            /// Kept as read: the kind was not known yet.
+            Kept(KeptSchema),
+            /// Skipped: the kind was known not to want it.
+            Skipped,
+        }
+
+        struct FormatVisitor;
+
+        impl<'de> Visitor<'de> for FormatVisitor {
+            type Value = ResponseFormat;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("internally tagged enum ResponseFormat")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                // serde's derive also reads the kind and then the content
+                // from a sequence; the shape and its errors are kept
+                let kind: ResponseFormatKind = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::missing_field("type"))?;
+                let (format, read) = match kind {
+                    ResponseFormatKind::Text => (ResponseFormat::Text, 0),
+                    ResponseFormatKind::JsonObject => (ResponseFormat::JsonObject, 0),
+                    ResponseFormatKind::JsonSchema => {
+                        let json_schema = seq.next_element()?.ok_or_else(|| {
+                            de::Error::invalid_length(
+                                0,
+                                &"struct variant ResponseFormat::JsonSchema with 1 element",
+                            )
+                        })?;
+                        (ResponseFormat::JsonSchema { json_schema }, 1)
+                    }
+                    ResponseFormatKind::StructuralTag => {
+                        let spec = seq.next_element()?.ok_or_else(|| {
+                            de::Error::invalid_length(
+                                0,
+                                &"struct variant ResponseFormat::StructuralTag with 1 element",
+                            )
+                        })?;
+                        (ResponseFormat::StructuralTag { spec }, 1)
+                    }
+                };
+                let mut extra = 0;
+                while seq.next_element::<de::IgnoredAny>()?.is_some() {
+                    extra += 1;
+                }
+                if extra > 0 {
+                    let expected: &dyn de::Expected = if read == 1 {
+                        &"1 element in sequence"
+                    } else {
+                        &"0 elements in sequence"
+                    };
+                    return Err(de::Error::invalid_length(read + extra, expected));
+                }
+                Ok(format)
+            }
+
+            fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut kind: Option<ResponseFormatKind> = None;
+                let mut schema: Option<Schema> = None;
+                let mut schema_twice = false;
+                // the other keys, a structural tag's object: kept while the
+                // kind may still be one
+                let mut spec = Map::new();
+                while let Some(field) = map.next_key::<Field>()? {
+                    match field {
+                        Field::Kind => {
+                            if kind.is_some() {
+                                return Err(de::Error::duplicate_field("type"));
+                            }
+                            kind = Some(map.next_value()?);
+                            if kind != Some(ResponseFormatKind::StructuralTag) {
+                                spec.clear();
+                            }
+                        }
+                        Field::JsonSchema if kind == Some(ResponseFormatKind::StructuralTag) => {
+                            // a repeat of one read before the kind: the last
+                            // value, in the first one's place
+                            schema_twice |= schema.is_some();
+                            spec.insert("json_schema".to_owned(), map.next_value()?);
+                        }
+                        Field::JsonSchema => {
+                            if schema.is_some() {
+                                // the derive reports the duplicate once the
+                                // object is read, whatever the second value;
+                                // a tag keeps the last, in the first one's place
+                                schema_twice = true;
+                                if kind.is_none() {
+                                    spec.insert("json_schema".to_owned(), map.next_value()?);
+                                } else {
+                                    map.next_value::<de::IgnoredAny>()?;
+                                }
+                                continue;
+                            }
+                            schema = Some(match kind {
+                                Some(ResponseFormatKind::JsonSchema) => {
+                                    Schema::Read(map.next_value()?)
+                                }
+                                Some(_) => {
+                                    map.next_value::<de::IgnoredAny>()?;
+                                    Schema::Skipped
+                                }
+                                None => {
+                                    // the key's place, kept for a tag; the
+                                    // value fills it once the kind is read
+                                    spec.insert("json_schema".to_owned(), Value::Null);
+                                    Schema::Kept(map.next_value()?)
+                                }
+                            });
+                        }
+                        Field::Other(name) => match kind {
+                            None | Some(ResponseFormatKind::StructuralTag) => {
+                                spec.insert(name, map.next_value()?);
+                            }
+                            Some(_) => {
+                                map.next_value::<de::IgnoredAny>()?;
+                            }
+                        },
+                    }
+                }
+                let kind = kind.ok_or_else(|| de::Error::missing_field("type"))?;
+                Ok(match kind {
+                    ResponseFormatKind::Text => ResponseFormat::Text,
+                    ResponseFormatKind::JsonObject => ResponseFormat::JsonObject,
+                    ResponseFormatKind::StructuralTag => {
+                        // the place kept before the kind takes its value; a
+                        // repeat of the key already took it
+                        if let Some(Schema::Kept(kept)) = schema.filter(|_| !schema_twice) {
+                            spec.insert("json_schema".to_owned(), Value::from(kept));
+                        }
+                        ResponseFormat::StructuralTag {
+                            spec: Box::new(spec),
+                        }
+                    }
+                    ResponseFormatKind::JsonSchema => {
+                        let json_schema = match schema {
+                            Some(Schema::Read(json_schema)) => json_schema,
+                            Some(Schema::Kept(KeptSchema::Object(entries))) => {
+                                // the derive's own visitor reads the entries as they
+                                // arrived, duplicates included, and raises its error first
+                                JsonSchemaFormat::deserialize(
+                                    MapDeserializer::<_, serde_json::Error>::new(
+                                        entries.into_iter(),
+                                    ),
+                                )
+                                .map_err(de::Error::custom)?
+                            }
+                            Some(Schema::Kept(KeptSchema::Other(value))) => {
+                                serde_json::from_value(value).map_err(de::Error::custom)?
+                            }
+                            Some(Schema::Skipped) | None => {
+                                return Err(de::Error::missing_field("json_schema"))
+                            }
+                        };
+                        if schema_twice {
+                            // the derive reads the first value before it meets the
+                            // second key: the value's own error comes first
+                            return Err(de::Error::duplicate_field("json_schema"));
+                        }
+                        ResponseFormat::JsonSchema {
+                            json_schema: Box::new(json_schema),
+                        }
+                    }
+                })
+            }
+        }
+
+        deserializer.deserialize_any(FormatVisitor)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct JsonSchemaFormat {
+    pub name: String,
+    pub schema: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
+    /// What the format is for, as the client describes it to the model.
+    // Declared last and defaulted, so the derive's positional form keeps
+    // reading `[name, schema, strict]` as it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// A `json_schema` object that arrived before the kind, kept for the end of
+/// the enclosing object: an object's entries as they arrived (duplicates
+/// included), so that the schema's own derive reads them at the end and raises
+/// its own error first, whatever it is, exactly as it does when `type` comes
+/// first; any other shape is kept as a `Value`, for the kind to accept or
+/// refuse. The two kinds that carry no schema drop it unread.
+enum KeptSchema {
+    Object(Vec<(String, Value)>),
+    Other(Value),
+}
+
+/// The kept schema as the value it was, for a structural tag's object.
+impl From<KeptSchema> for Value {
+    fn from(kept: KeptSchema) -> Self {
+        match kept {
+            KeptSchema::Object(entries) => Value::Object(entries.into_iter().collect()),
+            KeptSchema::Other(value) => value,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for KeptSchema {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct KeptVisitor;
+
+        impl<'de> Visitor<'de> for KeptVisitor {
+            type Value = KeptSchema;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("any valid JSON value")
+            }
+
+            fn visit_unit<E: de::Error>(self) -> Result<KeptSchema, E> {
+                Ok(KeptSchema::Other(Value::Null))
+            }
+
+            fn visit_bool<E: de::Error>(self, value: bool) -> Result<KeptSchema, E> {
+                Ok(KeptSchema::Other(Value::Bool(value)))
+            }
+
+            fn visit_i64<E: de::Error>(self, value: i64) -> Result<KeptSchema, E> {
+                Ok(KeptSchema::Other(Value::from(value)))
+            }
+
+            fn visit_u64<E: de::Error>(self, value: u64) -> Result<KeptSchema, E> {
+                Ok(KeptSchema::Other(Value::from(value)))
+            }
+
+            fn visit_f64<E: de::Error>(self, value: f64) -> Result<KeptSchema, E> {
+                Ok(KeptSchema::Other(Value::from(value)))
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<KeptSchema, E> {
+                Ok(KeptSchema::Other(Value::String(value.to_owned())))
+            }
+
+            fn visit_string<E: de::Error>(self, value: String) -> Result<KeptSchema, E> {
+                Ok(KeptSchema::Other(Value::String(value)))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<KeptSchema, A::Error> {
+                let mut items = Vec::new();
+                while let Some(item) = seq.next_element()? {
+                    items.push(item);
+                }
+                Ok(KeptSchema::Other(Value::Array(items)))
+            }
+
+            fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<KeptSchema, A::Error> {
+                let mut entries = Vec::with_capacity(map.size_hint().unwrap_or(0));
+                while let Some(key) = map.next_key::<String>()? {
+                    let value = map.next_value()?;
+                    entries.push((key, value));
+                }
+                Ok(KeptSchema::Object(entries))
+            }
+        }
+
+        deserializer.deserialize_any(KeptVisitor)
+    }
+}
+
+/// Strict structured outputs (`strict: true`) require every object node of the
+/// schema to pin `additionalProperties: false`, as the public API enforces.
+/// Walks `properties`, `items`, `prefixItems`, `anyOf`/`oneOf`/`allOf`,
+/// `$defs`/`definitions` and `not`; returns the JSON-pointer-like path of the
+/// first object node that lacks the pin.
+///
+/// A schema that holds the rule is walked without an allocation: the path is
+/// put together on the way back from a miss, a segment a level.
+pub fn strict_schema_missing_additional_properties(schema: &Value) -> Option<String> {
+    // The path from `node` to the first unpinned object node under it, empty
+    // when `node` is that node.
+    fn walk(node: &Value) -> Option<String> {
+        let obj = node.as_object()?;
+        let is_object_node = obj.get("type").and_then(Value::as_str) == Some("object")
+            || obj
+                .get("type")
+                .and_then(Value::as_array)
+                .is_some_and(|types| types.iter().any(|t| t.as_str() == Some("object")))
+            || (obj.get("type").is_none() && obj.contains_key("properties"));
+        if is_object_node && obj.get("additionalProperties") != Some(&Value::Bool(false)) {
+            return Some(String::new());
+        }
+        for key in ["properties", "$defs", "definitions"] {
+            if let Some(children) = obj.get(key).and_then(Value::as_object) {
+                for (name, child) in children {
+                    if let Some(rest) = walk(child) {
+                        return Some(format!("/{key}/{name}{rest}"));
+                    }
+                }
+            }
+        }
+        for key in ["anyOf", "oneOf", "allOf", "prefixItems"] {
+            if let Some(children) = obj.get(key).and_then(Value::as_array) {
+                for (index, child) in children.iter().enumerate() {
+                    if let Some(rest) = walk(child) {
+                        return Some(format!("/{key}/{index}{rest}"));
+                    }
+                }
+            }
+        }
+        for key in ["items", "not"] {
+            if let Some(child) = obj.get(key) {
+                if let Some(rest) = walk(child) {
+                    return Some(format!("/{key}{rest}"));
+                }
+            }
+        }
+        None
+    }
+    let path = walk(schema)?;
+    Some(if path.is_empty() {
+        "()".to_string()
+    } else {
+        path
+    })
+}
+
+/// Shared shape rules for a json_schema format: name non-empty, schema a JSON object.
+pub fn validate_json_schema_shape(
+    name: &str,
+    schema: &Value,
+) -> Result<(), validator::ValidationError> {
+    let (code, message) = if name.is_empty() {
+        ("json_schema_name_empty", "JSON schema name cannot be empty")
+    } else if !schema.is_object() {
+        (
+            "json_schema_schema_not_object",
+            "JSON schema 'schema' must be a JSON object",
+        )
+    } else {
+        return Ok(());
+    };
+    Err(invalid(code, message))
+}
+
+// ============================================================================
+// Streaming
+// ============================================================================
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct StreamOptions {
+    /// Chat Completions / Completions: include usage block at end of stream.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_usage: Option<bool>,
+
+    /// Chat Completions / Completions: emit a usage chunk with every streamed
+    /// delta instead of only in the final chunk.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continuous_usage_stats: Option<bool>,
+
+    /// Responses API: add random chars on `obfuscation` field of delta events
+    /// to normalize payload sizes. Defaults to `true` upstream when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_obfuscation: Option<bool>,
+
+    /// Additional fields not explicitly defined above (e.g. engine-specific
+    /// streaming options). Without this, the gateway silently drops them while
+    /// re-serializing the request for the backend.
+    #[serde(flatten)]
+    pub other: Map<String, Value>,
+}
+
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ToolCallDelta {
+    pub index: u32,
+    pub id: Option<String>,
+    #[serde(rename = "type")]
+    pub tool_type: Option<String>,
+    pub function: Option<FunctionCallDelta>,
+}
+
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct FunctionCallDelta {
+    pub name: Option<String>,
+    pub arguments: Option<String>,
+}
+
+// ============================================================================
+// Tools and Function Calling
+// ============================================================================
+
+/// Tool choice value for simple string options
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolChoiceValue {
+    Auto,
+    Required,
+    None,
+}
+
+/// A Chat Completions `tool_choice`: one of the three words, a named
+/// function, or an allowed-tools choice (the Responses API has its own
+/// `ResponsesToolChoice`). On the wire the allowed-tools choice is the
+/// contract's nested object, `{"type": "allowed_tools", "allowed_tools":
+/// {"mode": ..., "tools": [{"type": "function", "function": {"name": ...}}]}}`,
+/// read and written in that shape; the flat spelling this route read before
+/// it read the contract's is still accepted (the `wire` module).
+#[derive(Debug, Clone)]
+pub enum ToolChoice {
+    Value(ToolChoiceValue),
+    Function {
+        /// `"function"`.
+        tool_type: String,
+        function: FunctionChoice,
+    },
+    AllowedTools {
+        /// `"allowed_tools"`.
+        tool_type: String,
+        /// `"auto"` or `"required"`; the chat validator refuses another word.
+        mode: String,
+        tools: Vec<ToolReference>,
+    },
+}
+
+impl<'de> Deserialize<'de> for ToolChoice {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        wire::ToolChoice::deserialize(deserializer).map(Self::from)
+    }
+}
+
+impl Serialize for ToolChoice {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        wire::ToolChoiceView::from(self).serialize(serializer)
+    }
+}
+
+impl schemars::JsonSchema for ToolChoice {
+    fn schema_name() -> Cow<'static, str> {
+        "ToolChoice".into()
+    }
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        wire::ToolChoice::json_schema(generator)
+    }
+}
+
+impl Default for ToolChoice {
+    fn default() -> Self {
+        Self::Value(ToolChoiceValue::Auto)
+    }
+}
+
+impl ToolChoice {
+    /// Whether the choice leaves the model no choice but a call: a named
+    /// function, `required`, or allowed tools in `required` mode.
+    pub fn forces_call(&self) -> bool {
+        match self {
+            ToolChoice::Function { .. } => true,
+            ToolChoice::Value(ToolChoiceValue::Required) => true,
+            ToolChoice::AllowedTools { mode, .. } => mode == "required",
+            ToolChoice::Value(_) => false,
+        }
+    }
+
+    /// Serialize tool_choice to string for ResponsesResponse
+    ///
+    /// Returns the JSON-serialized tool_choice or "auto" as default
+    pub fn serialize_to_string(tool_choice: Option<&ToolChoice>) -> String {
+        tool_choice
+            .map(|tc| serde_json::to_string(tc).unwrap_or_else(|_| "auto".to_string()))
+            .unwrap_or_else(|| "auto".to_string())
+    }
+
+    /// The subset of `tools` this choice lets the model call, in the original
+    /// order: the named function for the function form, the listed functions
+    /// for `allowed_tools`. `None` when the choice does not narrow the list
+    /// (`auto`, `none`, `required`).
+    pub fn narrow_tools(&self, tools: &[Tool]) -> Option<Vec<Tool>> {
+        match self {
+            ToolChoice::AllowedTools { tools: allowed, .. } => {
+                let allowed: HashSet<&str> = allowed
+                    .iter()
+                    .filter_map(ToolReference::function_name)
+                    .collect();
+                Some(
+                    tools
+                        .iter()
+                        .filter(|tool| allowed.contains(tool.function.name.as_str()))
+                        .cloned()
+                        .collect(),
+                )
+            }
+            ToolChoice::Function { function, .. } => Some(
+                tools
+                    .iter()
+                    .filter(|tool| tool.function.name == function.name)
+                    .cloned()
+                    .collect(),
+            ),
+            ToolChoice::Value(_) => None,
+        }
+    }
+}
+
+/// The wire spellings of a chat [`ToolChoice`](super::ToolChoice). The read
+/// enum is named as the public type so serde's refusal of an unknown shape
+/// names the field's type, not a helper.
+mod wire {
+    use serde::{Deserialize, Serialize};
+
+    use super::{FunctionChoice, ToolChoiceValue};
+
+    /// The shapes read: the three words; the named function; the contract's
+    /// allowed-tools object; the flat allowed-tools object this route read
+    /// before it read the contract's.
+    #[derive(Deserialize, schemars::JsonSchema)]
+    #[serde(untagged)]
+    pub(super) enum ToolChoice {
+        Value(ToolChoiceValue),
+        Function {
+            #[serde(rename = "type")]
+            tool_type: String,
+            function: FunctionChoice,
+        },
+        AllowedTools {
+            #[serde(rename = "type")]
+            tool_type: String,
+            allowed_tools: AllowedToolsObject,
+        },
+        FlatAllowedTools {
+            #[serde(rename = "type")]
+            tool_type: String,
+            mode: String,
+            tools: Vec<AllowedToolReference>,
+        },
+    }
+
+    /// The contract's `allowed_tools` object: the mode and the tools.
+    #[derive(Deserialize, schemars::JsonSchema)]
+    pub(super) struct AllowedToolsObject {
+        pub(super) mode: String,
+        pub(super) tools: Vec<AllowedToolReference>,
+    }
+
+    /// An item of the allowed-tools list: the contract's nested function,
+    /// `{"type": "function", "function": {"name": ...}}`, or a flat reference
+    /// (`{"type": "function", "name": ...}` and the other kinds).
+    #[derive(Deserialize, schemars::JsonSchema)]
+    #[serde(untagged)]
+    pub(super) enum AllowedToolReference {
+        Nested {
+            #[serde(rename = "type")]
+            tool_type: FunctionTag,
+            function: FunctionChoice,
+        },
+        Flat(super::ToolReference),
+    }
+
+    /// The one `type` word of a nested function reference.
+    #[derive(Deserialize, schemars::JsonSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub(super) enum FunctionTag {
+        Function,
+    }
+
+    impl From<AllowedToolReference> for super::ToolReference {
+        fn from(reference: AllowedToolReference) -> Self {
+            match reference {
+                AllowedToolReference::Nested {
+                    tool_type: FunctionTag::Function,
+                    function,
+                } => Self::Function {
+                    name: function.name,
+                },
+                AllowedToolReference::Flat(reference) => reference,
+            }
+        }
+    }
+
+    impl From<ToolChoice> for super::ToolChoice {
+        fn from(choice: ToolChoice) -> Self {
+            match choice {
+                ToolChoice::Value(value) => Self::Value(value),
+                ToolChoice::Function {
+                    tool_type,
+                    function,
+                } => Self::Function {
+                    tool_type,
+                    function,
+                },
+                ToolChoice::AllowedTools {
+                    tool_type,
+                    allowed_tools: AllowedToolsObject { mode, tools },
+                }
+                | ToolChoice::FlatAllowedTools {
+                    tool_type,
+                    mode,
+                    tools,
+                } => Self::AllowedTools {
+                    tool_type,
+                    mode,
+                    tools: tools.into_iter().map(Into::into).collect(),
+                },
+            }
+        }
+    }
+
+    /// A chat choice as the contract writes it, borrowed from the typed value.
+    #[derive(Serialize)]
+    #[serde(untagged)]
+    pub(super) enum ToolChoiceView<'a> {
+        Value(&'a ToolChoiceValue),
+        Function {
+            #[serde(rename = "type")]
+            tool_type: &'a str,
+            function: &'a FunctionChoice,
+        },
+        AllowedTools {
+            #[serde(rename = "type")]
+            tool_type: &'a str,
+            allowed_tools: AllowedToolsView<'a>,
+        },
+    }
+
+    #[derive(Serialize)]
+    pub(super) struct AllowedToolsView<'a> {
+        mode: &'a str,
+        #[serde(serialize_with = "nested_functions")]
+        tools: &'a [super::ToolReference],
+    }
+
+    impl<'a> From<&'a super::ToolChoice> for ToolChoiceView<'a> {
+        fn from(choice: &'a super::ToolChoice) -> Self {
+            match choice {
+                super::ToolChoice::Value(value) => Self::Value(value),
+                super::ToolChoice::Function {
+                    tool_type,
+                    function,
+                } => Self::Function {
+                    tool_type,
+                    function,
+                },
+                super::ToolChoice::AllowedTools {
+                    tool_type,
+                    mode,
+                    tools,
+                } => Self::AllowedTools {
+                    tool_type,
+                    allowed_tools: AllowedToolsView { mode, tools },
+                },
+            }
+        }
+    }
+
+    /// The allowed-tools list with each function reference in the contract's
+    /// nested spelling; a reference of another kind keeps its own shape.
+    fn nested_functions<S: serde::Serializer>(
+        tools: &[super::ToolReference],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(tools.iter().map(ToolReferenceView))
+    }
+
+    struct ToolReferenceView<'a>(&'a super::ToolReference);
+
+    impl Serialize for ToolReferenceView<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            #[derive(Serialize)]
+            struct NestedFunction<'a> {
+                #[serde(rename = "type")]
+                tool_type: &'a str,
+                function: FunctionName<'a>,
+            }
+            #[derive(Serialize)]
+            struct FunctionName<'a> {
+                name: &'a str,
+            }
+            match self.0 {
+                super::ToolReference::Function { name } => NestedFunction {
+                    tool_type: "function",
+                    function: FunctionName { name },
+                }
+                .serialize(serializer),
+                other => other.serialize(serializer),
+            }
+        }
+    }
+}
+
+/// Function choice specification for ToolChoice::Function
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct FunctionChoice {
+    pub name: String,
+}
+
+/// Tool reference for ToolChoice::AllowedTools
+///
+/// Represents a reference to a specific tool in the allowed_tools array.
+/// Different tool types have different required fields.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type")]
+#[serde(rename_all = "snake_case")]
+pub enum ToolReference {
+    /// Reference to a function tool
+    #[serde(rename = "function")]
+    Function { name: String },
+
+    /// Reference to an MCP tool
+    #[serde(rename = "mcp")]
+    Mcp {
+        server_label: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+
+    /// File search hosted tool
+    #[serde(rename = "file_search")]
+    FileSearch,
+
+    /// Web search preview hosted tool
+    #[serde(rename = "web_search_preview")]
+    WebSearchPreview,
+
+    /// Computer use preview hosted tool
+    #[serde(rename = "computer_use_preview")]
+    ComputerUsePreview,
+
+    /// Code interpreter hosted tool
+    #[serde(rename = "code_interpreter")]
+    CodeInterpreter,
+
+    /// Image generation hosted tool
+    #[serde(rename = "image_generation")]
+    ImageGeneration,
+}
+
+impl ToolReference {
+    /// Get a unique identifier for this tool reference
+    pub fn identifier(&self) -> String {
+        match self {
+            ToolReference::Function { name } => format!("function:{name}"),
+            ToolReference::Mcp { server_label, name } => {
+                if let Some(n) = name {
+                    format!("mcp:{server_label}:{n}")
+                } else {
+                    format!("mcp:{server_label}")
+                }
+            }
+            ToolReference::FileSearch => "file_search".to_string(),
+            ToolReference::WebSearchPreview => "web_search_preview".to_string(),
+            ToolReference::ComputerUsePreview => "computer_use_preview".to_string(),
+            ToolReference::CodeInterpreter => "code_interpreter".to_string(),
+            ToolReference::ImageGeneration => "image_generation".to_string(),
+        }
+    }
+
+    /// Get the tool name if this is a function tool
+    pub fn function_name(&self) -> Option<&str> {
+        match self {
+            ToolReference::Function { name } => Some(name.as_str()),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct Tool {
+    #[serde(rename = "type")]
+    pub tool_type: String, // "function"
+    pub function: Function,
+}
+
+/// The schema a function declared without `parameters` is read with wherever
+/// a schema is needed: per the OpenAI spec, omitting the field defines a
+/// function with an empty parameter list.
+static EMPTY_PARAMETERS_SCHEMA: LazyLock<Value> = LazyLock::new(|| Value::Object(Map::new()));
+
+/// `parameters` as the client gave it: `None` for an explicit `null` as for
+/// an absent field. The serving engine reads both as "no schema" and its own
+/// template sees `null` for both, so the two must stay apart from a client's
+/// own `{}`, which the template renders as `{}`.
+fn deserialize_parameters<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Value>, D::Error> {
+    let value = Value::deserialize(deserializer)?;
+    Ok((!value.is_null()).then_some(value))
+}
+
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct Function {
+    pub name: String,
+    pub description: Option<String>,
+    /// The parameter schema as the client gave it; `None` when it gave none
+    /// (the field absent or `null`). Left out of a serialized function then,
+    /// as any optional field the client left out (a Responses function tool,
+    /// whose reference lists the field as required and nullable, writes `null`
+    /// for it: [`crate::responses::FunctionTool`]); the chat template is handed
+    /// `null` for it (what the engine's own template reads for such a
+    /// function). Read through [`Function::parameters_schema`] where a schema
+    /// object is needed.
+    #[serde(default, deserialize_with = "deserialize_parameters")]
+    pub parameters: Option<Value>, // JSON Schema
+    /// Whether to enable strict schema adherence (OpenAI structured outputs)
+    pub strict: Option<bool>,
+    /// The fields of the function object beyond the ones above, as the request
+    /// carried them and in their order: a vendor's extension, such as the
+    /// `response` schema some tool corpora describe a tool's result with. The
+    /// chat template renders the tool object as given, so they must reach it
+    /// as they reach the engine's own template, and a forwarded request keeps
+    /// them.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+impl Function {
+    /// The schema the function is read with: the client's, or the empty
+    /// schema when it gave none. The constraint builders, the structural tags
+    /// and the parsers read an object; only the template sees the difference.
+    pub fn parameters_schema(&self) -> &Value {
+        self.parameters.as_ref().unwrap_or(&EMPTY_PARAMETERS_SCHEMA)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub tool_type: String, // "function"
+    pub function: FunctionCallResponse,
+}
+
+/// Deprecated `function_call` field from the OpenAI API.
+/// Can be `"none"`, `"auto"`, or `{"name": "function_name"}`.
+#[derive(Debug, Clone)]
+pub enum FunctionCall {
+    None,
+    Auto,
+    Function { name: String },
+}
+
+impl Serialize for FunctionCall {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            FunctionCall::None => serializer.serialize_str("none"),
+            FunctionCall::Auto => serializer.serialize_str("auto"),
+            FunctionCall::Function { name } => {
+                use serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("name", name)?;
+                map.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for FunctionCall {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Buffered strictly: the plain value reader keeps the last of a repeated `name`.
+        let value = StrictValue.deserialize(deserializer)?;
+        match &value {
+            Value::String(s) => match s.as_str() {
+                "none" => Ok(FunctionCall::None),
+                "auto" => Ok(FunctionCall::Auto),
+                other => Err(de::Error::custom(format!(
+                    "unknown function_call value: \"{other}\""
+                ))),
+            },
+            Value::Object(map) => {
+                if let Some(Value::String(name)) = map.get("name") {
+                    Ok(FunctionCall::Function { name: name.clone() })
+                } else {
+                    Err(de::Error::custom(
+                        "function_call object must have a \"name\" string field",
+                    ))
+                }
+            }
+            _ => Err(de::Error::custom(
+                "function_call must be a string or object",
+            )),
+        }
+    }
+}
+
+impl schemars::JsonSchema for FunctionCall {
+    fn schema_name() -> Cow<'static, str> {
+        "FunctionCall".into()
+    }
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        // FunctionCall is either "none", "auto", or {"name": "..."}
+        let name_schema = generator.subschema_for::<String>();
+        schemars::json_schema!({
+            "anyOf": [
+                {
+                    "type": "string",
+                    "enum": ["none", "auto"]
+                },
+                {
+                    "type": "object",
+                    "properties": { "name": name_schema },
+                    "required": ["name"]
+                }
+            ]
+        })
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct FunctionCallResponse {
+    pub name: String,
+    /// The call's arguments as JSON text, the shape the API documents and a
+    /// response carries. A request's history may carry a call's arguments as
+    /// the JSON object itself (a client that replays the parsed call rather
+    /// than the text it received); the engines accept both shapes and hand
+    /// their template an object either way, so both are read here, an
+    /// object kept as its JSON text.
+    #[serde(default, deserialize_with = "deserialize_arguments_text")]
+    pub arguments: Option<String>, // JSON string
+}
+
+/// Tool-call `arguments` as text: a JSON string as written, a JSON object as
+/// its compact JSON text (keys in their order), null or absent as none. Any
+/// other shape is refused.
+fn deserialize_arguments_text<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    match Option::<Value>::deserialize(deserializer)? {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text)),
+        Some(object @ Value::Object(_)) => Ok(Some(object.to_string())),
+        Some(Value::Array(_)) => Err(de::Error::invalid_type(
+            de::Unexpected::Seq,
+            &"a JSON string or an object",
+        )),
+        Some(Value::Bool(flag)) => Err(de::Error::invalid_type(
+            de::Unexpected::Bool(flag),
+            &"a JSON string or an object",
+        )),
+        Some(Value::Number(_)) => Err(de::Error::invalid_type(
+            de::Unexpected::Other("a number"),
+            &"a JSON string or an object",
+        )),
+    }
+}
+
+// ============================================================================
+// Usage and Logging
+// ============================================================================
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct Usage {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub total_tokens: u32,
+    pub prompt_tokens_details: Option<PromptTokenUsageInfo>,
+    pub completion_tokens_details: Option<CompletionTokensDetails>,
+}
+
+impl Usage {
+    /// Create a Usage from prompt and completion token counts
+    pub fn from_counts(prompt_tokens: u32, completion_tokens: u32) -> Self {
+        Self {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        }
+    }
+
+    /// Add cached token details to this Usage
+    pub fn with_cached_tokens(mut self, cached_tokens: u32) -> Self {
+        // Calling this builder means the backend supplied cache accounting.
+        // Zero is therefore evidence of a cold miss, not absence of support,
+        // and must remain distinguishable from `prompt_tokens_details: None`.
+        self.prompt_tokens_details = Some(PromptTokenUsageInfo {
+            cached_tokens,
+            audio_tokens: None,
+            text_tokens: None,
+            image_tokens: None,
+            cache_write_tokens: None,
+        });
+        self
+    }
+
+    /// Add reasoning token details to this Usage
+    pub fn with_reasoning_tokens(mut self, reasoning_tokens: u32) -> Self {
+        if reasoning_tokens > 0 {
+            self.completion_tokens_details
+                .get_or_insert_default()
+                .reasoning_tokens = Some(reasoning_tokens);
+        }
+        self
+    }
+
+    /// Add speculative decoding details to this Usage.
+    pub fn with_speculative_tokens(mut self, accepted: u32, drafted: u32) -> Self {
+        if accepted > 0 || drafted > 0 {
+            let details = self.completion_tokens_details.get_or_insert_default();
+            details.accepted_prediction_tokens = Some(accepted);
+            // A zero draft count can mean unavailable, not zero proposals.
+            details.rejected_prediction_tokens =
+                (drafted > 0 && drafted >= accepted).then(|| drafted - accepted);
+        }
+        self
+    }
+
+    /// Drop prompt tokens the provider does not bill (the rendered generation stub).
+    pub fn with_unbilled_prompt_tokens(mut self, unbilled: u32) -> Self {
+        self.prompt_tokens = self.prompt_tokens.saturating_sub(unbilled);
+        self.total_tokens = self.prompt_tokens + self.completion_tokens;
+        if let Some(details) = &mut self.prompt_tokens_details {
+            details.cached_tokens = details.cached_tokens.min(self.prompt_tokens);
+        }
+        self
+    }
+
+    /// Report the prompt's image tokens: the tokens the gateway's multimodal
+    /// expansion wrote into the prompt for the request's images, as
+    /// `prompt_tokens_details.image_tokens`. `None` leaves the details as they
+    /// are: a request without an image the gateway expanded reports no image
+    /// count, as before. The count is kept within `prompt_tokens`, the total
+    /// the details break down.
+    pub fn with_image_tokens(mut self, image_tokens: Option<u32>) -> Self {
+        if let Some(image_tokens) = image_tokens {
+            self.prompt_tokens_details
+                .get_or_insert(PromptTokenUsageInfo {
+                    cached_tokens: 0,
+                    audio_tokens: None,
+                    text_tokens: None,
+                    image_tokens: None,
+                    cache_write_tokens: None,
+                })
+                .image_tokens = Some(image_tokens.min(self.prompt_tokens));
+        }
+        self
+    }
+
+    /// Default detail counters to zero, except unknown speculative rejections.
+    /// With explicit accepted tokens, unavailable/inconsistent drafts leave rejected
+    /// absent. Default zeros for non-speculative usage are schema defaults, not
+    /// measurements of speculative rejection. Otherwise this preserves the
+    /// shape the OpenAI API sends on every chat completion
+    /// (`prompt_tokens_details.{cached_tokens,audio_tokens}` and
+    /// `completion_tokens_details.{reasoning_tokens,audio_tokens,
+    /// accepted_prediction_tokens,rejected_prediction_tokens}`), which typed
+    /// clients read without a presence check. Counters already set are kept.
+    pub fn with_complete_details(mut self) -> Self {
+        let prompt = self
+            .prompt_tokens_details
+            .get_or_insert(PromptTokenUsageInfo {
+                cached_tokens: 0,
+                audio_tokens: None,
+                text_tokens: None,
+                image_tokens: None,
+                cache_write_tokens: None,
+            });
+        prompt.audio_tokens.get_or_insert(0);
+        let completion = self.completion_tokens_details.get_or_insert_default();
+        completion.reasoning_tokens.get_or_insert(0);
+        completion.audio_tokens.get_or_insert(0);
+        // Explicit accepted (including measured zero) with absent rejected marks
+        // unavailable proposals. Preserve it before inserting legacy schema defaults.
+        let unknown_rejected = completion.accepted_prediction_tokens.is_some()
+            && completion.rejected_prediction_tokens.is_none();
+        completion.accepted_prediction_tokens.get_or_insert(0);
+        if !unknown_rejected {
+            completion.rejected_prediction_tokens.get_or_insert(0);
+        }
+        self
+    }
+}
+
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct CompletionTokensDetails {
+    pub reasoning_tokens: Option<u32>,
+    pub audio_tokens: Option<u32>,
+    pub accepted_prediction_tokens: Option<u32>,
+    pub rejected_prediction_tokens: Option<u32>,
+    pub text_tokens: Option<u32>,
+}
+
+/// Usage information (used by rerank and other endpoints)
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct UsageInfo {
+    pub prompt_tokens: u32,
+    /// Generated tokens. The public API's embeddings usage has no such key
+    /// (only `prompt_tokens` and `total_tokens`), so a usage written without
+    /// it reads as none generated.
+    #[serde(default)]
+    pub completion_tokens: u32,
+    pub total_tokens: u32,
+    pub reasoning_tokens: Option<u32>,
+    pub prompt_tokens_details: Option<PromptTokenUsageInfo>,
+}
+
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct PromptTokenUsageInfo {
+    /// Prompt tokens read from the cache. The public API defaults the key to
+    /// zero, so details an upstream writes without it read as none cached.
+    #[serde(default)]
+    pub cached_tokens: u32,
+    #[serde(default)]
+    pub audio_tokens: Option<u32>,
+    pub text_tokens: Option<u32>,
+    pub image_tokens: Option<u32>,
+    pub cache_write_tokens: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct LogProbs {
+    pub tokens: Vec<String>,
+    pub token_logprobs: Vec<Option<f32>>,
+    pub top_logprobs: Vec<Option<HashMap<String, f32>>>,
+    pub text_offset: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum ChatLogProbs {
+    /// The public API's object: `content` and `refusal` are both always
+    /// present (`null` when there is none); the gateway produces no refusals,
+    /// so `refusal` is `null`.
+    Detailed {
+        #[serde(default)]
+        content: Option<Vec<ChatLogProbsContent>>,
+        #[serde(default)]
+        refusal: Option<Vec<ChatLogProbsContent>>,
+    },
+    Raw(Value),
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ChatLogProbsContent {
+    pub token: String,
+    pub logprob: f32,
+    pub bytes: Option<Vec<u8>>,
+    pub top_logprobs: Vec<TopLogProb>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct TopLogProb {
+    pub token: String,
+    pub logprob: f32,
+    pub bytes: Option<Vec<u8>>,
+}
+
+// ============================================================================
+// Error Types
+// ============================================================================
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ErrorResponse {
+    pub error: ErrorDetail,
+}
+
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ErrorDetail {
+    pub message: String,
+    #[serde(rename = "type")]
+    pub error_type: String,
+    pub param: Option<String>,
+    pub code: Option<String>,
+}
+
+// ============================================================================
+// Input Types
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum InputIds {
+    Single(Vec<i32>),
+    Batch(Vec<Vec<i32>>),
+}
+
+/// Shape probe for the first `input_ids` element: it alone picks the variant,
+/// so the rest parses in place instead of through untagged-enum buffering.
+enum FirstInputId {
+    Id(i32),
+    Ids(Vec<i32>),
+}
+
+impl<'de> Deserialize<'de> for FirstInputId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FirstInputIdVisitor;
+
+        impl<'de> Visitor<'de> for FirstInputIdVisitor {
+            type Value = FirstInputId;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a token id or an array of token ids")
+            }
+
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                i32::try_from(v)
+                    .map(FirstInputId::Id)
+                    .map_err(|_| E::invalid_value(de::Unexpected::Signed(v), &self))
+            }
+
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                i32::try_from(v)
+                    .map(FirstInputId::Id)
+                    .map_err(|_| E::invalid_value(de::Unexpected::Unsigned(v), &self))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+                Deserialize::deserialize(SeqAccessDeserializer::new(seq)).map(FirstInputId::Ids)
+            }
+        }
+
+        deserializer.deserialize_any(FirstInputIdVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for InputIds {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct InputIdsVisitor;
+
+        impl<'de> Visitor<'de> for InputIdsVisitor {
+            type Value = InputIds;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an array of token ids or an array of token id arrays")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                // An empty array is Single, matching untagged first-match order.
+                let Some(first) = seq.next_element::<FirstInputId>()? else {
+                    return Ok(InputIds::Single(Vec::new()));
+                };
+                let remaining = seq.size_hint().unwrap_or(0);
+                match first {
+                    FirstInputId::Id(id) => {
+                        let mut ids = Vec::with_capacity(remaining.saturating_add(1));
+                        ids.push(id);
+                        while let Some(id) = seq.next_element()? {
+                            ids.push(id);
+                        }
+                        Ok(InputIds::Single(ids))
+                    }
+                    FirstInputId::Ids(head) => {
+                        let mut seqs = Vec::with_capacity(remaining.saturating_add(1));
+                        seqs.push(head);
+                        while let Some(ids) = seq.next_element()? {
+                            seqs.push(ids);
+                        }
+                        Ok(InputIds::Batch(seqs))
+                    }
+                }
+            }
+        }
+
+        deserializer.deserialize_seq(InputIdsVisitor)
+    }
+}
+
+/// Token ids as their decimal rendering joined by spaces: the routing text of
+/// a prompt given as ids, on `/generate` and `/v1/completions` alike.
+pub(crate) fn join_ids<T: std::fmt::Display>(ids: impl IntoIterator<Item = T>) -> String {
+    use std::fmt::Write as _;
+    let ids = ids.into_iter();
+    let mut text = String::with_capacity(ids.size_hint().0 * 6);
+    for (i, id) in ids.enumerate() {
+        if i > 0 {
+            text.push(' ');
+        }
+        let _ = write!(text, "{id}");
+    }
+    text
+}
+
+/// LoRA adapter path - can be single path or batch of paths (an engine extension)
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum LoRAPath {
+    Single(Option<String>),
+    Batch(Vec<Option<String>>),
+}
+
+// ============================================================================
+// Redacted Types
+// ============================================================================
+#[derive(Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct Redacted(pub String);
+
+impl std::fmt::Debug for Redacted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
+
+// ============================================================================
+// Response Prompt
+// ============================================================================
+
+/// Reference to a prompt template and its variables.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ResponsePrompt {
+    pub id: String,
+    #[serde(serialize_with = "crate::common::serialize_with_sorted_keys")]
+    pub variables: Option<HashMap<String, PromptVariable>>,
+    pub version: Option<String>,
+}
+
+/// A prompt variable value: plain string or a typed input (text, image, file).
+///
+/// Variant order matters for `#[serde(untagged)]`: a bare JSON string succeeds
+/// as `String`; a JSON object falls through to `Typed`.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum PromptVariable {
+    String(String),
+    Typed(PromptVariableTyped),
+}
+
+/// Typed prompt variable input.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type")]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "variant names match OpenAI API spec"
+)]
+pub enum PromptVariableTyped {
+    #[serde(rename = "input_text")]
+    ResponseInputText { text: String },
+    #[serde(rename = "input_image")]
+    ResponseInputImage {
+        detail: Option<Detail>,
+        file_id: Option<String>,
+        image_url: Option<String>,
+    },
+    #[serde(rename = "input_file")]
+    ResponseInputFile {
+        /// The file's detail level, as an input file part takes it.
+        detail: Option<crate::responses::FileDetail>,
+        file_data: Option<String>,
+        file_id: Option<String>,
+        file_url: Option<String>,
+        filename: Option<String>,
+    },
+}
+
+/// Image detail level for [`PromptVariableTyped::ResponseInputImage`] and
+/// [`crate::responses::ResponseContentPart::InputImage`]. Spec allows
+/// `"low" | "high" | "auto" | "original"`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Detail {
+    Low,
+    High,
+    #[default]
+    Auto,
+    Original,
+}
+
+// ============================================================================
+// Responses API: prompt-cache retention & context management
+// ============================================================================
+
+/// Retention policy for prompt-cache entries on the Responses API.
+///
+/// Spec: `prompt_cache_retention: "in_memory" | "24h"` (`PromptCacheRetentionEnum`).
+/// `in-memory`, the spelling this crate wrote before, still reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub enum PromptCacheRetention {
+    #[serde(rename = "in_memory", alias = "in-memory")]
+    InMemory,
+    #[serde(rename = "24h")]
+    Duration24h,
+}
+
+/// A single entry in the Responses API `context_management` array.
+///
+/// Spec: each entry has `type` (currently only `"compaction"`) and an optional
+/// `compact_threshold` token count.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ContextManagementEntry {
+    #[serde(rename = "type")]
+    pub r#type: ContextManagementType,
+    pub compact_threshold: Option<u32>,
+}
+
+/// Type tag for [`ContextManagementEntry`]. Currently only `compaction` is
+/// defined by the spec; the enum is kept small so unknown values serde-fail
+/// (consistent with P5's fail-fast direction).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextManagementType {
+    Compaction,
+}
+
+// ============================================================================
+// Responses API: conversation reference
+// ============================================================================
+
+/// Reference to a conversation the response belongs to.
+///
+/// Spec: `conversation: string | ResponseConversationParam { id: string }`.
+/// Variant order matters for `#[serde(untagged)]`: a bare JSON string succeeds
+/// as `Id`; an object falls through to `Object`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum ConversationRef {
+    Id(String),
+    Object { id: String },
+}
+
+impl ConversationRef {
+    /// Return the underlying conversation id regardless of the wire shape.
+    pub fn as_id(&self) -> &str {
+        match self {
+            Self::Id(id) | Self::Object { id } => id.as_str(),
+        }
+    }
+
+    /// `true` when the underlying conversation id is the empty string.
+    /// Mirrors `String::is_empty` for callers that previously treated
+    /// `Option<String>` empty values as "unset".
+    pub fn is_empty(&self) -> bool {
+        self.as_id().is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde::Deserialize;
+    use serde_json::json;
+
+    use super::*;
+
+    /// Equal requests are written as one body: a request's map goes upstream with its keys
+    /// sorted, where a standard map gave every parse an order of its own.
+    #[test]
+    fn equal_requests_are_written_as_one_body_with_sorted_map_keys() {
+        // A request type, a body with every map out of order, the maps as they are written.
+        fn check<T: de::DeserializeOwned + Serialize>(body: &str, sorted: &[&str]) {
+            let written: HashSet<String> = (0..8)
+                .map(|_| serde_json::to_string(&serde_json::from_str::<T>(body).unwrap()).unwrap())
+                .collect();
+            assert_eq!(
+                written.len(),
+                1,
+                "equal requests are written as one body: {body}"
+            );
+            let written = written.iter().next().unwrap();
+            for map in sorted {
+                assert!(written.contains(map), "{map} is not in {written}");
+            }
+        }
+        check::<crate::chat::ChatCompletionRequest>(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"logit_bias":{"9":1.0,"1":-1.0,"5":2.0,"3":0.5},"metadata":{"zone":"c","tenant":"a","trace":"b","app":"d"},"session_params":{"zone":"c","tenant":"a","trace":"b","app":"d"},"chat_template_kwargs":{"zone":"c","tenant":"a","trace":"b","app":"d"}}"#,
+            &[
+                r#""logit_bias":{"1":-1.0,"3":0.5,"5":2.0,"9":1.0}"#,
+                r#""metadata":{"app":"d","tenant":"a","trace":"b","zone":"c"}"#,
+                r#""session_params":{"app":"d","tenant":"a","trace":"b","zone":"c"}"#,
+                r#""chat_template_kwargs":{"app":"d","tenant":"a","trace":"b","zone":"c"}"#,
+            ],
+        );
+        check::<crate::completion::CompletionRequest>(
+            r#"{"model":"m","prompt":"hi","logit_bias":{"9":1.0,"1":-1.0,"5":2.0,"3":0.5},"session_params":{"zone":"c","tenant":"a","trace":"b","app":"d"}}"#,
+            &[
+                r#""logit_bias":{"1":-1.0,"3":0.5,"5":2.0,"9":1.0}"#,
+                r#""session_params":{"app":"d","tenant":"a","trace":"b","zone":"c"}"#,
+            ],
+        );
+        check::<crate::generate::GenerateRequest>(
+            r#"{"text":"hi","session_params":{"zone":"c","tenant":"a","trace":"b","app":"d"},"custom_labels":{"zone":"c","tenant":"a","trace":"b","app":"d"}}"#,
+            &[
+                r#""session_params":{"app":"d","tenant":"a","trace":"b","zone":"c"}"#,
+                r#""custom_labels":{"app":"d","tenant":"a","trace":"b","zone":"c"}"#,
+            ],
+        );
+        check::<crate::responses::ResponsesRequest>(
+            r#"{"model":"m","input":"hi","metadata":{"zone":"c","tenant":"a","trace":"b","app":"d"},"prompt":{"id":"p","variables":{"zone":"c","tenant":"a","trace":"b","app":"d"}},"tools":[{"type":"mcp","server_label":"docs","server_url":"https://mcp.example/sse","headers":{"zone":"c","tenant":"a","trace":"b","app":"d"}}]}"#,
+            &[
+                r#""metadata":{"app":"d","tenant":"a","trace":"b","zone":"c"}"#,
+                r#""variables":{"app":"d","tenant":"a","trace":"b","zone":"c"}"#,
+                r#""headers":{"app":"d","tenant":"a","trace":"b","zone":"c"}"#,
+            ],
+        );
+        check::<crate::messages::CreateMessageRequest>(
+            r#"{"model":"m","max_tokens":16,"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"mcp_toolset","mcp_server_name":"docs","configs":{"zone":{"enabled":true},"tenant":{"enabled":true},"trace":{"enabled":true},"app":{"enabled":true}}}]}"#,
+            &[
+                r#""configs":{"app":{"enabled":true},"tenant":{"enabled":true},"trace":{"enabled":true},"zone":{"enabled":true}}"#,
+            ],
+        );
+    }
+
+    /// A history tool call's `arguments`: the JSON text the API documents,
+    /// or the JSON object itself, kept as its text so every reader and a
+    /// forwarded request see the documented shape; null and absent are
+    /// none; any other shape is refused.
+    #[test]
+    fn tool_call_arguments_are_read_as_text_or_as_an_object() {
+        let call = |arguments: Value| -> Result<ToolCall, serde_json::Error> {
+            serde_json::from_value(json!({
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "get_weather", "arguments": arguments}
+            }))
+        };
+        let text = call(json!("{\"city\": \"Paris\"}")).expect("text");
+        assert_eq!(
+            text.function.arguments.as_deref(),
+            Some("{\"city\": \"Paris\"}")
+        );
+
+        let object = call(json!({"unit": "celsius", "city": "Paris"})).expect("object");
+        assert_eq!(
+            object.function.arguments.as_deref(),
+            Some("{\"unit\":\"celsius\",\"city\":\"Paris\"}")
+        );
+        let forwarded = serde_json::to_value(&object).expect("serialize");
+        assert_eq!(
+            forwarded["function"]["arguments"],
+            json!("{\"unit\":\"celsius\",\"city\":\"Paris\"}")
+        );
+
+        assert!(call(Value::Null)
+            .expect("null")
+            .function
+            .arguments
+            .is_none());
+        let absent: ToolCall = serde_json::from_value(json!({
+            "id": "call_1", "type": "function", "function": {"name": "get_weather"}
+        }))
+        .expect("absent");
+        assert!(absent.function.arguments.is_none());
+
+        for other in [json!(42), json!(["x"]), json!(true)] {
+            let error = call(other.clone()).expect_err("refused").to_string();
+            assert!(
+                error.contains("expected a JSON string or an object"),
+                "{other}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_logprobs_object_carries_content_and_refusal() {
+        // Parsed as an engine reports it (content only), the object leaves
+        // with both of the public API's properties, `refusal` null.
+        let logprobs: ChatLogProbs = serde_json::from_value(json!({
+            "content": [{"token": "Hi", "logprob": -0.1, "bytes": [72, 105], "top_logprobs": []}]
+        }))
+        .expect("parse");
+        assert!(matches!(logprobs, ChatLogProbs::Detailed { .. }));
+        let value = serde_json::to_value(&logprobs).expect("serialize");
+        assert_eq!(value["content"][0]["token"], "Hi", "{value}");
+        assert_eq!(value.get("refusal"), Some(&Value::Null), "{value}");
+    }
+
+    #[test]
+    fn to_value_exact_keeps_f32_fields_as_the_client_wrote_them() {
+        let request: crate::chat::ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "glm-5.3-flash",
+            "messages": [{"role": "user", "content": "hi"}],
+            "top_p": 0.95,
+            "temperature": 0.7
+        }))
+        .unwrap();
+        // The widening this guards against: 0.95f32 is 0.949999988079071 as f64.
+        assert_ne!(
+            serde_json::to_value(&request).unwrap()["top_p"],
+            json!(0.95)
+        );
+        let exact = to_value_exact(&request).unwrap();
+        assert_eq!(exact["top_p"], json!(0.95));
+        assert_eq!(exact["temperature"], json!(0.7));
+        assert_eq!(exact["model"], json!("glm-5.3-flash"));
+    }
+
+    /// A tool definition may carry fields the OpenAI schema does not name
+    /// (the `response` schema of a BFCL tool); the typed view keeps them, in
+    /// their order, so the chat template and a forwarded request see the tool
+    /// as the client wrote it.
+    #[test]
+    fn a_function_keeps_the_fields_beyond_the_schema_in_their_order() {
+        let written = json!({
+            "type": "function",
+            "function": {
+                "name": "authenticate",
+                "description": "Authenticate a user.",
+                "parameters": {"type": "object", "properties": {"user": {"type": "string"}}},
+                "response": {"type": "dict", "properties": {"ok": {"type": "boolean"}}},
+                "x_vendor": ["kept", 1]
+            }
+        });
+        let tool: Tool = serde_json::from_value(written.clone()).unwrap();
+        assert_eq!(tool.function.name, "authenticate");
+        assert_eq!(tool.function.extra.len(), 2);
+        assert_eq!(
+            serde_json::to_string(&tool).unwrap(),
+            serde_json::to_string(&written).unwrap()
+        );
+    }
+
+    #[derive(Deserialize)]
+    struct NullableBoolTest {
+        #[serde(default, deserialize_with = "deserialize_null_as_false")]
+        field: bool,
+    }
+
+    #[test]
+    fn test_deserialize_null_as_false() {
+        let cases = [
+            (json!({"field": true}), true),
+            (json!({"field": false}), false),
+            (json!({"field": null}), false),
+            (json!({}), false),
+        ];
+        for (input, expected) in cases {
+            let t: NullableBoolTest = serde_json::from_value(input).unwrap();
+            assert_eq!(t.field, expected);
+        }
+    }
+
+    #[test]
+    fn test_deserialize_null_as_false_rejects_non_bool() {
+        let result = serde_json::from_value::<NullableBoolTest>(json!({"field": "yes"}));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn stream_options_preserve_unknown_fields() {
+        let raw = json!({
+            "include_usage": true,
+            "continuous_usage_stats": true,
+            "step_usage_chunks": "all",
+            "engine_specific": {"nested": 1},
+        });
+
+        let opts: StreamOptions = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(opts.include_usage, Some(true));
+        assert_eq!(opts.continuous_usage_stats, Some(true));
+        assert_eq!(opts.other.get("step_usage_chunks"), Some(&json!("all")));
+
+        // Re-serializing must round-trip the engine-specific keys, otherwise the
+        // gateway would strip them on the way to the backend.
+        assert_eq!(serde_json::to_value(&opts).unwrap(), raw);
+    }
+
+    #[test]
+    fn stream_options_without_unknown_fields_stay_compact() {
+        let opts: StreamOptions = serde_json::from_value(json!({"include_usage": true})).unwrap();
+        assert!(opts.other.is_empty());
+        assert_eq!(
+            serde_json::to_value(&opts).unwrap(),
+            json!({"include_usage": true})
+        );
+    }
+
+    #[test]
+    fn cached_token_builder_preserves_explicit_zero() {
+        let usage = Usage::from_counts(16, 1).with_cached_tokens(0);
+        assert!(matches!(
+            usage.prompt_tokens_details,
+            Some(PromptTokenUsageInfo {
+                cached_tokens: 0,
+                audio_tokens: None,
+                text_tokens: None,
+                image_tokens: None,
+                cache_write_tokens: None,
+            })
+        ));
+    }
+
+    #[test]
+    fn unbilled_prompt_tokens_come_off_the_prompt_and_total() {
+        let usage = Usage::from_counts(10, 4)
+            .with_cached_tokens(10)
+            .with_unbilled_prompt_tokens(3);
+        assert_eq!(
+            (
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens
+            ),
+            (7, 4, 11)
+        );
+        assert_eq!(
+            usage
+                .prompt_tokens_details
+                .as_ref()
+                .map(|d| d.cached_tokens),
+            Some(7),
+            "cached tokens are clamped to the billed prompt"
+        );
+
+        let saturated = Usage::from_counts(2, 4).with_unbilled_prompt_tokens(3);
+        assert_eq!((saturated.prompt_tokens, saturated.total_tokens), (0, 4));
+        assert!(saturated.prompt_tokens_details.is_none());
+
+        let unchanged = Usage::from_counts(10, 4).with_unbilled_prompt_tokens(0);
+        assert_eq!((unchanged.prompt_tokens, unchanged.total_tokens), (10, 14));
+    }
+
+    #[test]
+    fn image_tokens_are_reported_within_the_prompt_or_not_at_all() {
+        let none = Usage::from_counts(10, 4).with_image_tokens(None);
+        assert!(
+            none.prompt_tokens_details.is_none(),
+            "no image count opens no details"
+        );
+        let kept = Usage::from_counts(10, 4)
+            .with_cached_tokens(2)
+            .with_image_tokens(None);
+        assert_eq!(
+            kept.prompt_tokens_details
+                .as_ref()
+                .map(|d| (d.cached_tokens, d.image_tokens)),
+            Some((2, None)),
+            "no image count leaves the cache details as they are"
+        );
+
+        let reported = Usage::from_counts(535, 4).with_image_tokens(Some(324));
+        assert_eq!(
+            reported
+                .prompt_tokens_details
+                .as_ref()
+                .map(|d| (d.cached_tokens, d.image_tokens)),
+            Some((0, Some(324))),
+            "the details the count opens default the cache to zero"
+        );
+        let beside_cache = Usage::from_counts(535, 4)
+            .with_cached_tokens(100)
+            .with_image_tokens(Some(324));
+        assert_eq!(
+            beside_cache
+                .prompt_tokens_details
+                .as_ref()
+                .map(|d| (d.cached_tokens, d.image_tokens)),
+            Some((100, Some(324)))
+        );
+
+        let clamped = Usage::from_counts(10, 4).with_image_tokens(Some(12));
+        assert_eq!(
+            clamped
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|d| d.image_tokens),
+            Some(10),
+            "the count stays within the prompt"
+        );
+    }
+
+    #[test]
+    fn content_part_deserializes_audio_url() {
+        let value = json!({
+            "type": "audio_url",
+            "audio_url": {
+                "url": "https://example.com/audio.wav"
+            }
+        });
+        let part: ContentPart = serde_json::from_value(value).expect("audio_url content part");
+        assert_eq!(
+            part,
+            ContentPart::AudioUrl {
+                audio_url: AudioUrl {
+                    url: "https://example.com/audio.wav".to_string().into(),
+                },
+            }
+        );
+    }
+
+    /// A known `type` whose body does not fit it is refused with serde's
+    /// reason for the field, not read as an unknown part.
+    #[test]
+    fn content_part_refuses_a_malformed_known_type_with_the_fields_reason() {
+        for (value, reason) in [
+            (
+                json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,AA==", "max_long_side_pixel": -1}}),
+                "invalid value: integer `-1`, expected u32, in `image_url`",
+            ),
+            (
+                json!({"type": "video_url", "video_url": {"url": "data:video/mp4;base64,AA==", "fps": "1"}}),
+                "invalid type: string \"1\", expected f64, in `video_url`",
+            ),
+            (
+                json!({"type": "image_url", "image_url": {"detail": "high"}}),
+                "missing field `image_url.url`",
+            ),
+            (json!({"type": "image_url"}), "missing field `image_url`"),
+            (
+                json!({"type": "text", "text": 5}),
+                "invalid type: integer `5`, expected a string, in `text`",
+            ),
+            (
+                json!({"type": "refusal", "refusal": null}),
+                "invalid type: null, expected a string, in `refusal`",
+            ),
+        ] {
+            let error = serde_json::from_value::<ContentPart>(value.clone()).unwrap_err();
+            assert_eq!(error.to_string(), reason, "{value}");
+        }
+    }
+
+    /// Every typed kind reads back typed: the `ContentPart` variants, the
+    /// `KnownContentPart` mirror and `KnownContentPart::names` name the same
+    /// set, and the match below has no wildcard, so a new variant does not
+    /// compile until it has a sample here (a kind missing from the mirror or
+    /// the names would read back as an unknown part and fail the round trip).
+    #[test]
+    fn every_typed_content_part_reads_back_typed() {
+        let samples = [
+            ContentPart::Text {
+                text: "t".to_string(),
+            },
+            ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "u".to_string().into(),
+                    detail: None,
+                    max_long_side_pixel: None,
+                },
+            },
+            ContentPart::AudioUrl {
+                audio_url: AudioUrl {
+                    url: "u".to_string().into(),
+                },
+            },
+            ContentPart::InputAudio {
+                input_audio: InputAudio {
+                    data: "d".to_string().into(),
+                    format: "wav".to_string(),
+                },
+            },
+            ContentPart::VideoUrl {
+                video_url: VideoUrl {
+                    url: "u".to_string().into(),
+                    fps: None,
+                    max_long_side_pixel: None,
+                },
+            },
+            ContentPart::Refusal {
+                refusal: "r".to_string(),
+            },
+        ];
+        for part in samples {
+            match &part {
+                ContentPart::Text { .. }
+                | ContentPart::ImageUrl { .. }
+                | ContentPart::AudioUrl { .. }
+                | ContentPart::InputAudio { .. }
+                | ContentPart::VideoUrl { .. }
+                | ContentPart::Refusal { .. } => {}
+                ContentPart::Unknown(_) => panic!("a typed sample"),
+            }
+            let value = serde_json::to_value(&part).unwrap();
+            assert_eq!(serde_json::from_value::<ContentPart>(value).unwrap(), part);
+        }
+    }
+
+    #[test]
+    fn content_part_round_trips_unknown_type() {
+        let value = json!({
+            "type": "vendor_special",
+            "payload": {"items": [1, "two", null], "enabled": true},
+            "vendor_option": "keep"
+        });
+        let part: ContentPart = serde_json::from_value(value.clone()).unwrap();
+
+        assert!(
+            matches!(&part, ContentPart::Unknown(fields) if fields["type"] == "vendor_special")
+        );
+        assert_eq!(serde_json::to_value(&part).unwrap(), value);
+    }
+
+    #[test]
+    fn content_part_rejects_non_objects() {
+        for value in [
+            json!(null),
+            json!(true),
+            json!(42),
+            json!("text"),
+            json!([]),
+        ] {
+            assert!(serde_json::from_value::<ContentPart>(value).is_err());
+        }
+    }
+
+    #[test]
+    fn content_part_known_types_take_precedence_over_fallback() {
+        for value in [
+            json!({"type": "text", "text": "hello"}),
+            json!({"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}),
+            json!({"type": "audio_url", "audio_url": {"url": "https://example.com/audio.wav"}}),
+            json!({"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}}),
+            json!({"type": "video_url", "video_url": {"url": "https://example.com/video.mp4"}}),
+        ] {
+            let part: ContentPart = serde_json::from_value(value.clone()).unwrap();
+            assert!(!matches!(&part, ContentPart::Unknown(_)));
+            assert_eq!(serde_json::to_value(&part).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn content_part_round_trips_input_audio() {
+        let value = json!({
+            "type": "input_audio",
+            "input_audio": {
+                "data": "UklGRg==",
+                "format": "wav"
+            }
+        });
+        let part: ContentPart =
+            serde_json::from_value(value.clone()).expect("input_audio content part");
+        assert_eq!(
+            part,
+            ContentPart::InputAudio {
+                input_audio: InputAudio {
+                    data: "UklGRg==".to_string().into(),
+                    format: "wav".to_string(),
+                },
+            }
+        );
+        assert_eq!(serde_json::to_value(part).unwrap(), value);
+    }
+
+    #[test]
+    fn conversation_ref_deserializes_bare_string() {
+        let v = json!("conv_abc");
+        let r: ConversationRef = serde_json::from_value(v).expect("string form");
+        assert!(matches!(r, ConversationRef::Id(ref s) if s == "conv_abc"));
+        assert_eq!(r.as_id(), "conv_abc");
+        // Bare string round-trips back to a JSON string.
+        assert_eq!(serde_json::to_value(&r).unwrap(), json!("conv_abc"));
+    }
+
+    #[test]
+    fn conversation_ref_deserializes_object() {
+        let v = json!({"id": "conv_xyz"});
+        let r: ConversationRef = serde_json::from_value(v).expect("object form");
+        assert!(matches!(r, ConversationRef::Object { ref id } if id == "conv_xyz"));
+        assert_eq!(r.as_id(), "conv_xyz");
+        // Object round-trips back to an object.
+        assert_eq!(serde_json::to_value(&r).unwrap(), json!({"id": "conv_xyz"}));
+    }
+
+    #[test]
+    fn conversation_ref_is_empty() {
+        assert!(ConversationRef::Id(String::new()).is_empty());
+        assert!(!ConversationRef::Id("conv_1".to_string()).is_empty());
+        assert!(ConversationRef::Object { id: String::new() }.is_empty());
+    }
+
+    #[test]
+    fn input_ids_deserializes_single() {
+        let ids: InputIds = serde_json::from_str("[1, -2, 3]").unwrap();
+        assert!(matches!(ids, InputIds::Single(ref v) if v == &[1, -2, 3]));
+    }
+
+    #[test]
+    fn input_ids_deserializes_batch() {
+        let ids: InputIds = serde_json::from_str("[[1, 2], [3], []]").unwrap();
+        assert!(matches!(ids, InputIds::Batch(ref v) if v == &[vec![1, 2], vec![3], vec![]]));
+    }
+
+    #[test]
+    fn input_ids_empty_array_is_single() {
+        let ids: InputIds = serde_json::from_str("[]").unwrap();
+        assert!(matches!(ids, InputIds::Single(ref v) if v.is_empty()));
+    }
+
+    #[test]
+    fn input_ids_rejects_invalid_input() {
+        for input in [
+            "[1, [2]]",
+            "[[1], 2]",
+            "[\"a\"]",
+            "[1.5]",
+            "[5000000000]",
+            "\"nope\"",
+            "null",
+            "7",
+        ] {
+            assert!(
+                serde_json::from_str::<InputIds>(input).is_err(),
+                "accepted {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn input_ids_round_trip() {
+        for input in [json!([1, 2, 3]), json!([[1, 2], [3]]), json!([])] {
+            let ids: InputIds = serde_json::from_value(input.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&ids).unwrap(), input);
+        }
+    }
+
+    #[test]
+    fn function_deserializes_without_parameters() {
+        // Per the OpenAI spec, omitting `parameters` defines a function with
+        // an empty parameter list: no schema was given, and a consumer that
+        // needs one reads the empty schema.
+        let value = json!({"name": "web_search", "description": ""});
+        let function: Function = serde_json::from_value(value).expect("parameterless function");
+        assert_eq!(function.parameters, None);
+        assert_eq!(function.parameters_schema(), &json!({}));
+
+        // An explicit null is the same thing: `Value::Null` is not a JSON
+        // Schema and must not reach the constraint builders as one.
+        let value = json!({"name": "web_search", "parameters": null});
+        let function: Function = serde_json::from_value(value).expect("null parameters");
+        assert_eq!(function.parameters, None);
+        assert_eq!(function.parameters_schema(), &json!({}));
+
+        // Serialized, such a function leaves the field out, as the client
+        // did; a client's own `{}` stays apart from it.
+        assert_eq!(
+            serde_json::to_value(&function).unwrap(),
+            json!({"name": "web_search"})
+        );
+        let empty: Function =
+            serde_json::from_value(json!({"name": "web_search", "parameters": {}})).unwrap();
+        assert_eq!(empty.parameters, Some(json!({})));
+
+        // A real schema passes through untouched.
+        let schema = json!({"type": "object", "properties": {"q": {"type": "string"}}});
+        let value = json!({"name": "web_search", "parameters": schema});
+        let function: Function = serde_json::from_value(value).expect("schema");
+        assert_eq!(function.parameters.as_ref(), Some(&schema));
+        assert_eq!(function.parameters_schema(), &schema);
+    }
+
+    #[test]
+    fn reasoning_tokens_do_not_clear_speculative_tokens() {
+        let details = Usage::from_counts(10, 20)
+            .with_speculative_tokens(12, 16)
+            .with_reasoning_tokens(5)
+            .completion_tokens_details
+            .expect("details");
+        assert_eq!(details.reasoning_tokens, Some(5));
+        assert_eq!(details.accepted_prediction_tokens, Some(12));
+        assert_eq!(details.rejected_prediction_tokens, Some(4));
+    }
+
+    #[test]
+    fn speculative_tokens_do_not_clear_reasoning_tokens() {
+        let details = Usage::from_counts(10, 20)
+            .with_reasoning_tokens(5)
+            .with_speculative_tokens(12, 16)
+            .completion_tokens_details
+            .expect("details");
+        assert_eq!(details.reasoning_tokens, Some(5));
+        assert_eq!(details.accepted_prediction_tokens, Some(12));
+        assert_eq!(details.rejected_prediction_tokens, Some(4));
+    }
+
+    #[test]
+    fn zero_speculative_counts_leave_usage_untouched() {
+        let usage = Usage::from_counts(10, 20).with_speculative_tokens(0, 0);
+        assert!(usage.completion_tokens_details.is_none());
+    }
+
+    /// The public API defaults `cached_tokens` to zero: prompt details an
+    /// upstream writes without the key read as none cached, where the usage,
+    /// and the completion around it, failed to parse.
+    #[test]
+    fn prompt_details_without_cached_tokens_read_as_none_cached() {
+        let usage: Usage = serde_json::from_value(json!({
+            "prompt_tokens": 9, "completion_tokens": 3, "total_tokens": 12,
+            "prompt_tokens_details": {"audio_tokens": 0}
+        }))
+        .expect("a usage without cached_tokens parses");
+        let details = usage.prompt_tokens_details.expect("details");
+        assert_eq!(details.cached_tokens, 0);
+        assert_eq!(details.audio_tokens, Some(0));
+    }
+
+    /// The newer counters an upstream reports, on the prompt and on the
+    /// completion, are written back as they arrived.
+    #[test]
+    fn the_newer_token_counters_of_an_upstream_usage_are_kept() {
+        let sent = json!({
+            "prompt_tokens": 9, "completion_tokens": 3, "total_tokens": 12,
+            "prompt_tokens_details": {
+                "cached_tokens": 4, "audio_tokens": 0, "text_tokens": 7,
+                "image_tokens": 2, "cache_write_tokens": 5
+            },
+            "completion_tokens_details": {
+                "reasoning_tokens": 0, "audio_tokens": 0, "accepted_prediction_tokens": 0,
+                "rejected_prediction_tokens": 0, "text_tokens": 3
+            }
+        });
+        let usage: Usage = serde_json::from_value(sent.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&usage).unwrap(), sent);
+    }
+
+    /// A usage the gateway builds is written as before: the newer counters stay
+    /// off the wire unless an upstream reported them.
+    #[test]
+    fn a_built_usage_is_written_without_the_newer_counters() {
+        let usage = Usage::from_counts(3, 4)
+            .with_cached_tokens(0)
+            .with_complete_details();
+        assert_eq!(
+            serde_json::to_value(&usage).unwrap(),
+            json!({
+                "prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7,
+                "prompt_tokens_details": {"cached_tokens": 0, "audio_tokens": 0},
+                "completion_tokens_details": {
+                    "reasoning_tokens": 0, "audio_tokens": 0,
+                    "accepted_prediction_tokens": 0, "rejected_prediction_tokens": 0
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn json_schema_shape_requires_name_and_object_schema() {
+        let cases = [
+            ("", json!({}), Some("json_schema_name_empty")),
+            ("", json!("x"), Some("json_schema_name_empty")),
+            ("w", json!("x"), Some("json_schema_schema_not_object")),
+            ("w", json!(1), Some("json_schema_schema_not_object")),
+            ("w", json!([]), Some("json_schema_schema_not_object")),
+            ("w", json!(null), Some("json_schema_schema_not_object")),
+            ("w", json!(true), Some("json_schema_schema_not_object")),
+            ("w", json!({}), None),
+            (
+                "w",
+                json!({"type": "object", "properties": {"city": {"type": "string"}}}),
+                None,
+            ),
+        ];
+        for (name, schema, expected) in cases {
+            let result = validate_json_schema_shape(name, &schema);
+            match expected {
+                Some(code) => {
+                    let err = result.expect_err(&format!("{name:?}/{schema} should fail"));
+                    assert_eq!(err.code, code, "{name:?}/{schema}");
+                }
+                None => assert!(result.is_ok(), "{name:?}/{schema} should pass"),
+            }
+        }
+    }
+
+    /// The strict walk names the first object node that lacks the pin by its
+    /// path from the root, a segment a step, and the root itself as `()`; a
+    /// schema that pins every object node names none.
+    #[test]
+    fn the_strict_walk_names_the_first_unpinned_node_by_its_path() {
+        let open = || json!({"type": "object", "properties": {"x": {"type": "string"}}});
+        let pinned = |key: &str, child: Value| {
+            let mut node = json!({"type": "object", "additionalProperties": false});
+            node[key] = child;
+            node
+        };
+        let text = json!({"type": "string"});
+        let cases = [
+            (open(), Some("()")),
+            (json!({"type": ["object", "null"]}), Some("()")),
+            (json!({"properties": {}}), Some("()")),
+            (
+                pinned("properties", json!({"a": open()})),
+                Some("/properties/a"),
+            ),
+            (
+                pinned("properties", json!({"": open()})),
+                Some("/properties/"),
+            ),
+            (pinned("$defs", json!({"a": open()})), Some("/$defs/a")),
+            (
+                pinned("definitions", json!({"a": open()})),
+                Some("/definitions/a"),
+            ),
+            (pinned("anyOf", json!([text, open()])), Some("/anyOf/1")),
+            (pinned("oneOf", json!([open()])), Some("/oneOf/0")),
+            (
+                pinned("allOf", json!([text, text, open()])),
+                Some("/allOf/2"),
+            ),
+            (
+                pinned("prefixItems", json!([text, open()])),
+                Some("/prefixItems/1"),
+            ),
+            (pinned("items", open()), Some("/items")),
+            (pinned("not", open()), Some("/not")),
+            (
+                pinned(
+                    "properties",
+                    json!({"a": {"type": "array", "items": {"anyOf": [
+                        text,
+                        pinned("properties", json!({"b": open()}))
+                    ]}}}),
+                ),
+                Some("/properties/a/items/anyOf/1/properties/b"),
+            ),
+            // First is depth first: the node under the first name, not its nearer sibling.
+            (
+                pinned(
+                    "properties",
+                    json!({"a": pinned("properties", json!({"deep": open()})), "b": open()}),
+                ),
+                Some("/properties/a/properties/deep"),
+            ),
+            // First is by kind: named children, then the lists, then `items` and `not`.
+            (
+                json!({
+                    "type": "object", "additionalProperties": false,
+                    "not": open(), "items": open(), "anyOf": [open()], "properties": {"p": open()}
+                }),
+                Some("/properties/p"),
+            ),
+            (
+                json!({
+                    "type": "object", "additionalProperties": false,
+                    "not": open(), "items": open(), "anyOf": [open()]
+                }),
+                Some("/anyOf/0"),
+            ),
+            (
+                json!({
+                    "type": "object", "additionalProperties": false,
+                    "not": open(), "items": open()
+                }),
+                Some("/items"),
+            ),
+            // First within a kind is by key: `properties`, `$defs`, `definitions`,
+            // and `anyOf`, `oneOf`, `allOf`, `prefixItems`.
+            (
+                json!({
+                    "type": "object", "additionalProperties": false,
+                    "definitions": {"d": open()}, "$defs": {"d": open()},
+                    "properties": {"p": open()}
+                }),
+                Some("/properties/p"),
+            ),
+            (
+                json!({
+                    "type": "object", "additionalProperties": false,
+                    "definitions": {"d": open()}, "$defs": {"d": open()}
+                }),
+                Some("/$defs/d"),
+            ),
+            (
+                json!({
+                    "type": "object", "additionalProperties": false,
+                    "prefixItems": [open()], "allOf": [open()],
+                    "oneOf": [open()], "anyOf": [open()]
+                }),
+                Some("/anyOf/0"),
+            ),
+            (
+                json!({
+                    "type": "object", "additionalProperties": false,
+                    "prefixItems": [open()], "allOf": [open()], "oneOf": [open()]
+                }),
+                Some("/oneOf/0"),
+            ),
+            (
+                json!({
+                    "type": "object", "additionalProperties": false,
+                    "prefixItems": [open()], "allOf": [open()]
+                }),
+                Some("/allOf/0"),
+            ),
+            // First in a list is its first element.
+            (pinned("anyOf", json!([open(), open()])), Some("/anyOf/0")),
+            (
+                pinned(
+                    "properties",
+                    json!({"a": text, "b": pinned("items", text.clone())}),
+                ),
+                None,
+            ),
+            (text.clone(), None),
+            (json!(true), None),
+        ];
+        for (schema, path) in cases {
+            assert_eq!(
+                strict_schema_missing_additional_properties(&schema).as_deref(),
+                path,
+                "{schema}"
+            );
+        }
+    }
+
+    /// A named function, `required`, and allowed tools in `required` mode
+    /// force a call; `auto`, `none`, and allowed tools in `auto` mode do not.
+    #[test]
+    fn a_tool_choice_says_whether_it_forces_a_call() {
+        let choice =
+            |body: Value| -> ToolChoice { serde_json::from_value(body).expect("a tool choice") };
+        for forcing in [
+            json!("required"),
+            json!({"type": "function", "function": {"name": "lookup"}}),
+            json!({"type": "allowed_tools", "mode": "required", "tools": []}),
+        ] {
+            assert!(choice(forcing.clone()).forces_call(), "{forcing}");
+        }
+        for free in [
+            json!("auto"),
+            json!("none"),
+            json!({"type": "allowed_tools", "mode": "auto", "tools": []}),
+        ] {
+            assert!(!choice(free.clone()).forces_call(), "{free}");
+        }
+    }
+
+    /// The allowed-tools choice reads in the contract's nested shape and in
+    /// the flat shape this route read before, to the same choice, and is
+    /// written back in the contract's shape; the words and the named function
+    /// round-trip as they are.
+    #[test]
+    fn an_allowed_tools_choice_reads_both_shapes_and_writes_the_contracts() {
+        let contract = json!({"type": "allowed_tools", "allowed_tools": {"mode": "required",
+            "tools": [{"type": "function", "function": {"name": "get_weather"}},
+                      {"type": "function", "function": {"name": "get_time"}}]}});
+        let flat = json!({"type": "allowed_tools", "mode": "required",
+            "tools": [{"type": "function", "name": "get_weather"},
+                      {"type": "function", "function": {"name": "get_time"}}]});
+        for body in [&contract, &flat] {
+            let choice: ToolChoice = serde_json::from_value(body.clone()).expect("a tool choice");
+            let ToolChoice::AllowedTools {
+                tool_type,
+                mode,
+                tools,
+            } = &choice
+            else {
+                panic!("{body} read as {choice:?}")
+            };
+            assert_eq!(
+                (tool_type.as_str(), mode.as_str()),
+                ("allowed_tools", "required")
+            );
+            assert_eq!(
+                tools
+                    .iter()
+                    .map(ToolReference::function_name)
+                    .collect::<Vec<_>>(),
+                [Some("get_weather"), Some("get_time")],
+                "{body}"
+            );
+            assert!(choice.forces_call(), "{body}");
+            assert_eq!(
+                serde_json::to_value(&choice).expect("json"),
+                contract,
+                "{body}"
+            );
+        }
+        for body in [
+            json!("auto"),
+            json!("required"),
+            json!({"type": "function", "function": {"name": "get_weather"}}),
+        ] {
+            let choice: ToolChoice = serde_json::from_value(body.clone()).expect("a tool choice");
+            assert_eq!(serde_json::to_value(&choice).expect("json"), body);
+        }
+        for refused in [
+            json!({"type": "allowed_tools", "allowed_tools": {"mode": "auto"}}),
+            json!({"type": "allowed_tools", "allowed_tools": {"mode": "auto",
+                "tools": [{"type": "custom", "function": {"name": "x"}}]}}),
+            json!({"type": "allowed_tools"}),
+        ] {
+            let err = serde_json::from_value::<ToolChoice>(refused.clone())
+                .expect_err(&refused.to_string())
+                .to_string();
+            assert_eq!(
+                err, "data did not match any variant of untagged enum ToolChoice",
+                "{refused}"
+            );
+        }
+    }
+
+    /// An assistant `refusal` part reads as a typed part, writes back as the
+    /// public API spells it, and is the turn's text to the renderers; a text
+    /// part keeps being text and a media part has none.
+    #[test]
+    fn a_refusal_part_is_typed_and_read_as_text() {
+        let body = json!({"type": "refusal", "refusal": "I cannot help with that."});
+        let part: ContentPart = serde_json::from_value(body.clone()).expect("a content part");
+        assert_eq!(
+            part,
+            ContentPart::Refusal {
+                refusal: "I cannot help with that.".to_string()
+            }
+        );
+        assert_eq!(part.text(), Some("I cannot help with that."));
+        assert_eq!(serde_json::to_value(&part).expect("json"), body);
+        let text: ContentPart =
+            serde_json::from_value(json!({"type": "text", "text": "hi"})).expect("a content part");
+        assert_eq!(text.text(), Some("hi"));
+        let image: ContentPart = serde_json::from_value(
+            json!({"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}),
+        )
+        .expect("a content part");
+        assert_eq!(image.text(), None);
+    }
+
+    /// `response_format` on the wire: `{"type": ...}` with the schema object
+    /// under `json_schema`. The three kinds read in either key order, an
+    /// unknown key is ignored, and a kind that carries no schema ignores a
+    /// `json_schema` field of any shape.
+    #[test]
+    fn a_response_format_reads_its_three_kinds_in_either_key_order() {
+        let read = |text: &str| serde_json::from_str::<ResponseFormat>(text);
+        assert!(matches!(
+            read(r#"{"type":"text"}"#).expect("text"),
+            ResponseFormat::Text
+        ));
+        assert!(matches!(
+            read(r#"{"type":"json_object"}"#).expect("json_object"),
+            ResponseFormat::JsonObject
+        ));
+        let schema = json!({
+            "type": "object",
+            "properties": {"city": {"type": "string"}, "days": {"type": "integer"}},
+            "required": ["city"],
+            "additionalProperties": false
+        });
+        let type_first = format!(
+            r#"{{"type":"json_schema","json_schema":{{"name":"answer","schema":{schema},"strict":true}}}}"#
+        );
+        let type_last = format!(
+            r#"{{"json_schema":{{"strict":true,"schema":{schema},"name":"answer"}},"type":"json_schema"}}"#
+        );
+        for text in [&type_first, &type_last] {
+            match read(text).expect("json_schema") {
+                ResponseFormat::JsonSchema { json_schema } => {
+                    assert_eq!(json_schema.name, "answer");
+                    assert_eq!(json_schema.schema, schema);
+                    assert_eq!(json_schema.strict, Some(true));
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        let format = read(&type_first).expect("json_schema");
+        assert_eq!(
+            serde_json::to_value(&format).expect("serializes"),
+            json!({"type": "json_schema", "json_schema": {"name": "answer", "schema": schema, "strict": true}})
+        );
+        assert!(matches!(
+            read(r#"{"type":"text","verbosity":"low"}"#).expect("an unknown key is ignored"),
+            ResponseFormat::Text
+        ));
+        assert!(matches!(
+            read(r#"{"type":"text","json_schema":"not an object"}"#).expect("ignored for text"),
+            ResponseFormat::Text
+        ));
+        assert!(matches!(
+            read(r#"{"json_schema":{"name":1},"type":"json_object"}"#)
+                .expect("ignored for json_object"),
+            ResponseFormat::JsonObject
+        ));
+        assert!(matches!(
+            read(r#"{"json_schema":{"name":"a","name":"b"},"type":"text"}"#)
+                .expect("a repeated field is ignored with the object, for text"),
+            ResponseFormat::Text
+        ));
+        assert!(matches!(
+            read(r#"{"json_schema":{"strict":true,"strict":false},"type":"json_object"}"#)
+                .expect("a repeated field is ignored with the object, for json_object"),
+            ResponseFormat::JsonObject
+        ));
+        assert!(matches!(
+            read(r#"{"type":"json_schema","json_schema":{"name":"a","schema":{}},"strict":true}"#)
+                .expect("a stray key beside the schema is ignored"),
+            ResponseFormat::JsonSchema { .. }
+        ));
+        assert!(serde_json::from_str::<Option<ResponseFormat>>("null")
+            .expect("null")
+            .is_none());
+    }
+
+    /// The errors are the derive's, word for word: the missing tag, an
+    /// unknown kind, the missing or malformed schema object, a duplicate key,
+    /// the sequence form's lengths. Read on their own they carry a position
+    /// where the derive gave none (it read the variant from its buffer after
+    /// the object); inside a request both point at the field's end, except a
+    /// malformed schema object under `json_schema`, whose column is the
+    /// failing token's instead of the closing brace's (pinned last).
+    #[test]
+    fn a_response_format_error_names_what_is_wrong() {
+        let err = |text: &str| {
+            serde_json::from_str::<ResponseFormat>(text)
+                .expect_err(text)
+                .to_string()
+        };
+        for (text, message) in [
+            (
+                r#"{"json_schema":{"name":"a","schema":{}}}"#,
+                "missing field `type` at line 1 column 40",
+            ),
+            ("{}", "missing field `type` at line 1 column 2"),
+            (
+                r#"{"type":"xml"}"#,
+                "unknown variant `xml`, expected one of `text`, `json_object`, `json_schema`, `structural_tag` at line 1 column 13",
+            ),
+            (
+                r#"{"type":1}"#,
+                "invalid type: integer `1`, expected variant identifier at line 1 column 9",
+            ),
+            (
+                r#"{"type":"json_schema"}"#,
+                "missing field `json_schema` at line 1 column 22",
+            ),
+            (
+                r#"{"type":"json_schema","json_schema":null}"#,
+                "invalid type: null, expected struct JsonSchemaFormat at line 1 column 40",
+            ),
+            (
+                r#"{"type":"json_schema","json_schema":"text"}"#,
+                "invalid type: string \"text\", expected struct JsonSchemaFormat at line 1 column 42",
+            ),
+            (
+                r#"{"json_schema":"text","type":"json_schema"}"#,
+                "invalid type: string \"text\", expected struct JsonSchemaFormat at line 1 column 43",
+            ),
+            (
+                r#"{"type":"json_schema","json_schema":{"schema":{}}}"#,
+                "missing field `name` at line 1 column 49",
+            ),
+            (
+                r#"{"type":"json_schema","json_schema":{"name":"a"}}"#,
+                "missing field `schema` at line 1 column 48",
+            ),
+            (
+                r#"{"type":"text","type":"text"}"#,
+                "duplicate field `type` at line 1 column 21",
+            ),
+            (
+                r#"{"type":"json_schema","json_schema":{"name":"a","schema":{}},"json_schema":{"name":"b","schema":{}}}"#,
+                "duplicate field `json_schema` at line 1 column 100",
+            ),
+            (
+                r#""text""#,
+                "invalid type: string \"text\", expected internally tagged enum ResponseFormat at line 1 column 6",
+            ),
+            ("[]", "missing field `type` at line 1 column 2"),
+            (
+                r#"["xml"]"#,
+                "unknown variant `xml`, expected one of `text`, `json_object`, `json_schema`, `structural_tag` at line 1 column 6",
+            ),
+            (
+                "[1]",
+                "invalid type: integer `1`, expected variant identifier at line 1 column 2",
+            ),
+            (
+                r#"["json_schema"]"#,
+                "invalid length 0, expected struct variant ResponseFormat::JsonSchema with 1 element at line 1 column 15",
+            ),
+            (
+                r#"["json_schema","text"]"#,
+                "invalid type: string \"text\", expected struct JsonSchemaFormat at line 1 column 21",
+            ),
+            (
+                r#"["json_schema",{"name":"a","schema":{}},"extra"]"#,
+                "invalid length 2, expected 1 element in sequence at line 1 column 48",
+            ),
+            (
+                r#"["text",{"json_schema":"x"}]"#,
+                "invalid length 1, expected 0 elements in sequence at line 1 column 28",
+            ),
+            (
+                r#"["json_object","x","y"]"#,
+                "invalid length 2, expected 0 elements in sequence at line 1 column 23",
+            ),
+        ] {
+            assert_eq!(err(text), message, "{text}");
+        }
+        // the sequence form the derive read is still read
+        assert!(matches!(
+            serde_json::from_str::<ResponseFormat>(r#"["text"]"#).expect("text"),
+            ResponseFormat::Text
+        ));
+        match serde_json::from_str::<ResponseFormat>(
+            r#"["json_schema",["a",{"type":"object"},true]]"#,
+        )
+        .expect("json_schema")
+        {
+            ResponseFormat::JsonSchema { json_schema } => {
+                assert_eq!(json_schema.name, "a");
+                assert_eq!(json_schema.strict, Some(true));
+            }
+            other => panic!("{other:?}"),
+        }
+        // inside a request: the field's end, and the one moved column
+        let request_err = |format: &str| {
+            let text = format!(
+                r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],"response_format":{format},"max_tokens":8}}"#
+            );
+            serde_json::from_str::<crate::chat::ChatCompletionRequest>(&text)
+                .expect_err(format)
+                .to_string()
+        };
+        assert_eq!(
+            request_err(r#"{"json_schema":{"name":"a","schema":{}},"type":"xml"}"#),
+            "unknown variant `xml`, expected one of `text`, `json_object`, `json_schema`, `structural_tag` at line 1 column 127"
+        );
+        assert_eq!(
+            request_err(r#"{"type":"json_schema","json_schema":"text"}"#),
+            "invalid type: string \"text\", expected struct JsonSchemaFormat at line 1 column 117"
+        );
+    }
+
+    /// The two kinds that carry a value carry it behind a pointer: a format is
+    /// two words wherever one is held (the Gateway's chat route task holds a
+    /// request's format three times over its awaits, and the schema's 128
+    /// bytes inline had put that task's box over the allocator's 3,584-byte
+    /// class edge on every chat request), and the text written back is the
+    /// text read.
+    #[test]
+    fn a_response_formats_schema_and_tag_ride_behind_a_pointer_each() {
+        assert_eq!(size_of::<ResponseFormat>(), 2 * size_of::<usize>());
+        assert_eq!(
+            size_of::<Option<ResponseFormat>>(),
+            size_of::<ResponseFormat>()
+        );
+        let schema_text = concat!(
+            r#"{"type":"json_schema","json_schema":{"name":"a","schema":{"type":"object"},"#,
+            r#""strict":true,"description":"d"}}"#
+        );
+        let tag_text = r#"{"type":"structural_tag","structures":[],"triggers":["<w>"]}"#;
+        let read = |text: &str| serde_json::from_str::<ResponseFormat>(text).expect(text);
+        let schema = read(schema_text);
+        let ResponseFormat::JsonSchema { json_schema } = &schema else {
+            panic!("{schema:?}");
+        };
+        assert_eq!(size_of_val(json_schema), size_of::<usize>());
+        assert_eq!(json_schema.description.as_deref(), Some("d"));
+        let tag = read(tag_text);
+        let ResponseFormat::StructuralTag { spec } = &tag else {
+            panic!("{tag:?}");
+        };
+        assert_eq!(size_of_val(spec), size_of::<usize>());
+        assert_eq!(spec.keys().collect::<Vec<_>>(), ["structures", "triggers"]);
+        for (format, text) in [(&schema, schema_text), (&tag, tag_text)] {
+            assert_eq!(serde_json::to_string(format).expect("writes"), text);
+        }
+    }
+
+    /// A structural tag is carried as it arrived: every key but `type`, in
+    /// the order they came, in whichever spelling the engine's grammar
+    /// compiler takes (`structures` with `triggers`, or a `format`), unknown
+    /// keys included, so the text written back is the text read. With `type`
+    /// last the keys before it are kept the same, in their places, a
+    /// `json_schema` among them as the value it was (the last one where the
+    /// key repeats, in the first one's place, before the kind as after it, as
+    /// the derive's flattened map keeps it); the sequence form reads the
+    /// kind, then the object.
+    #[test]
+    fn a_structural_tag_response_format_is_kept_as_it_arrived() {
+        let read = |text: &str| serde_json::from_str::<ResponseFormat>(text).expect(text);
+        let spec_of = |format: &ResponseFormat| match format {
+            ResponseFormat::StructuralTag { spec } => (**spec).clone(),
+            other => panic!("{other:?}"),
+        };
+        let structures = concat!(
+            r#"{"type":"structural_tag","structures":[{"begin":"<w>","schema":{"type":"object","#,
+            r#""properties":{"city":{"type":"string"},"temp_c":{"type":"integer"}},"#,
+            r#""required":["city","temp_c"],"additionalProperties":false},"end":"</w>"}],"#,
+            r#""triggers":["<w>"]}"#
+        );
+        let triggered = concat!(
+            r#"{"type":"structural_tag","format":{"type":"triggered_tags","triggers":["<w>"],"#,
+            r#""tags":[{"begin":"<w>","content":{"type":"json_schema","json_schema":"#,
+            r#"{"type":"object"}},"end":"</w>"}]},"note":"kept"}"#
+        );
+        for text in [structures, triggered] {
+            let format = read(text);
+            assert_eq!(serde_json::to_string(&format).expect("writes"), text);
+            assert_eq!(
+                serde_json::to_value(&format).expect("writes"),
+                serde_json::from_str::<Value>(text).expect("json")
+            );
+        }
+        assert_eq!(
+            spec_of(&read(structures)).keys().collect::<Vec<_>>(),
+            ["structures", "triggers"]
+        );
+        // `type` last: the keys before it are kept, a `json_schema` among them
+        let late = read(
+            r#"{"triggers":["<w>"],"json_schema":{"name":"n","name":"m"},"structures":[],"type":"structural_tag"}"#,
+        );
+        let spec = spec_of(&late);
+        assert_eq!(spec["triggers"], json!(["<w>"]));
+        assert_eq!(spec["structures"], json!([]));
+        assert_eq!(spec["json_schema"], json!({"name": "m"}));
+        assert_eq!(spec.len(), 3);
+        assert_eq!(
+            spec.keys().collect::<Vec<_>>(),
+            ["triggers", "json_schema", "structures"],
+            "the keys keep their places"
+        );
+        let ordered = r#"{"triggers":["<w>"],"json_schema":{"name":"m"},"structures":[],"type":"structural_tag"}"#;
+        assert_eq!(
+            serde_json::to_string(&read(ordered)).expect("writes"),
+            r#"{"type":"structural_tag","triggers":["<w>"],"json_schema":{"name":"m"},"structures":[]}"#
+        );
+        // a repeated `json_schema`: the last value, in the first one's place
+        for text in [
+            r#"{"json_schema":1,"triggers":[],"json_schema":2,"type":"structural_tag"}"#,
+            r#"{"type":"structural_tag","json_schema":1,"triggers":[],"json_schema":2}"#,
+            r#"{"json_schema":1,"type":"structural_tag","triggers":[],"json_schema":2}"#,
+        ] {
+            assert_eq!(
+                serde_json::to_string(&read(text)).expect("writes"),
+                r#"{"type":"structural_tag","json_schema":2,"triggers":[]}"#,
+                "{text}"
+            );
+        }
+        // inside a request: the field reads and writes back as sent
+        let body = format!(
+            r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],"response_format":{structures}}}"#
+        );
+        let request: crate::chat::ChatCompletionRequest =
+            serde_json::from_str(&body).expect("a request");
+        assert_eq!(
+            serde_json::to_value(&request).expect("writes")["response_format"],
+            serde_json::from_str::<Value>(structures).expect("json")
+        );
+        // the sequence form: the kind, then the object
+        assert_eq!(
+            spec_of(&read(r#"["structural_tag",{"triggers":[]}]"#)),
+            serde_json::from_str::<Map<String, Value>>(r#"{"triggers":[]}"#).expect("an object")
+        );
+        assert_eq!(
+            serde_json::from_str::<ResponseFormat>(r#"["structural_tag"]"#)
+                .expect_err("no object")
+                .to_string(),
+            "invalid length 0, expected struct variant ResponseFormat::StructuralTag with 1 element at line 1 column 18"
+        );
+    }
+
+    /// One value of each kind writes its name under `type` and reads back as
+    /// the same kind, from a `Value` and from text; `kind_of` matches every
+    /// variant of `ResponseFormat`, so a new variant fails this build until
+    /// the reader learns it, and the unknown-kind list is the names in order.
+    #[test]
+    fn a_response_format_round_trips_each_kind_under_its_name() {
+        fn kind_of(format: &ResponseFormat) -> ResponseFormatKind {
+            match format {
+                ResponseFormat::Text => ResponseFormatKind::Text,
+                ResponseFormat::JsonObject => ResponseFormatKind::JsonObject,
+                ResponseFormat::JsonSchema { .. } => ResponseFormatKind::JsonSchema,
+                ResponseFormat::StructuralTag { .. } => ResponseFormatKind::StructuralTag,
+            }
+        }
+        let formats = [
+            ResponseFormat::Text,
+            ResponseFormat::JsonObject,
+            ResponseFormat::JsonSchema {
+                json_schema: Box::new(JsonSchemaFormat {
+                    description: None,
+                    name: "answer".to_owned(),
+                    schema: json!({"type": "object"}),
+                    strict: None,
+                }),
+            },
+            ResponseFormat::StructuralTag {
+                spec: Box::default(),
+            },
+        ];
+        assert_eq!(formats.len(), ResponseFormatKind::ALL.len());
+        for (format, kind) in formats.iter().zip(ResponseFormatKind::ALL) {
+            assert_eq!(kind_of(format), kind);
+            let written = serde_json::to_value(format).expect("writes");
+            assert_eq!(written["type"], kind.name(), "{written}");
+            let read: ResponseFormat = serde_json::from_value(written.clone()).expect("reads back");
+            assert_eq!(kind_of(&read), kind, "{written}");
+            let read: ResponseFormat =
+                serde_json::from_str(&written.to_string()).expect("reads back from text");
+            assert_eq!(kind_of(&read), kind, "{written}");
+        }
+        assert_eq!(
+            RESPONSE_FORMAT_KINDS,
+            ResponseFormatKind::ALL.map(ResponseFormatKind::name)
+        );
+    }
+
+    /// A schema object that arrives before `type` is kept as it arrived and
+    /// read by the schema's own derive once the kind wants it: a repeated
+    /// field is the duplicate-field error, a field malformed before it repeats
+    /// the invalid-type error, in that order as in the other (the position
+    /// then being the enclosing object's end, the derive's); a duplicate
+    /// deeper in the schema keeps the last value in both orders, as a `Value`
+    /// does.
+    #[test]
+    fn a_kept_schema_object_refuses_a_repeated_field_in_either_order() {
+        let err = |text: &str| {
+            serde_json::from_str::<ResponseFormat>(text)
+                .expect_err(text)
+                .to_string()
+        };
+        for (text, message) in [
+            (
+                r#"{"type":"json_schema","json_schema":{"name":"a","name":"b","schema":{}}}"#,
+                "duplicate field `name` at line 1 column 54",
+            ),
+            (
+                r#"{"json_schema":{"name":"a","name":"b","schema":{}},"type":"json_schema"}"#,
+                "duplicate field `name` at line 1 column 72",
+            ),
+            (
+                r#"{"type":"json_schema","json_schema":{"name":"a","schema":{},"schema":{}}}"#,
+                "duplicate field `schema` at line 1 column 68",
+            ),
+            (
+                r#"{"json_schema":{"name":"a","schema":{},"schema":{}},"type":"json_schema"}"#,
+                "duplicate field `schema` at line 1 column 73",
+            ),
+            (
+                r#"{"type":"json_schema","json_schema":{"name":"a","schema":{},"strict":true,"strict":false}}"#,
+                "duplicate field `strict` at line 1 column 82",
+            ),
+            (
+                r#"{"json_schema":{"name":"a","schema":{},"strict":true,"strict":false},"type":"json_schema"}"#,
+                "duplicate field `strict` at line 1 column 90",
+            ),
+            (
+                r#"{"type":"json_schema","json_schema":{"name":1,"name":"b","schema":{}}}"#,
+                "invalid type: integer `1`, expected a string at line 1 column 45",
+            ),
+            (
+                r#"{"json_schema":{"name":1,"name":"b","schema":{}},"type":"json_schema"}"#,
+                "invalid type: integer `1`, expected a string at line 1 column 70",
+            ),
+            // the field repeated at the top level: the first value is read
+            // before the repeat is raised, as the derive's visitor does
+            (
+                r#"{"json_schema":{"name":1},"json_schema":{"name":"a","schema":{}},"type":"json_schema"}"#,
+                "invalid type: integer `1`, expected a string at line 1 column 86",
+            ),
+            (
+                r#"{"json_schema":5,"json_schema":{},"type":"json_schema"}"#,
+                "invalid type: integer `5`, expected struct JsonSchemaFormat at line 1 column 55",
+            ),
+            (
+                r#"{"json_schema":{"name":"a","schema":{}},"json_schema":{},"type":"json_schema"}"#,
+                "duplicate field `json_schema` at line 1 column 78",
+            ),
+            // the eager read's one difference in text: a repeated `type` after
+            // a malformed schema reads the schema's error here and
+            // `duplicate field `type`` under the derive; both refuse the body
+            (
+                r#"{"type":"json_schema","json_schema":{"name":1},"type":"text"}"#,
+                "invalid type: integer `1`, expected a string at line 1 column 45",
+            ),
+        ] {
+            assert_eq!(err(text), message, "{text}");
+        }
+        for text in [
+            r#"{"type":"json_schema","json_schema":{"name":"a","schema":{"x":1,"x":2}}}"#,
+            r#"{"json_schema":{"name":"a","schema":{"x":1,"x":2}},"type":"json_schema"}"#,
+        ] {
+            match serde_json::from_str::<ResponseFormat>(text).expect(text) {
+                ResponseFormat::JsonSchema { json_schema } => {
+                    assert_eq!(json_schema.schema, json!({"x": 2}), "{text}");
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        // a kept object with a repeated unknown key is as the derive read it:
+        // the key ignored, no error
+        assert!(matches!(
+            serde_json::from_str::<ResponseFormat>(
+                r#"{"json_schema":{"name":"a","schema":{},"note":1,"note":2},"type":"json_schema"}"#
+            )
+            .expect("an unknown key twice is ignored"),
+            ResponseFormat::JsonSchema { .. }
+        ));
+    }
+
+    #[cfg(test)]
+    mod speculative_usage_regression {
+        use super::Usage;
+
+        #[test]
+        fn accepted_survives_unknown_drafted_count() {
+            let usage = Usage::from_counts(10, 5).with_speculative_tokens(2, 0);
+            let details = usage
+                .completion_tokens_details
+                .expect("accepted must not be discarded");
+            assert_eq!(details.accepted_prediction_tokens, Some(2));
+            assert_eq!(
+                details.rejected_prediction_tokens, None,
+                "unknown drafted is not measured rejection"
+            );
+        }
+    }
+
+    #[cfg(test)]
+    mod speculative_complete_details_regression {
+        use super::Usage;
+
+        #[test]
+        fn complete_details_preserves_unknown_rejected() {
+            for drafted in [0, 1] {
+                let usage = Usage::from_counts(10, 5)
+                    .with_reasoning_tokens(3)
+                    .with_speculative_tokens(2, drafted)
+                    .with_complete_details();
+                let json = serde_json::to_value(&usage).unwrap();
+                let details = &json["completion_tokens_details"];
+                assert_eq!(details["accepted_prediction_tokens"], 2);
+                assert_eq!(details["reasoning_tokens"], 3);
+                assert!(
+                    details.get("rejected_prediction_tokens").is_none(),
+                    "unknown or inconsistent drafts must not be zero-filled: {json}"
+                );
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod speculative_usage_controls {
+        use super::Usage;
+        #[test]
+        fn known_drafts_keep_measured_rejected_including_zero() {
+            for (accepted, drafted, rejected) in [(2, 3, 1), (2, 2, 0), (0, 3, 3)] {
+                let usage = Usage::from_counts(10, 5)
+                    .with_speculative_tokens(accepted, drafted)
+                    .with_reasoning_tokens(3)
+                    .with_complete_details();
+                let details = usage.completion_tokens_details.unwrap();
+                assert_eq!(details.accepted_prediction_tokens, Some(accepted));
+                assert_eq!(details.rejected_prediction_tokens, Some(rejected));
+                assert_eq!(details.reasoning_tokens, Some(3));
+            }
+        }
+        #[test]
+        fn no_speculation_keeps_zero_schema_defaults() {
+            assert!(Usage::from_counts(10, 5)
+                .with_speculative_tokens(0, 0)
+                .completion_tokens_details
+                .is_none());
+            for usage in [
+                Usage::from_counts(10, 5),
+                Usage::from_counts(10, 5).with_speculative_tokens(0, 0),
+            ] {
+                let json = serde_json::to_value(usage.with_complete_details()).unwrap();
+                assert_eq!(
+                    json["completion_tokens_details"]["accepted_prediction_tokens"],
+                    0
+                );
+                assert_eq!(
+                    json["completion_tokens_details"]["rejected_prediction_tokens"],
+                    0
+                );
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod zero_accepted_unknown_rejections {
+        use super::Usage;
+
+        #[test]
+        fn complete_details_keeps_explicit_zero_accepted_unknown_rejected() {
+            let mut usage = Usage::from_counts(10, 5);
+            usage
+                .completion_tokens_details
+                .get_or_insert_default()
+                .accepted_prediction_tokens = Some(0);
+            let details = usage
+                .with_complete_details()
+                .completion_tokens_details
+                .unwrap();
+            assert_eq!(details.accepted_prediction_tokens, Some(0));
+            assert_eq!(details.rejected_prediction_tokens, None);
+        }
+    }
+
+    /// The routing text of a JSON input: the string itself, an array's string
+    /// members joined on spaces, nothing for any other shape.
+    #[test]
+    fn a_json_inputs_routing_text_is_its_strings_joined() {
+        assert_eq!(routing_text_of_input(&json!("hello world")), "hello world");
+        assert_eq!(routing_text_of_input(&json!(["a", 1, "b", null])), "a b");
+        assert_eq!(routing_text_of_input(&json!([[1, 2], [3]])), "");
+        assert_eq!(routing_text_of_input(&json!({"text": "x"})), "");
+        assert_eq!(routing_text_of_input(&json!(7)), "");
+    }
+
+    /// Each body states its output limit under its own field's name, and
+    /// one reader answers them all. A chat body's current field stands
+    /// ahead of its deprecated one. A body that names no limit states none,
+    /// and so does a protocol that generates no text.
+    #[test]
+    fn a_body_states_its_output_limit_through_one_reader() {
+        use crate::{
+            chat::ChatCompletionRequest, completion::CompletionRequest,
+            embedding::EmbeddingRequest, generate::GenerateRequest, messages::CreateMessageRequest,
+            responses::ResponsesRequest,
+        };
+
+        fn limit<T: GenerationRequest + de::DeserializeOwned>(body: Value) -> Option<u32> {
+            let request: T = serde_json::from_value(body).expect("a body of its protocol");
+            request.max_output_tokens()
+        }
+        let chat = |fields: Value| {
+            let mut body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+            let extra = fields.as_object().expect("an object").clone();
+            body.as_object_mut().expect("an object").extend(extra);
+            limit::<ChatCompletionRequest>(body)
+        };
+        assert_eq!(chat(json!({"max_completion_tokens": 64})), Some(64));
+        assert_eq!(chat(json!({"max_tokens": 32})), Some(32));
+        assert_eq!(
+            chat(json!({"max_completion_tokens": 64, "max_tokens": 32})),
+            Some(64),
+            "the current field ahead of the deprecated one"
+        );
+        assert_eq!(chat(json!({})), None);
+
+        let completion = json!({"model": "m", "prompt": "hi", "max_tokens": 16});
+        assert_eq!(limit::<CompletionRequest>(completion), Some(16));
+        let messages = json!({"model": "m", "max_tokens": 8, "messages": []});
+        assert_eq!(limit::<CreateMessageRequest>(messages), Some(8));
+        let responses = json!({"model": "m", "input": "hi", "max_output_tokens": 128});
+        assert_eq!(limit::<ResponsesRequest>(responses), Some(128));
+        let generate =
+            json!({"model": "m", "text": "hi", "sampling_params": {"max_new_tokens": 4}});
+        assert_eq!(limit::<GenerateRequest>(generate), Some(4));
+        let unbounded = json!({"model": "m", "text": "hi"});
+        assert_eq!(limit::<GenerateRequest>(unbounded), None);
+
+        let embedding = json!({"model": "m", "input": "hi"});
+        assert_eq!(limit::<EmbeddingRequest>(embedding), None);
+    }
+
+    /// The type names the validation messages print, one per JSON shape.
+    #[test]
+    fn a_json_values_type_name_is_the_word_a_validation_message_prints() {
+        assert_eq!(json_type_name(&Value::Null), "null");
+        assert_eq!(json_type_name(&json!(true)), "a boolean");
+        assert_eq!(json_type_name(&json!(1)), "a number");
+        assert_eq!(json_type_name(&json!("x")), "a string");
+        assert_eq!(json_type_name(&json!([])), "an array");
+        assert_eq!(json_type_name(&json!({})), "an object");
+    }
+}

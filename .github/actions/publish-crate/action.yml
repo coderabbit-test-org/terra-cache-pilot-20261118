@@ -1,0 +1,70 @@
+name: 'Publish Crate'
+description: 'Check version and publish a Rust crate to crates.io'
+
+inputs:
+  crate:
+    description: 'Crate name on crates.io'
+    required: true
+  path:
+    description: 'Path to crate directory'
+    required: true
+  token:
+    description: 'Crates.io registry token'
+    required: true
+
+outputs:
+  published:
+    description: 'Whether the crate was published'
+    value: ${{ steps.check.outputs.changed }}
+  version:
+    description: 'The published version'
+    value: ${{ steps.check.outputs.local }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Check if version changed
+      id: check
+      shell: bash
+      run: |
+        LOCAL=$(grep -E '^[[:space:]]*version[[:space:]]*=' ${{ inputs.path }}/Cargo.toml | head -1 | cut -d'"' -f2)
+        INDEX=$(curl -s "https://crates.io/api/v1/crates/${{ inputs.crate }}")
+        PUBLISHED=$(jq -r '.crate.max_version // "0.0.0"' <<<"${INDEX}")
+        echo "local=${LOCAL}" >> $GITHUB_OUTPUT
+        echo "published=${PUBLISHED}" >> $GITHUB_OUTPUT
+        echo "${{ inputs.crate }}: local=${LOCAL}, newest published=${PUBLISHED}"
+        # Publish when this exact version is not on crates.io yet. A final follows its candidates
+        # (1.14.0 after 1.14.0-rc.1) and a patch of an older line follows a newer release; neither
+        # is the newest by a version sort, both are new versions.
+        if jq -e --arg v "${LOCAL}" '[.versions[]?.num] | index($v) != null' <<<"${INDEX}" > /dev/null; then
+          echo "changed=false" >> $GITHUB_OUTPUT
+          echo "Version ${LOCAL} is on crates.io already, skipping publish"
+        else
+          echo "changed=true" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Setup Rust
+      if: steps.check.outputs.changed == 'true'
+      uses: dtolnay/rust-toolchain@1.100.0
+
+    - name: Install protoc
+      if: steps.check.outputs.changed == 'true'
+      uses: arduino/setup-protoc@v3
+      with:
+        repo-token: ${{ github.token }}
+
+    - name: Publish to crates.io
+      if: steps.check.outputs.changed == 'true'
+      shell: bash
+      env:
+        CARGO_REGISTRY_TOKEN: ${{ inputs.token }}
+      run: |
+        cd ${{ inputs.path }}
+        if cargo publish 2>&1 | tee /tmp/publish.log; then
+          echo "Published ${{ inputs.crate }}@${{ steps.check.outputs.local }}"
+        elif grep -q "already exists" /tmp/publish.log; then
+          echo "Version already exists on crates.io, skipping"
+        else
+          cat /tmp/publish.log
+          exit 1
+        fi

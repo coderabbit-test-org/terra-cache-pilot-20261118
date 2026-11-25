@@ -1,0 +1,2620 @@
+//! Integration tests for workflow engine
+
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+
+use serde::{Deserialize, Serialize};
+use tokio::{
+    sync::Notify,
+    time::{sleep, timeout},
+};
+use wfaas::{
+    BackoffStrategy, EventSubscriber, FailureAction, InMemoryStore, LoggingSubscriber, RetryPolicy,
+    StateStore, StepDefinition, StepExecutor, StepId, StepResult, StepStatus, ValidationError,
+    WorkflowContext, WorkflowData, WorkflowDefinition, WorkflowEngine, WorkflowError,
+    WorkflowEvent, WorkflowInstanceId, WorkflowResult, WorkflowState, WorkflowStatus,
+};
+
+/// Test workflow data type for integration tests.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct TestWorkflowData {
+    /// Execution count for tracking step invocations
+    pub execution_count: u32,
+    /// Test key for context sharing tests
+    pub test_key: Option<String>,
+}
+
+impl WorkflowData for TestWorkflowData {
+    fn workflow_type() -> &'static str {
+        "test_workflow"
+    }
+}
+
+// Test step that counts invocations
+struct CountingStep {
+    counter: Arc<AtomicU32>,
+    should_succeed_after: u32,
+}
+
+#[async_trait::async_trait]
+impl StepExecutor<TestWorkflowData> for CountingStep {
+    async fn execute(
+        &self,
+        context: &mut WorkflowContext<TestWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        let count = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
+
+        // Store count in context
+        context.data.execution_count = count;
+
+        if count >= self.should_succeed_after {
+            Ok(StepResult::Success)
+        } else {
+            Err(WorkflowError::StepFailed {
+                step_id: StepId::new("counting_step"),
+                message: format!("Not ready yet, attempt {count}"),
+            })
+        }
+    }
+}
+
+// Test step that always succeeds
+struct AlwaysSucceedStep;
+
+#[async_trait::async_trait]
+impl StepExecutor<TestWorkflowData> for AlwaysSucceedStep {
+    async fn execute(
+        &self,
+        _context: &mut WorkflowContext<TestWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        Ok(StepResult::Success)
+    }
+}
+
+struct AlwaysFailStep;
+
+#[async_trait::async_trait]
+impl StepExecutor<TestWorkflowData> for AlwaysFailStep {
+    async fn execute(
+        &self,
+        _context: &mut WorkflowContext<TestWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        Ok(StepResult::Failure)
+    }
+}
+
+/// A step that counts its executions and succeeds.
+struct TrackingStep {
+    counter: Arc<AtomicU32>,
+}
+
+#[async_trait::async_trait]
+impl StepExecutor<TestWorkflowData> for TrackingStep {
+    async fn execute(
+        &self,
+        _context: &mut WorkflowContext<TestWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        self.counter.fetch_add(1, Ordering::SeqCst);
+        Ok(StepResult::Success)
+    }
+}
+
+#[tokio::test]
+async fn test_simple_workflow_execution() {
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+
+    // Subscribe to events for logging
+    engine
+        .event_bus()
+        .subscribe(Arc::new(LoggingSubscriber))
+        .await;
+
+    // Create a simple workflow
+    let workflow = WorkflowDefinition::new("test_workflow", "Simple Test Workflow")
+        .add_step(StepDefinition::new(
+            "step1",
+            "First Step",
+            Arc::new(AlwaysSucceedStep),
+        ))
+        .add_step(StepDefinition::new(
+            "step2",
+            "Second Step",
+            Arc::new(AlwaysSucceedStep),
+        ));
+
+    let instance_id = started(&engine, workflow).await.unwrap();
+
+    // Wait for completion
+    sleep(Duration::from_millis(100)).await;
+
+    // Check status
+    let state = engine.get_status(instance_id).await.unwrap();
+    assert_eq!(state.status, WorkflowStatus::Completed);
+    assert_eq!(state.step_states.len(), 2);
+}
+
+#[tokio::test]
+async fn test_workflow_with_retry() {
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+    engine
+        .event_bus()
+        .subscribe(Arc::new(LoggingSubscriber))
+        .await;
+
+    let counter = Arc::new(AtomicU32::new(0));
+
+    // Create workflow with retry logic
+    let workflow = WorkflowDefinition::new("retry_workflow", "Workflow with Retry").add_step(
+        StepDefinition::new(
+            "retry_step",
+            "Step that retries",
+            Arc::new(CountingStep {
+                counter: Arc::clone(&counter),
+                should_succeed_after: 3,
+            }),
+        )
+        .with_retry(RetryPolicy {
+            max_attempts: 5,
+            backoff: BackoffStrategy::Fixed(Duration::from_millis(10)),
+        })
+        .with_timeout(Duration::from_secs(5)),
+    );
+
+    let instance_id = started(&engine, workflow).await.unwrap();
+
+    // Wait for completion
+    sleep(Duration::from_millis(500)).await;
+
+    // Check that step was retried and eventually succeeded
+    let state = engine.get_status(instance_id).await.unwrap();
+    assert_eq!(state.status, WorkflowStatus::Completed);
+
+    let step_state = state.step_states.get(&StepId::new("retry_step")).unwrap();
+    assert_eq!(step_state.status, StepStatus::Succeeded);
+    assert_eq!(step_state.attempt, 3); // Should have taken 3 attempts
+
+    // Verify counter
+    assert_eq!(counter.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn test_workflow_failure_after_max_retries() {
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+    engine
+        .event_bus()
+        .subscribe(Arc::new(LoggingSubscriber))
+        .await;
+
+    let counter = Arc::new(AtomicU32::new(0));
+
+    // Create workflow that will fail
+    let workflow = WorkflowDefinition::new("failing_workflow", "Workflow that Fails").add_step(
+        StepDefinition::new(
+            "failing_step",
+            "Step that always fails",
+            Arc::new(CountingStep {
+                counter: Arc::clone(&counter),
+                should_succeed_after: 10, // Will never succeed within max_attempts
+            }),
+        )
+        .with_retry(RetryPolicy {
+            max_attempts: 3,
+            backoff: BackoffStrategy::Fixed(Duration::from_millis(10)),
+        })
+        .with_failure_action(FailureAction::FailWorkflow),
+    );
+
+    let instance_id = started(&engine, workflow).await.unwrap();
+
+    // Wait for completion
+    sleep(Duration::from_millis(500)).await;
+
+    // Check that workflow failed
+    let state = engine.get_status(instance_id).await.unwrap();
+    assert_eq!(state.status, WorkflowStatus::Failed);
+
+    let step_state = state.step_states.get(&StepId::new("failing_step")).unwrap();
+    assert_eq!(step_state.status, StepStatus::Failed);
+    assert_eq!(step_state.attempt, 3); // Should have tried 3 times
+
+    // Verify counter
+    assert_eq!(counter.load(Ordering::SeqCst), 3);
+}
+
+/// A step that panics with words of its own.
+struct PanickingStep;
+
+#[async_trait::async_trait]
+impl StepExecutor<TestWorkflowData> for PanickingStep {
+    #[expect(clippy::panic, reason = "the case needs a step that panics")]
+    async fn execute(
+        &self,
+        _context: &mut WorkflowContext<TestWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        panic!("the step's own words");
+    }
+}
+
+/// A step that panics fails its attempt, and its run ends as failed after
+/// that one attempt. Left to unwind its task, the step read as running for
+/// ever, and a wait on its run lasted the whole timeout.
+#[tokio::test]
+async fn a_step_that_panics_ends_its_run_as_failed() {
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+    let workflow = WorkflowDefinition::new("panicking_workflow", "A step panics").add_step(
+        StepDefinition::new(
+            "panicking_step",
+            "Step that panics",
+            Arc::new(PanickingStep),
+        )
+        .with_retry(RetryPolicy {
+            max_attempts: 3,
+            backoff: BackoffStrategy::Fixed(Duration::from_millis(10)),
+        })
+        .with_failure_action(FailureAction::FailWorkflow),
+    );
+    let instance_id = started(&engine, workflow).await.unwrap();
+
+    let state = engine
+        .wait_for_terminal_state(instance_id, "panicking", Duration::from_secs(5))
+        .await
+        .unwrap();
+
+    assert_eq!(state.status, WorkflowStatus::Failed);
+    let step_state = state
+        .step_states
+        .get(&StepId::new("panicking_step"))
+        .unwrap();
+    assert_eq!(step_state.status, StepStatus::Failed);
+    assert_eq!(step_state.attempt, 1);
+    assert_eq!(step_state.last_error.as_deref(), Some("Step failed"));
+    assert_eq!(
+        wfaas::completion_outcome(&state, "panicking"),
+        Err("Workflow failed at step panicking_step: Step failed".to_string())
+    );
+    assert!(!format!("{state:?}").contains("the step's own words"));
+}
+
+/// Where a step author's other code panics.
+#[derive(Debug, Clone, Copy)]
+enum PanicsIn {
+    RunIf,
+    IsRetryable,
+    OnSuccess,
+    OnFailure,
+}
+
+/// A step whose named code panics. It fails where that code needs a failure,
+/// and counts each entry into the code that panics.
+struct HookPanics {
+    at: PanicsIn,
+    entered: Arc<AtomicU32>,
+}
+
+#[async_trait::async_trait]
+impl StepExecutor<TestWorkflowData> for HookPanics {
+    async fn execute(
+        &self,
+        _context: &mut WorkflowContext<TestWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        match self.at {
+            PanicsIn::RunIf | PanicsIn::OnSuccess => Ok(StepResult::Success),
+            PanicsIn::IsRetryable | PanicsIn::OnFailure => Err(WorkflowError::StepFailed {
+                step_id: StepId::new("hooked_step"),
+                message: "its own failure".to_string(),
+            }),
+        }
+    }
+
+    #[expect(clippy::panic, reason = "the case needs a retry answer that panics")]
+    fn is_retryable(&self, _error: &WorkflowError) -> bool {
+        if matches!(self.at, PanicsIn::IsRetryable) {
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            panic!("the retry answer's own words");
+        }
+        false
+    }
+
+    #[expect(clippy::panic, reason = "the case needs a hook that panics")]
+    async fn on_success(&self, _context: &WorkflowContext<TestWorkflowData>) -> WorkflowResult<()> {
+        if matches!(self.at, PanicsIn::OnSuccess) {
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            panic!("the success hook's own words");
+        }
+        Ok(())
+    }
+
+    #[expect(clippy::panic, reason = "the case needs a hook that panics")]
+    async fn on_failure(
+        &self,
+        _context: &WorkflowContext<TestWorkflowData>,
+        _error: &WorkflowError,
+    ) -> WorkflowResult<()> {
+        if matches!(self.at, PanicsIn::OnFailure) {
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            panic!("the failure hook's own words");
+        }
+        Ok(())
+    }
+}
+
+/// A panic in a step author's other code ends the run too: the condition,
+/// the retry answer and the two end hooks. A hook's panic is logged like its
+/// error and leaves what the step came to. Each row hung its run before. The
+/// case reads that the code ran, so it fails where the engine calls it no more.
+#[tokio::test]
+async fn a_panic_in_a_steps_condition_or_hooks_ends_its_run() {
+    const FAILURE: &str = "Step failed: hooked_step - its own failure";
+    let rows = [
+        (
+            PanicsIn::RunIf,
+            WorkflowStatus::Failed,
+            StepStatus::Failed,
+            Some("Step failed"),
+        ),
+        (
+            PanicsIn::IsRetryable,
+            WorkflowStatus::Failed,
+            StepStatus::Failed,
+            Some(FAILURE),
+        ),
+        (
+            PanicsIn::OnSuccess,
+            WorkflowStatus::Completed,
+            StepStatus::Succeeded,
+            None,
+        ),
+        (
+            PanicsIn::OnFailure,
+            WorkflowStatus::Failed,
+            StepStatus::Failed,
+            Some(FAILURE),
+        ),
+    ];
+    for (panics_in, run, step, error) in rows {
+        let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+        let entered = Arc::new(AtomicU32::new(0));
+        let mut hooked = StepDefinition::new(
+            "hooked_step",
+            "Step whose other code panics",
+            Arc::new(HookPanics {
+                at: panics_in,
+                entered: Arc::clone(&entered),
+            }),
+        )
+        .with_retry(RetryPolicy {
+            max_attempts: 3,
+            backoff: BackoffStrategy::Fixed(Duration::from_millis(10)),
+        })
+        .with_failure_action(FailureAction::FailWorkflow);
+        if matches!(panics_in, PanicsIn::RunIf) {
+            let entered = Arc::clone(&entered);
+            let condition = move |_: &WorkflowContext<TestWorkflowData>| -> bool {
+                entered.fetch_add(1, Ordering::SeqCst);
+                panic!("the condition's own words")
+            };
+            hooked = hooked.run_if(condition);
+        }
+        let workflow = WorkflowDefinition::new("hooked_workflow", "A step's other code panics")
+            .add_step(hooked);
+        let instance_id = started(&engine, workflow).await.unwrap();
+
+        let state = engine
+            .wait_for_terminal_state(instance_id, "hooked", Duration::from_secs(5))
+            .await
+            .map_err(|error| format!("{panics_in:?}: {error}"))
+            .unwrap();
+
+        assert_eq!(state.status, run, "{panics_in:?}");
+        let step_state = state.step_states.get(&StepId::new("hooked_step")).unwrap();
+        assert_eq!(step_state.status, step, "{panics_in:?}");
+        assert_eq!(step_state.last_error.as_deref(), error, "{panics_in:?}");
+        if matches!(panics_in, PanicsIn::IsRetryable) {
+            assert_eq!(step_state.attempt, 1, "a panicked answer allows no retry");
+        }
+        assert_eq!(entered.load(Ordering::SeqCst), 1, "{panics_in:?} ran once");
+    }
+}
+
+/// Which method of a step panics as it is called, before it returns its
+/// future.
+#[derive(Debug, Clone, Copy)]
+enum Call {
+    Execute,
+    OnSuccess,
+    OnFailure,
+}
+
+/// A step's future, as a method written without the async sugar returns it.
+type Boxed<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// A step written without the async sugar: the named method panics in the
+/// call itself. It fails where the failure hook needs a failure.
+struct PanicsAtCall(Call);
+
+impl StepExecutor<TestWorkflowData> for PanicsAtCall {
+    #[expect(clippy::panic, reason = "the case needs a call that panics")]
+    fn execute<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        _context: &'life1 mut WorkflowContext<TestWorkflowData>,
+    ) -> Boxed<'async_trait, WorkflowResult<StepResult>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        match self.0 {
+            Call::Execute => panic!("the call's own words"),
+            Call::OnSuccess => Box::pin(async { Ok(StepResult::Success) }),
+            Call::OnFailure => Box::pin(async {
+                Err(WorkflowError::StepFailed {
+                    step_id: StepId::new("called_step"),
+                    message: "its own failure".to_string(),
+                })
+            }),
+        }
+    }
+
+    fn is_retryable(&self, _error: &WorkflowError) -> bool {
+        false
+    }
+
+    #[expect(clippy::panic, reason = "the case needs a call that panics")]
+    fn on_success<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        _context: &'life1 WorkflowContext<TestWorkflowData>,
+    ) -> Boxed<'async_trait, WorkflowResult<()>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        if matches!(self.0, Call::OnSuccess) {
+            panic!("the call's own words");
+        }
+        Box::pin(async { Ok(()) })
+    }
+
+    #[expect(clippy::panic, reason = "the case needs a call that panics")]
+    fn on_failure<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 self,
+        _context: &'life1 WorkflowContext<TestWorkflowData>,
+        _error: &'life2 WorkflowError,
+    ) -> Boxed<'async_trait, WorkflowResult<()>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait,
+    {
+        if matches!(self.0, Call::OnFailure) {
+            panic!("the call's own words");
+        }
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// A method that panics as it is called, before it returns its future, is
+/// caught as a panic inside the future is. The engine makes the call inside
+/// its guard. Each row hung its run before.
+#[tokio::test]
+async fn a_method_that_panics_as_it_is_called_is_caught() {
+    let rows = [
+        (
+            Call::Execute,
+            WorkflowStatus::Failed,
+            StepStatus::Failed,
+            Some("Step failed"),
+        ),
+        (
+            Call::OnSuccess,
+            WorkflowStatus::Completed,
+            StepStatus::Succeeded,
+            None,
+        ),
+        (
+            Call::OnFailure,
+            WorkflowStatus::Failed,
+            StepStatus::Failed,
+            Some("Step failed: called_step - its own failure"),
+        ),
+    ];
+    for (call, run, step, error) in rows {
+        let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+        let workflow = WorkflowDefinition::new("called_workflow", "A call panics").add_step(
+            StepDefinition::new(
+                "called_step",
+                "Step whose call panics",
+                Arc::new(PanicsAtCall(call)),
+            )
+            .with_failure_action(FailureAction::FailWorkflow),
+        );
+        let instance_id = started(&engine, workflow).await.unwrap();
+
+        let state = engine
+            .wait_for_terminal_state(instance_id, "called", Duration::from_secs(5))
+            .await
+            .map_err(|error| format!("{call:?}: {error}"))
+            .unwrap();
+
+        assert_eq!(state.status, run, "{call:?}");
+        let step_state = state.step_states.get(&StepId::new("called_step")).unwrap();
+        assert_eq!(step_state.status, step, "{call:?}");
+        assert_eq!(step_state.last_error.as_deref(), error, "{call:?}");
+    }
+}
+
+/// A condition that panics ends its run by its step's failure action, as a
+/// panic in `execute` does, and the run's outcome names the step and failure.
+/// Under `ContinueNextStep` the step is skipped with the failure kept, and the
+/// workflow goes on to its end.
+#[tokio::test]
+async fn a_condition_that_panics_ends_its_run_by_the_steps_failure_action() {
+    const FAILURE: &str = "Step failed";
+    let rows = [
+        (
+            FailureAction::FailWorkflow,
+            WorkflowStatus::Failed,
+            StepStatus::Failed,
+            Err(format!("Workflow failed at step gated_step: {FAILURE}")),
+        ),
+        (
+            FailureAction::ContinueNextStep,
+            WorkflowStatus::Completed,
+            StepStatus::Skipped,
+            Ok("gated completed successfully via workflow".to_string()),
+        ),
+    ];
+    for (action, run, step, outcome) in rows {
+        let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+        let condition =
+            |_: &WorkflowContext<TestWorkflowData>| -> bool { panic!("the condition's own words") };
+        let workflow = WorkflowDefinition::new("gated_workflow", "A condition panics").add_step(
+            StepDefinition::new(
+                "gated_step",
+                "Step whose condition panics",
+                Arc::new(HookPanics {
+                    at: PanicsIn::RunIf,
+                    entered: Arc::default(),
+                }),
+            )
+            .with_failure_action(action)
+            .run_if(condition),
+        );
+        let instance_id = started(&engine, workflow).await.unwrap();
+
+        let state = engine
+            .wait_for_terminal_state(instance_id, "gated", Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        assert_eq!(state.status, run, "{action:?}");
+        let step_state = state.step_states.get(&StepId::new("gated_step")).unwrap();
+        assert_eq!(step_state.status, step, "{action:?}");
+        assert_eq!(
+            step_state.last_error.as_deref(),
+            Some(FAILURE),
+            "{action:?}"
+        );
+        assert_eq!(
+            wfaas::completion_outcome(&state, "gated"),
+            outcome,
+            "{action:?}"
+        );
+    }
+}
+
+/// A step that fails for good, with words of its own.
+struct FailsForGood;
+
+#[async_trait::async_trait]
+impl StepExecutor<TestWorkflowData> for FailsForGood {
+    async fn execute(
+        &self,
+        _context: &mut WorkflowContext<TestWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        Err(WorkflowError::StepFailed {
+            step_id: StepId::new("fails"),
+            message: "its own words".to_string(),
+        })
+    }
+
+    fn is_retryable(&self, _error: &WorkflowError) -> bool {
+        false
+    }
+}
+
+/// `fails` fails for good at once. `retries`, on a branch of its own, fails
+/// once and begins its second attempt after its backoff, so it is the last
+/// step an attempt named. It then succeeds.
+fn a_failure_beside_a_later_attempt(id: &str) -> WorkflowDefinition<TestWorkflowData> {
+    WorkflowDefinition::new(id, "A failure beside a later attempt")
+        .add_step(StepDefinition::new(
+            "fails",
+            "Fails for good",
+            Arc::new(FailsForGood),
+        ))
+        .add_step(
+            StepDefinition::new(
+                "retries",
+                "Succeeds at its second attempt",
+                Arc::new(CountingStep {
+                    counter: Arc::new(AtomicU32::new(0)),
+                    should_succeed_after: 2,
+                }),
+            )
+            .with_retry(RetryPolicy {
+                max_attempts: 2,
+                backoff: BackoffStrategy::Fixed(Duration::from_millis(50)),
+            }),
+        )
+}
+
+const FAILED_AT_FAILS: &str = "Workflow failed at step fails: Step failed: fails - its own words";
+
+#[tokio::test]
+async fn a_failed_runs_outcome_names_the_step_that_failed() {
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+    let workflow = a_failure_beside_a_later_attempt("two_branches");
+    let instance_id = started(&engine, workflow).await.unwrap();
+
+    let state = wait_until_settled(&engine, instance_id).await.unwrap();
+    assert_eq!(state.status, WorkflowStatus::Failed);
+    assert_eq!(
+        state.step_states[&StepId::new("retries")].status,
+        StepStatus::Succeeded
+    );
+    assert_eq!(
+        wfaas::completion_outcome(&state, "two branches"),
+        Err(FAILED_AT_FAILS.to_string())
+    );
+}
+
+#[tokio::test]
+async fn a_blocked_runs_outcome_names_the_step_that_failed() {
+    // A third step waits on the one that fails, so it never runs and the
+    // run ends by the blocked verdict.
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+    let workflow = a_failure_beside_a_later_attempt("a_blocked_branch").add_step(
+        StepDefinition::new(
+            "waits",
+            "Waits on the step that fails",
+            Arc::new(AlwaysSucceedStep),
+        )
+        .depends_on(&["fails"]),
+    );
+    let instance_id = started(&engine, workflow).await.unwrap();
+
+    let state = wait_until_settled(&engine, instance_id).await.unwrap();
+    assert_eq!(state.status, WorkflowStatus::Failed);
+    assert_eq!(
+        state.step_states[&StepId::new("retries")].status,
+        StepStatus::Succeeded
+    );
+    assert_eq!(
+        wfaas::completion_outcome(&state, "a blocked branch"),
+        Err(FAILED_AT_FAILS.to_string())
+    );
+}
+
+/// A step that fails for good after a wait.
+struct FailsLater(Duration);
+
+#[async_trait::async_trait]
+impl StepExecutor<TestWorkflowData> for FailsLater {
+    async fn execute(
+        &self,
+        _context: &mut WorkflowContext<TestWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        sleep(self.0).await;
+        Err(WorkflowError::StepFailed {
+            step_id: StepId::new("fails_later"),
+            message: "its later words".to_string(),
+        })
+    }
+
+    fn is_retryable(&self, _error: &WorkflowError) -> bool {
+        false
+    }
+}
+
+/// Keeps the step each failed event names.
+#[derive(Default)]
+struct FailedSteps(parking_lot::Mutex<Vec<StepId>>);
+
+#[async_trait::async_trait]
+impl EventSubscriber for FailedSteps {
+    async fn on_event(&self, event: &WorkflowEvent) {
+        if let WorkflowEvent::WorkflowFailed { failed_step, .. } = event {
+            self.0.lock().push(failed_step.clone());
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_run_of_two_failed_steps_is_named_by_the_first_to_fail() {
+    // Two steps fail for good on branches of their own, one of them later.
+    // A set of the failed steps gives either first, so one run proves
+    // little: sixteen do.
+    const RUNS: usize = 16;
+    let failed = Arc::new(FailedSteps::default());
+    for run in 0..RUNS {
+        let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+        let events: Arc<dyn EventSubscriber> = Arc::clone(&failed) as _;
+        engine.event_bus().subscribe(events).await;
+        let workflow = WorkflowDefinition::new("two_failures", "Two failures")
+            .add_step(StepDefinition::new(
+                "fails",
+                "Fails for good",
+                Arc::new(FailsForGood),
+            ))
+            .add_step(StepDefinition::new(
+                "fails_later",
+                "Fails for good, later",
+                Arc::new(FailsLater(Duration::from_millis(20))),
+            ));
+        let instance_id = started(&engine, workflow).await.unwrap();
+
+        let state = wait_until_settled(&engine, instance_id).await.unwrap();
+        assert_eq!(
+            wfaas::completion_outcome(&state, "two failures"),
+            Err(FAILED_AT_FAILS.to_string()),
+            "run {run}"
+        );
+    }
+
+    // Each run's failed event names the same step. The bus tells its
+    // subscribers on tasks of their own, so the events are waited for.
+    timeout(Duration::from_secs(5), async {
+        while failed.0.lock().len() < RUNS {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("every run's failed event arrives");
+    assert_eq!(*failed.0.lock(), vec![StepId::new("fails"); RUNS]);
+}
+
+#[tokio::test]
+async fn a_step_that_fails_at_its_condition_is_the_current_step_at_once() {
+    // `gated` fails at its condition after `before` ran. A delayed step
+    // keeps the run going, so the run is read while it runs and then
+    // cancelled: neither read passes the run's end.
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+    let workflow = WorkflowDefinition::new("failed_gate", "A failed gate in a running workflow")
+        .add_step(StepDefinition::new(
+            "before",
+            "Runs first",
+            Arc::new(AlwaysSucceedStep),
+        ))
+        .add_step(
+            StepDefinition::new(
+                "gated",
+                "Fails at its condition",
+                Arc::new(AlwaysSucceedStep),
+            )
+            .depends_on(&["before"])
+            .run_if(|_| panic!("the condition's own words")),
+        )
+        .add_step(
+            StepDefinition::new("later", "Keeps the run going", Arc::new(AlwaysSucceedStep))
+                .with_delay(Duration::from_secs(60)),
+        );
+    let instance_id = started(&engine, workflow).await.unwrap();
+    let gated = StepId::new("gated");
+
+    let running = timeout(Duration::from_secs(5), async {
+        loop {
+            let state = engine.get_status(instance_id).await.unwrap();
+            if state.step_states[&gated].status == StepStatus::Failed {
+                break state;
+            }
+            sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the gate fails");
+    assert_eq!(running.status, WorkflowStatus::Running);
+    assert_eq!(running.current_step, Some(gated.clone()));
+
+    engine.cancel_workflow(instance_id).await.unwrap();
+    assert!(engine.wait_for_shutdown(Duration::from_secs(5)).await);
+    let cancelled = engine
+        .wait_for_terminal_state(instance_id, "failed gate", Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(cancelled.status, WorkflowStatus::Cancelled);
+    assert_eq!(cancelled.current_step, Some(gated));
+}
+
+#[tokio::test]
+async fn test_workflow_continue_on_failure() {
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+    engine
+        .event_bus()
+        .subscribe(Arc::new(LoggingSubscriber))
+        .await;
+
+    let counter = Arc::new(AtomicU32::new(0));
+
+    // Create workflow where first step fails but workflow continues
+    let workflow = WorkflowDefinition::new("continue_workflow", "Continue on Failure")
+        .add_step(
+            StepDefinition::new(
+                "failing_step",
+                "Step that fails",
+                Arc::new(CountingStep {
+                    counter: Arc::clone(&counter),
+                    should_succeed_after: 10,
+                }),
+            )
+            .with_retry(RetryPolicy {
+                max_attempts: 2,
+                backoff: BackoffStrategy::Fixed(Duration::from_millis(10)),
+            })
+            .with_failure_action(FailureAction::ContinueNextStep),
+        )
+        .add_step(StepDefinition::new(
+            "success_step",
+            "Step that succeeds",
+            Arc::new(AlwaysSucceedStep),
+        ));
+
+    let instance_id = started(&engine, workflow).await.unwrap();
+
+    // Wait for completion
+    sleep(Duration::from_millis(500)).await;
+
+    // Workflow should complete despite first step failing
+    let state = engine.get_status(instance_id).await.unwrap();
+    assert_eq!(state.status, WorkflowStatus::Completed);
+
+    // First step should be skipped
+    let step1_state = state.step_states.get(&StepId::new("failing_step")).unwrap();
+    assert_eq!(step1_state.status, StepStatus::Skipped);
+
+    // Second step should succeed
+    let step2_state = state.step_states.get(&StepId::new("success_step")).unwrap();
+    assert_eq!(step2_state.status, StepStatus::Succeeded);
+}
+
+#[tokio::test]
+async fn test_workflow_context_sharing() {
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+
+    struct ContextWriterStep {
+        value: String,
+    }
+
+    #[async_trait::async_trait]
+    impl StepExecutor<TestWorkflowData> for ContextWriterStep {
+        async fn execute(
+            &self,
+            context: &mut WorkflowContext<TestWorkflowData>,
+        ) -> WorkflowResult<StepResult> {
+            context.data.test_key = Some(self.value.clone());
+            Ok(StepResult::Success)
+        }
+    }
+
+    struct ContextReaderStep {
+        expected_value: String,
+    }
+
+    #[async_trait::async_trait]
+    impl StepExecutor<TestWorkflowData> for ContextReaderStep {
+        async fn execute(
+            &self,
+            context: &mut WorkflowContext<TestWorkflowData>,
+        ) -> WorkflowResult<StepResult> {
+            let value = context
+                .data
+                .test_key
+                .as_ref()
+                .ok_or_else(|| WorkflowError::ContextValueNotFound("test_key".to_string()))?;
+
+            if value == &self.expected_value {
+                Ok(StepResult::Success)
+            } else {
+                Err(WorkflowError::StepFailed {
+                    step_id: StepId::new("reader"),
+                    message: format!("Expected {}, got {}", self.expected_value, value),
+                })
+            }
+        }
+    }
+
+    let workflow = WorkflowDefinition::new("context_workflow", "Context Sharing Test")
+        .add_step(StepDefinition::new(
+            "writer",
+            "Write to context",
+            Arc::new(ContextWriterStep {
+                value: "test_value".to_string(),
+            }),
+        ))
+        .add_step(StepDefinition::new(
+            "reader",
+            "Read from context",
+            Arc::new(ContextReaderStep {
+                expected_value: "test_value".to_string(),
+            }),
+        ));
+
+    let instance_id = started(&engine, workflow).await.unwrap();
+
+    sleep(Duration::from_millis(100)).await;
+
+    let state = engine.get_status(instance_id).await.unwrap();
+    assert_eq!(state.status, WorkflowStatus::Completed);
+}
+
+// ============================================================================
+// DAG / Parallel Execution Tests
+// ============================================================================
+
+/// The (step name, instant) records the timing steps of one test share.
+type Timeline = Arc<parking_lot::RwLock<Vec<(String, std::time::Instant)>>>;
+
+// Step that records when it starts and ends (for testing parallel execution)
+struct TimingStep {
+    step_name: String,
+    duration_ms: u64,
+    start_times: Timeline,
+    end_times: Timeline,
+}
+
+#[async_trait::async_trait]
+impl StepExecutor<TestWorkflowData> for TimingStep {
+    async fn execute(
+        &self,
+        _context: &mut WorkflowContext<TestWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        let start = std::time::Instant::now();
+        self.start_times
+            .write()
+            .push((self.step_name.clone(), start));
+
+        sleep(Duration::from_millis(self.duration_ms)).await;
+
+        let end = std::time::Instant::now();
+        self.end_times.write().push((self.step_name.clone(), end));
+
+        Ok(StepResult::Success)
+    }
+}
+
+/// A timing step named `name` that sleeps `duration_ms`, recording into the
+/// test's timelines.
+fn timing_step(
+    name: &str,
+    duration_ms: u64,
+    start_times: &Timeline,
+    end_times: &Timeline,
+) -> Arc<dyn StepExecutor<TestWorkflowData>> {
+    Arc::new(TimingStep {
+        step_name: name.to_string(),
+        duration_ms,
+        start_times: Arc::clone(start_times),
+        end_times: Arc::clone(end_times),
+    })
+}
+
+/// Registers `workflow` with `engine` and starts an instance of it with the
+/// default data: the instance id, or the registration's or the start's error
+/// as text (a helper outside the test functions neither unwraps nor panics).
+async fn started(
+    engine: &WorkflowEngine<TestWorkflowData>,
+    workflow: WorkflowDefinition<TestWorkflowData>,
+) -> Result<WorkflowInstanceId, String> {
+    let workflow_id = workflow.id.clone();
+    engine
+        .register_workflow(workflow)
+        .map_err(|error| error.to_string())?;
+    engine
+        .start_workflow(workflow_id, TestWorkflowData::default())
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Poll until the workflow is neither pending nor running (without the
+/// engine's waiter, which cleans the state up), bounded at 5s total; the last
+/// state read comes back for inspection, or the status read's error.
+async fn wait_until_settled(
+    engine: &WorkflowEngine<TestWorkflowData>,
+    instance_id: WorkflowInstanceId,
+) -> WorkflowResult<WorkflowState<TestWorkflowData>> {
+    let mut state = engine.get_status(instance_id).await?;
+    for _ in 0..100 {
+        if state.status != WorkflowStatus::Running && state.status != WorkflowStatus::Pending {
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+        state = engine.get_status(instance_id).await?;
+    }
+    Ok(state)
+}
+
+#[tokio::test]
+async fn test_parallel_execution_no_dependencies() {
+    // Steps without dependencies should run in parallel
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+
+    let start_times: Timeline = Arc::new(parking_lot::RwLock::new(Vec::new()));
+    let end_times: Timeline = Arc::new(parking_lot::RwLock::new(Vec::new()));
+
+    // Three steps, each taking 100ms, no dependencies
+    // If parallel: ~100ms total
+    // If sequential: ~300ms total
+    let workflow = WorkflowDefinition::new("parallel_workflow", "Parallel Test")
+        .add_step(StepDefinition::new(
+            "step_a",
+            "Step A",
+            timing_step("step_a", 100, &start_times, &end_times),
+        ))
+        .add_step(StepDefinition::new(
+            "step_b",
+            "Step B",
+            timing_step("step_b", 100, &start_times, &end_times),
+        ))
+        .add_step(StepDefinition::new(
+            "step_c",
+            "Step C",
+            timing_step("step_c", 100, &start_times, &end_times),
+        ));
+
+    let workflow_id = workflow.id.clone();
+    engine.register_workflow(workflow).unwrap();
+
+    let overall_start = std::time::Instant::now();
+    let instance_id = engine
+        .start_workflow(workflow_id, TestWorkflowData::default())
+        .await
+        .unwrap();
+
+    let state = wait_until_settled(&engine, instance_id).await.unwrap();
+
+    let overall_duration = overall_start.elapsed();
+    assert_eq!(state.status, WorkflowStatus::Completed);
+
+    // Check that all steps completed
+    assert_eq!(end_times.read().len(), 3);
+
+    // Verify parallel execution: all steps should start around the same time
+    let starts = start_times.read();
+    let first_start = starts.iter().map(|(_, t)| t).min().unwrap();
+    let last_start = starts.iter().map(|(_, t)| t).max().unwrap();
+
+    // All starts should be within 100ms of each other (allowing for scheduling variance)
+    let start_spread = last_start.duration_since(*first_start);
+    assert!(
+        start_spread < Duration::from_millis(100),
+        "Steps did not start in parallel, spread: {start_spread:?}",
+    );
+
+    // Total duration should be less than sequential (300ms) - use generous threshold
+    assert!(
+        overall_duration < Duration::from_millis(500),
+        "Parallel execution took too long: {overall_duration:?}",
+    );
+}
+
+#[tokio::test]
+async fn test_dag_with_dependencies() {
+    // DAG: A and B run in parallel, C waits for both
+    //   A ──┐
+    //       ├──> C
+    //   B ──┘
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+
+    let start_times: Timeline = Arc::new(parking_lot::RwLock::new(Vec::new()));
+    let end_times: Timeline = Arc::new(parking_lot::RwLock::new(Vec::new()));
+
+    let workflow = WorkflowDefinition::new("dag_workflow", "DAG Test")
+        .add_step(StepDefinition::new(
+            "step_a",
+            "Step A",
+            timing_step("step_a", 50, &start_times, &end_times),
+        ))
+        .add_step(StepDefinition::new(
+            "step_b",
+            "Step B",
+            timing_step("step_b", 100, &start_times, &end_times),
+        ))
+        .add_step(
+            StepDefinition::new(
+                "step_c",
+                "Step C",
+                timing_step("step_c", 50, &start_times, &end_times),
+            )
+            .depends_on(&["step_a", "step_b"]),
+        );
+
+    let instance_id = started(&engine, workflow).await.unwrap();
+
+    let state = wait_until_settled(&engine, instance_id).await.unwrap();
+    assert_eq!(state.status, WorkflowStatus::Completed);
+
+    // Verify step C started after both A and B finished
+    let starts = start_times.read();
+    let ends = end_times.read();
+
+    let c_start = starts.iter().find(|(n, _)| n == "step_c").unwrap().1;
+    let a_end = ends.iter().find(|(n, _)| n == "step_a").unwrap().1;
+    let b_end = ends.iter().find(|(n, _)| n == "step_b").unwrap().1;
+
+    assert!(c_start >= a_end, "Step C started before Step A finished");
+    assert!(c_start >= b_end, "Step C started before Step B finished");
+}
+
+#[tokio::test]
+async fn test_dag_dependency_failure_blocks_dependents() {
+    // If step A fails with FailWorkflow, step B (depends on A) should not run
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+
+    let b_executed = Arc::new(AtomicU32::new(0));
+
+    struct FailingStep;
+
+    #[async_trait::async_trait]
+    impl StepExecutor<TestWorkflowData> for FailingStep {
+        async fn execute(
+            &self,
+            _context: &mut WorkflowContext<TestWorkflowData>,
+        ) -> WorkflowResult<StepResult> {
+            Err(WorkflowError::StepFailed {
+                step_id: StepId::new("failing"),
+                message: "Intentional failure".to_string(),
+            })
+        }
+
+        fn is_retryable(&self, _error: &WorkflowError) -> bool {
+            false // Disable retries for this test
+        }
+    }
+
+    let workflow = WorkflowDefinition::new("blocked_workflow", "Blocked Test")
+        .add_step(
+            StepDefinition::new("step_a", "Step A", Arc::new(FailingStep))
+                .with_failure_action(FailureAction::FailWorkflow),
+        )
+        .add_step(
+            StepDefinition::new(
+                "step_b",
+                "Step B",
+                Arc::new(TrackingStep {
+                    counter: Arc::clone(&b_executed),
+                }),
+            )
+            .depends_on(&["step_a"]),
+        );
+
+    let instance_id = started(&engine, workflow).await.unwrap();
+
+    let state = wait_until_settled(&engine, instance_id).await.unwrap();
+    assert_eq!(state.status, WorkflowStatus::Failed);
+
+    // Step B should not have executed
+    assert_eq!(b_executed.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn test_dag_failed_step_leaves_its_independent_sibling_running() {
+    // A root, then two steps that depend on the root alone: step B fails under
+    // FailWorkflow, step C runs. The failure does not skip the sibling: C ran
+    // once, and the workflow ends Failed. B and C launch together when A ends,
+    // and C ends at once, so this does not show what a failure does to a step
+    // that becomes ready after it, or to one still under way.
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+
+    let c_executed = Arc::new(AtomicU32::new(0));
+
+    struct FailingStep;
+
+    #[async_trait::async_trait]
+    impl StepExecutor<TestWorkflowData> for FailingStep {
+        async fn execute(
+            &self,
+            _context: &mut WorkflowContext<TestWorkflowData>,
+        ) -> WorkflowResult<StepResult> {
+            Err(WorkflowError::StepFailed {
+                step_id: StepId::new("step_b"),
+                message: "Intentional failure".to_string(),
+            })
+        }
+
+        fn is_retryable(&self, _error: &WorkflowError) -> bool {
+            false
+        }
+    }
+
+    let workflow = WorkflowDefinition::new("sibling_workflow", "Sibling Test")
+        .add_step(StepDefinition::new(
+            "step_a",
+            "Step A",
+            Arc::new(AlwaysSucceedStep),
+        ))
+        .add_step(
+            StepDefinition::new("step_b", "Step B", Arc::new(FailingStep))
+                .with_failure_action(FailureAction::FailWorkflow)
+                .depends_on(&["step_a"]),
+        )
+        .add_step(
+            StepDefinition::new(
+                "step_c",
+                "Step C",
+                Arc::new(TrackingStep {
+                    counter: Arc::clone(&c_executed),
+                }),
+            )
+            .depends_on(&["step_a"]),
+        );
+
+    let instance_id = started(&engine, workflow).await.unwrap();
+
+    let state = wait_until_settled(&engine, instance_id).await.unwrap();
+    assert_eq!(state.status, WorkflowStatus::Failed);
+    assert_eq!(c_executed.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        state.step_states[&StepId::new("step_c")].status,
+        StepStatus::Succeeded
+    );
+    assert_eq!(
+        state.step_states[&StepId::new("step_b")].status,
+        StepStatus::Failed
+    );
+}
+
+#[test]
+fn test_dag_validation_cycle_detection() {
+    // Create a workflow with a cycle: A -> B -> C -> A
+    let mut workflow = WorkflowDefinition::new("cyclic_workflow", "Cyclic Test")
+        .add_step(
+            StepDefinition::new("step_a", "Step A", Arc::new(AlwaysSucceedStep))
+                .depends_on(&["step_c"]),
+        )
+        .add_step(
+            StepDefinition::new("step_b", "Step B", Arc::new(AlwaysSucceedStep))
+                .depends_on(&["step_a"]),
+        )
+        .add_step(
+            StepDefinition::new("step_c", "Step C", Arc::new(AlwaysSucceedStep))
+                .depends_on(&["step_b"]),
+        );
+
+    let result = workflow.validate();
+    assert!(result.is_err());
+    assert!(matches!(
+        result.unwrap_err(),
+        ValidationError::CycleDetected(_)
+    ));
+}
+
+#[test]
+fn test_dag_validation_missing_dependency() {
+    // Create a workflow with a missing dependency
+    let mut workflow = WorkflowDefinition::new("missing_dep_workflow", "Missing Dep Test")
+        .add_step(StepDefinition::new(
+            "step_a",
+            "Step A",
+            Arc::new(AlwaysSucceedStep),
+        ))
+        .add_step(
+            StepDefinition::new("step_b", "Step B", Arc::new(AlwaysSucceedStep))
+                .depends_on(&["nonexistent_step"]),
+        );
+
+    let result = workflow.validate();
+    assert!(result.is_err());
+    assert!(matches!(
+        result.unwrap_err(),
+        ValidationError::MissingDependency { .. }
+    ));
+}
+
+#[test]
+fn test_dag_validation_valid_workflow() {
+    // Create a valid DAG workflow
+    let mut workflow = WorkflowDefinition::new("valid_workflow", "Valid Test")
+        .add_step(StepDefinition::new(
+            "step_a",
+            "Step A",
+            Arc::new(AlwaysSucceedStep),
+        ))
+        .add_step(StepDefinition::new(
+            "step_b",
+            "Step B",
+            Arc::new(AlwaysSucceedStep),
+        ))
+        .add_step(
+            StepDefinition::new("step_c", "Step C", Arc::new(AlwaysSucceedStep))
+                .depends_on(&["step_a", "step_b"]),
+        )
+        .add_step(
+            StepDefinition::new("step_d", "Step D", Arc::new(AlwaysSucceedStep))
+                .depends_on(&["step_c"]),
+        );
+
+    let result = workflow.validate();
+    assert!(result.is_ok());
+}
+
+// ============================================================================
+// Scheduled/Delayed Steps Tests (#24)
+// ============================================================================
+
+/// The delay (or lead time) the timed tests give their one step. Each test
+/// judges it on the step's recorded start against a clock taken before the
+/// run, not on the run's length, which the completion waiter's polls (the
+/// first of them 100 ms in) set with or without the delay.
+const STEP_DELAY: Duration = Duration::from_millis(100);
+
+/// Register `workflow`, start it and wait for its completion, or the
+/// registration's, the start's or the wait's error as text.
+async fn completed(
+    engine: &WorkflowEngine<TestWorkflowData>,
+    workflow: WorkflowDefinition<TestWorkflowData>,
+) -> Result<(), String> {
+    let instance_id = started(engine, workflow).await?;
+    engine
+        .wait_for_completion(instance_id, "test", Duration::from_secs(5))
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_step_delay() {
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+    let start_times: Timeline = Arc::new(parking_lot::RwLock::new(Vec::new()));
+    let end_times: Timeline = Arc::new(parking_lot::RwLock::new(Vec::new()));
+
+    // A workflow with one step delayed by STEP_DELAY, recording when it ran.
+    let workflow = WorkflowDefinition::new("delay_workflow", "Delay Test").add_step(
+        StepDefinition::new(
+            "delayed_step",
+            "Delayed Step",
+            timing_step("delayed_step", 0, &start_times, &end_times),
+        )
+        .with_delay(STEP_DELAY),
+    );
+
+    let clock = std::time::Instant::now();
+    completed(&engine, workflow).await.unwrap();
+
+    // The delay was applied: the step started no sooner than STEP_DELAY after
+    // the clock, which was taken before the registration.
+    let waited = start_times.read()[0].1.duration_since(clock);
+    assert!(
+        waited >= STEP_DELAY,
+        "Step delay not applied, the step started after {waited:?}",
+    );
+}
+
+#[tokio::test]
+async fn test_step_scheduled_at() {
+    use chrono::Utc;
+
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+    let start_times: Timeline = Arc::new(parking_lot::RwLock::new(Vec::new()));
+    let end_times: Timeline = Arc::new(parking_lot::RwLock::new(Vec::new()));
+
+    // Schedule the step STEP_DELAY ahead, with the clock taken before the
+    // schedule is computed.
+    let clock = std::time::Instant::now();
+    let scheduled_time = Utc::now() + chrono::Duration::from_std(STEP_DELAY).unwrap();
+
+    let workflow = WorkflowDefinition::new("scheduled_workflow", "Scheduled Test").add_step(
+        StepDefinition::new(
+            "scheduled_step",
+            "Scheduled Step",
+            timing_step("scheduled_step", 0, &start_times, &end_times),
+        )
+        .scheduled_at(scheduled_time),
+    );
+
+    completed(&engine, workflow).await.unwrap();
+
+    // The schedule was respected: the step started no sooner than STEP_DELAY
+    // after the clock.
+    let waited = start_times.read()[0].1.duration_since(clock);
+    assert!(
+        waited >= STEP_DELAY,
+        "Scheduled time not respected, the step started after {waited:?}",
+    );
+}
+
+// ============================================================================
+// Conditional Branching Tests (#25)
+// ============================================================================
+
+#[tokio::test]
+async fn test_run_if_true() {
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+
+    let executed = Arc::new(AtomicU32::new(0));
+    let executed_clone = Arc::clone(&executed);
+
+    // Step with run_if that always returns true
+    let workflow = WorkflowDefinition::new("run_if_true_workflow", "Run If True Test").add_step(
+        StepDefinition::new(
+            "conditional_step",
+            "Conditional Step",
+            Arc::new(TrackingStep { counter: executed }),
+        )
+        .run_if(|_ctx| true),
+    );
+
+    let instance_id = started(&engine, workflow).await.unwrap();
+
+    engine
+        .wait_for_completion(instance_id, "test", Duration::from_secs(5))
+        .await
+        .unwrap();
+
+    // Step should have executed (condition was true)
+    // Note: wait_for_completion cleans up state, so we verify via counter
+    assert_eq!(executed_clone.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn test_run_if_false() {
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+
+    let executed = Arc::new(AtomicU32::new(0));
+    let executed_clone = Arc::clone(&executed);
+
+    // Step with run_if that always returns false
+    let workflow = WorkflowDefinition::new("run_if_false_workflow", "Run If False Test").add_step(
+        StepDefinition::new(
+            "conditional_step",
+            "Conditional Step",
+            Arc::new(TrackingStep { counter: executed }),
+        )
+        .run_if(|_ctx| false),
+    );
+
+    let instance_id = started(&engine, workflow).await.unwrap();
+
+    let state = wait_until_settled(&engine, instance_id).await.unwrap();
+
+    assert_eq!(state.status, WorkflowStatus::Completed);
+
+    // Step should NOT have executed (skipped due to run_if)
+    assert_eq!(executed_clone.load(Ordering::SeqCst), 0);
+
+    // Verify step was marked as skipped
+    let step_state = state
+        .step_states
+        .get(&StepId::new("conditional_step"))
+        .unwrap();
+    assert_eq!(step_state.status, StepStatus::Skipped);
+}
+
+#[tokio::test]
+async fn test_run_if_context_based() {
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+
+    // Step that sets test_key in context
+    struct SetKeyStep;
+
+    #[async_trait::async_trait]
+    impl StepExecutor<TestWorkflowData> for SetKeyStep {
+        async fn execute(
+            &self,
+            context: &mut WorkflowContext<TestWorkflowData>,
+        ) -> WorkflowResult<StepResult> {
+            context.data.test_key = Some("execute_next".to_string());
+            Ok(StepResult::Success)
+        }
+    }
+
+    let executed = Arc::new(AtomicU32::new(0));
+    let executed_clone = Arc::clone(&executed);
+
+    // Workflow where second step only runs if first step sets the right key
+    let workflow = WorkflowDefinition::new("context_run_if_workflow", "Context Run If Test")
+        .add_step(StepDefinition::new(
+            "set_key_step",
+            "Set Key",
+            Arc::new(SetKeyStep),
+        ))
+        .add_step(
+            StepDefinition::new(
+                "conditional_step",
+                "Conditional Step",
+                Arc::new(TrackingStep { counter: executed }),
+            )
+            .depends_on(&["set_key_step"])
+            .run_if(|ctx| ctx.data.test_key.as_deref() == Some("execute_next")),
+        );
+
+    let instance_id = started(&engine, workflow).await.unwrap();
+
+    engine
+        .wait_for_completion(instance_id, "test", Duration::from_secs(5))
+        .await
+        .unwrap();
+
+    // Step should have executed because context had the right value
+    // Note: wait_for_completion cleans up state, so we verify via counter
+    assert_eq!(executed_clone.load(Ordering::SeqCst), 1);
+}
+
+/// Regression test: instantly-skipped run_if steps feeding a dependent chain
+/// must not trigger a spurious "Workflow deadlocked" failure. The skip signal
+/// must be sent in the same tracker lock scope as the removal from `running`,
+/// otherwise the scheduler can observe running == 0 with the completion unsent.
+#[tokio::test]
+async fn test_run_if_skip_chain_no_spurious_deadlock() {
+    for i in 0..50 {
+        let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+
+        let workflow = WorkflowDefinition::new(
+            "run_if_skip_chain_workflow",
+            "Run If Skip Chain Deadlock Regression",
+        )
+        .add_step(
+            StepDefinition::new("root", "Root", Arc::new(AlwaysSucceedStep)).run_if(|_ctx| false),
+        )
+        .add_step(
+            StepDefinition::new("mid", "Mid", Arc::new(AlwaysSucceedStep))
+                .depends_on(&["root"])
+                .run_if(|_ctx| false),
+        )
+        .add_step(
+            StepDefinition::new("leaf", "Leaf", Arc::new(AlwaysSucceedStep)).depends_on(&["mid"]),
+        );
+
+        let instance_id = started(&engine, workflow).await.unwrap();
+
+        let result = engine
+            .wait_for_completion(instance_id, "skip-chain", Duration::from_secs(5))
+            .await;
+        assert!(result.is_ok(), "iteration {i} failed: {result:?}");
+    }
+}
+
+/// A -> B(run_if=false) -> C: the chain completes with B skipped and C executed.
+#[tokio::test]
+async fn test_run_if_false_mid_chain_completes() {
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+
+    let executed = Arc::new(AtomicU32::new(0));
+    let executed_clone = Arc::clone(&executed);
+
+    let workflow = WorkflowDefinition::new("run_if_mid_chain_workflow", "Run If Mid Chain Test")
+        .add_step(StepDefinition::new("a", "A", Arc::new(AlwaysSucceedStep)))
+        .add_step(
+            StepDefinition::new("b", "B", Arc::new(AlwaysSucceedStep))
+                .depends_on(&["a"])
+                .run_if(|_ctx| false),
+        )
+        .add_step(
+            StepDefinition::new("c", "C", Arc::new(TrackingStep { counter: executed }))
+                .depends_on(&["b"]),
+        );
+
+    let instance_id = started(&engine, workflow).await.unwrap();
+
+    let state = wait_until_settled(&engine, instance_id).await.unwrap();
+
+    assert_eq!(state.status, WorkflowStatus::Completed);
+    assert_eq!(
+        state.step_states.get(&StepId::new("b")).unwrap().status,
+        StepStatus::Skipped
+    );
+    assert_eq!(executed_clone.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn test_depends_on_any() {
+    // DAG: A and B run in parallel, C waits for ANY (not both)
+    //   A ──┐
+    //       ├──> C (any_of)
+    //   B ──┘
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+
+    let start_times: Timeline = Arc::new(parking_lot::RwLock::new(Vec::new()));
+    let end_times: Timeline = Arc::new(parking_lot::RwLock::new(Vec::new()));
+
+    // A takes 50ms, B takes 200ms
+    // C should start after A finishes (not wait for B)
+    let workflow = WorkflowDefinition::new("depends_on_any_workflow", "Depends On Any Test")
+        .add_step(StepDefinition::new(
+            "step_a",
+            "Step A",
+            timing_step("step_a", 50, &start_times, &end_times),
+        ))
+        .add_step(StepDefinition::new(
+            "step_b",
+            "Step B",
+            timing_step("step_b", 200, &start_times, &end_times),
+        ))
+        .add_step(
+            StepDefinition::new(
+                "step_c",
+                "Step C",
+                timing_step("step_c", 50, &start_times, &end_times),
+            )
+            .depends_on_any(&["step_a", "step_b"]),
+        );
+
+    let instance_id = started(&engine, workflow).await.unwrap();
+
+    engine
+        .wait_for_completion(instance_id, "test", Duration::from_secs(5))
+        .await
+        .unwrap();
+
+    // Verify step C started after A finished but before B finished
+    // Note: wait_for_completion cleans up state, so we verify via timing
+    let starts = start_times.read();
+    let ends = end_times.read();
+
+    let c_start = starts.iter().find(|(n, _)| n == "step_c").unwrap().1;
+    let a_end = ends.iter().find(|(n, _)| n == "step_a").unwrap().1;
+    let b_end = ends.iter().find(|(n, _)| n == "step_b").unwrap().1;
+
+    assert!(
+        c_start >= a_end,
+        "Step C should start after Step A finishes"
+    );
+    assert!(
+        c_start < b_end,
+        "Step C should start before Step B finishes (any_of semantics)"
+    );
+}
+
+#[tokio::test]
+async fn test_depends_on_any_combined_with_depends_on() {
+    // DAG: C requires ALL of [A] AND ANY of [B, D]
+    // A takes 50ms, B takes 100ms, D takes 200ms
+    // C should start after A AND (B or D) complete
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+
+    let start_times: Timeline = Arc::new(parking_lot::RwLock::new(Vec::new()));
+    let end_times: Timeline = Arc::new(parking_lot::RwLock::new(Vec::new()));
+
+    let workflow = WorkflowDefinition::new("combined_deps_workflow", "Combined Dependencies Test")
+        .add_step(StepDefinition::new(
+            "step_a",
+            "Step A",
+            timing_step("step_a", 50, &start_times, &end_times),
+        ))
+        .add_step(StepDefinition::new(
+            "step_b",
+            "Step B",
+            timing_step("step_b", 100, &start_times, &end_times),
+        ))
+        .add_step(StepDefinition::new(
+            "step_d",
+            "Step D",
+            timing_step("step_d", 200, &start_times, &end_times),
+        ))
+        .add_step(
+            StepDefinition::new(
+                "step_c",
+                "Step C",
+                timing_step("step_c", 50, &start_times, &end_times),
+            )
+            .depends_on(&["step_a"]) // Must wait for A
+            .depends_on_any(&["step_b", "step_d"]), // AND any of B or D
+        );
+
+    let instance_id = started(&engine, workflow).await.unwrap();
+
+    engine
+        .wait_for_completion(instance_id, "test", Duration::from_secs(5))
+        .await
+        .unwrap();
+
+    // Verify step C started after both A AND B finished
+    // (B finishes at 100ms, which is after A at 50ms)
+    // Note: wait_for_completion cleans up state, so we verify via timing
+    let starts = start_times.read();
+    let ends = end_times.read();
+
+    let c_start = starts.iter().find(|(n, _)| n == "step_c").unwrap().1;
+    let a_end = ends.iter().find(|(n, _)| n == "step_a").unwrap().1;
+    let b_end = ends.iter().find(|(n, _)| n == "step_b").unwrap().1;
+    let d_end = ends.iter().find(|(n, _)| n == "step_d").unwrap().1;
+
+    assert!(
+        c_start >= a_end,
+        "Step C should start after Step A (depends_on)"
+    );
+    assert!(
+        c_start >= b_end || c_start >= d_end,
+        "Step C should start after at least one of B or D (depends_on_any)"
+    );
+    // Since B finishes first (100ms) and A finishes before B, C should start around 100ms
+    assert!(
+        c_start < d_end,
+        "Step C should start before D finishes (any_of semantics)"
+    );
+}
+
+#[test]
+fn test_dag_validation_depends_on_any_missing() {
+    // Create a workflow with a missing depends_on_any dependency
+    let mut workflow = WorkflowDefinition::new("missing_any_dep_workflow", "Missing Any Dep Test")
+        .add_step(StepDefinition::new(
+            "step_a",
+            "Step A",
+            Arc::new(AlwaysSucceedStep),
+        ))
+        .add_step(
+            StepDefinition::new("step_b", "Step B", Arc::new(AlwaysSucceedStep))
+                .depends_on_any(&["nonexistent_step"]),
+        );
+
+    let result = workflow.validate();
+    assert!(result.is_err());
+    assert!(matches!(
+        result.unwrap_err(),
+        ValidationError::MissingDependency { .. }
+    ));
+}
+
+#[tokio::test]
+async fn test_depends_on_any_all_fail() {
+    // When ALL depends_on_any dependencies fail, the step should be blocked
+    // Workflow: A and B both fail, C depends_on_any([A, B])
+    // Expected: C should not run, workflow should fail
+
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+
+    let c_executed = Arc::new(AtomicU32::new(0));
+    let c_executed_clone = Arc::clone(&c_executed);
+
+    let workflow = WorkflowDefinition::new("all_any_fail_workflow", "All Any Fail Test")
+        .add_step(StepDefinition::new(
+            "step_a",
+            "Step A (fails)",
+            Arc::new(AlwaysFailStep),
+        ))
+        .add_step(StepDefinition::new(
+            "step_b",
+            "Step B (fails)",
+            Arc::new(AlwaysFailStep),
+        ))
+        .add_step(
+            StepDefinition::new(
+                "step_c",
+                "Step C (depends on any of A, B)",
+                Arc::new(TrackingStep {
+                    counter: c_executed,
+                }),
+            )
+            .depends_on_any(&["step_a", "step_b"]),
+        );
+
+    let instance_id = started(&engine, workflow).await.unwrap();
+
+    let state = wait_until_settled(&engine, instance_id).await.unwrap();
+
+    // Workflow should have failed (because all depends_on_any deps failed)
+    assert_eq!(state.status, WorkflowStatus::Failed);
+
+    // Step C should NOT have executed
+    assert_eq!(c_executed_clone.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn test_depends_on_any_one_fails_one_succeeds() {
+    // When only SOME depends_on_any dependencies fail (but at least one succeeds),
+    // the step should still run
+    // Workflow: A fails, B succeeds, C depends_on_any([A, B])
+    // Expected: C should run (B succeeded)
+
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+
+    let c_executed = Arc::new(AtomicU32::new(0));
+    let c_executed_clone = Arc::clone(&c_executed);
+
+    // Note: Step A uses ContinueNextStep so its failure doesn't fail the workflow.
+    // This is the correct way to model "any of" semantics where a failing path
+    // shouldn't fail the entire workflow if another path succeeds.
+    let workflow = WorkflowDefinition::new("one_any_fail_workflow", "One Any Fail Test")
+        .add_step(
+            StepDefinition::new("step_a", "Step A (fails)", Arc::new(AlwaysFailStep))
+                .with_failure_action(FailureAction::ContinueNextStep),
+        )
+        .add_step(StepDefinition::new(
+            "step_b",
+            "Step B (succeeds)",
+            Arc::new(AlwaysSucceedStep),
+        ))
+        .add_step(
+            StepDefinition::new(
+                "step_c",
+                "Step C (depends on any of A, B)",
+                Arc::new(TrackingStep {
+                    counter: c_executed,
+                }),
+            )
+            .depends_on_any(&["step_a", "step_b"]),
+        );
+
+    let instance_id = started(&engine, workflow).await.unwrap();
+
+    let state = wait_until_settled(&engine, instance_id).await.unwrap();
+
+    // Workflow should have completed (B succeeded, so C could run)
+    assert_eq!(state.status, WorkflowStatus::Completed);
+
+    // Step C SHOULD have executed (because B succeeded)
+    assert_eq!(c_executed_clone.load(Ordering::SeqCst), 1);
+}
+
+/// Regression: a `Skip` step must not persist its (stale) context copy back to
+/// shared state. The engine snapshots the whole context per step and writes it
+/// back wholesale, so a parallel branch that skips after a sibling committed a
+/// mutation would otherwise clobber it (last-writer-wins). See engine.rs.
+#[tokio::test]
+async fn test_skip_does_not_clobber_parallel_context_mutation() {
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+
+    // Both steps snapshot the context at ~t0 (both see test_key=None). The
+    // writer then commits its mutation at ~t40; the skipping step wakes at ~t120
+    // and, with the pre-fix bug, writes its stale (None) snapshot back last —
+    // clobbering the writer. The delays make that ordering deterministic:
+    //   skip reads None (t0) < writer persists Some (t40) < skip persists (t120)
+
+    struct WriterStep;
+    #[async_trait::async_trait]
+    impl StepExecutor<TestWorkflowData> for WriterStep {
+        async fn execute(
+            &self,
+            context: &mut WorkflowContext<TestWorkflowData>,
+        ) -> WorkflowResult<StepResult> {
+            sleep(Duration::from_millis(40)).await;
+            context.data.test_key = Some("survived".to_string());
+            Ok(StepResult::Success)
+        }
+    }
+
+    struct SlowSkipStep;
+    #[async_trait::async_trait]
+    impl StepExecutor<TestWorkflowData> for SlowSkipStep {
+        async fn execute(
+            &self,
+            _context: &mut WorkflowContext<TestWorkflowData>,
+        ) -> WorkflowResult<StepResult> {
+            sleep(Duration::from_millis(120)).await;
+            Ok(StepResult::Skip)
+        }
+    }
+
+    // No dependency between the two steps → they run in parallel.
+    let workflow = WorkflowDefinition::new("skip_clobber", "Skip must not clobber")
+        .add_step(StepDefinition::new(
+            "writer",
+            "Writer",
+            Arc::new(WriterStep),
+        ))
+        .add_step(StepDefinition::new(
+            "slow_skip",
+            "Slow skip",
+            Arc::new(SlowSkipStep),
+        ));
+
+    let instance_id = started(&engine, workflow).await.unwrap();
+
+    sleep(Duration::from_millis(250)).await;
+
+    let state = engine.get_status(instance_id).await.unwrap();
+    assert_eq!(state.status, WorkflowStatus::Completed);
+    assert_eq!(
+        state.context.data.test_key.as_deref(),
+        Some("survived"),
+        "a Skip step clobbered a parallel step's committed context mutation"
+    );
+}
+
+// ============================================================================
+// Terminal State Reclamation Tests
+// ============================================================================
+
+/// Poll until the workflow reaches `Completed`, bounded at 1s total.
+async fn wait_until_completed(
+    engine: &WorkflowEngine<TestWorkflowData>,
+    instance_id: WorkflowInstanceId,
+) -> bool {
+    for _ in 0..50 {
+        if engine
+            .get_status(instance_id)
+            .await
+            .is_ok_and(|state| state.status == WorkflowStatus::Completed)
+        {
+            return true;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    false
+}
+
+fn single_step_workflow(id: &str) -> WorkflowDefinition<TestWorkflowData> {
+    WorkflowDefinition::new(id, "Single Step").add_step(StepDefinition::new(
+        "step1",
+        "Step 1",
+        Arc::new(AlwaysSucceedStep),
+    ))
+}
+
+struct BlockUntilNotifiedStep {
+    notify: Arc<Notify>,
+}
+
+#[async_trait::async_trait]
+impl StepExecutor<TestWorkflowData> for BlockUntilNotifiedStep {
+    async fn execute(
+        &self,
+        _context: &mut WorkflowContext<TestWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        self.notify.notified().await;
+        Ok(StepResult::Success)
+    }
+}
+
+fn blocked_workflow(id: &str, notify: Arc<Notify>) -> WorkflowDefinition<TestWorkflowData> {
+    WorkflowDefinition::new(id, "Blocked").add_step(StepDefinition::new(
+        "blocked_step",
+        "Blocked Step",
+        Arc::new(BlockUntilNotifiedStep { notify }),
+    ))
+}
+
+#[tokio::test]
+async fn test_sweep_reclaims_state_after_waiter_timeout() {
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+    let notify = Arc::new(Notify::new());
+
+    let workflow = blocked_workflow("waiter_timeout", Arc::clone(&notify));
+    let instance_id = started(&engine, workflow).await.unwrap();
+
+    let err = engine
+        .wait_for_completion(instance_id, "test", Duration::from_millis(50))
+        .await
+        .unwrap_err();
+    assert!(
+        err.contains("timeout"),
+        "expected timeout error, got: {err}"
+    );
+
+    // The timed-out waiter must not remove a still-running workflow's state,
+    // and the sweep must not reclaim non-terminal state even with a zero TTL.
+    assert_eq!(
+        engine.get_status(instance_id).await.unwrap().status,
+        WorkflowStatus::Running
+    );
+    assert_eq!(
+        engine
+            .state_store()
+            .cleanup_old_workflows(Duration::ZERO)
+            .await,
+        0
+    );
+
+    notify.notify_one();
+    assert!(
+        wait_until_completed(&engine, instance_id).await,
+        "workflow did not complete after notify"
+    );
+
+    // The workflow outlived its waiter; the sweep reclaims the terminal state.
+    assert_eq!(
+        engine
+            .state_store()
+            .cleanup_old_workflows(Duration::ZERO)
+            .await,
+        1
+    );
+    assert!(matches!(
+        engine.get_status(instance_id).await,
+        Err(WorkflowError::NotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn test_waiter_timeout_reclaims_already_terminal_state() {
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+    let notify = Arc::new(Notify::new());
+
+    let workflow = blocked_workflow("timeout_terminal", Arc::clone(&notify));
+    let instance_id = started(&engine, workflow).await.unwrap();
+
+    // The waiter sees Running at t=0 and sleeps 100ms, past its 50ms timeout;
+    // the workflow terminates mid-sleep (notify at t=20ms), so the timeout
+    // branch runs against an already-terminal state and must reclaim it.
+    let (result, ()) = tokio::join!(
+        engine.wait_for_completion(instance_id, "test", Duration::from_millis(50)),
+        async {
+            sleep(Duration::from_millis(20)).await;
+            notify.notify_one();
+        }
+    );
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("timeout"),
+        "expected timeout error, got: {err}"
+    );
+    assert!(matches!(
+        engine.get_status(instance_id).await,
+        Err(WorkflowError::NotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn test_wait_for_completion_removes_terminal_state() {
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+
+    let workflow = single_step_workflow("terminal_cleanup");
+    let instance_id = started(&engine, workflow).await.unwrap();
+
+    engine
+        .wait_for_completion(instance_id, "test", Duration::from_secs(5))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        engine.get_status(instance_id).await,
+        Err(WorkflowError::NotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn test_cleanup_task_reclaims_state_and_stops_on_shutdown() {
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+    let handle = engine.start_cleanup_task(Some(Duration::ZERO), Some(Duration::from_millis(20)));
+
+    let workflow = single_step_workflow("cleanup_task");
+    let instance_id = started(&engine, workflow).await.unwrap();
+
+    // No waiter runs; only the cleanup task can reclaim the terminal state.
+    let mut reclaimed = false;
+    for _ in 0..50 {
+        if matches!(
+            engine.get_status(instance_id).await,
+            Err(WorkflowError::NotFound(_))
+        ) {
+            reclaimed = true;
+            break;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    assert!(reclaimed, "cleanup task did not reclaim terminal state");
+
+    engine.shutdown();
+    timeout(Duration::from_secs(1), handle)
+        .await
+        .expect("cleanup task did not stop on shutdown")
+        .unwrap();
+}
+
+/// A step that fails on every attempt, tells the test when its first attempt
+/// runs, and holds that attempt until the test releases it.
+struct HeldFailingStep {
+    attempts: Arc<AtomicU32>,
+    first_attempt_running: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait::async_trait]
+impl StepExecutor<TestWorkflowData> for HeldFailingStep {
+    async fn execute(
+        &self,
+        _context: &mut WorkflowContext<TestWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.first_attempt_running.notify_one();
+            self.release.notified().await;
+        }
+        Err(WorkflowError::StepFailed {
+            step_id: StepId::new("held_step"),
+            message: "fails every time".to_string(),
+        })
+    }
+}
+
+/// A workflow cancelled while a step's attempt is under way is not attempted
+/// again: the retry loop reads the cancellation before every attempt.
+#[tokio::test]
+async fn a_cancelled_workflow_stops_before_the_next_attempt() {
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+    let attempts = Arc::new(AtomicU32::new(0));
+    let first_attempt_running = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+
+    let workflow = WorkflowDefinition::new("cancel_before_retry_workflow", "Cancel Before Retry")
+        .add_step(
+            StepDefinition::new(
+                "held_step",
+                "Step held in its first attempt",
+                Arc::new(HeldFailingStep {
+                    attempts: Arc::clone(&attempts),
+                    first_attempt_running: Arc::clone(&first_attempt_running),
+                    release: Arc::clone(&release),
+                }),
+            )
+            .with_retry(RetryPolicy {
+                max_attempts: 10,
+                backoff: BackoffStrategy::Fixed(Duration::from_millis(10)),
+            })
+            .with_timeout(Duration::from_secs(5)),
+        );
+
+    let instance_id = started(&engine, workflow).await.unwrap();
+
+    timeout(Duration::from_secs(5), first_attempt_running.notified())
+        .await
+        .expect("the first attempt runs");
+    engine.cancel_workflow(instance_id).await.unwrap();
+    release.notify_one();
+
+    // The workflow's task ends once the loop reads the cancellation.
+    for _ in 0..250 {
+        if engine.active_workflow_count() == 0 {
+            break;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        engine.active_workflow_count(),
+        0,
+        "the workflow's task ended"
+    );
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "no attempt after the cancellation"
+    );
+    let state = engine.get_status(instance_id).await.unwrap();
+    assert_eq!(state.status, WorkflowStatus::Cancelled);
+}
+
+/// A workflow cancelled while a step waits out its backoff ends then, not
+/// when the backoff does: the wait reads the cancellation.
+#[tokio::test]
+async fn a_cancelled_workflow_ends_its_step_s_backoff_wait() {
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+    let attempts = Arc::new(AtomicU32::new(0));
+    let first_attempt_running = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+
+    let workflow = WorkflowDefinition::new("cancel_in_backoff_workflow", "Cancel In Backoff")
+        .add_step(
+            StepDefinition::new(
+                "held_step",
+                "Step held in its first attempt",
+                Arc::new(HeldFailingStep {
+                    attempts: Arc::clone(&attempts),
+                    first_attempt_running: Arc::clone(&first_attempt_running),
+                    release: Arc::clone(&release),
+                }),
+            )
+            .with_retry(RetryPolicy {
+                max_attempts: 3,
+                backoff: BackoffStrategy::Fixed(Duration::from_secs(30)),
+            })
+            .with_timeout(Duration::from_secs(5)),
+        );
+
+    let instance_id = started(&engine, workflow).await.unwrap();
+    timeout(Duration::from_secs(5), first_attempt_running.notified())
+        .await
+        .expect("the first attempt runs");
+    release.notify_one();
+
+    // The first attempt's failure puts the step into its 30 s backoff.
+    let mut retrying = false;
+    for _ in 0..250 {
+        let state = engine.get_status(instance_id).await.unwrap();
+        if state.step_states[&StepId::new("held_step")].status == StepStatus::Retrying {
+            retrying = true;
+            break;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    assert!(retrying, "the step waits out its backoff");
+
+    let cancelled_at = std::time::Instant::now();
+    engine.cancel_workflow(instance_id).await.unwrap();
+
+    // The workflow's task ends inside the backoff, not after it.
+    for _ in 0..100 {
+        if engine.active_workflow_count() == 0 {
+            break;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        engine.active_workflow_count(),
+        0,
+        "the workflow's task ended {:?} after the cancellation, inside the 30 s backoff",
+        cancelled_at.elapsed()
+    );
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "no attempt after the cancellation"
+    );
+    let state = engine.get_status(instance_id).await.unwrap();
+    assert_eq!(state.status, WorkflowStatus::Cancelled);
+}
+
+/// A `RetryIndefinitely` step keeps retrying past its policy's attempts: the
+/// policy's `max_attempts` bounds the other failure actions only.
+#[tokio::test]
+async fn a_retry_indefinitely_step_keeps_retrying_past_the_policy_s_attempts() {
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+    let counter = Arc::new(AtomicU32::new(0));
+
+    let workflow = WorkflowDefinition::new("retry_indefinitely_workflow", "Retry Indefinitely")
+        .add_step(
+            StepDefinition::new(
+                "stubborn_step",
+                "Step that succeeds on its fifth attempt",
+                Arc::new(CountingStep {
+                    counter: Arc::clone(&counter),
+                    should_succeed_after: 5,
+                }),
+            )
+            .with_retry(RetryPolicy {
+                max_attempts: 2,
+                backoff: BackoffStrategy::Fixed(Duration::from_millis(1)),
+            })
+            .with_failure_action(FailureAction::RetryIndefinitely)
+            .with_timeout(Duration::from_secs(5)),
+        );
+
+    let instance_id = started(&engine, workflow).await.unwrap();
+
+    let mut completed = false;
+    for _ in 0..250 {
+        if engine
+            .get_status(instance_id)
+            .await
+            .is_ok_and(|state| state.status == WorkflowStatus::Completed)
+        {
+            completed = true;
+            break;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    assert!(completed, "the workflow completes once the step succeeds");
+
+    let state = engine.get_status(instance_id).await.unwrap();
+    let step_state = state
+        .step_states
+        .get(&StepId::new("stubborn_step"))
+        .unwrap();
+    assert_eq!(step_state.status, StepStatus::Succeeded);
+    assert_eq!(step_state.attempt, 5);
+    assert_eq!(counter.load(Ordering::SeqCst), 5);
+}
+
+/// The terminal state a waiter reads of a cancelled workflow still carries
+/// the steps that completed before the cancellation, and the outcome line
+/// reads the cancellation.
+#[tokio::test]
+async fn a_cancelled_workflow_s_terminal_state_keeps_its_completed_steps() {
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+    let attempts = Arc::new(AtomicU32::new(0));
+    let first_attempt_running = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let workflow = WorkflowDefinition::new("cancel_after_a_step_workflow", "Cancel After A Step")
+        .add_step(StepDefinition::new(
+            "done_step",
+            "Step that completes",
+            Arc::new(AlwaysSucceedStep),
+        ))
+        .add_step(
+            StepDefinition::new(
+                "held_step",
+                "Step held in its first attempt",
+                Arc::new(HeldFailingStep {
+                    attempts: Arc::clone(&attempts),
+                    first_attempt_running: Arc::clone(&first_attempt_running),
+                    release: Arc::clone(&release),
+                }),
+            )
+            .with_retry(RetryPolicy {
+                max_attempts: 3,
+                backoff: BackoffStrategy::Fixed(Duration::from_secs(30)),
+            })
+            .with_timeout(Duration::from_secs(5))
+            .depends_on(&["done_step"]),
+        );
+    let instance_id = started(&engine, workflow).await.unwrap();
+    timeout(Duration::from_secs(5), first_attempt_running.notified())
+        .await
+        .expect("the held step runs after the completed one");
+    engine.cancel_workflow(instance_id).await.unwrap();
+    release.notify_one();
+    let state = engine
+        .wait_for_terminal_state(instance_id, "cancel after a step", Duration::from_secs(10))
+        .await
+        .unwrap();
+    assert_eq!(state.status, WorkflowStatus::Cancelled);
+    assert_eq!(
+        state.step_states[&StepId::new("done_step")].status,
+        StepStatus::Succeeded,
+        "the completed step stays readable in the terminal state"
+    );
+    assert_eq!(
+        state.step_states[&StepId::new("held_step")].status,
+        StepStatus::Cancelled,
+        "the step cancelled in its backoff reads so, not retrying"
+    );
+    assert_eq!(
+        wfaas::completion_outcome(&state, "cancel after a step"),
+        Err("Workflow cancelled for cancel after a step".to_string())
+    );
+}
+
+/// A step held in its attempt, released after the cancellation, succeeds.
+struct HeldSucceedingStep {
+    running: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait::async_trait]
+impl StepExecutor<TestWorkflowData> for HeldSucceedingStep {
+    async fn execute(
+        &self,
+        _context: &mut WorkflowContext<TestWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        self.running.notify_one();
+        self.release.notified().await;
+        Ok(StepResult::Success)
+    }
+}
+
+/// The cancellation is written at once, while a step past its cancel read
+/// is still on its task: the terminal state a waiter reads carries that
+/// step's own end, not the running record the cancellation found, and the
+/// step's end is written before the state is cleaned up.
+#[tokio::test]
+async fn a_cancelled_workflow_s_terminal_state_waits_for_a_step_past_its_cancel_read() {
+    let engine = WorkflowEngine::<TestWorkflowData>::new();
+    let running = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let workflow = WorkflowDefinition::new("cancel_under_a_step_workflow", "Cancel Under A Step")
+        .add_step(StepDefinition::new(
+            "held_ok_step",
+            "Step held in its attempt, then succeeding",
+            Arc::new(HeldSucceedingStep {
+                running: Arc::clone(&running),
+                release: Arc::clone(&release),
+            }),
+        ))
+        .add_step(
+            StepDefinition::new("next_step", "Step after it", Arc::new(AlwaysSucceedStep))
+                .depends_on(&["held_ok_step"]),
+        );
+    let instance_id = started(&engine, workflow).await.unwrap();
+    timeout(Duration::from_secs(5), running.notified())
+        .await
+        .expect("the held step runs");
+    engine.cancel_workflow(instance_id).await.unwrap();
+    // The waiter polls the cancelled state while the step is still held;
+    // the release comes 300 ms into its wait.
+    let (state, ()) = tokio::join!(
+        timeout(
+            Duration::from_secs(5),
+            engine.wait_for_terminal_state(
+                instance_id,
+                "cancel under a step",
+                Duration::from_secs(10),
+            ),
+        ),
+        async {
+            sleep(Duration::from_millis(300)).await;
+            release.notify_one();
+        }
+    );
+    let state = state.expect("the waiter ends once the step has").unwrap();
+    assert_eq!(
+        state.step_states[&StepId::new("held_ok_step")].status,
+        StepStatus::Succeeded,
+        "the state carries the held step's own end, not the running record"
+    );
+    assert_ne!(
+        state.step_states[&StepId::new("next_step")].status,
+        StepStatus::Succeeded,
+        "the step after the cancellation did not run"
+    );
+}
+
+/// A step whose attempt skips.
+struct AttemptSkipStep;
+
+#[async_trait::async_trait]
+impl StepExecutor<TestWorkflowData> for AttemptSkipStep {
+    async fn execute(
+        &self,
+        _context: &mut WorkflowContext<TestWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        Ok(StepResult::Skip)
+    }
+}
+
+/// A step that skips in its attempt is recorded as skipped, as one its
+/// `run_if` gate skipped is: its record does not keep the running status
+/// its attempt began with, which a waiter on a cancelled workflow would
+/// take for a step still on its task.
+#[tokio::test]
+async fn a_step_that_skips_in_its_attempt_reads_skipped() {
+    let engine = WorkflowEngine::<TestWorkflowData>::new();
+    let workflow = WorkflowDefinition::new("attempt_skip_workflow", "Attempt Skip")
+        .add_step(StepDefinition::new(
+            "skipping_step",
+            "Step that skips in its attempt",
+            Arc::new(AttemptSkipStep),
+        ))
+        .add_step(
+            StepDefinition::new("next_step", "Step after it", Arc::new(AlwaysSucceedStep))
+                .depends_on(&["skipping_step"]),
+        );
+    let instance_id = started(&engine, workflow).await.unwrap();
+    let state = engine
+        .wait_for_terminal_state(instance_id, "attempt skip", Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(state.status, WorkflowStatus::Completed);
+    assert_eq!(
+        state.step_states[&StepId::new("skipping_step")].status,
+        StepStatus::Skipped,
+        "the attempt's skip is the step's record"
+    );
+    assert_eq!(
+        state.step_states[&StepId::new("next_step")].status,
+        StepStatus::Succeeded
+    );
+}
+
+/// A store that writes the workflow's cancel right after the step's cancel
+/// read. The engine reads the cancel once in its scheduler before it
+/// dispatches the step and once in the step's attempt loop before the first
+/// attempt; the cancel lands between that second read and the attempt's
+/// start.
+#[derive(Clone)]
+struct CancelAfterTheStepsRead {
+    inner: InMemoryStore<TestWorkflowData>,
+    reads: Arc<AtomicU32>,
+}
+
+#[async_trait::async_trait]
+impl StateStore<TestWorkflowData> for CancelAfterTheStepsRead {
+    async fn save(&self, state: WorkflowState<TestWorkflowData>) -> WorkflowResult<()> {
+        self.inner.save(state).await
+    }
+
+    async fn load(
+        &self,
+        instance_id: WorkflowInstanceId,
+    ) -> WorkflowResult<WorkflowState<TestWorkflowData>> {
+        self.inner.load(instance_id).await
+    }
+
+    async fn update<F>(&self, instance_id: WorkflowInstanceId, f: F) -> WorkflowResult<()>
+    where
+        F: FnOnce(&mut WorkflowState<TestWorkflowData>) + Send,
+    {
+        self.inner.update(instance_id, f).await
+    }
+
+    async fn delete(&self, instance_id: WorkflowInstanceId) -> WorkflowResult<()> {
+        self.inner.delete(instance_id).await
+    }
+
+    async fn list_active(&self) -> WorkflowResult<Vec<WorkflowState<TestWorkflowData>>> {
+        self.inner.list_active().await
+    }
+
+    async fn list_all(&self) -> WorkflowResult<Vec<WorkflowState<TestWorkflowData>>> {
+        self.inner.list_all().await
+    }
+
+    async fn is_cancelled(&self, instance_id: WorkflowInstanceId) -> WorkflowResult<bool> {
+        let read = self.inner.is_cancelled(instance_id).await?;
+        if self.reads.fetch_add(1, Ordering::SeqCst) == 1 {
+            self.inner
+                .update(instance_id, |state| {
+                    state.status = WorkflowStatus::Cancelled;
+                })
+                .await?;
+        }
+        Ok(read)
+    }
+
+    async fn cleanup_old_workflows(&self, ttl: Duration) -> usize {
+        self.inner.cleanup_old_workflows(ttl).await
+    }
+
+    async fn get_context(
+        &self,
+        instance_id: WorkflowInstanceId,
+    ) -> WorkflowResult<WorkflowContext<TestWorkflowData>> {
+        self.inner.get_context(instance_id).await
+    }
+
+    async fn cleanup_if_terminal(&self, instance_id: WorkflowInstanceId) -> bool {
+        self.inner.cleanup_if_terminal(instance_id).await
+    }
+}
+
+/// A step that records that it ran.
+struct RanStep {
+    ran: Arc<AtomicU32>,
+}
+
+#[async_trait::async_trait]
+impl StepExecutor<TestWorkflowData> for RanStep {
+    async fn execute(
+        &self,
+        _context: &mut WorkflowContext<TestWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        self.ran.fetch_add(1, Ordering::SeqCst);
+        Ok(StepResult::Success)
+    }
+}
+
+/// A cancel that lands between a step's cancel read and its first attempt's
+/// start: the attempt's start reads the cancel inside its own store update
+/// and the step never runs. Before this, the step past its read ran on under
+/// the cancelled workflow, and a waiter whose snapshot fell in that window
+/// read the step pending and the workflow over.
+#[tokio::test]
+async fn a_step_whose_cancel_lands_after_its_read_does_not_start() {
+    let store = CancelAfterTheStepsRead {
+        inner: InMemoryStore::new(),
+        reads: Arc::new(AtomicU32::new(0)),
+    };
+    let engine: WorkflowEngine<TestWorkflowData, CancelAfterTheStepsRead> =
+        WorkflowEngine::with_store(store.clone());
+    let ran = Arc::new(AtomicU32::new(0));
+    let workflow = WorkflowDefinition::new("cancel_after_read_workflow", "Cancel After Read")
+        .add_step(StepDefinition::new(
+            "only_step",
+            "Step whose cancel lands after its read",
+            Arc::new(RanStep {
+                ran: Arc::clone(&ran),
+            }),
+        ));
+    let workflow_id = workflow.id.clone();
+    engine
+        .register_workflow(workflow)
+        .map_err(|error| error.to_string())
+        .unwrap();
+    let instance_id = engine
+        .start_workflow(workflow_id, TestWorkflowData::default())
+        .await
+        .unwrap();
+    let state = engine
+        .wait_for_terminal_state(instance_id, "cancel after read", Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert!(
+        store.reads.load(Ordering::SeqCst) >= 2,
+        "the step read the cancel before its attempt"
+    );
+    assert_eq!(state.status, WorkflowStatus::Cancelled);
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        0,
+        "the step's executor never ran"
+    );
+    assert_ne!(
+        state.step_states[&StepId::new("only_step")].status,
+        StepStatus::Succeeded,
+        "the step did not run on under the cancelled workflow"
+    );
+}

@@ -1,0 +1,702 @@
+//! Streaming Harmony Responses API implementation
+
+use std::{
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use axum::response::Response;
+use openai_protocol::responses::{ResponseUsage, ResponsesRequest};
+use serde_json::json;
+use smg_mcp::McpServerBinding;
+use tracing::{debug, warn};
+use uuid::Uuid;
+
+use super::{
+    common::{
+        build_next_request_with_tools, open_mcp_session, owned_request,
+        strip_image_generation_from_request_tools, withhold_server_tools, McpCallTracking,
+    },
+    execution::execute_mcp_tools,
+};
+use crate::{
+    middleware::TenantRequestMeta,
+    observability::metrics::Metrics,
+    routers::{
+        common::{
+            mcp_utils::DEFAULT_MAX_ITERATIONS,
+            sse::{sse_channel, SseSender},
+        },
+        grpc::{
+            common::responses::{
+                await_stream_startup, ensure_mcp_connection, load_history,
+                persist_response_if_needed, stream_startup_channel,
+                streaming::{ResponseStreamEventEmitter, StreamStartupSender},
+                tool_call_limit,
+                utils::{
+                    add_model_call_usage, iteration_exceeds_safety_limit, tool_call_allowance,
+                    tool_call_overflow, McpToolCallLimit,
+                },
+                BackgroundStream, ReplayInto, ResponsesContext,
+            },
+            harmony::{processor::ResponsesIterationResult, streaming::HarmonyStreamingProcessor},
+        },
+    },
+    tenant::storage_tenant,
+};
+
+/// Serve Harmony Responses API with streaming (SSE)
+///
+/// This is the streaming equivalent of `serve_harmony_responses()`.
+/// Emits SSE events for lifecycle, MCP list_tools, and per-iteration streaming.
+///
+/// `background` is set when the client streams a background response: the
+/// stream runs under the id its `queued` record was stored under, carries
+/// `response.queued`, and outlives a client that leaves.
+pub(crate) async fn serve_harmony_responses_stream(
+    ctx: &ResponsesContext,
+    request: ResponsesRequest,
+    tenant_request_meta: TenantRequestMeta,
+    background: Option<BackgroundStream>,
+) -> Response {
+    // Load the history the request continues, as the caller's tenant may see
+    // it; `request` itself stays as it came, for the persist.
+    let tenant = storage_tenant(&tenant_request_meta);
+    let current_request = match load_history(
+        ctx.history_stores(),
+        &request,
+        tenant.as_deref(),
+        ReplayInto::Harmony,
+    )
+    .await
+    {
+        Ok(req) => req,
+        Err(err_response) => return err_response,
+    };
+
+    // Check MCP connection BEFORE starting stream and get whether MCP tools are present
+    let (has_mcp_tools, mcp_servers) = match ensure_mcp_connection(
+        &ctx.mcp_orchestrator,
+        &ctx.mcp_format_registry,
+        current_request.tools.as_deref(),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(response) => return response,
+    };
+
+    // Create SSE channel; a background stream's events go through a relay, so
+    // the work and its terminal record outlive a client that leaves.
+    let (tx, rx) = sse_channel();
+    let tx = match &background {
+        Some(_) => BackgroundStream::detach(tx),
+        None => tx,
+    };
+    let (startup_tx, startup_rx) = stream_startup_channel();
+
+    // Create response event emitter
+    let response_id = background
+        .as_ref()
+        .map(|run| run.id().to_string())
+        .unwrap_or_else(|| format!("resp_{}", Uuid::now_v7()));
+    let model = current_request.model.clone();
+    let created_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut emitter = ResponseStreamEventEmitter::new(response_id.clone(), model, created_at);
+
+    // Set original request for complete response fields
+    emitter.set_original_request(current_request.clone());
+
+    // Clone context for spawned task
+    let ctx_clone = ctx.clone();
+
+    let stream_task = async move {
+        let ctx = &ctx_clone;
+
+        // Emit initial response.created and response.in_progress events (a
+        // background stream reports response.queued between the two)
+        if emitter.send_created(&tx).await.is_err() {
+            return Ok(());
+        }
+        if request.background.unwrap_or(false) {
+            let event = emitter.emit_queued();
+            if emitter.send_event(&event, &tx).await.is_err() {
+                return Ok(());
+            }
+        }
+        if emitter.send_in_progress(&tx).await.is_err() {
+            return Ok(());
+        }
+
+        if has_mcp_tools {
+            execute_mcp_tool_loop_streaming(
+                ctx,
+                current_request,
+                &request,
+                tenant_request_meta.clone(),
+                mcp_servers,
+                &mut emitter,
+                &tx,
+                Some(startup_tx),
+            )
+            .await;
+        } else {
+            execute_without_mcp_streaming(
+                ctx,
+                current_request,
+                &request,
+                tenant_request_meta,
+                &mut emitter,
+                &tx,
+                Some(startup_tx),
+            )
+            .await;
+        }
+        // The error the stream ended with, if any, for the runner of a
+        // background stream to store.
+        emitter.take_error().map_or(Ok(()), Err)
+    };
+    // Spawn async task to handle streaming
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "streaming task is fire-and-forget; client disconnect terminates it unless it runs a background response, whose slot bounds it"
+    )]
+    match background {
+        Some(run) => {
+            let storage = ctx.response_storage.clone();
+            let request_context = ctx.request_context.clone();
+            tokio::spawn(run.run(storage, request_context, stream_task));
+        }
+        None => {
+            tokio::spawn(stream_task);
+        }
+    }
+
+    await_stream_startup(startup_rx, rx).await
+}
+
+/// Execute MCP tool loop with streaming
+///
+/// Handles the full MCP workflow:
+/// - Adds static MCP tools to request
+/// - Emits mcp_list_tools events
+/// - Loops through tool execution iterations
+/// - Emits final response.completed event
+/// - Persists response internally
+#[expect(
+    clippy::too_many_arguments,
+    reason = "streaming MCP loop needs request state, emitter, channel and startup barrier"
+)]
+async fn execute_mcp_tool_loop_streaming(
+    ctx: &ResponsesContext,
+    mut current_request: ResponsesRequest,
+    original_request: &ResponsesRequest,
+    tenant_request_meta: TenantRequestMeta,
+    mcp_servers: Vec<McpServerBinding>,
+    emitter: &mut ResponseStreamEventEmitter,
+    tx: &SseSender,
+    mut startup: Option<StreamStartupSender>,
+) {
+    let max_tool_calls = current_request.max_tool_calls.map(|n| n as usize);
+
+    // Note: For streaming, the emitter's original_request (set before spawn) preserves
+    // the original tools. MCP tools are only merged into current_request for model calls.
+
+    let session = open_mcp_session(ctx, mcp_servers, &mut current_request);
+
+    // Once the MCP loop has taken ownership of image_generation
+    // dispatch, drop the hosted-tool descriptor so the harmony builder
+    // advertises only the MCP-exposed function-tool name (which
+    // `has_exposed_tool` actually recognizes for dispatch). See the
+    // helper doc comment in `common.rs` for the full rationale.
+    strip_image_generation_from_request_tools(
+        &mut current_request,
+        &session,
+        &ctx.mcp_format_registry,
+    );
+
+    // Shared with each iteration's pipeline context by reference count; the
+    // loop takes it back (`owned_request`) when it appends the tool outputs.
+    let mut current_request = Arc::new(current_request);
+
+    let mut mcp_tracking = McpCallTracking::new();
+    // The request's `max_tool_calls` is spent: the generation under way is the
+    // response's final turn, made with the server tools withheld, and its
+    // answer ends the loop whatever it holds.
+    let mut final_turn = false;
+
+    // Emit mcp_list_tools on first iteration
+    for binding in session.mcp_servers() {
+        let tools_for_server = session.list_tools_for_binding(binding);
+        let list_error = binding.list_error.as_deref();
+
+        if emitter
+            .emit_mcp_list_tools_sequence(&binding.label, &tools_for_server, list_error, tx)
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+
+    debug!(
+        tool_count = session.mcp_tools().len(),
+        "Emitted mcp_list_tools on first iteration"
+    );
+
+    // Every model call of the loop adds to it; every answering exit reports it.
+    let mut usage_total: Option<ResponseUsage> = None;
+
+    // MCP tool loop (bounded by the safety net below)
+    let mut iteration_count = 0;
+    loop {
+        iteration_count += 1;
+
+        // Record tool loop iteration metric
+        Metrics::record_mcp_tool_iteration(&current_request.model);
+
+        // Safety check: prevent infinite loops
+        if iteration_exceeds_safety_limit(iteration_count, final_turn) {
+            emitter
+                .emit_error(
+                    &format!("Maximum tool iterations ({DEFAULT_MAX_ITERATIONS}) exceeded"),
+                    Some("max_iterations_exceeded"),
+                    tx,
+                )
+                .await;
+            return;
+        }
+
+        debug!(
+            iteration = iteration_count,
+            "Harmony Responses streaming iteration"
+        );
+
+        // Execute pipeline and get stream + load guards, under the
+        // iteration's tenant rate-limit reservation
+        let startup_pending = startup.is_some();
+        let (execution_result, _load_guards, reservation, router_stops) = match ctx
+            .pipeline
+            .execute_harmony_responses_streaming(
+                &current_request,
+                ctx,
+                Some(tenant_request_meta.clone()),
+                startup.take(),
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(err_response) => {
+                if startup_pending {
+                    return;
+                }
+                emitter
+                    .emit_error(
+                        &format!("Pipeline execution failed: {err_response:?}"),
+                        Some("pipeline_error"),
+                        tx,
+                    )
+                    .await;
+                return;
+            }
+        };
+
+        // The server calls this turn may open items for: the calls the request
+        // may still run, none on the final turn.
+        let server_call_allowance = if final_turn {
+            0
+        } else {
+            tool_call_allowance(max_tool_calls, mcp_tracking.total_calls())
+        };
+        // Process stream with token-level streaming; the reservation is
+        // settled with the engine's counts the stream brought, or closed
+        // unsettled (its debit kept) when the stream broke or ended before
+        // its terminal frame.
+        let iteration_result = match HarmonyStreamingProcessor::process_responses_iteration_stream(
+            execution_result,
+            emitter,
+            tx,
+            Some(&session),
+            Some(&ctx.mcp_format_registry),
+            &router_stops,
+            Some(server_call_allowance),
+        )
+        .await
+        {
+            Ok((result, counts)) => {
+                // The counts come with the terminal frame; a stream that
+                // ended before it brought none, and the reservation keeps
+                // its debit as the chat streams' does.
+                match counts {
+                    Some(counts) => reservation.settle(counts.settlement()).await,
+                    None => reservation.close_unsettled().await,
+                }
+                result
+            }
+            Err(error) => {
+                reservation.close_unsettled().await;
+                emitter
+                    .emit_error(&error.message, Some(error.code), tx)
+                    .await;
+                return;
+            }
+        };
+
+        // Handle iteration result (tool calls or completion)
+        match iteration_result {
+            ResponsesIterationResult::ToolCallsFound {
+                tool_calls,
+                analysis,
+                partial_text,
+                usage,
+                request_id: _,
+                // The stored object and the terminal read the finish the
+                // emitter was told.
+                finish_reason: _,
+            } => {
+                debug!(
+                    tool_call_count = tool_calls.len(),
+                    has_analysis = analysis.is_some(),
+                    partial_text_len = partial_text.len(),
+                    "Tool calls found - separating MCP and function tools"
+                );
+
+                add_model_call_usage(&mut usage_total, Some(&usage));
+
+                // Separate MCP and function tool calls based on session exposure.
+                let (mut mcp_tool_calls, function_tool_calls): (Vec<_>, Vec<_>) = tool_calls
+                    .into_iter()
+                    .partition(|tc| session.has_exposed_tool(&tc.function.name));
+
+                debug!(
+                    mcp_calls = mcp_tool_calls.len(),
+                    function_calls = function_tool_calls.len(),
+                    "Tool calls separated by type in streaming"
+                );
+
+                // The cap the batch overflows, if any, and the batch's
+                // permitted prefix (the regular loop's rule): the request's own
+                // cap runs the prefix and gives the model one final turn on the
+                // results, the server tools withheld (the public contract at
+                // `max_tool_calls`); the internal safety cap ends the stream as
+                // failed with nothing of the batch executed. The final turn's
+                // own server calls, made with the tools withheld, do not run.
+                let overflow = if final_turn {
+                    mcp_tool_calls.clear();
+                    None
+                } else {
+                    tool_call_overflow(
+                        max_tool_calls,
+                        mcp_tracking.total_calls(),
+                        mcp_tool_calls.len(),
+                    )
+                };
+                if let Some((McpToolCallLimit::User, remaining)) = overflow {
+                    mcp_tool_calls.truncate(remaining);
+                }
+                if let Some((McpToolCallLimit::Safety, _)) = overflow {
+                    let effective_limit = tool_call_limit(max_tool_calls);
+                    let total_calls_after = mcp_tracking.total_calls() + mcp_tool_calls.len();
+                    warn!(
+                        current_calls = mcp_tracking.total_calls(),
+                        new_calls = mcp_tool_calls.len() + function_tool_calls.len(),
+                        total_after = total_calls_after,
+                        effective_limit = effective_limit,
+                        user_max = ?max_tool_calls,
+                        "Reached the tool call safety limit in streaming - ending the stream as failed"
+                    );
+
+                    // The run is aborted, not answered: the stream ends as the
+                    // non-streamed path does, `response.failed` with the error,
+                    // and the usage the non-streamed response carries; and the
+                    // failed object is stored as that path stores its own, read
+                    // before the terminal drains the items, so a background
+                    // response is polled as `failed` with this error rather
+                    // than as a run that ended without a result.
+                    let error = json!({
+                        "code": "max_tool_calls_exceeded",
+                        "message": format!(
+                            "Reached the max_tool_calls limit ({effective_limit}) before executing the remaining tool calls."
+                        ),
+                    });
+                    let final_response =
+                        emitter.finalize_failed(usage_total.clone(), error.clone());
+                    // A foreground record that could not be written is already
+                    // logged and counted by persist; the terminal keeps the
+                    // run's own error, as the regular stream does, and the
+                    // leftover is noted at debug.
+                    if let Err(not_stored) = persist_response_if_needed(
+                        ctx.conversation_storage.clone(),
+                        ctx.conversation_item_storage.clone(),
+                        ctx.response_storage.clone(),
+                        &final_response,
+                        original_request,
+                        storage_tenant(&tenant_request_meta).as_deref(),
+                        ctx.request_context.clone(),
+                    )
+                    .await
+                    {
+                        debug!(
+                            error = ?not_stored.error_object(),
+                            "The tool-call-limit exit keeps its own error over the store failure"
+                        );
+                    }
+                    let usage_json = usage_total.as_ref().map(|usage| json!(usage));
+                    if let Err(e) = emitter.emit_terminal(usage_json, Some(&error), tx).await {
+                        warn!(error = %e, "Failed to end the Harmony Responses stream at the tool-call limit");
+                    }
+                    return;
+                }
+
+                // Execute MCP tools (if any). The emitter keeps the
+                // caller-declared tool list (hosted-tool config lives there);
+                // `execute_mcp_tools` merges the per-kind overrides into
+                // dispatch args and forwards the request-level `user`
+                // identifier for hosted tools.
+                let mcp_results = if mcp_tool_calls.is_empty() {
+                    Vec::new()
+                } else {
+                    match execute_mcp_tools(
+                        &session,
+                        &ctx.mcp_format_registry,
+                        &mcp_tool_calls,
+                        &mut mcp_tracking,
+                        &current_request.model,
+                        emitter.effective_tools().unwrap_or(&[]),
+                        original_request.user.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(results) => results,
+                        Err(err_response) => {
+                            emitter
+                                .emit_error(
+                                    &format!("MCP tool execution failed: {err_response:?}"),
+                                    Some("mcp_tool_error"),
+                                    tx,
+                                )
+                                .await;
+                            return;
+                        }
+                    }
+                };
+
+                // Update mcp_call output items with execution results (if any MCP tools were executed)
+                if !mcp_results.is_empty() {
+                    emitter.update_mcp_call_outputs(&mcp_results);
+                }
+
+                // A client call, or the final turn's answer, exits the MCP
+                // loop and emits the completion
+                if !function_tool_calls.is_empty() || final_turn {
+                    debug!(
+                        final_turn,
+                        "Function tool calls present or the final turn answered - exiting MCP loop and emitting completion"
+                    );
+
+                    // Function tool calls were already emitted during streaming
+                    // processing. The final object is stored as the completed
+                    // exit stores its own (before the terminal drains the items):
+                    // the client runs the calls and continues with this id as
+                    // `previous_response_id`, and a background response is
+                    // polled from this record. Then response.completed with the
+                    // usage the non-streamed response carries.
+                    let final_response = emitter.finalize(usage_total.clone());
+                    // As the completed exit: a foreground response the client
+                    // expects stored ends with response.failed when its
+                    // record could not be written.
+                    let not_stored = persist_response_if_needed(
+                        ctx.conversation_storage.clone(),
+                        ctx.conversation_item_storage.clone(),
+                        ctx.response_storage.clone(),
+                        &final_response,
+                        original_request,
+                        storage_tenant(&tenant_request_meta).as_deref(),
+                        ctx.request_context.clone(),
+                    )
+                    .await
+                    .err()
+                    .map(|e| e.error_object());
+                    emitter
+                        .finish_stream(usage_total.as_ref(), not_stored.as_ref(), tx)
+                        .await;
+                    return;
+                }
+
+                // Only MCP tools - continue loop with their results
+                debug!("Only MCP tools - continuing loop with results");
+
+                // Build next request with appended history
+                let mut next_request = build_next_request_with_tools(
+                    owned_request(current_request),
+                    mcp_tool_calls,
+                    mcp_results,
+                    analysis,
+                    partial_text,
+                );
+                if matches!(overflow, Some((McpToolCallLimit::User, _))) {
+                    final_turn = true;
+                    withhold_server_tools(&mut next_request, |name| session.has_exposed_tool(name));
+                }
+                current_request = Arc::new(next_request);
+
+                // Continue loop
+            }
+            ResponsesIterationResult::Completed { response, usage } => {
+                debug!(
+                    output_items = response.output.len(),
+                    input_tokens = usage.prompt_tokens,
+                    output_tokens = usage.completion_tokens,
+                    "Harmony Responses streaming completed - no more tool calls"
+                );
+                add_model_call_usage(&mut usage_total, Some(&usage));
+
+                // Finalize response from emitter's accumulated data
+                let final_response = emitter.finalize(usage_total.clone());
+
+                // Persist response to storage if store=true; a foreground
+                // response the client expects stored ends with
+                // response.failed when its record could not be written.
+                let tenant = storage_tenant(&tenant_request_meta);
+                let not_stored = persist_response_if_needed(
+                    ctx.conversation_storage.clone(),
+                    ctx.conversation_item_storage.clone(),
+                    ctx.response_storage.clone(),
+                    &final_response,
+                    original_request,
+                    tenant.as_deref(),
+                    ctx.request_context.clone(),
+                )
+                .await
+                .err()
+                .map(|e| e.error_object());
+
+                // The terminal with the usage the non-streamed response (and
+                // the stored final response) carries
+                emitter
+                    .finish_stream(usage_total.as_ref(), not_stored.as_ref(), tx)
+                    .await;
+                return;
+            }
+        }
+    }
+}
+
+/// Execute without MCP tool loop (single execution with streaming)
+///
+/// For function tools or no tools - executes pipeline once and emits completion.
+/// The streaming processor handles all output items (reasoning, message, function tool calls).
+async fn execute_without_mcp_streaming(
+    ctx: &ResponsesContext,
+    current_request: ResponsesRequest,
+    original_request: &ResponsesRequest,
+    tenant_request_meta: TenantRequestMeta,
+    emitter: &mut ResponseStreamEventEmitter,
+    tx: &SseSender,
+    mut startup: Option<StreamStartupSender>,
+) {
+    debug!("No MCP tools - executing single iteration");
+    let tenant = storage_tenant(&tenant_request_meta);
+
+    // Execute pipeline and get stream + load guards, under the request's
+    // tenant rate-limit reservation; the one iteration shares the request
+    // with its context instead of copying it.
+    let current_request = Arc::new(current_request);
+    let startup_pending = startup.is_some();
+    let (execution_result, _load_guards, reservation, router_stops) = match ctx
+        .pipeline
+        .execute_harmony_responses_streaming(
+            &current_request,
+            ctx,
+            Some(tenant_request_meta),
+            startup.take(),
+        )
+        .await
+    {
+        Ok(result) => result,
+        Err(err_response) => {
+            if startup_pending {
+                return;
+            }
+            emitter
+                .emit_error(
+                    &format!("Pipeline execution failed: {err_response:?}"),
+                    Some("pipeline_error"),
+                    tx,
+                )
+                .await;
+            return;
+        }
+    };
+
+    // Process stream (no MCP context, all tools treated as function tools);
+    // the reservation is settled with the engine's counts the stream
+    // brought, or closed unsettled (its debit kept) when the stream broke
+    // or ended before its terminal frame.
+    let iteration_result = match HarmonyStreamingProcessor::process_responses_iteration_stream(
+        execution_result,
+        emitter,
+        tx,
+        None,
+        None,
+        &router_stops,
+        None,
+    )
+    .await
+    {
+        Ok((result, counts)) => {
+            // The counts come with the terminal frame; a stream that ended
+            // before it brought none, and the reservation keeps its debit
+            // as the chat streams' does.
+            match counts {
+                Some(counts) => reservation.settle(counts.settlement()).await,
+                None => reservation.close_unsettled().await,
+            }
+            result
+        }
+        Err(error) => {
+            reservation.close_unsettled().await;
+            emitter
+                .emit_error(&error.message, Some(error.code), tx)
+                .await;
+            return;
+        }
+    };
+    // _load_guards dropped here after iteration completes
+
+    // Extract usage from iteration result
+    let usage = match iteration_result {
+        ResponsesIterationResult::ToolCallsFound { usage, .. } => usage,
+        ResponsesIterationResult::Completed { usage, .. } => usage,
+    };
+
+    // The response-level usage of this model call is shared by the stored
+    // object and its terminal event.
+    let usage = ResponseUsage::from(&usage);
+    let final_response = emitter.finalize(Some(usage.clone()));
+
+    // Persist response to storage if store=true; a foreground response the
+    // client expects stored ends with response.failed when its record could
+    // not be written.
+    let not_stored = persist_response_if_needed(
+        ctx.conversation_storage.clone(),
+        ctx.conversation_item_storage.clone(),
+        ctx.response_storage.clone(),
+        &final_response,
+        original_request,
+        tenant.as_deref(),
+        ctx.request_context.clone(),
+    )
+    .await
+    .err()
+    .map(|e| e.error_object());
+
+    // The terminal with the usage the non-streamed response (and the stored
+    // final response) carries
+    emitter
+        .finish_stream(Some(&usage), not_stored.as_ref(), tx)
+        .await;
+}

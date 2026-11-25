@@ -1,0 +1,1529 @@
+"""
+SGLang gRPC Servicer
+
+Implements the SglangScheduler gRPC service using GrpcRequestManager
+for orchestration without tokenization.
+"""
+
+import asyncio
+import json
+import logging
+import math
+import os
+import time
+from collections.abc import AsyncIterator
+from contextlib import aclosing
+from datetime import datetime, timezone
+from traceback import format_exc as get_exception_traceback
+
+import grpc
+import msgspec
+import sglang
+from google.protobuf.json_format import MessageToDict
+from google.protobuf.struct_pb2 import Struct
+from google.protobuf.timestamp_pb2 import Timestamp
+from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.disaggregation.kv_events import (
+    KVEventsConfig,
+)
+from sglang.srt.managers.io_struct import (
+    FlushCacheReqInput,
+    ProfileReq,
+    ProfileReqType,
+    TokenizedEmbeddingReqInput,
+    TokenizedGenerateReqInput,
+)
+from sglang.srt.sampling.sampling_params import SamplingParams as SGLSamplingParams
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import get_bool_env_var
+from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
+from smg_grpc_proto.generated import common_pb2
+
+from smg_grpc_servicer.engine_status import abort_for_constraint_failure
+from smg_grpc_servicer.health_probe import await_probe
+from smg_grpc_servicer.sglang.compat import (
+    get_disaggregation_types,
+    get_multimodal_types,
+    get_tokenizer,
+)
+from smg_grpc_servicer.sglang.config_view import EngineConfigView, v41_vision
+from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
+from smg_grpc_servicer.sglang.hidden_states import (
+    refuse_hidden_states_above_server_mode,
+    refuse_hidden_states_on_this_servicer,
+)
+from smg_grpc_servicer.sglang.kv_events import subscribe_kv_events
+from smg_grpc_servicer.sglang.loads import (
+    convert_loads_to_protobuf,
+    effective_running_window,
+    load_record,
+    ranks_with_a_window,
+)
+from smg_grpc_servicer.sglang.lora import PreloadedLoras
+from smg_grpc_servicer.sglang.model_artifacts import tokenizer_dir_for
+from smg_grpc_servicer.sglang.request_manager import (
+    GrpcRequestManager,
+    _validate_token_ids_logprobs,
+)
+from smg_grpc_servicer.sglang.utils import (
+    abort_code_from_output,
+    grammar_abort,
+    scheduler_abort,
+    to_token_id_array,
+)
+from smg_grpc_servicer.tensor_wire import tensor_from_parts
+from smg_grpc_servicer.tokenizer_bundle import tokenizer_bundle, tokenizer_chunks
+
+from ..constrained_decoding import (
+    grammar_backend_entry,
+    grammar_start_labels,
+    sglang_constrained_decoding_start,
+    sglang_grammar_backend,
+)
+from ..mm_item_limits import MM_ITEM_LIMITS_KEY, sglang_item_limits
+from ..pd_pairing import pairing_protocol_from_env
+
+DisaggregationMode, FAKE_BOOTSTRAP_HOST = get_disaggregation_types()
+
+Modality, MultimodalDataItem, MultimodalProcessorOutput = get_multimodal_types()
+
+logger = logging.getLogger(__name__)
+HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
+# Profile round-trips include trace serialization, which can take minutes.
+PROFILE_COMM_TIMEOUT = 600.0
+
+
+# The grid only the Router's DeepSeek-V4.1 preprocessor sends with an image
+# batch; GLM-5.3 Flash sends ``patches_per_image`` as well.
+V41_MARKER = "vit_grid"
+V41_PREFIX = "DeepSeek-V4.1 image batch:"
+
+
+def _v41_image_tokens(height: int, width: int, ratio: int) -> int:
+    """How many prompt positions SGLang's V4.1 model fills for a patch grid: the
+    length of its ``image_token_types`` for the downsampled grid, a start token,
+    each line's tokens and a newline, and an end token."""
+    lines, tokens_per_line = (height + ratio - 1) // ratio, (width + ratio - 1) // ratio
+    return lines * (tokens_per_line + 1) + 2
+
+
+def _deepseek_v41_items(feature, tensors: dict, offsets: list, vision=None) -> list:
+    """One item per image, the shape SGLang's own DeepSeek-V4.1 processor builds.
+
+    The Router sends every image's patches in one tensor, with each image's
+    patch grid (``vit_grid``), patch count and token count alongside. SGLang's
+    V4.1 model encodes one image per item and reads its grid as ``n_vit_h`` /
+    ``n_vit_w``; a batch whose counts disagree is refused here, before the
+    scheduler, where it would stop the engine. With the served model's patch
+    size and downsample ratio (``vision``, from ``v41_vision``), so is a batch
+    whose patch rows or spans do not fit that model.
+    """
+    prefix = V41_PREFIX
+    if "patches_per_image" not in tensors:
+        raise ValueError(f"{prefix} no patches_per_image")
+    counts = {}
+    for name in ("vit_grid", "patches_per_image", "types_per_image"):
+        tensor = tensors.get(name)
+        if tensor is None:
+            continue
+        if tensor.is_floating_point() or tensor.is_complex():
+            raise ValueError(f"{prefix} {name} is {tensor.dtype}, not an integer tensor")
+        counts[name] = tensor.reshape(-1).tolist()
+    grid_values = counts["vit_grid"]
+    if len(grid_values) % 2:
+        raise ValueError(
+            f"{prefix} vit_grid holds {len(grid_values)} values, not (height, width) pairs"
+        )
+    grids = list(zip(grid_values[0::2], grid_values[1::2]))
+    patches = counts["patches_per_image"]
+    tokens = counts.get("types_per_image")
+    images = len(grids)
+    if images == 0:
+        raise ValueError(f"{prefix} no images")
+    for name, count in (
+        ("placeholders", len(offsets)),
+        ("patch counts", len(patches)),
+        ("token counts", images if tokens is None else len(tokens)),
+    ):
+        if count != images:
+            raise ValueError(f"{prefix} {images} images but {count} {name}")
+    # A patch row holds at least one value.
+    if len(feature.shape) < 2 or 0 in feature.shape[1:]:
+        raise ValueError(
+            f"{prefix} pixel_values has shape {list(feature.shape)}, not rows of patches"
+        )
+    rows = feature.shape[0]
+    if sum(patches) != rows:
+        raise ValueError(f"{prefix} {sum(patches)} patches but the pixel tensor has {rows} rows")
+    if vision is not None:
+        patch_size = vision[0]
+        # The model's patch embedding is a Linear(3 * patch_size**2, ...) over
+        # each flattened row.
+        row_values = math.prod(feature.shape[1:])
+        if row_values != 3 * patch_size**2:
+            raise ValueError(
+                f"{prefix} each patch row holds {row_values} values, but the model's "
+                f"{patch_size}x{patch_size} patches take 3x{patch_size}x{patch_size} = "
+                f"{3 * patch_size**2}"
+            )
+    items = []
+    start = 0
+    previous_last = None
+    for index, ((height, width), count, (first, last)) in enumerate(zip(grids, patches, offsets)):
+        if height < 1 or width < 1 or height * width != count:
+            raise ValueError(
+                f"{prefix} image {index} has a {height}x{width} grid but {count} patches"
+            )
+        # SGLang writes the items' embeddings over the placeholders in prompt
+        # order, so the ranges must be in prompt order and must not overlap.
+        if previous_last is not None and first <= previous_last:
+            raise ValueError(
+                f"{prefix} image {index}'s placeholder {first}..={last} does not start "
+                f"after image {index - 1}'s, which ends at {previous_last}"
+            )
+        previous_last = last
+        span = last - first + 1
+        if tokens is not None and span != tokens[index]:
+            raise ValueError(
+                f"{prefix} image {index} fills {span} prompt positions but has "
+                f"{tokens[index]} tokens"
+            )
+        if vision is not None:
+            grid_tokens = _v41_image_tokens(height, width, vision[1])
+            if span != grid_tokens:
+                raise ValueError(
+                    f"{prefix} image {index} fills {span} prompt positions but its "
+                    f"{height}x{width} grid makes {grid_tokens} tokens"
+                )
+        pixels = feature[start : start + count]
+        items.append(
+            MultimodalDataItem(
+                modality=Modality.IMAGE,
+                # The scheduler receives the item pickled, and a view would
+                # carry every image's patches with it.
+                feature=pixels if images == 1 else pixels.clone(),
+                model_specific_data={"n_vit_h": int(height), "n_vit_w": int(width)},
+                offsets=[(first, last)],
+            )
+        )
+        start += count
+    return items
+
+
+def _aggregate_communicator_results(results: list, ok_message: str) -> tuple[bool, str]:
+    """Aggregate per-DP-rank communicator outputs into (success, message)."""
+    if not results:
+        return False, "No response from scheduler"
+    failures = [r for r in results if not r.success]
+    if failures:
+        return False, " | ".join(r.message or "failed" for r in failures)
+    return True, ok_message
+
+
+SAMPLING_DEFAULT_KEYS = (
+    "temperature",
+    "top_p",
+    "top_k",
+    "min_p",
+    "repetition_penalty",
+)
+
+
+def _filtered_sampling_defaults(params: dict | None) -> dict:
+    if not params:
+        return {}
+    return {
+        key: params[key]
+        for key in SAMPLING_DEFAULT_KEYS
+        if key in params and params[key] is not None
+    }
+
+
+def _compute_aggregate_protobuf(
+    loads: list,
+) -> sglang_scheduler_pb2.AggregateMetrics:
+    """Compute aggregate metrics from list of SchedulerLoad protobuf messages."""
+    if not loads:
+        return sglang_scheduler_pb2.AggregateMetrics()
+
+    n = len(loads)
+    total_running = sum(load.num_running_reqs for load in loads)
+    total_waiting = sum(load.num_waiting_reqs for load in loads)
+
+    return sglang_scheduler_pb2.AggregateMetrics(
+        total_running_reqs=total_running,
+        total_waiting_reqs=total_waiting,
+        total_reqs=total_running + total_waiting,
+        avg_token_usage=round(sum(load.token_usage for load in loads) / n, 4),
+        avg_throughput=round(sum(load.gen_throughput for load in loads) / n, 2),
+        avg_utilization=round(sum(load.utilization for load in loads) / n, 4),
+    )
+
+
+def _scheduler_abort_detail(finish_reason: dict) -> str:
+    """The engine's own account of an abort, for the constraint-failure status."""
+    return (
+        f"the scheduler aborted the request: {finish_reason.get('message') or 'no reason reported'}"
+    )
+
+
+class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer):
+    """
+    Standalone gRPC service implementation using GrpcRequestManager.
+    Fully separated from HTTP server with its own process and no shared globals.
+    """
+
+    # The running window the schedulers computed, once every rank's load
+    # snapshot has shown its bound (the bound does not change for the
+    # engine's lifetime); 0 until then. See `_running_window`.
+    _computed_running_window: int = 0
+
+    def __init__(
+        self,
+        request_manager: GrpcRequestManager,
+        server_args: ServerArgs,
+        model_config: ModelConfig,
+        model_info: dict,
+        scheduler_info: dict,
+        health_servicer: SGLangHealthServicer | None = None,
+    ):
+        """Initialize the standalone gRPC service."""
+        self.request_manager = request_manager
+        self.server_args = server_args
+        self.model_config = model_config
+        self.model_info = model_info
+        self.scheduler_info = scheduler_info
+        self.start_time = time.time()
+        self.health_servicer = health_servicer
+        self.loras = PreloadedLoras(server_args)
+        # SamplingParams.normalize requires a tokenizer whenever string stops
+        # are used; the scheduler matches them with its own tokenizer.
+        if server_args.skip_tokenizer_init:
+            self.tokenizer = None
+        else:
+            self.tokenizer = get_tokenizer(
+                server_args.tokenizer_path,
+                tokenizer_mode=server_args.tokenizer_mode,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.revision,
+                tokenizer_backend=server_args.tokenizer_backend,
+            )
+        self.mm_receiver = None
+        if (
+            self.server_args.language_only
+            and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
+        ):
+            from sglang.srt.disaggregation import encode_receiver as mm_receiver
+
+            self.mm_receiver = mm_receiver.create_mm_receiver(self.server_args)
+
+        # Parse KV events config for SubscribeKvEvents support
+        self._kv_events_config: KVEventsConfig | None = None
+        if server_args.kv_events_config:
+            try:
+                self._kv_events_config = KVEventsConfig.from_cli(server_args.kv_events_config)
+                if self._kv_events_config.publisher != "zmq":
+                    logger.info(
+                        "KV events publisher is '%s', SubscribeKvEvents disabled",
+                        self._kv_events_config.publisher,
+                    )
+                    self._kv_events_config = None
+                else:
+                    logger.info(
+                        "KV events enabled: endpoint=%s",
+                        self._kv_events_config.endpoint,
+                    )
+            except Exception as e:
+                logger.warning("Failed to parse kv_events_config: %s", e)
+
+        # Start the request manager's event loop using auto_create_handle_loop
+        self.request_manager.auto_create_handle_loop()
+
+        logger.info("gRPC scheduler servicer initialized")
+
+    async def ListLoadedLoRAAdapters(
+        self,
+        request: sglang_scheduler_pb2.ListLoadedLoRAAdaptersRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> sglang_scheduler_pb2.ListLoadedLoRAAdaptersResponse:
+        return sglang_scheduler_pb2.ListLoadedLoRAAdaptersResponse(
+            loaded_adapters=self.loras.adapters
+        )
+
+    async def Generate(
+        self,
+        request: sglang_scheduler_pb2.GenerateRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> AsyncIterator[sglang_scheduler_pb2.GenerateResponse]:
+        """Handle generation requests with streaming responses."""
+        logger.info(f"Receive generation request: {request.request_id}")
+
+        response_generator = None
+        try:
+            # Convert gRPC request to internal format
+            tokenized_req = self._convert_generate_request(request)
+            self._handle_epd_disaggregation_encode_request(request, tokenized_req)
+
+            # Submit to request manager (automatically handles n>1)
+            response_generator = self.request_manager.generate_request(
+                obj=tokenized_req,
+                request_id=request.request_id,
+                grpc_context=context,
+            )
+
+            async for output in response_generator:
+                # Handle batch responses (for n>1 non-streaming)
+                if isinstance(output, list):
+                    for batch_output in output:
+                        if "error" in batch_output:
+                            await context.abort(
+                                abort_code_from_output(batch_output),
+                                batch_output["error"],
+                            )
+                        elif (grammar := grammar_abort(batch_output)) is not None:
+                            # The one abort the scheduler attributes to the
+                            # request's grammar (named before its status: a PD
+                            # decode side stamps a 500 on it too).
+                            await abort_for_constraint_failure(
+                                context, _scheduler_abort_detail(grammar)
+                            )
+                        elif (aborted := scheduler_abort(batch_output)) is not None:
+                            # The scheduler's own abort, with its status: the
+                            # caller's error or the worker's, never a completion.
+                            await context.abort(
+                                abort_code_from_output(batch_output),
+                                aborted.get("message") or "aborted by the scheduler",
+                            )
+                        else:
+                            # All non-error batch outputs are final responses
+                            yield self._create_completion_response(request.request_id, batch_output)
+                else:
+                    # Handle single response (for streaming or n=1 non-streaming)
+                    if "error" in output:
+                        await context.abort(
+                            abort_code_from_output(output),
+                            output["error"],
+                        )
+                    elif (grammar := grammar_abort(output)) is not None:
+                        # The one abort the scheduler itself attributes to the
+                        # request's grammar (the plugin's name on its finish):
+                        # the constraint-failure status every wire shares,
+                        # never a `Complete(finish_reason = "abort")` a client
+                        # reads as an empty success. Named before its status:
+                        # a PD decode side stamps a 500 on it too.
+                        await abort_for_constraint_failure(
+                            context, _scheduler_abort_detail(grammar)
+                        )
+                    elif (aborted := scheduler_abort(output)) is not None:
+                        # The scheduler's own abort, with its status (a 400 for
+                        # the caller's input, a 503 for a full queue): the stream
+                        # ends with that status and the scheduler's message, as
+                        # the TokenSpeed servicer ends it, not with a
+                        # `Complete(finish_reason = "abort")` that drops both.
+                        await context.abort(
+                            abort_code_from_output(output),
+                            aborted.get("message") or "aborted by the scheduler",
+                        )
+                    elif request.stream:
+                        yield self._create_chunk_response(request.request_id, output)
+                        if output.get("finished", False):
+                            yield self._create_completion_response(request.request_id, output)
+                    else:
+                        # Non-streaming n=1: single completion response
+                        yield self._create_completion_response(request.request_id, output)
+
+        except grpc.aio.AbortError:
+            raise
+        except ValueError as e:
+            logger.warning(f"Generate invalid request {request.request_id}: {e}")
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(e))
+        except Exception as e:
+            logger.error(
+                f"Generate failed for request {request.request_id}: {e}\n"
+                f"{get_exception_traceback()}"
+            )
+            await context.abort(grpc.StatusCode.INTERNAL, str(e))
+        finally:
+            if response_generator is not None:
+                await response_generator.aclose()
+
+    async def Embed(
+        self,
+        request: sglang_scheduler_pb2.EmbedRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> sglang_scheduler_pb2.EmbedResponse:
+        """Handle embedding requests."""
+        logger.info(f"Receive embedding request: {request.request_id}")
+
+        try:
+            tokenized_req = self._convert_embed_request(request)
+
+            future = await self.request_manager.embedding_request(
+                obj=tokenized_req,
+                request_id=request.request_id,
+            )
+
+            result = await future
+
+            if "error" in result:
+                code = abort_code_from_output(result)
+                await context.abort(code, result["error"])
+                return
+
+            embedding = result["embedding"]
+            return sglang_scheduler_pb2.EmbedResponse(
+                embedding=embedding,
+                prompt_tokens=result.get("prompt_tokens", 0),
+                embedding_dim=len(embedding),
+            )
+
+        except grpc.aio.AbortError:
+            raise
+        except ValueError as e:
+            logger.warning(f"Embed invalid request {request.request_id}: {e}")
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(e))
+        except Exception as e:
+            logger.error(
+                f"Embed failed for request {request.request_id}: {e}\n{get_exception_traceback()}"
+            )
+            await context.abort(grpc.StatusCode.INTERNAL, str(e))
+
+    async def HealthCheck(
+        self,
+        request: sglang_scheduler_pb2.HealthCheckRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> sglang_scheduler_pb2.HealthCheckResponse:
+        """
+        Check the health of the inference server by sending a special request to generate one token.
+        Similar to HTTP server's /health endpoint.
+
+        The wait is :func:`await_probe`'s: any scheduler push after the probe
+        started, or the probe's own output, is healthy (a scheduler that aborts
+        the probe answers with a push, which counts); a probe whose submission
+        fails, the send to the scheduler raising, is unhealthy at once; neither
+        within ``HEALTH_CHECK_TIMEOUT`` is unhealthy at the deadline.
+        """
+        rid = f"HEALTH_CHECK_{time.time()}"
+        logger.info(f"Receive health check request: {rid}")
+
+        if self.request_manager.gracefully_exit:
+            logger.info("Health check request received during shutdown. Returning unhealthy.")
+            return sglang_scheduler_pb2.HealthCheckResponse(
+                healthy=False, message="Server is shutting down"
+            )
+
+        # Create a special health check request
+        sampling_params = SGLSamplingParams(max_new_tokens=1, temperature=0.0)
+        sampling_params.normalize(tokenizer=self.tokenizer)
+
+        # Create health check request
+        is_generation = self.scheduler_info.get("is_generation")
+        if is_generation is None:
+            is_generation = not self.server_args.is_embedding
+
+        if is_generation:
+            health_req = TokenizedGenerateReqInput(
+                rid=rid,
+                input_text="",
+                input_ids=to_token_id_array([0]),
+                input_embeds=None,
+                mm_inputs=None,
+                token_type_ids=None,
+                sampling_params=sampling_params,
+                return_logprob=False,
+                logprob_start_len=-1,
+                top_logprobs_num=0,
+                stream=False,
+                token_ids_logprob=None,
+                require_reasoning=False,
+            )
+            # Set disaggregation params if needed
+            if self.server_args.disaggregation_mode != DisaggregationMode.NULL.value:
+                health_req.bootstrap_host = FAKE_BOOTSTRAP_HOST
+                health_req.bootstrap_room = 0
+        else:
+            sampling_params.max_new_tokens = 0
+            health_req = TokenizedEmbeddingReqInput(
+                rid=rid,
+                input_text="",
+                input_ids=to_token_id_array([0]),
+                mm_inputs=None,
+                token_type_ids=[0],
+                sampling_params=sampling_params,
+            )
+
+        # Submit health check request
+        async def run_health_check():
+            try:
+                # The probe leaves the stream at its first output. Closing the
+                # stream on the way out releases the probe's request state
+                # here, in the probe's own task, rather than whenever the
+                # garbage collector finalizes the abandoned stream.
+                async with aclosing(
+                    self.request_manager.generate_request(obj=health_req, request_id=rid)
+                ) as outputs:
+                    async for _ in outputs:
+                        # Got at least one response, server is healthy
+                        return True
+            except Exception as e:
+                logger.warning(f"Health check failed: {e}")
+                return False
+            return False
+
+        started = time.time()
+        task = asyncio.create_task(run_health_check())
+
+        try:
+            verdict = await await_probe(
+                task,
+                started=started,
+                last_receive=lambda: self.request_manager.last_receive_tstamp,
+                timeout=HEALTH_CHECK_TIMEOUT,
+            )
+            if verdict:
+                return sglang_scheduler_pb2.HealthCheckResponse(
+                    healthy=True, message="Health check passed"
+                )
+            if verdict is None:
+                # Neither a push nor the probe's verdict within the deadline.
+                logger.warning(f"Health check timeout after {HEALTH_CHECK_TIMEOUT}s")
+                return sglang_scheduler_pb2.HealthCheckResponse(
+                    healthy=False, message=f"Health check timeout after {HEALTH_CHECK_TIMEOUT}s"
+                )
+            # The probe failed (logged where it did): the answer is now, not
+            # at the deadline.
+            return sglang_scheduler_pb2.HealthCheckResponse(
+                healthy=False, message="Health check probe failed"
+            )
+        finally:
+            # The RPC may be cancelled before a scheduler response or the timeout.
+            # Reap its probe before removing state that the probe can still access.
+            task.cancel()
+            try:
+                await asyncio.gather(task, return_exceptions=True)
+            finally:
+                self.request_manager._cleanup_request_state(rid)
+
+    async def Abort(
+        self,
+        request: sglang_scheduler_pb2.AbortRequest,
+        _context: grpc.aio.ServicerContext,
+    ) -> sglang_scheduler_pb2.AbortResponse:
+        """Abort an ongoing request."""
+        logger.info(f"Receive abort request: {request.request_id}")
+
+        try:
+            success = await self.request_manager.abort_request(request.request_id)
+
+            return sglang_scheduler_pb2.AbortResponse(
+                success=success,
+                message=f"Request {request.request_id} {'aborted' if success else 'not found'}",
+            )
+        except Exception as e:
+            logger.error(
+                f"Abort failed for request {request.request_id}: {e}\n{get_exception_traceback()}"
+            )
+            return sglang_scheduler_pb2.AbortResponse(
+                success=False,
+                message=str(e),
+            )
+
+    def _default_sampling_params_json(self) -> str:
+        defaults = dict(self.model_config.get_default_sampling_params() or {})
+        preferred = self.server_args.preferred_sampling_params
+        if preferred:
+            if isinstance(preferred, str):
+                try:
+                    preferred = json.loads(preferred)
+                except json.JSONDecodeError:
+                    logger.warning("Failed to parse preferred_sampling_params JSON")
+                    preferred = {}
+            if isinstance(preferred, dict):
+                defaults.update(preferred)
+            else:
+                logger.warning(
+                    "Ignoring preferred_sampling_params with unsupported type: %s",
+                    type(preferred).__name__,
+                )
+
+        defaults = _filtered_sampling_defaults(defaults)
+        return json.dumps(defaults, separators=(",", ":")) if defaults else ""
+
+    def _preferred_sampling_params_json(self) -> str:
+        preferred = self.server_args.preferred_sampling_params
+        if isinstance(preferred, dict):
+            return json.dumps(preferred, separators=(",", ":"))
+        if isinstance(preferred, str):
+            return preferred
+        return ""
+
+    async def GetModelInfo(
+        self,
+        _request: sglang_scheduler_pb2.GetModelInfoRequest,
+        _context: grpc.aio.ServicerContext,
+    ) -> sglang_scheduler_pb2.GetModelInfoResponse:
+        """Get model information."""
+        logger.debug("Receive model info request")
+
+        is_generation = self.scheduler_info.get("is_generation")
+        if is_generation is None:
+            is_generation = not self.server_args.is_embedding
+
+        return sglang_scheduler_pb2.GetModelInfoResponse(
+            model_path=self.server_args.model_path,
+            tokenizer_path=self.server_args.tokenizer_path or "",
+            is_generation=is_generation,
+            preferred_sampling_params=self._preferred_sampling_params_json(),
+            default_sampling_params_json=self._default_sampling_params_json(),
+            weight_version=self.server_args.weight_version or "",
+            served_model_name=self.server_args.served_model_name,
+            max_context_length=self.model_info["max_context_length"],
+            vocab_size=self.model_info["vocab_size"],
+            supports_vision=self.model_info["supports_vision"],
+            model_type=self.model_info.get("model_type") or "",
+            architectures=self.model_info.get("architectures") or [],
+            eos_token_ids=self.model_info["eos_token_ids"],
+            pad_token_id=self.model_info["pad_token_id"],
+            bos_token_id=self.model_info["bos_token_id"],
+            max_req_input_len=self.model_info["max_req_input_len"],
+            # Classification model support
+            id2label_json=self.model_info.get("id2label_json") or "",
+            num_labels=self.model_info.get("num_labels") or 0,
+        )
+
+    async def GetServerInfo(
+        self,
+        _request: sglang_scheduler_pb2.GetServerInfoRequest,
+        _context: grpc.aio.ServicerContext,
+    ) -> sglang_scheduler_pb2.GetServerInfoResponse:
+        """Get server information."""
+        logger.debug("Receive server info request")
+
+        # 0.5.20 turned ServerArgs from a dataclass into a msgspec Struct, so
+        # dataclasses.asdict() raises. A Struct keeps its declared fields OUT
+        # of __dict__ (upstream carries `dict=True` only so the underscore
+        # extras have somewhere to live), which is why vars() returns those
+        # extras and none of the fields the gateway reads. msgspec's own
+        # asdict is the conversion upstream uses on this type.
+        server_args_dict = msgspec.structs.asdict(self.server_args)
+        server_args_struct = Struct()
+
+        def make_serializable(obj):
+            if obj is None:
+                return None
+            elif isinstance(obj, (str, int, float, bool)):
+                return obj
+            elif isinstance(obj, (list, tuple, set)):
+                return [make_serializable(item) for item in obj]
+            elif isinstance(obj, dict):
+                return {k: make_serializable(v) for k, v in obj.items()}
+            else:
+                return str(obj)
+
+        serializable_args = make_serializable(server_args_dict)
+        from smg_grpc_servicer.sglang.mm_defaults import encoder_dtype
+
+        serializable_args["multimodal_encoder_dtype"] = encoder_dtype(
+            None, lambda: self.model_config.dtype
+        )
+        # The operator's PD pairing protocol rides with the server args, so
+        # the gateway reads it as the worker's `pairing_protocol` label.
+        pairing_protocol = pairing_protocol_from_env()
+        if pairing_protocol:
+            serializable_args["pairing_protocol"] = pairing_protocol
+        # The engine's own per-request media limits, flat, for the gateway's
+        # media pipeline to hold requests to: the precomputed inputs it sends
+        # bypass the tokenizer manager's own check.
+        item_limits = sglang_item_limits(self.server_args)
+        if item_limits:
+            serializable_args[MM_ITEM_LIMITS_KEY] = item_limits
+        # The engine's reasoning parser and where it starts a grammar on a
+        # thinking prompt (after the thought with a parser, from the first
+        # token without), for the gateway to shape a forced tool call's
+        # grammar by.
+        serializable_args.update(
+            grammar_start_labels(
+                self.server_args, sglang_constrained_decoding_start(self.server_args)
+            )
+        )
+        # The grammar backend the scheduler runs, resolved (the raw argument
+        # is None unless set), under the same key the Rust servicer reads.
+        grammar_backend_entry(serializable_args, sglang_grammar_backend(self.server_args))
+        # The gateway reads this worker's running window (its PD admission
+        # bound, its share of the fleet's capacity) from `max_running_requests`
+        # here, which is None unless the operator set the flag: the scheduler
+        # then computes the bound itself and publishes it with its load
+        # snapshots. Report the bound the scheduler enforces under the
+        # argument's name and in the flag's units (the whole worker's, across
+        # its attention-DP workers), so a default start advertises the window
+        # a flag would; the operator's flag, when set, stays the figure
+        # reported.
+        if not serializable_args.get("max_running_requests"):
+            window = self._running_window()
+            if window > 0:
+                serializable_args["max_running_requests"] = window
+        server_args_struct.update(serializable_args)
+
+        # Convert scheduler_info to Struct
+        scheduler_info_struct = Struct()
+        scheduler_info_struct.update(self.scheduler_info)
+
+        # Get runtime state from request manager
+        manager_state = self.request_manager.get_server_info()
+
+        # Calculate uptime
+        uptime = time.time() - self.start_time
+
+        # Create timestamp
+        start_timestamp = Timestamp()
+        start_timestamp.FromSeconds(int(self.start_time))
+
+        return sglang_scheduler_pb2.GetServerInfoResponse(
+            server_args=server_args_struct,
+            scheduler_info=scheduler_info_struct,
+            active_requests=manager_state["active_requests"],
+            is_paused=manager_state["paused"],
+            last_receive_timestamp=manager_state["last_receive_time"],
+            uptime_seconds=uptime,
+            sglang_version=sglang.__version__,
+            server_type="grpc",
+            start_time=start_timestamp,
+            max_total_num_tokens=self.scheduler_info.get("max_total_num_tokens", 0),
+        )
+
+    def _attention_dp_size(self) -> int:
+        """How many attention-DP workers the flag is split across, on either
+        engine release (see `ServerArgsSection.attention_dp_width`: the pinned
+        release's ``dp_size`` under ``--enable-dp-attention``, the newer
+        releases' resolved ``attn_dp_size``)."""
+        return EngineConfigView(self.server_args).server_args.attention_dp_width
+
+    def _rank_count(self) -> int:
+        """How many schedulers publish a load snapshot, on either engine
+        release (see `ServerArgsSection.scheduler_count`)."""
+        return EngineConfigView(self.server_args).server_args.scheduler_count
+
+    def _running_window(self) -> int:
+        """The running window the schedulers enforce, in the flag's units: the
+        operator's `--max-running-requests` when set, else the figure the
+        schedulers publish in their load snapshots (one attention-DP worker's
+        share each, scaled back to the flag's units), else 0 (no snapshot
+        published yet, or a request manager without the reader). The figure is
+        cached once every rank has published its bound; a partial read (the
+        reader skips the ranks that have not published yet) is reported as it
+        stands and read again on the next call, so a rank with a smaller bound
+        still corrects it."""
+        configured = EngineConfigView(self.server_args).server_args.max_running_requests
+        if configured is not None:
+            return configured
+        if self._computed_running_window > 0:
+            return self._computed_running_window
+        reader = getattr(self.request_manager, "load_snapshot_reader", None)
+        if reader is None:
+            return 0
+        try:
+            snapshots = reader.read_all()
+        except Exception as e:  # noqa: BLE001 - the window is advisory; GetServerInfo must answer
+            logger.debug("load snapshots unreadable while resolving the running window: %s", e)
+            return 0
+        window = effective_running_window(snapshots, self._attention_dp_size())
+        if window > 0 and ranks_with_a_window(snapshots) >= self._rank_count():
+            self._computed_running_window = window
+            logger.info(
+                "max_running_requests is unset: reporting the scheduler's computed window %d",
+                window,
+            )
+        return window
+
+    async def GetLoads(
+        self,
+        request: sglang_scheduler_pb2.GetLoadsRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> sglang_scheduler_pb2.GetLoadsResponse:
+        """
+        Get comprehensive load metrics for all DP ranks.
+
+        Reads the schedulers' published LoadSnapshots, providing full
+        parity with the HTTP /v1/loads endpoint.
+        """
+        logger.debug("Receive get loads request")
+
+        include = list(request.include) if request.include else ["all"]
+        dp_rank = request.dp_rank if request.HasField("dp_rank") else None
+
+        try:
+            results = await self.request_manager.get_loads(include=include, dp_rank=dp_rank)
+        except ValueError as e:
+            # Validation error (e.g., invalid include sections)
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details(str(e))
+            return sglang_scheduler_pb2.GetLoadsResponse()
+        except TimeoutError:
+            context.set_code(grpc.StatusCode.DEADLINE_EXCEEDED)
+            context.set_details("Timeout waiting for scheduler response")
+            return sglang_scheduler_pb2.GetLoadsResponse()
+        except Exception as e:
+            logger.error(f"GetLoads failed: {e}\n{get_exception_traceback()}")
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(f"Failed to get load metrics: {e}")
+            return sglang_scheduler_pb2.GetLoadsResponse()
+
+        loads = [convert_loads_to_protobuf(r) for r in results]
+
+        return sglang_scheduler_pb2.GetLoadsResponse(
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            version=sglang.__version__,
+            dp_rank_count=len(loads),
+            loads=loads,
+            aggregate=_compute_aggregate_protobuf(loads),
+        )
+
+    async def FlushCache(
+        self,
+        request: common_pb2.FlushCacheRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> common_pb2.FlushCacheResponse:
+        """Flush the KV cache on all scheduler processes."""
+        logger.debug("Receive flush cache request (timeout_s=%.1f)", request.timeout_s)
+        timeout_s = request.timeout_s
+        comm_timeout = max(30.0, timeout_s + 10.0)
+        try:
+            results = await self.request_manager.send_communicator_req(
+                FlushCacheReqInput(timeout_s=timeout_s),
+                "flush_cache_communicator",
+                timeout=comm_timeout,
+            )
+        except TimeoutError:
+            context.set_code(grpc.StatusCode.DEADLINE_EXCEEDED)
+            context.set_details(
+                f"Flush cache timed out after {comm_timeout}s. "
+                "The scheduler may be unresponsive or under heavy load."
+            )
+            return common_pb2.FlushCacheResponse(
+                success=False, message=f"Flush cache timed out after {comm_timeout}s"
+            )
+        except Exception as e:
+            logger.error(f"FlushCache failed: {e}\n{get_exception_traceback()}")
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(f"Flush cache failed: {e}")
+            return common_pb2.FlushCacheResponse(success=False, message=f"Flush cache failed: {e}")
+
+        success, message = _aggregate_communicator_results(results, "Cache flushed successfully")
+        if not results:
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(message)
+        return common_pb2.FlushCacheResponse(success=success, message=message)
+
+    async def StartProfile(
+        self,
+        request: common_pb2.StartProfileRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> common_pb2.ProfileResponse:
+        """Start the profiler on all scheduler processes."""
+        logger.debug("Receive start profile request")
+
+        # Env-var overrides mirror sglang's TokenizerCommunicatorMixin defaults.
+        with_stack = request.with_stack if request.HasField("with_stack") else None
+        with_stack = (with_stack is not False) and get_bool_env_var(
+            "SGLANG_PROFILE_WITH_STACK", "true"
+        )
+        record_shapes = request.record_shapes if request.HasField("record_shapes") else None
+        record_shapes = (record_shapes is not False) and get_bool_env_var(
+            "SGLANG_PROFILE_RECORD_SHAPES", "true"
+        )
+
+        req = ProfileReq(
+            req_type=ProfileReqType.START_PROFILE,
+            output_dir=request.output_dir if request.HasField("output_dir") else None,
+            start_step=request.start_step if request.HasField("start_step") else None,
+            num_steps=request.num_steps if request.HasField("num_steps") else None,
+            activities=list(request.activities) if request.activities else None,
+            with_stack=with_stack,
+            record_shapes=record_shapes,
+            profile_by_stage=request.profile_by_stage,
+            profile_id=str(time.time()),
+        )
+        return await self._run_profile_req(req, "Start profiling", context)
+
+    async def StopProfile(
+        self,
+        request: common_pb2.StopProfileRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> common_pb2.ProfileResponse:
+        """Stop the profiler and export traces."""
+        logger.debug("Receive stop profile request")
+        req = ProfileReq(req_type=ProfileReqType.STOP_PROFILE)
+        return await self._run_profile_req(req, "Stop profiling", context)
+
+    async def _run_profile_req(
+        self,
+        req: ProfileReq,
+        op_name: str,
+        context: grpc.aio.ServicerContext,
+    ) -> common_pb2.ProfileResponse:
+        """Send a ProfileReq to the scheduler and aggregate per-rank results."""
+        try:
+            results = await self.request_manager.send_communicator_req(
+                req, "profile_communicator", timeout=PROFILE_COMM_TIMEOUT
+            )
+        except TimeoutError:
+            context.set_code(grpc.StatusCode.DEADLINE_EXCEEDED)
+            context.set_details(f"{op_name} timed out after {PROFILE_COMM_TIMEOUT}s")
+            return common_pb2.ProfileResponse(
+                success=False, message=f"{op_name} timed out after {PROFILE_COMM_TIMEOUT}s"
+            )
+        except Exception as e:
+            logger.error(f"{op_name} failed: {e}\n{get_exception_traceback()}")
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(f"{op_name} failed: {e}")
+            return common_pb2.ProfileResponse(success=False, message=f"{op_name} failed: {e}")
+
+        success, message = _aggregate_communicator_results(results, f"{op_name} succeeded")
+        if not results:
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(message)
+        return common_pb2.ProfileResponse(success=success, message=message)
+
+    async def GetTokenizer(
+        self,
+        request: common_pb2.GetTokenizerRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> AsyncIterator[common_pb2.GetTokenizerChunk]:
+        """Stream tokenizer artifacts as a ZIP bundle.
+
+        Resolves the tokenizer directory from server_args, zips all relevant
+        tokenizer files, and streams them as GetTokenizerChunk messages.
+        The final chunk carries the SHA-256 fingerprint of the full archive.
+        """
+        logger.info("Receive GetTokenizer request")
+
+        try:
+            tokenizer_dir = await asyncio.to_thread(tokenizer_dir_for, self.server_args)
+        except Exception as e:
+            logger.exception("Failed to resolve tokenizer metadata")
+            await context.abort(grpc.StatusCode.INTERNAL, str(e))
+        if tokenizer_dir is None:
+            await context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                "No local tokenizer metadata is available on this server.",
+            )
+
+        # Reading and compressing the tokenizer directory is file I/O and CPU
+        # measured in hundreds of milliseconds: the shared bundle builds it in
+        # a worker thread, once, and the scheduler keeps answering everything
+        # else (streams, health checks, aborts) meanwhile.
+        try:
+            zip_data, sha256 = await tokenizer_bundle(tokenizer_dir)
+        except Exception as e:
+            logger.error(f"Failed to build tokenizer ZIP: {e}\n{get_exception_traceback()}")
+            await context.abort(grpc.StatusCode.INTERNAL, str(e))
+
+        logger.info(
+            "Streaming tokenizer bundle: %d bytes, sha256=%s",
+            len(zip_data),
+            sha256,
+        )
+
+        for chunk in tokenizer_chunks(zip_data, sha256):
+            yield chunk
+
+    async def SubscribeKvEvents(
+        self,
+        request: common_pb2.SubscribeKvEventsRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> AsyncIterator[common_pb2.KvEventBatch]:
+        """Relay the scheduler's ZMQ KV cache events, every DP rank's publisher,
+        as one gRPC stream (see ``smg_grpc_servicer.kv_relay``)."""
+        if self._kv_events_config is None:
+            await context.abort(
+                grpc.StatusCode.UNIMPLEMENTED,
+                "KV cache events not enabled. Start SGLang with "
+                '--kv-events-config \'{"publisher": "zmq"}\'',
+            )
+            return
+
+        async for batch in subscribe_kv_events(
+            self._kv_events_config,
+            self.server_args,
+            request.start_sequence_number,
+            context,
+            load_source=self._load_record,
+        ):
+            yield batch
+
+    def _load_record(self, dp_rank: int | None) -> common_pb2.EngineLoad | None:
+        """The load record the KV-event stream carries for ``dp_rank``: the
+        scheduler's published snapshot as ``GetLoads`` reports it, read for
+        every batch and heartbeat; ``None`` while none is published. A read
+        that raises is the recorder's to report."""
+        return load_record(self.request_manager.load_snapshot_reader.read_all(), dp_rank)
+
+    def _handle_epd_disaggregation_encode_request(
+        self,
+        grpc_req: sglang_scheduler_pb2.GenerateRequest,
+        tokenized_req: TokenizedGenerateReqInput,
+    ) -> None:
+        if not self.mm_receiver:
+            return
+
+        image_urls = list(grpc_req.mm_inputs.image_urls)
+        if not image_urls:
+            return
+
+        encode_req = self.mm_receiver.build_and_send_encode_request(
+            image_urls=image_urls,
+            rid=grpc_req.request_id,
+        )
+        tokenized_req.need_wait_for_mm_inputs = bool(encode_req.need_wait_for_mm_inputs)
+        tokenized_req.num_items_assigned = encode_req.num_items_assigned
+
+    # Helper methods for request/response conversion
+
+    def _convert_generate_request(
+        self, grpc_req: sglang_scheduler_pb2.GenerateRequest
+    ) -> TokenizedGenerateReqInput:
+        """Convert gRPC GenerateRequest to internal format."""
+
+        # Older proto packages remain usable for text and single-modality requests.
+        extra_mm_inputs = getattr(grpc_req, "extra_mm_inputs", ())
+        if extra_mm_inputs and not (
+            grpc_req.HasField("mm_inputs") and grpc_req.mm_inputs.HasField("pixel_values")
+        ):
+            raise ValueError("SGLang extra_mm_inputs requires primary preprocessed inputs")
+
+        # Extract tokenized input
+        if not grpc_req.HasField("tokenized"):
+            raise ValueError("Tokenized input must be provided")
+
+        input_text = grpc_req.tokenized.original_text
+        input_ids = to_token_id_array(grpc_req.tokenized.input_ids)
+
+        # Convert sampling params
+        sampling_params = self._convert_sampling_params(grpc_req.sampling_params)
+        sampling_params.normalize(tokenizer=self.tokenizer)
+
+        # Extract disaggregated params if present
+        bootstrap_host = None
+        bootstrap_port = None
+        bootstrap_room = None
+        if grpc_req.HasField("disaggregated_params"):
+            # Don't use 'or None' as it treats 0 as falsy
+            bootstrap_host = (
+                grpc_req.disaggregated_params.bootstrap_host
+                if grpc_req.disaggregated_params.bootstrap_host
+                else None
+            )
+            bootstrap_port = (
+                grpc_req.disaggregated_params.bootstrap_port
+                if grpc_req.disaggregated_params.bootstrap_port
+                else None
+            )
+            bootstrap_room = (
+                grpc_req.disaggregated_params.bootstrap_room
+            )  # Can be 0, don't use 'or None'
+
+        # Parse multimodal inputs if present
+        mm_inputs = None
+        if (
+            grpc_req.HasField("mm_inputs")
+            and not grpc_req.mm_inputs.HasField("pixel_values")
+            and V41_MARKER in grpc_req.mm_inputs.model_specific_tensors
+        ):
+            # Grids without the pixels they describe would drop the images unseen.
+            raise ValueError(f"{V41_PREFIX} no pixel_values to cut its per-image items from")
+        if grpc_req.HasField("mm_inputs") and grpc_req.mm_inputs.HasField("pixel_values"):
+            mm_inputs = self._parse_mm_inputs(grpc_req.mm_inputs, extra_mm_inputs, len(input_ids))
+
+        # Create request
+        require_reasoning = bool(grpc_req.require_reasoning)
+        if grpc_req.return_hidden_states:
+            # The engine's launch-time cap first, in its own words; then this
+            # servicer's own answer: hidden states are served by the Rust one.
+            refuse_hidden_states_above_server_mode()
+            refuse_hidden_states_on_this_servicer()
+
+        return TokenizedGenerateReqInput(
+            rid=grpc_req.request_id,
+            input_text=input_text,
+            input_ids=input_ids,
+            input_embeds=None,
+            mm_inputs=mm_inputs,
+            token_type_ids=None,
+            sampling_params=sampling_params,
+            return_logprob=grpc_req.return_logprob,
+            logprob_start_len=(
+                grpc_req.logprob_start_len if grpc_req.logprob_start_len is not None else -1
+            ),
+            top_logprobs_num=grpc_req.top_logprobs_num or 0,
+            stream=grpc_req.stream or False,
+            lora_id=self.loras.resolve(grpc_req.lora_id) if grpc_req.lora_id else None,
+            token_ids_logprob=(
+                list(grpc_req.token_ids_logprob) if grpc_req.token_ids_logprob else None
+            ),
+            bootstrap_host=bootstrap_host,
+            bootstrap_port=bootstrap_port,
+            bootstrap_room=bootstrap_room,
+            require_reasoning=require_reasoning,
+        )
+
+    @staticmethod
+    def _decode_tensor_data(tensor_data):
+        """Decode a proto TensorData message into a torch.Tensor."""
+        return tensor_from_parts(tensor_data.data, tensor_data.shape, tensor_data.dtype)
+
+    def _parse_mm_inputs(self, mm_proto, extra_mm_inputs, prompt_len) -> MultimodalProcessorOutput:
+        """Parse proto MultimodalInputs into a MultimodalProcessorOutput for the scheduler."""
+        mm_items = []
+        im_token_id = video_token_id = None
+        seen = set()
+        for batch in (mm_proto, *extra_mm_inputs):
+            labels = set(batch.modalities)
+            if not labels or labels == {"image"}:
+                modality = Modality.IMAGE
+            elif labels == {"video"}:
+                modality = Modality.VIDEO
+            else:
+                raise ValueError(f"Unsupported SGLang tensor modalities: {labels}")
+            if modality in seen:
+                raise ValueError("SGLang requires one batch per modality")
+            seen.add(modality)
+            token = batch.im_token_id if batch.HasField("im_token_id") else None
+            if modality == Modality.VIDEO:
+                if token is None:
+                    raise ValueError("SGLang video tensors require a placeholder token id")
+                video_token_id = token
+            else:
+                im_token_id = token
+            offsets = []
+            for placeholder in batch.mm_placeholders:
+                start, length = placeholder.offset, placeholder.length
+                if length == 0:
+                    raise ValueError(f"multimodal placeholder at offset {start} has zero length")
+                end = start + length - 1
+                if end >= prompt_len:
+                    raise ValueError(
+                        f"multimodal placeholder {start}..={end} lies outside the prompt "
+                        f"of {prompt_len} tokens"
+                    )
+                offsets.append((start, end))
+            if not offsets:
+                logger.warning(
+                    "No mm_placeholders from Rust gateway — token expansion may have "
+                    "failed to find the placeholder token in input_ids. "
+                    "Check that placeholder_token_id matches the tokenized image token."
+                )
+            feature = self._decode_tensor_data(batch.pixel_values)
+            tensors = {
+                key: self._decode_tensor_data(value)
+                for key, value in batch.model_specific_tensors.items()
+            }
+            if modality != Modality.IMAGE and V41_MARKER in tensors:
+                # Only an image batch is cut into V4.1 items. Under the video
+                # label the batch would go on as a video item, which SGLang's
+                # V4.1 model has no embedder for.
+                raise ValueError(f"{V41_PREFIX} vit_grid on a video batch")
+            if modality == Modality.IMAGE and V41_MARKER in tensors:
+                if token is None:
+                    # SGLang pads the image positions only when the id is set.
+                    # Without it the model finds no position for the items'
+                    # embeddings and fails in the scheduler.
+                    raise ValueError(f"{V41_PREFIX} no im_token_id")
+                vision = v41_vision(self.model_config.hf_config)
+                mm_items.extend(_deepseek_v41_items(feature, tensors, offsets, vision))
+                continue
+            mm_items.append(
+                MultimodalDataItem(
+                    modality=modality,
+                    feature=feature,
+                    model_specific_data=tensors,
+                    offsets=offsets or None,
+                )
+            )
+        return MultimodalProcessorOutput(
+            mm_items=mm_items,
+            im_token_id=im_token_id if Modality.IMAGE in seen else video_token_id,
+            video_token_id=video_token_id,
+        )
+
+    def _convert_embed_request(
+        self, grpc_req: sglang_scheduler_pb2.EmbedRequest
+    ) -> TokenizedEmbeddingReqInput:
+        """Convert gRPC EmbedRequest to internal format."""
+
+        # Extract tokenized input
+        if not grpc_req.HasField("tokenized"):
+            raise ValueError("Tokenized input must be provided")
+
+        input_text = grpc_req.tokenized.original_text
+        input_ids = to_token_id_array(grpc_req.tokenized.input_ids)
+
+        # Convert sampling params
+        sampling_params = self._convert_sampling_params(grpc_req.sampling_params)
+
+        # For embedding requests, max_new_tokens should be 0.
+        # The scheduler logic expects an integer, not None.
+        sampling_params.max_new_tokens = 0
+
+        sampling_params.normalize(tokenizer=self.tokenizer)
+
+        return TokenizedEmbeddingReqInput(
+            rid=grpc_req.request_id,
+            input_text=input_text,
+            input_ids=input_ids,
+            mm_inputs=None,
+            token_type_ids=list(grpc_req.token_type_ids),
+            sampling_params=sampling_params,
+        )
+
+    def _convert_sampling_params(
+        self, grpc_params: sglang_scheduler_pb2.SamplingParams
+    ) -> SGLSamplingParams:
+        """Convert gRPC SamplingParams to internal format."""
+
+        # Handle constraint types
+        regex = None
+        json_schema = None
+        ebnf_grammar = None
+        structural_tag = None
+
+        if grpc_params.HasField("regex"):
+            regex = grpc_params.regex
+        elif grpc_params.HasField("json_schema"):
+            json_schema = grpc_params.json_schema
+        elif grpc_params.HasField("ebnf_grammar"):
+            ebnf_grammar = grpc_params.ebnf_grammar
+        elif grpc_params.HasField("structural_tag"):
+            structural_tag = grpc_params.structural_tag
+
+        # Handle optional parameters conversion
+        custom_params = (
+            MessageToDict(grpc_params.custom_params)
+            if grpc_params.HasField("custom_params")
+            else None
+        )
+        max_new_tokens = (
+            grpc_params.max_new_tokens if grpc_params.HasField("max_new_tokens") else None
+        )
+        stream_interval = (
+            grpc_params.stream_interval if grpc_params.HasField("stream_interval") else None
+        )
+        logit_bias = dict(grpc_params.logit_bias) if grpc_params.logit_bias else None
+        stop = list(grpc_params.stop) if grpc_params.stop else None
+        stop_token_ids = list(grpc_params.stop_token_ids) if grpc_params.stop_token_ids else None
+
+        # proto3 cannot tell an unset scalar from its zero, and the zeros of
+        # these three are never meant: top_p 0.0 keeps the top token only,
+        # top_k 0 is an empty candidate set, and a repetition factor of 0.0
+        # sends a repeated token's positive logit to infinity (the scheduler's
+        # own checks refuse all three where they run). An unset one means the
+        # neutral value: the whole distribution, every token, no penalty.
+        top_p = grpc_params.top_p if grpc_params.top_p != 0.0 else 1.0
+        top_k = grpc_params.top_k if grpc_params.top_k != 0 else -1
+        repetition_penalty = (
+            grpc_params.repetition_penalty if grpc_params.repetition_penalty != 0.0 else 1.0
+        )
+
+        return SGLSamplingParams(
+            temperature=grpc_params.temperature,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=grpc_params.min_p,
+            frequency_penalty=grpc_params.frequency_penalty,
+            presence_penalty=grpc_params.presence_penalty,
+            repetition_penalty=repetition_penalty,
+            max_new_tokens=max_new_tokens,
+            min_new_tokens=grpc_params.min_new_tokens,
+            stop=stop,
+            stop_token_ids=stop_token_ids,
+            skip_special_tokens=grpc_params.skip_special_tokens,
+            spaces_between_special_tokens=grpc_params.spaces_between_special_tokens,
+            no_stop_trim=grpc_params.no_stop_trim,
+            regex=regex,
+            json_schema=json_schema,
+            ebnf=ebnf_grammar,
+            structural_tag=structural_tag,
+            n=grpc_params.n,
+            ignore_eos=grpc_params.ignore_eos,
+            stream_interval=stream_interval,
+            logit_bias=logit_bias,
+            custom_params=custom_params,
+        )
+
+    def _convert_output_logprobs_to_proto(
+        self, logprobs_data: dict
+    ) -> sglang_scheduler_pb2.OutputLogProbs | None:
+        """Convert output logprobs dict to proto (no None values, plain floats)."""
+        if not logprobs_data:
+            return None
+
+        token_logprobs_val = logprobs_data.get("token_logprobs_val", [])
+        token_logprobs_idx = logprobs_data.get("token_logprobs_idx", [])
+        top_logprobs_val = logprobs_data.get("top_logprobs_val", [])
+        top_logprobs_idx = logprobs_data.get("top_logprobs_idx", [])
+        selected_values = logprobs_data.get("token_ids_logprobs_val", [])
+        selected_ids = logprobs_data.get("token_ids_logprobs_idx", [])
+        _validate_token_ids_logprobs(selected_values, selected_ids)
+
+        # Build TopLogProbs entries
+        top_logprobs_proto = []
+        if top_logprobs_val and top_logprobs_idx:
+            for val_list, idx_list in zip(top_logprobs_val, top_logprobs_idx):
+                top_logprobs_proto.append(
+                    sglang_scheduler_pb2.TopLogProbs(
+                        values=val_list,
+                        token_ids=idx_list,
+                    )
+                )
+
+        return sglang_scheduler_pb2.OutputLogProbs(
+            token_logprobs=token_logprobs_val,  # Plain float array
+            token_ids=token_logprobs_idx,
+            top_logprobs=top_logprobs_proto,
+            token_ids_logprobs=[
+                sglang_scheduler_pb2.TopLogProbs(values=values, token_ids=token_ids)
+                for values, token_ids in zip(selected_values, selected_ids)
+            ],
+        )
+
+    def _convert_input_logprobs_to_proto(
+        self, logprobs_data: dict
+    ) -> sglang_scheduler_pb2.InputLogProbs | None:
+        """Convert input logprobs dict to proto (first token is None, wrapped in InputTokenLogProb)."""
+        if not logprobs_data:
+            return None
+
+        token_logprobs_val = logprobs_data.get("token_logprobs_val", [])
+        token_logprobs_idx = logprobs_data.get("token_logprobs_idx", [])
+        top_logprobs_val = logprobs_data.get("top_logprobs_val", [])
+        top_logprobs_idx = logprobs_data.get("top_logprobs_idx", [])
+
+        # Wrap values in InputTokenLogProb (None for first token, value for others)
+        token_logprobs_wrapped = [
+            (
+                sglang_scheduler_pb2.InputTokenLogProb()
+                if x is None
+                else sglang_scheduler_pb2.InputTokenLogProb(value=x)
+            )
+            for x in token_logprobs_val
+        ]
+
+        # Build TopLogProbs entries
+        top_logprobs_proto = []
+        if top_logprobs_val and top_logprobs_idx:
+            for val_list, idx_list in zip(top_logprobs_val, top_logprobs_idx):
+                top_logprobs_proto.append(
+                    sglang_scheduler_pb2.TopLogProbs(
+                        values=val_list,
+                        token_ids=idx_list,
+                    )
+                )
+
+        return sglang_scheduler_pb2.InputLogProbs(
+            token_logprobs=token_logprobs_wrapped,
+            token_ids=token_logprobs_idx,
+            top_logprobs=top_logprobs_proto,
+        )
+
+    def _create_chunk_response(
+        self, request_id: str, output: dict
+    ) -> sglang_scheduler_pb2.GenerateResponse:
+        """Create a streaming chunk response."""
+        meta_info = output.get("meta_info", {})
+
+        # Convert output logprobs if present
+        output_logprobs_proto = self._convert_output_logprobs_to_proto(
+            output.get("output_logprobs")
+        )
+
+        # Convert input logprobs if present (only in first chunk)
+        input_logprobs_proto = self._convert_input_logprobs_to_proto(output.get("input_logprobs"))
+
+        return sglang_scheduler_pb2.GenerateResponse(
+            request_id=request_id,
+            chunk=sglang_scheduler_pb2.GenerateStreamChunk(
+                token_ids=output.get("token_ids", []),
+                prompt_tokens=meta_info.get("prompt_tokens", 0),
+                completion_tokens=meta_info.get("completion_tokens", 0),
+                cached_tokens=meta_info.get("cached_tokens", 0),
+                reasoning_tokens=meta_info.get("reasoning_tokens", 0),
+                output_logprobs=output_logprobs_proto,
+                input_logprobs=input_logprobs_proto,
+                index=output.get("index", 0),
+            ),
+        )
+
+    def _create_completion_response(
+        self, request_id: str, output: dict
+    ) -> sglang_scheduler_pb2.GenerateResponse:
+        """Create a completion response."""
+
+        # Extract meta info and finish reason details
+        meta_info = output.get("meta_info", {})
+        finish_reason_data = meta_info.get("finish_reason")
+
+        # Determine finish reason, default is stop
+        finish_reason = "stop"
+        if finish_reason_data:
+            if isinstance(finish_reason_data, dict):
+                finish_reason_type = finish_reason_data.get("type")
+            else:
+                # Handle legacy string format
+                finish_reason_type = finish_reason_data
+
+            if finish_reason_type == "length":
+                finish_reason = "length"
+            elif finish_reason_type == "abort":
+                finish_reason = "abort"
+
+        # Extract matched_stop information
+        matched_stop_kwargs = {}
+        if isinstance(finish_reason_data, dict) and "matched" in finish_reason_data:
+            matched = finish_reason_data["matched"]
+            if isinstance(matched, int):
+                matched_stop_kwargs["matched_token_id"] = matched
+            elif isinstance(matched, str):
+                matched_stop_kwargs["matched_stop_str"] = matched
+
+        # Complete includes all selected rows, while the last stream chunk
+        # contains only that scheduler tick's rows.
+        logprobs_data = output.get("output_logprobs")
+        if "complete_token_ids_logprobs" in output:
+            logprobs_data = {
+                **(logprobs_data or {}),
+                **output["complete_token_ids_logprobs"],
+            }
+        output_logprobs_proto = self._convert_output_logprobs_to_proto(logprobs_data)
+
+        # Convert input logprobs if present
+        input_logprobs_proto = self._convert_input_logprobs_to_proto(output.get("input_logprobs"))
+
+        return sglang_scheduler_pb2.GenerateResponse(
+            request_id=request_id,
+            complete=sglang_scheduler_pb2.GenerateComplete(
+                output_ids=output.get("token_ids", []),
+                finish_reason=finish_reason,
+                prompt_tokens=meta_info.get("prompt_tokens", 0),
+                completion_tokens=meta_info.get(
+                    "completion_tokens", len(output.get("token_ids", []))
+                ),
+                cached_tokens=meta_info.get("cached_tokens", 0),
+                reasoning_tokens=meta_info.get("reasoning_tokens", 0),
+                spec_accepted_tokens=meta_info.get("spec_num_correct_drafts", 0),
+                spec_draft_tokens=meta_info.get("spec_num_proposed_drafts", 0),
+                output_logprobs=output_logprobs_proto,
+                input_logprobs=input_logprobs_proto,
+                index=output.get("index", 0),
+                **matched_stop_kwargs,
+            ),
+        )
+
+    async def shutdown(self):
+        """Shutdown the service."""
+        logger.info("Shutting down gRPC service")
+
+        # Mark health service as NOT_SERVING before shutdown
+        if self.health_servicer:
+            self.health_servicer.set_not_serving()
+
+        # Shutdown request manager (handles its own tasks)
+        await self.request_manager.shutdown()

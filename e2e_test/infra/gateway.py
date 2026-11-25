@@ -1,0 +1,855 @@
+"""Gateway class for managing Shepherd Model Gateway router instances."""
+
+from __future__ import annotations
+
+import logging
+import os
+import subprocess
+import tempfile
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import IO, TYPE_CHECKING, Any
+
+import httpx
+
+from .cloud_credentials import PROXY_ENV, cloud_environment, resolve_cloud_credentials
+from .constants import (
+    CLOUD_REQUEST_TIMEOUT_SECS,
+    DEFAULT_HOST,
+    DEFAULT_ROUTER_TIMEOUT,
+    ENV_SHOW_ROUTER_LOGS,
+    get_parser,
+    get_zmq_engine_count,
+    host_port,
+    trtllm_runs_engines_own_servicer,
+)
+from .process_utils import (
+    ProcessExitedError,
+    get_open_port,
+    kill_process_tree,
+    port_is_free,
+    release_port,
+    wait_for_health,
+    wait_for_workers_ready,
+)
+
+if TYPE_CHECKING:
+    from .worker import Worker
+
+logger = logging.getLogger(__name__)
+
+
+def workers_labelled_by_hand(workers: list | None) -> list:
+    """The workers of ``workers`` whose servicer advertises no structural-tag
+    vocabulary, so the harness labels them: the TensorRT-LLM workers on the
+    engine's own gRPC server. On the Rust servicer the launcher advertises
+    the vocabulary of the xgrammar installed beside the engine itself."""
+    labelled = [w for w in workers or () if getattr(w, "engine", None) == "trtllm"]
+    if not labelled or not trtllm_runs_engines_own_servicer():
+        return []
+    return labelled
+
+
+def build_epd_mode_args(
+    encode_workers: list[Worker],
+    prefill_workers: list[Worker],
+    decode_workers: list[Worker],
+    encode_policy: str = "consistent_hashing",
+) -> list[str]:
+    """Build the ``smg.launch_router`` args for EPD disaggregation.
+
+    ``--encode`` / ``--prefill`` are repeatable ``URL [BOOTSTRAP_PORT]`` flags;
+    ``--decode`` is a repeatable ``URL`` flag. Multimodal tensors ride inline
+    (SMG -> encode); encode -> prefill embeddings and prefill -> decode KV move
+    over Mooncake independently of this flag.
+    """
+    args = ["--epd-disaggregation"]
+    for en in encode_workers:
+        args += ["--encode", en.base_url]
+        if en.bootstrap_port is not None:
+            args.append(str(en.bootstrap_port))
+    for pf in prefill_workers:
+        args += ["--prefill", pf.base_url]
+        if pf.bootstrap_port is not None:
+            args.append(str(pf.bootstrap_port))
+    for dc in decode_workers:
+        args += ["--decode", dc.base_url]
+    if encode_policy:
+        args += ["--encode-policy", encode_policy]
+    args += ["--multimodal-tensor-transport", "inline"]
+    return args
+
+
+@dataclass
+class WorkerInfo:
+    """Information about a worker connected to the gateway."""
+
+    id: str
+    url: str
+    model: str | None = None
+    status: str = "unknown"
+    pending_requests: int = 0
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+class Gateway:
+    """Manages a Shepherd Model Gateway router instance.
+
+    Four startup modes:
+    - Regular: start(worker_urls=[...], model_path="...") — with
+      workers=[...] when this harness launched them: a worker's exit ends
+      the readiness wait at once with its death report
+    - PD: start(prefill_workers=[...], decode_workers=[...])
+    - IGW: start(igw_mode=True), then add_worker(url) dynamically
+    - Cloud: start(cloud_backend="openai"|"xai"|"anthropic")
+    """
+
+    def __init__(
+        self,
+        host: str = DEFAULT_HOST,
+        port: int | None = None,
+        prometheus_port: int | None = None,
+    ):
+        self.host = host
+        self._port_auto_allocated = port is None
+        self._prometheus_port_auto_allocated = prometheus_port is None
+        self.port = port or get_open_port(host=host)
+        self.prometheus_port = prometheus_port or get_open_port(host=host)
+        self.base_url = f"http://{host_port(self.host, self.port)}"
+        self.metrics_url = f"http://{host_port(self.host, self.prometheus_port)}"
+
+        self.process: subprocess.Popen | None = None
+        self.model_path: str | None = None
+        self.policy: str = "round_robin"
+        self.log_level: str = "warn"
+        self.log_dir: str | None = None
+        # The router's captured output (None while it goes to the terminal).
+        self.log_path: str | None = None
+        self._log_file: IO[Any] | None = None
+        self._log_is_temporary = False
+        # The PD workers a PD/EPD gateway was started with (tests kill and restart them).
+        self.encode_workers: list[Worker] = []
+        self.prefill_workers: list[Worker] = []
+        self.decode_workers: list[Worker] = []
+        self.pd_mode: bool = False
+        self.igw_mode: bool = False
+        self.cloud_mode: bool = False
+        self.cloud_backend: str | None = None
+        self._started: bool = False
+        self._env: dict[str, str] | None = None
+
+    @property
+    def is_running(self) -> bool:
+        """Check if the gateway process is running."""
+        return self.process is not None and self.process.poll() is None
+
+    @property
+    def ws_base_url(self) -> str:
+        """``ws://host:port`` of this gateway (an IPv6 host in brackets)."""
+        return f"ws://{host_port(self.host, self.port)}"
+
+    def start(
+        self,
+        *,
+        worker_urls: list[str] | None = None,
+        workers: list[Worker] | None = None,
+        model_path: str | None = None,
+        prefill_workers: list[Worker] | None = None,
+        decode_workers: list[Worker] | None = None,
+        encode_workers: list[Worker] | None = None,
+        encode_policy: str = "consistent_hashing",
+        igw_mode: bool = False,
+        cloud_backend: str | None = None,
+        history_backend: str = "memory",
+        backend: str | None = None,
+        policy: str = "round_robin",
+        timeout: float = DEFAULT_ROUTER_TIMEOUT,
+        show_output: bool | None = None,
+        extra_args: list[str] | None = None,
+        log_level: str | None = None,
+        log_dir: str | None = None,
+        env: dict[str, str] | None = None,
+    ) -> None:
+        """Start the gateway in exactly one mode (regular, PD, IGW, or cloud).
+
+        ``env`` adds variables to the gateway process's environment (over the
+        test process's own), for a test that arms a gateway-side test hook.
+        """
+        if self._started:
+            raise RuntimeError("Gateway already started")
+        if env:
+            proxy = bool(cloud_backend and env.get(PROXY_ENV, os.environ.get(PROXY_ENV, "")))
+            self._env = {
+                **cloud_environment(os.environ, proxy=proxy),
+                **cloud_environment(env, proxy=proxy),
+            }
+
+        is_epd_mode = encode_workers is not None
+        is_pd_mode = (prefill_workers is not None or decode_workers is not None) and not is_epd_mode
+        is_regular_mode = worker_urls is not None
+        is_igw_mode = igw_mode
+        is_cloud_mode = cloud_backend is not None
+
+        modes_specified = sum(
+            [is_epd_mode, is_pd_mode, is_regular_mode, is_igw_mode, is_cloud_mode]
+        )
+        if modes_specified != 1:
+            raise ValueError(
+                "Specify exactly one mode: worker_urls, encode/prefill/decode_workers "
+                "(EPD), prefill/decode_workers (PD), igw_mode=True, or cloud_backend"
+            )
+        if workers is not None and not is_regular_mode:
+            raise ValueError("workers are the launched processes behind worker_urls")
+
+        if show_output is None:
+            show_output = os.environ.get(ENV_SHOW_ROUTER_LOGS, "0") == "1"
+
+        self.policy = policy
+        if log_level:
+            self.log_level = log_level
+        if log_dir:
+            self.log_dir = log_dir
+
+        if is_igw_mode:
+            self.pd_mode = False
+            self.igw_mode = True
+            self._launch(
+                mode_args=["--enable-igw"],
+                timeout=timeout,
+                show_output=show_output,
+                extra_args=extra_args,
+                log_msg="IGW gateway (no workers)",
+            )
+        elif is_epd_mode:
+            self.pd_mode = True
+            self.igw_mode = False
+            encodes = encode_workers or []
+            prefills = prefill_workers or []
+            decodes = decode_workers or []
+            self.encode_workers = list(encodes)
+            self.prefill_workers = list(prefills)
+            self.decode_workers = list(decodes)
+            mode_args = build_epd_mode_args(encodes, prefills, decodes, encode_policy)
+            # A disaggregated gateway autoloads each worker's tokenizer after
+            # the worker reports healthy and holds `/readiness` until every one
+            # is registered. The worker count puts this launch on the
+            # readiness-aware wait of the regular branch, so a class's first
+            # request does not race that load (a 503 `tokenizer_not_ready`).
+            # A launch that names no worker (a fleet registered through the
+            # API afterwards) keeps the health wait: readiness needs each role.
+            fleet = [*encodes, *prefills, *decodes]
+            self._launch(
+                mode_args=mode_args,
+                timeout=timeout,
+                show_output=show_output,
+                extra_args=extra_args,
+                num_workers=len(fleet) or None,
+                log_msg=(
+                    f"EPD gateway ({len(encodes)} encode, "
+                    f"{len(prefills)} prefill, {len(decodes)} decode)"
+                ),
+                worker_urls=self._fleet_urls(mode_args),
+                workers=fleet,
+            )
+        elif is_pd_mode:
+            self.pd_mode = True
+            self.igw_mode = False
+            prefills = prefill_workers or []
+            decodes = decode_workers or []
+            self.prefill_workers = list(prefills)
+            self.decode_workers = list(decodes)
+
+            mode_args = ["--pd-disaggregation"]
+            for pf in prefills:
+                if pf.bootstrap_port is not None:
+                    mode_args += ["--prefill", pf.base_url, str(pf.bootstrap_port)]
+                else:
+                    mode_args += ["--prefill", pf.worker_url]
+            for dc in decodes:
+                mode_args += ["--decode", dc.worker_url]
+
+            # The readiness-aware wait, as for the EPD gateway above; an empty
+            # launch keeps the health wait the same way.
+            fleet = [*prefills, *decodes]
+            self._launch(
+                mode_args=mode_args,
+                timeout=timeout,
+                show_output=show_output,
+                extra_args=extra_args,
+                num_workers=len(fleet) or None,
+                log_msg=f"PD gateway ({len(prefills)} prefill, {len(decodes)} decode)",
+                worker_urls=self._fleet_urls(mode_args),
+                workers=fleet,
+            )
+        elif is_cloud_mode:
+            assert cloud_backend is not None
+            self.pd_mode = False
+            self.igw_mode = False
+            self.cloud_mode = True
+            self.cloud_backend = cloud_backend
+            mode_args = self._build_cloud_args(cloud_backend, history_backend)
+            self._launch(
+                mode_args=mode_args,
+                timeout=timeout,
+                show_output=show_output,
+                extra_args=extra_args,
+                num_workers=1,
+                log_msg=f"{cloud_backend} cloud gateway",
+            )
+        else:
+            if not model_path:
+                raise ValueError("model_path is required for regular mode")
+            if not worker_urls:
+                raise ValueError("worker_urls must be non-empty for regular mode")
+            self.model_path = model_path
+            self.pd_mode = False
+            self.igw_mode = False
+            mode_args = ["--model-path", model_path, "--worker-urls", *worker_urls]
+            # ZMQ workers share one wire across engine runtimes, so the router
+            # cannot probe the backend from the ipc:// URL — pin it explicitly.
+            if backend is not None:
+                mode_args += ["--backend", backend]
+            # Grouped ZMQ lane: the handshake must await every engine the
+            # worker launched (see get_zmq_engine_count).
+            engine_count = get_zmq_engine_count()
+            if engine_count > 1:
+                mode_args += ["--zmq-engine-count", str(engine_count)]
+            self._launch(
+                mode_args=mode_args,
+                timeout=timeout,
+                show_output=show_output,
+                extra_args=extra_args,
+                num_workers=len(worker_urls),
+                log_msg=f"gateway with {len(worker_urls)} worker(s)",
+                worker_urls=worker_urls,
+                workers=workers,
+            )
+            # A worker whose servicer cannot advertise which structural-tag
+            # vocabulary its grammar compiler takes is labelled by its
+            # operator: a TensorRT-LLM worker on the engine's own gRPC
+            # servicer (`tensorrt_llm.commands.serve`), which reports no such
+            # fact, over the xgrammar its pinned wheel carries
+            # (scripts/ci_install_trtllm.sh: 0.1.32, before the `optional`,
+            # `plus`, `star` and `token` nodes), and the gateway spells that
+            # worker's structural tags in the older vocabulary. On the Rust
+            # servicer the launcher advertises the vocabulary itself
+            # (`workers_labelled_by_hand`).
+            # The router is up by now (`_launch`): a label that does not land
+            # within its wait takes the router down with it before the error
+            # goes out, so a caller that does not shut down on failure leaves
+            # no process and no port behind. The launch is marked failed
+            # first, so a temporary log is kept and the error names its tail
+            # (`_open_log_file`'s contract), as `_launch` does when the router
+            # exits.
+            try:
+                self.label_workers(
+                    workers_labelled_by_hand(workers), {"structural_tag_vocabulary": "older"}
+                )
+            except Exception as e:
+                detail = self._output_tail()
+                self._started = False
+                self.shutdown()
+                raise RuntimeError(f"{e}; {detail}") from e
+
+    def _ensure_ports_free(self) -> None:
+        """Re-check the auto-allocated ports right before the launch.
+
+        They were reserved by number when this gateway was constructed, often
+        minutes before the launch (the engines start in between), and any
+        process that picks its own ports can have taken one since. A taken
+        port is re-allocated; the router would otherwise exit at once with
+        "Address already in use".
+        """
+        if self._port_auto_allocated and not port_is_free(self.port, self.host):
+            old = self.port
+            release_port(old)
+            self.port = get_open_port(host=self.host)
+            self.base_url = f"http://{host_port(self.host, self.port)}"
+            logger.warning("Router port %d was taken since reservation; using %d", old, self.port)
+        if self._prometheus_port_auto_allocated and not port_is_free(
+            self.prometheus_port, self.host
+        ):
+            old = self.prometheus_port
+            release_port(old)
+            self.prometheus_port = get_open_port(host=self.host)
+            self.metrics_url = f"http://{host_port(self.host, self.prometheus_port)}"
+            logger.warning(
+                "Metrics port %d was taken since reservation; using %d", old, self.prometheus_port
+            )
+
+    def _open_log_file(self) -> IO[Any]:
+        """The file the router's output goes to when it is not shown.
+
+        It goes under the log dir given to ``start``, else under
+        ``E2E_LOG_DIR`` (the directory a failed lane's logs are uploaded
+        from, as for the workers). Without either it is a private, uniquely
+        named file in the temp dir, removed at shutdown unless the launch
+        failed (the error names it then).
+        """
+        log_dir = self.log_dir or os.environ.get("E2E_LOG_DIR")
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+            path = os.path.join(log_dir, f"router-{self.port}.log")
+            self._log_file = open(path, "w", encoding="utf-8")
+            self._log_is_temporary = False
+        else:
+            # Created exclusively with a random suffix and mode 0600: a shared
+            # temp dir may hold another user's file or a symlink at a
+            # predictable name.
+            fd, path = tempfile.mkstemp(prefix=f"smg-router-{self.port}-", suffix=".log")
+            self._log_file = os.fdopen(fd, "w", encoding="utf-8")
+            self._log_is_temporary = True
+        self.log_path = path
+        return self._log_file
+
+    def read_log(self) -> str:
+        """The router's captured output so far; empty when it goes to the terminal."""
+        if self.log_path is None:
+            return ""
+        with open(self.log_path, encoding="utf-8", errors="replace") as log:
+            return log.read()
+
+    def _output_tail(self, lines: int = 40) -> str:
+        if self.log_path is None:
+            return "its output is in the test log above (SHOW_ROUTER_LOGS=1)"
+        tail = self.read_log().splitlines()[-lines:]
+        if not tail:
+            return f"its output file {self.log_path} is empty"
+        return f"last {len(tail)} lines of {self.log_path}:\n" + "\n".join(tail)
+
+    @staticmethod
+    def _fleet_urls(mode_args: list[str]) -> list[str]:
+        """The worker URLs a disaggregated launch names: the token after each
+        ``--encode``, ``--prefill`` and ``--decode`` flag, which the readiness
+        wait takes as its registration gate."""
+        return [
+            mode_args[i + 1]
+            for i, arg in enumerate(mode_args[:-1])
+            if arg in ("--encode", "--prefill", "--decode")
+        ]
+
+    def _launch(
+        self,
+        mode_args: list[str],
+        timeout: float,
+        show_output: bool,
+        extra_args: list[str] | None,
+        num_workers: int | None = None,
+        log_msg: str = "",
+        worker_urls: list[str] | None = None,
+        workers: list[Worker] | None = None,
+    ) -> None:
+        """Launch the gateway process and wait for it to become ready.
+
+        The wait ends early when the process exits: the exit code and the
+        tail of its output are the error, not a readiness timeout. It ends
+        the same way when one of ``workers`` exits, with that worker's death
+        report.
+        """
+        self._ensure_ports_free()
+        cmd = self._build_base_cmd()
+        cmd.extend(mode_args)
+
+        if extra_args:
+            cmd.extend(extra_args)
+
+        logger.info("Starting %s on port %d", log_msg or "gateway", self.port)
+        logger.debug("Gateway command: %s", " ".join(cmd))
+
+        stdout_target: int | IO[Any] | None = None
+        stderr_target: int | IO[Any] | None = None
+        if not show_output:
+            try:
+                stdout_target = self._open_log_file()
+            except OSError:
+                self.shutdown()
+                raise
+            stderr_target = subprocess.STDOUT
+
+        try:
+            self.process = subprocess.Popen(
+                cmd,
+                env=self._env,
+                stdout=stdout_target,
+                stderr=stderr_target,
+                start_new_session=True,
+            )
+        except Exception:
+            self._close_log_file()
+            raise
+
+        try:
+            if num_workers is not None:
+                wait_for_workers_ready(
+                    self.base_url,
+                    num_workers,
+                    timeout=timeout,
+                    process=self.process,
+                    expected_urls=worker_urls,
+                    workers=workers,
+                )
+            else:
+                wait_for_health(self.base_url, timeout=timeout, process=self.process)
+        except ProcessExitedError as e:
+            detail = self._output_tail()
+            self.shutdown()
+            raise ProcessExitedError(f"{e}; {detail}") from e
+        except (RuntimeError, TimeoutError):
+            self.shutdown()
+            raise
+
+        self._started = True
+        logger.info("Gateway ready at %s", self.base_url)
+
+    def _close_log_file(self) -> None:
+        if self._log_file is not None:
+            try:
+                self._log_file.close()
+            except OSError:
+                pass
+            self._log_file = None
+
+    def shutdown(self) -> None:
+        """Shutdown the gateway and release auto-allocated ports."""
+        if self.process is not None:
+            # An exited router has nothing left to signal (poll() reaps it).
+            if self.process.poll() is None:
+                logger.info("Shutting down gateway (PID %d)", self.process.pid)
+                kill_process_tree(self.process.pid)
+            self.process = None
+        self._close_log_file()
+        if self._log_is_temporary and self._started and self.log_path is not None:
+            # A launch that succeeded leaves no file behind in the temp dir.
+            try:
+                os.unlink(self.log_path)
+            except OSError:
+                pass
+            self.log_path = None
+
+        if self._port_auto_allocated:
+            release_port(self.port)
+        if self._prometheus_port_auto_allocated:
+            release_port(self.prometheus_port)
+
+        self._started = False
+
+    def _build_base_cmd(self) -> list[str]:
+        """Build the base command for launching the router."""
+        cmd = [
+            "python3",
+            "-m",
+            "smg.launch_router",
+            "--host",
+            self.host,
+            "--port",
+            str(self.port),
+            "--prometheus-port",
+            str(self.prometheus_port),
+            "--prometheus-host",
+            self.host,
+            "--policy",
+            self.policy,
+            "--log-level",
+            self.log_level,
+        ]
+        if self.log_dir:
+            cmd.extend(["--log-dir", self.log_dir])
+        # The lane's parser (E2E_PARSER); unset, the gateway keeps its default.
+        parser = get_parser()
+        if parser:
+            cmd.extend(["--parser", parser])
+        return cmd
+
+    def _build_cloud_args(self, cloud_backend: str, history_backend: str) -> list[str]:
+        """Build CLI args and env for cloud mode."""
+        credentials = resolve_cloud_credentials(cloud_backend, environ=self._env)
+        worker_url, api_key_env, backend_type = (
+            credentials.worker_root,
+            credentials.api_key_env,
+            credentials.backend_type,
+        )
+        self._env = cloud_environment(
+            self._env if self._env is not None else os.environ, proxy=credentials.is_proxy
+        )
+        self._env[api_key_env] = credentials.api_key
+
+        actual_history_backend = history_backend
+        if history_backend == "oracle-custom":
+            actual_history_backend = "oracle"
+            flyway_user = os.environ.get("ATP_FLYWAY_USER", "")
+            flyway_password = os.environ.get("ATP_FLYWAY_PASSWORD", "")
+            flyway_dsn = os.environ.get("ATP_FLYWAY_DSN", "")
+            if not all([flyway_user, flyway_password, flyway_dsn]):
+                raise ValueError(
+                    "ATP_FLYWAY_USER, ATP_FLYWAY_PASSWORD, and ATP_FLYWAY_DSN "
+                    "environment variables required for oracle-custom backend"
+                )
+            self._env["ATP_USER"] = flyway_user
+            self._env["ATP_PASSWORD"] = flyway_password
+            self._env["ATP_DSN"] = flyway_dsn
+
+        mode_args = [
+            "--backend",
+            backend_type,
+            "--worker-urls",
+            worker_url,
+            "--history-backend",
+            actual_history_backend,
+            "--disable-health-check",
+            "--request-timeout-secs",
+            str(CLOUD_REQUEST_TIMEOUT_SECS),
+        ]
+
+        if history_backend == "oracle-custom":
+            schema_config_path = (
+                Path(__file__).resolve().parents[2]
+                / "scripts"
+                / "oracle_flyway"
+                / "schema-config.yaml"
+            )
+            mode_args.extend(["--schema-config", str(schema_config_path)])
+
+        return mode_args
+
+    def health(self, timeout: float = 5.0) -> bool:
+        """Check gateway health. Returns True if healthy."""
+        try:
+            resp = httpx.get(f"{self.base_url}/health", timeout=timeout)
+            return resp.status_code == 200
+        except (httpx.RequestError, httpx.TimeoutException):
+            return False
+
+    def _worker_from_api_response(self, w: dict) -> WorkerInfo:
+        """Convert API response dict to WorkerInfo."""
+        status = "healthy" if w.get("is_healthy", False) else "unhealthy"
+        return WorkerInfo(
+            id=w.get("id", ""),
+            url=w.get("url", ""),
+            model=w.get("model_id"),
+            status=status,
+            pending_requests=w.get("load", 0),
+            metadata={
+                "worker_type": w.get("worker_type"),
+                "connection_mode": w.get("connection_mode"),
+                "priority": w.get("priority"),
+                "cost": w.get("cost"),
+                "pd_pairing": w.get("pd_pairing"),
+            },
+        )
+
+    def list_workers(self, timeout: float = 5.0, strict: bool = False) -> list[WorkerInfo]:
+        """List all workers connected to the gateway.
+
+        With ``strict=True``, request failures and non-200 responses raise
+        instead of degrading to ``[]`` — required when an empty list is the
+        assertion target (e.g. "worker was removed"), where a swallowed error
+        would pass vacuously.
+        """
+        try:
+            resp = httpx.get(f"{self.base_url}/workers", timeout=timeout)
+            if resp.status_code == 200:
+                data = resp.json()
+                return [self._worker_from_api_response(w) for w in data.get("workers", [])]
+            if strict:
+                raise RuntimeError(f"GET /workers returned {resp.status_code}: {resp.text}")
+            return []
+        except (httpx.RequestError, httpx.TimeoutException):
+            if strict:
+                raise
+            return []
+
+    def label_workers(self, workers: list, labels: dict[str, str], timeout: float = 10.0) -> None:
+        """Merge ``labels`` into the labels of ``workers`` the gateway already
+        registered (``PATCH /workers/{id}``): what an operator sets on a worker
+        whose servicer does not advertise the fact itself. The gateway keeps an
+        operator's label across its own refreshes of the labels it discovered.
+        The gateway queues the update (202), so this returns once ``GET
+        /workers`` shows the labels on every one of ``workers``, and raises
+        when they are not there after ``timeout`` seconds.
+        """
+        if not workers:
+            return
+        ids_by_url = {w.url.rstrip("/"): w.id for w in self.list_workers(strict=True)}
+        pending: set[str] = set()
+        for worker in workers:
+            worker_id = ids_by_url.get(worker.base_url.rstrip("/"))
+            if not worker_id:
+                raise RuntimeError(f"{worker.base_url} is not registered; it cannot be labelled")
+            resp = httpx.patch(
+                f"{self.base_url}/workers/{worker_id}", json={"labels": labels}, timeout=10.0
+            )
+            if resp.status_code not in (200, 202):
+                raise RuntimeError(
+                    f"PATCH /workers/{worker_id} returned {resp.status_code}: {resp.text}"
+                )
+            pending.add(worker_id)
+        deadline = time.monotonic() + timeout
+        while pending:
+            resp = httpx.get(f"{self.base_url}/workers", timeout=5.0)
+            if resp.status_code == 200:
+                for w in resp.json().get("workers", []):
+                    if w.get("id") in pending and all(
+                        (w.get("labels") or {}).get(key) == value for key, value in labels.items()
+                    ):
+                        pending.discard(w["id"])
+            if pending and time.monotonic() > deadline:
+                raise RuntimeError(f"labels {labels} are not on {sorted(pending)} after {timeout}s")
+            if pending:
+                time.sleep(0.1)
+
+    def add_worker(
+        self,
+        worker_url: str,
+        timeout: float = 10.0,
+        wait_ready: bool = True,
+        ready_timeout: float = 60.0,
+        labels: dict[str, str] | None = None,
+        worker_type: str | None = None,
+        bootstrap_port: int | None = None,
+        spec: dict | None = None,
+    ) -> tuple[bool, str | None]:
+        """Add a worker to the gateway. Returns (success, worker_id or error).
+
+        ``labels`` are attached to the worker's ``WorkerSpec`` (e.g.
+        ``{"realtime": "true"}`` to make it eligible for realtime routing).
+        ``worker_type`` (``"prefill"``/``"decode"``/``"encode"``) and the
+        prefill ``bootstrap_port`` register a disaggregated worker at runtime.
+        ``spec`` adds other ``WorkerSpec`` fields (``kv_connector``,
+        ``kv_role``, ``runtime_type``, ``connection_mode``).
+        """
+        body: dict = {"url": worker_url, **(spec or {})}
+        if labels:
+            body["labels"] = labels
+        if worker_type:
+            body["worker_type"] = worker_type
+        if bootstrap_port is not None:
+            body["bootstrap_port"] = bootstrap_port
+        try:
+            resp = httpx.post(
+                f"{self.base_url}/workers",
+                json=body,
+                timeout=timeout,
+            )
+            if resp.status_code in (200, 202):
+                data = resp.json()
+                worker_id = data.get("worker_id")
+
+                if wait_ready and worker_id:
+                    start = time.perf_counter()
+                    while time.perf_counter() - start < ready_timeout:
+                        workers = self.list_workers()
+                        for w in workers:
+                            if w.id == worker_id:
+                                return True, worker_id
+                        time.sleep(1.0)
+                    return False, f"Worker {worker_id} not ready within {ready_timeout}s"
+
+                return True, worker_id
+            return False, resp.text
+        except (httpx.RequestError, httpx.TimeoutException) as e:
+            return False, str(e)
+
+    def remove_worker(self, worker_url: str, timeout: float = 10.0) -> tuple[bool, str]:
+        """Remove a worker from the gateway by URL. Returns (success, message)."""
+        workers = self.list_workers(timeout=timeout)
+        worker_id = next((w.id for w in workers if w.url == worker_url), None)
+
+        if not worker_id:
+            return False, f"Worker with URL {worker_url} not found"
+
+        try:
+            resp = httpx.delete(
+                f"{self.base_url}/workers/{worker_id}",
+                timeout=timeout,
+            )
+            # 200 = removed synchronously; 202 = removal accepted and queued
+            # for background processing. Either means the request succeeded —
+            # callers that need completion poll list_workers for absence.
+            if resp.status_code in (200, 202):
+                return True, resp.text
+            return False, resp.text
+        except (httpx.RequestError, httpx.TimeoutException) as e:
+            return False, str(e)
+
+    def list_models(self, timeout: float = 5.0) -> list[dict]:
+        """List available models (OpenAI-compatible)."""
+        try:
+            resp = httpx.get(f"{self.base_url}/v1/models", timeout=timeout)
+            if resp.status_code == 200:
+                return resp.json().get("data", [])
+            return []
+        except (httpx.RequestError, httpx.TimeoutException):
+            return []
+
+    def __enter__(self) -> Gateway:
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.shutdown()
+
+
+def launch_cloud_gateway(
+    runtime: str,
+    *,
+    history_backend: str = "memory",
+    extra_args: list[str] | None = None,
+    timeout: float = 60,
+    show_output: bool | None = None,
+    max_attempts: int = 3,
+    post_start: Callable[[Gateway, float], None] | None = None,
+) -> Gateway:
+    """Launch gateway with a cloud API runtime (openai, xai, anthropic).
+
+    Retries up to max_attempts because the AddWorker workflow can fail
+    intermittently due to a race condition in the workflow engine's
+    parallel step context handling. An optional post_start barrier receives
+    the same attempt's absolute deadline; its TimeoutError uses these existing
+    attempts, while other failures are cleaned up and propagated without retry.
+    """
+    from .model_specs import THIRD_PARTY_MODELS
+
+    if runtime not in THIRD_PARTY_MODELS:
+        raise ValueError(
+            f"Unknown cloud runtime: {runtime}. Available: {list(THIRD_PARTY_MODELS.keys())}"
+        )
+
+    last_error: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        gateway = Gateway()
+        barrier_started = False
+        try:
+            deadline = time.monotonic() + timeout
+            gateway.start(
+                cloud_backend=runtime,
+                history_backend=history_backend,
+                timeout=timeout,
+                show_output=show_output,
+                extra_args=extra_args,
+            )
+            if post_start is not None:
+                barrier_started = True
+                post_start(gateway, deadline)
+            return gateway
+        except BaseException as error:
+            if barrier_started:
+                gateway._started = False
+                if gateway.log_path is not None:
+                    error.add_note(f"Gateway setup log retained at {gateway.log_path}")
+            if not isinstance(error, TimeoutError):
+                if barrier_started:
+                    gateway.shutdown()
+                raise
+            last_error = error
+            logger.warning(
+                "Cloud gateway startup attempt %d/%d timed out: %s (log: %s)",
+                attempt,
+                max_attempts,
+                error,
+                gateway.log_path,
+            )
+            # Cleanup failures propagate from here, never becoming another
+            # startup attempt with ownership of the previous router uncertain.
+            gateway.shutdown()
+    raise last_error  # type: ignore[misc]

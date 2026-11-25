@@ -1,0 +1,166 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+**/build/
+**/develop-eggs/
+**/dist/
+**/downloads/
+**/eggs/
+.eggs/
+**/lib/
+**/lib64/
+**/parts/
+**/sdist/
+**/var/
+**/wheels/
+**/share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+
+# Tokenizer cache for tests
+.tokenizer_cache
+.pytest_cache/
+cover/
+
+# Translations
+*.mo
+*.pot
+
+# Logs
+*.log
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# pytype static type analyzer
+.pytype/
+
+# Cython debug symbols
+cython_debug/
+
+# PyCharm
+#  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
+#  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
+#  and can be added to the global gitignore or merged into this file.  For a more nuclear
+#  option (not recommended) you can uncomment the following to ignore the entire idea folder.
+.idea/
+
+# MacOS
+.DS_Store
+
+# Vim
+*.swp
+
+# SGL
+benchmark/mmlu/data
+benchmark/mmlu/data.tar
+benchmark/llava_bench/images
+benchmark/llava_bench/mme_pack
+*.jsonl
+# Parity fixtures recorded from transformers
+!crates/response_template/tests/fixtures/hf/*.jsonl
+tmp*.txt
+
+# Torch Compile logs
+tl_out/
+
+# Plots
+*.png
+*.pdf
+# Lossless image fixtures for preprocessing parity tests
+!crates/multimodal/tests/fixtures/images/*.png
+!crates/multimodal/tests/fixtures/images/decoded_rgb/*.png
+
+# personnal
+work_dirs/
+*.csv
+
+!logo.png
+
+# Rust target directory
+target/
+# Older builds of the kv-index churn bench wrote this into the crate directory under cargo test
+churn_result.json
+
+# VSCode
+.vscode
+
+# Autoenv
+.env.leave
+
+# uv lock files
+uv.lock
+
+# Generated vision test fixtures (regenerate with: python multimodal/scripts/generate_vision_golden.py)
+multimodal/tests/fixtures/golden/
+
+lmms-eval
+
+**/.claude/
+**/.serena/
+ctags/
+outputs/
+
+# Eval Cache
+.longbench_cache/
+
+# CUDA kernel develop, profile and debug
+*.nsys-rep
+*.ncu-rep
+*.nvcudmp
+
+# MkDocs build output
+site/
+
+# Compiled WASM test fixtures (rebuild with: ./wasm/tests/fixtures/build_fixtures.sh)
+wasm/tests/fixtures/*.wasm
+
+# Generated client SDK files (run `make generate-clients` to regenerate)
+clients/openapi/smg-openapi.yaml
+clients/python/smg_client/types/_generated.py
+clients/java/src/
+clients/java/.openapi-generator/
+clients/java/target/
+clients/java/build.sbt
+clients/java/gradle.properties
+openapitools.json

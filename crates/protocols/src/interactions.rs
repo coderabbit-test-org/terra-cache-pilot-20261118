@@ -1,0 +1,1729 @@
+// Gemini Interactions API types
+// https://ai.google.dev/gemini-api/docs/interactions
+
+use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use serde_with::skip_serializing_none;
+use validator::{Validate, ValidationError};
+
+use super::{
+    common::{
+        default_true, deserialize_null_as_false, empty_tool_name, invalid, Function,
+        GenerationRequest,
+    },
+    sampling_params::validate_top_p_value,
+    validated::Normalizable,
+};
+
+// ============================================================================
+// Request Type
+// ============================================================================
+
+#[skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[validate(schema(function = "validate_interactions_request"))]
+pub struct InteractionsRequest {
+    /// Model identifier (e.g., "gemini-2.5-flash")
+    /// Required if agent is not provided
+    pub model: Option<String>,
+
+    /// Agent name (e.g., "deep-research-pro-preview-12-2025")
+    /// Required if model is not provided
+    pub agent: Option<String>,
+
+    /// Input content - can be string or array of Content objects
+    #[validate(custom(function = "validate_input"))]
+    pub input: InteractionsInput,
+
+    /// System instruction for the model
+    #[serde(alias = "systemInstruction")]
+    pub system_instruction: Option<String>,
+
+    /// Available tools
+    #[validate(custom(function = "validate_tools"))]
+    pub tools: Option<Vec<InteractionsTool>>,
+
+    /// Response format for structured outputs
+    #[serde(alias = "responseFormat")]
+    pub response_format: Option<Value>,
+
+    /// MIME type for the response (required if response_format is set)
+    #[serde(alias = "responseMimeType")]
+    pub response_mime_type: Option<String>,
+
+    /// Whether to stream the response
+    #[serde(default, deserialize_with = "deserialize_null_as_false")]
+    pub stream: bool,
+
+    /// Whether to store the interaction (default: true)
+    #[serde(default = "default_true")]
+    pub store: bool,
+
+    /// Run request in background (agents only)
+    #[serde(default)]
+    pub background: bool,
+
+    /// Generation configuration
+    #[serde(alias = "generationConfig")]
+    #[validate(nested)]
+    pub generation_config: Option<GenerationConfig>,
+
+    /// Agent configuration (only applicable when agent is specified)
+    #[serde(alias = "agentConfig")]
+    pub agent_config: Option<AgentConfig>,
+
+    /// Response modalities (text, image, audio)
+    #[serde(alias = "responseModalities")]
+    pub response_modalities: Option<Vec<ResponseModality>>,
+
+    /// Link to prior interaction for stateful conversations
+    #[serde(alias = "previousInteractionId")]
+    pub previous_interaction_id: Option<String>,
+
+    /// The request's other fields (`continuation_token`, `safety_settings`,
+    /// `service_tier`, `webhook_config`, `environment`, `labels`,
+    /// `cached_content`, and any the API adds), forwarded to the upstream as
+    /// written, as the Messages request's `other` is. A modeled field takes its
+    /// camelCase spelling as an alias, so that spelling fills the typed field,
+    /// where the gateway's checks read it, and never rides here.
+    #[serde(flatten)]
+    pub other: Map<String, Value>,
+}
+
+impl Default for InteractionsRequest {
+    fn default() -> Self {
+        Self {
+            model: None,
+            agent: None,
+            agent_config: None,
+            input: InteractionsInput::Text(String::new()),
+            system_instruction: None,
+            previous_interaction_id: None,
+            tools: None,
+            generation_config: None,
+            response_format: None,
+            response_mime_type: None,
+            response_modalities: None,
+            stream: false,
+            background: false,
+            store: true,
+            other: Map::new(),
+        }
+    }
+}
+
+impl Normalizable for InteractionsRequest {
+    // Use default no-op implementation
+}
+
+impl GenerationRequest for InteractionsRequest {
+    fn is_stream(&self) -> bool {
+        self.stream
+    }
+
+    fn get_model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    fn extract_text_for_routing(&self) -> String {
+        fn text_of(content: &Content) -> Option<&str> {
+            match content {
+                Content::Text { text, .. } => text.as_deref(),
+                _ => None,
+            }
+        }
+
+        /// `texts` into `buffer`, a space between each: the shape `join(" ")`
+        /// gives, empty pieces included.
+        fn push_joined<'a>(buffer: &mut String, texts: impl Iterator<Item = &'a str>) {
+            for (index, text) in texts.enumerate() {
+                if index > 0 {
+                    buffer.push(' ');
+                }
+                buffer.push_str(text);
+            }
+        }
+
+        match &self.input {
+            InteractionsInput::Text(text) => text.clone(),
+            InteractionsInput::Content(content) => text_of(content).unwrap_or_default().to_owned(),
+            InteractionsInput::Contents(contents) => {
+                let mut buffer = String::new();
+                push_joined(&mut buffer, contents.iter().filter_map(text_of));
+                buffer
+            }
+            InteractionsInput::Turns(turns) => {
+                let mut buffer = String::new();
+                for (index, turn) in turns.iter().enumerate() {
+                    if index > 0 {
+                        buffer.push(' ');
+                    }
+                    match &turn.content {
+                        Some(TurnContent::Text(text)) => buffer.push_str(text),
+                        Some(TurnContent::Contents(contents)) => {
+                            push_joined(&mut buffer, contents.iter().filter_map(text_of));
+                        }
+                        None => {}
+                    }
+                }
+                buffer
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Response Type
+// ============================================================================
+
+#[skip_serializing_none]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct Interaction {
+    /// Object type, always "interaction"
+    pub object: Option<String>,
+
+    /// Model used
+    pub model: Option<String>,
+
+    /// Agent used
+    pub agent: Option<String>,
+
+    /// Interaction ID
+    pub id: String,
+
+    /// Interaction status
+    pub status: InteractionsStatus,
+
+    /// Creation timestamp (ISO 8601)
+    pub created: Option<String>,
+
+    /// Last update timestamp (ISO 8601)
+    pub updated: Option<String>,
+
+    /// Role of the interaction
+    pub role: Option<String>,
+
+    /// Output content
+    pub outputs: Option<Vec<Content>>,
+
+    /// Usage information
+    pub usage: Option<InteractionsUsage>,
+
+    /// Previous interaction ID for conversation threading
+    pub previous_interaction_id: Option<String>,
+}
+
+impl Interaction {
+    /// Check if the interaction is complete
+    pub fn is_complete(&self) -> bool {
+        matches!(self.status, InteractionsStatus::Completed)
+    }
+
+    /// Check if the interaction is in progress
+    pub fn is_in_progress(&self) -> bool {
+        matches!(self.status, InteractionsStatus::InProgress)
+    }
+
+    /// Check if the interaction failed
+    pub fn is_failed(&self) -> bool {
+        matches!(self.status, InteractionsStatus::Failed)
+    }
+
+    /// Check if the interaction requires action (tool execution)
+    pub fn requires_action(&self) -> bool {
+        matches!(self.status, InteractionsStatus::RequiresAction)
+    }
+}
+
+// ============================================================================
+// Streaming Event Types (SSE)
+// ============================================================================
+
+/// Server-Sent Event for Interactions API streaming
+/// See: <https://ai.google.dev/api/interactions-api#streaming>
+#[skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "event_type")]
+pub enum InteractionStreamEvent {
+    /// Emitted when an interaction begins processing
+    #[serde(rename = "interaction.start")]
+    InteractionStart {
+        /// The interaction object
+        interaction: Option<Interaction>,
+        /// Event ID for resuming streams
+        event_id: Option<String>,
+    },
+
+    /// Emitted when an interaction completes
+    #[serde(rename = "interaction.complete")]
+    InteractionComplete {
+        /// The interaction object
+        interaction: Option<Interaction>,
+        /// Event ID for resuming streams
+        event_id: Option<String>,
+    },
+
+    /// Emitted when interaction status changes
+    #[serde(rename = "interaction.status_update")]
+    InteractionStatusUpdate {
+        /// The interaction ID
+        interaction_id: Option<String>,
+        /// The new status
+        status: Option<InteractionsStatus>,
+        /// Event ID for resuming streams
+        event_id: Option<String>,
+    },
+
+    /// Signals the beginning of a new content block
+    #[serde(rename = "content.start")]
+    ContentStart {
+        /// Content block index in outputs array
+        index: Option<u32>,
+        /// The content object
+        content: Option<Content>,
+        /// Event ID for resuming streams
+        event_id: Option<String>,
+    },
+
+    /// Streams incremental content updates
+    #[serde(rename = "content.delta")]
+    ContentDelta {
+        /// Content block index in outputs array
+        index: Option<u32>,
+        /// Event ID for resuming streams
+        event_id: Option<String>,
+        /// The delta content
+        delta: Option<Delta>,
+    },
+
+    /// Marks the end of a content block
+    #[serde(rename = "content.stop")]
+    ContentStop {
+        /// Content block index in outputs array
+        index: Option<u32>,
+        /// Event ID for resuming streams
+        event_id: Option<String>,
+    },
+
+    /// Error event
+    #[serde(rename = "error")]
+    Error {
+        /// Error information
+        error: Option<InteractionsError>,
+        /// Event ID for resuming streams
+        event_id: Option<String>,
+    },
+}
+
+/// Delta content for streaming updates
+/// See: <https://ai.google.dev/api/interactions-api#ContentDelta>
+#[skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Delta {
+    /// Text delta
+    Text {
+        text: Option<String>,
+        annotations: Option<Vec<Annotation>>,
+    },
+    /// Image delta
+    Image {
+        data: Option<String>,
+        uri: Option<String>,
+        mime_type: Option<ImageMimeType>,
+        resolution: Option<MediaResolution>,
+    },
+    /// Audio delta
+    Audio {
+        data: Option<String>,
+        uri: Option<String>,
+        mime_type: Option<AudioMimeType>,
+        /// The audio's channel count and sample rate, as the public API takes them
+        channels: Option<u32>,
+        sample_rate: Option<u32>,
+    },
+    /// Document delta
+    Document {
+        data: Option<String>,
+        uri: Option<String>,
+        mime_type: Option<DocumentMimeType>,
+    },
+    /// Video delta
+    Video {
+        data: Option<String>,
+        uri: Option<String>,
+        mime_type: Option<VideoMimeType>,
+        resolution: Option<MediaResolution>,
+    },
+    /// Thought summary delta
+    ThoughtSummary {
+        content: Option<ThoughtSummaryContent>,
+    },
+    /// Thought signature delta
+    ThoughtSignature { signature: Option<String> },
+    /// Function call delta
+    FunctionCall {
+        name: Option<String>,
+        arguments: Option<String>,
+        id: Option<String>,
+    },
+    /// Function result delta
+    FunctionResult {
+        name: Option<String>,
+        is_error: Option<bool>,
+        result: Option<Value>,
+        call_id: Option<String>,
+    },
+    /// Code execution call delta
+    CodeExecutionCall {
+        arguments: Option<CodeExecutionArguments>,
+        id: Option<String>,
+    },
+    /// Code execution result delta
+    CodeExecutionResult {
+        result: Option<String>,
+        is_error: Option<bool>,
+        signature: Option<String>,
+        call_id: Option<String>,
+    },
+    /// URL context call delta
+    UrlContextCall {
+        arguments: Option<UrlContextArguments>,
+        id: Option<String>,
+    },
+    /// URL context result delta
+    UrlContextResult {
+        signature: Option<String>,
+        result: Option<Vec<UrlContextResultData>>,
+        is_error: Option<bool>,
+        call_id: Option<String>,
+    },
+    /// Google search call delta
+    GoogleSearchCall {
+        arguments: Option<GoogleSearchArguments>,
+        id: Option<String>,
+    },
+    /// Google search result delta
+    GoogleSearchResult {
+        signature: Option<String>,
+        result: Option<Vec<GoogleSearchResultData>>,
+        is_error: Option<bool>,
+        call_id: Option<String>,
+    },
+    /// File search call delta
+    FileSearchCall { id: Option<String> },
+    /// File search result delta
+    FileSearchResult {
+        result: Option<Vec<FileSearchResultData>>,
+    },
+    /// MCP server tool call delta
+    McpServerToolCall {
+        name: Option<String>,
+        server_name: Option<String>,
+        arguments: Option<Value>,
+        id: Option<String>,
+    },
+    /// MCP server tool result delta
+    McpServerToolResult {
+        name: Option<String>,
+        server_name: Option<String>,
+        result: Option<Value>,
+        call_id: Option<String>,
+    },
+}
+
+/// Error information in streaming events
+#[skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InteractionsError {
+    /// Error code
+    pub code: Option<String>,
+    /// Error message
+    pub message: Option<String>,
+}
+
+// ============================================================================
+// Query Parameters
+// ============================================================================
+
+/// Query parameters for GET /interactions/{id}
+#[skip_serializing_none]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct InteractionsGetParams {
+    /// Whether to stream the response
+    pub stream: Option<bool>,
+    /// Last event ID for resuming a stream
+    pub last_event_id: Option<String>,
+    /// API version
+    pub api_version: Option<String>,
+}
+
+/// Query parameters for DELETE /interactions/{id}
+#[skip_serializing_none]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct InteractionsDeleteParams {
+    /// API version
+    pub api_version: Option<String>,
+}
+
+/// Query parameters for POST /interactions/{id}/cancel
+#[skip_serializing_none]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct InteractionsCancelParams {
+    /// API version
+    pub api_version: Option<String>,
+}
+
+// ============================================================================
+// Interaction Tools
+// ============================================================================
+
+/// Interaction tool types
+/// See: <https://ai.google.dev/api/interactions-api#Resource:Tool>
+#[skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum InteractionsTool {
+    /// Function tool with function declaration
+    Function(Function),
+    /// Google Search built-in tool
+    GoogleSearch {
+        /// The kinds of search to run (`web_search`, `image_search`, ...)
+        search_types: Option<Vec<String>>,
+    },
+    /// Code Execution built-in tool
+    CodeExecution {},
+    /// URL Context built-in tool
+    UrlContext {},
+    /// MCP Server tool
+    McpServer {
+        name: Option<String>,
+        url: Option<String>,
+        headers: Option<HashMap<String, String>>,
+        /// The server's tools the model may call, a list of configurations
+        allowed_tools: Option<Vec<AllowedTools>>,
+    },
+    /// File Search built-in tool
+    FileSearch {
+        /// Names of file search stores to search
+        file_search_store_names: Option<Vec<String>>,
+        /// Maximum number of results to return
+        top_k: Option<u32>,
+        /// Metadata filter for search
+        metadata_filter: Option<String>,
+    },
+    /// Computer Use built-in tool. The open sets of values (the
+    /// environment, the safety policies) are kept as strings.
+    ComputerUse {
+        environment: Option<String>,
+        excluded_predefined_functions: Option<Vec<String>>,
+        disabled_safety_policies: Option<Vec<String>>,
+        enable_prompt_injection_detection: Option<bool>,
+    },
+    /// Google Maps built-in tool
+    GoogleMaps {
+        enable_widget: Option<bool>,
+        latitude: Option<f64>,
+        longitude: Option<f64>,
+    },
+    /// Retrieval built-in tool. Each source's configuration is kept as
+    /// written, as the gateway reads none of them.
+    Retrieval {
+        retrieval_types: Option<Vec<String>>,
+        vertex_ai_search_config: Option<Value>,
+        rag_store_config: Option<Value>,
+        exa_ai_search_config: Option<Value>,
+        parallel_ai_search_config: Option<Value>,
+    },
+}
+
+/// Allowed tools configuration for MCP server
+#[skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct AllowedTools {
+    /// Tool choice mode: auto, any, none, or validated
+    pub mode: Option<ToolChoiceType>,
+    /// List of allowed tool names
+    pub tools: Option<Vec<String>>,
+}
+
+/// A tool choice mode. The SDK keeps the set open, so a mode this build does
+/// not name is kept as written (`Other`), as the tools' other open sets are.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ToolChoiceType {
+    Auto,
+    Any,
+    None,
+    Validated,
+    /// A mode this build does not name, kept as the client wrote it
+    #[serde(untagged)]
+    Other(String),
+}
+
+// ============================================================================
+// Generation Config (Gemini-specific)
+// ============================================================================
+
+/// A field with an underscore also reads its camelCase spelling, which the
+/// public API accepts too, as the request's top-level fields do. So that key
+/// fills the typed field, is checked there and goes upstream in snake_case.
+#[skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+pub struct GenerationConfig {
+    #[validate(range(min = 0.0, max = 2.0))]
+    pub temperature: Option<f32>,
+
+    #[serde(alias = "topP")]
+    #[validate(custom(function = "validate_top_p_value"))]
+    pub top_p: Option<f32>,
+
+    pub seed: Option<i64>,
+
+    #[serde(alias = "stopSequences")]
+    #[validate(custom(function = "validate_stop_sequences"))]
+    pub stop_sequences: Option<Vec<String>>,
+
+    #[serde(alias = "toolChoice")]
+    pub tool_choice: Option<ToolChoice>,
+
+    #[serde(alias = "thinkingLevel")]
+    pub thinking_level: Option<ThinkingLevel>,
+
+    #[serde(alias = "thinkingSummaries")]
+    pub thinking_summaries: Option<ThinkingSummaries>,
+
+    #[serde(alias = "maxOutputTokens")]
+    #[validate(range(min = 1))]
+    pub max_output_tokens: Option<u32>,
+
+    #[serde(alias = "speechConfig")]
+    pub speech_config: Option<Vec<SpeechConfig>>,
+
+    #[serde(alias = "imageConfig")]
+    pub image_config: Option<ImageConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingLevel {
+    Minimal,
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingSummaries {
+    Auto,
+    None,
+}
+
+/// Tool choice can be a simple mode or a detailed config
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ToolChoice {
+    Type(ToolChoiceType),
+    Config(ToolChoiceConfig),
+}
+
+#[skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct ToolChoiceConfig {
+    #[serde(alias = "allowedTools")]
+    pub allowed_tools: Option<AllowedTools>,
+}
+
+#[skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SpeechConfig {
+    pub voice: Option<String>,
+    pub language: Option<String>,
+    pub speaker: Option<String>,
+}
+
+#[skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ImageConfig {
+    #[serde(alias = "aspectRatio")]
+    pub aspect_ratio: Option<AspectRatio>,
+    #[serde(alias = "imageSize")]
+    pub image_size: Option<ImageSize>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub enum AspectRatio {
+    #[serde(rename = "1:1")]
+    Square,
+    #[serde(rename = "2:3")]
+    Portrait2x3,
+    #[serde(rename = "3:2")]
+    Landscape3x2,
+    #[serde(rename = "3:4")]
+    Portrait3x4,
+    #[serde(rename = "4:3")]
+    Landscape4x3,
+    #[serde(rename = "4:5")]
+    Portrait4x5,
+    #[serde(rename = "5:4")]
+    Landscape5x4,
+    #[serde(rename = "9:16")]
+    Portrait9x16,
+    #[serde(rename = "16:9")]
+    Landscape16x9,
+    #[serde(rename = "21:9")]
+    UltraWide,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub enum ImageSize {
+    #[serde(rename = "1K")]
+    OneK,
+    #[serde(rename = "2K")]
+    TwoK,
+    #[serde(rename = "4K")]
+    FourK,
+}
+
+/// Agent configuration
+/// See: <https://ai.google.dev/api/interactions-api#CreateInteraction-deep_research>
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentConfig {
+    /// Dynamic agent configuration
+    Dynamic {},
+    /// Deep Research agent configuration
+    #[serde(rename = "deep-research")]
+    DeepResearch {
+        /// Whether to include thought summaries ("auto" or "none")
+        #[serde(alias = "thinkingSummaries", skip_serializing_if = "Option::is_none")]
+        thinking_summaries: Option<ThinkingSummaries>,
+    },
+}
+
+// ============================================================================
+// Input/Output Types
+// ============================================================================
+
+/// Input can be Content, array of Content, array of Turn, or string
+/// See: <https://ai.google.dev/api/interactions-api#request-body>
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum InteractionsInput {
+    /// Simple text input
+    Text(String),
+    /// Single content block
+    Content(Content),
+    /// Array of content blocks
+    Contents(Vec<Content>),
+    /// Array of turns (conversation history)
+    Turns(Vec<Turn>),
+}
+
+/// A turn in a conversation with role and content
+/// See: <https://ai.google.dev/api/interactions-api#Resource:Turn>
+#[skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Turn {
+    /// Role: "user" or "model"
+    pub role: Option<String>,
+    /// Content can be array of Content or string
+    pub content: Option<TurnContent>,
+}
+
+/// Turn content can be array of Content or a simple string
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum TurnContent {
+    Contents(Vec<Content>),
+    Text(String),
+}
+
+/// Content is a polymorphic type representing different content types
+/// See: <https://ai.google.dev/api/interactions-api#Resource:Content>
+#[skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Content {
+    /// Text content
+    Text {
+        text: Option<String>,
+        annotations: Option<Vec<Annotation>>,
+    },
+
+    /// Image content
+    Image {
+        data: Option<String>,
+        uri: Option<String>,
+        mime_type: Option<ImageMimeType>,
+        resolution: Option<MediaResolution>,
+    },
+
+    /// Audio content
+    Audio {
+        data: Option<String>,
+        uri: Option<String>,
+        mime_type: Option<AudioMimeType>,
+        /// The audio's channel count and sample rate, as the public API takes them
+        channels: Option<u32>,
+        sample_rate: Option<u32>,
+    },
+
+    /// Document content (PDF)
+    Document {
+        data: Option<String>,
+        uri: Option<String>,
+        mime_type: Option<DocumentMimeType>,
+    },
+
+    /// Video content
+    Video {
+        data: Option<String>,
+        uri: Option<String>,
+        mime_type: Option<VideoMimeType>,
+        resolution: Option<MediaResolution>,
+        /// How the video is sampled, kept as written
+        processing: Option<Value>,
+        name: Option<String>,
+    },
+
+    /// Thought content
+    Thought {
+        signature: Option<String>,
+        summary: Option<Vec<ThoughtSummaryContent>>,
+    },
+
+    /// Function call content
+    FunctionCall {
+        name: String,
+        arguments: Value,
+        id: String,
+    },
+
+    /// Function result content
+    FunctionResult {
+        name: Option<String>,
+        is_error: Option<bool>,
+        result: Value,
+        call_id: String,
+    },
+
+    /// Code execution call content
+    CodeExecutionCall {
+        arguments: Option<CodeExecutionArguments>,
+        id: Option<String>,
+    },
+
+    /// Code execution result content
+    CodeExecutionResult {
+        result: Option<String>,
+        is_error: Option<bool>,
+        signature: Option<String>,
+        call_id: Option<String>,
+    },
+
+    /// URL context call content
+    UrlContextCall {
+        arguments: Option<UrlContextArguments>,
+        id: Option<String>,
+    },
+
+    /// URL context result content
+    UrlContextResult {
+        signature: Option<String>,
+        result: Option<Vec<UrlContextResultData>>,
+        is_error: Option<bool>,
+        call_id: Option<String>,
+    },
+
+    /// Google search call content
+    GoogleSearchCall {
+        arguments: Option<GoogleSearchArguments>,
+        id: Option<String>,
+    },
+
+    /// Google search result content
+    GoogleSearchResult {
+        signature: Option<String>,
+        result: Option<Vec<GoogleSearchResultData>>,
+        is_error: Option<bool>,
+        call_id: Option<String>,
+    },
+
+    /// File search call content
+    FileSearchCall { id: Option<String> },
+
+    /// File search result content
+    FileSearchResult {
+        result: Option<Vec<FileSearchResultData>>,
+    },
+
+    /// MCP server tool call content
+    McpServerToolCall {
+        name: String,
+        server_name: String,
+        arguments: Value,
+        id: String,
+    },
+
+    /// MCP server tool result content
+    McpServerToolResult {
+        name: Option<String>,
+        server_name: Option<String>,
+        result: Value,
+        call_id: String,
+    },
+}
+
+/// Content types allowed in thought summary (text or image only)
+#[skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ThoughtSummaryContent {
+    /// Text content in thought summary
+    Text {
+        text: Option<String>,
+        annotations: Option<Vec<Annotation>>,
+    },
+    /// Image content in thought summary
+    Image {
+        data: Option<String>,
+        uri: Option<String>,
+        mime_type: Option<ImageMimeType>,
+        resolution: Option<MediaResolution>,
+    },
+}
+
+/// Annotation for text content (citations)
+#[skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Annotation {
+    /// Start of the attributed segment, measured in bytes
+    pub start_index: Option<u32>,
+    /// End of the attributed segment, exclusive
+    pub end_index: Option<u32>,
+    /// Source attributed for a portion of the text (URL, title, or other identifier)
+    pub source: Option<String>,
+    /// The annotation's other keys, kept as written: its `type`
+    /// (`url_citation`, `file_citation`, `place_citation`, `speech_metadata`,
+    /// `word_info`) and that kind's fields.
+    #[serde(flatten)]
+    pub other: Map<String, Value>,
+}
+
+/// Arguments for URL context call
+#[skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct UrlContextArguments {
+    /// The URLs to fetch
+    pub urls: Option<Vec<String>>,
+}
+
+/// Result data for URL context result
+#[skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct UrlContextResultData {
+    /// The URL that was fetched
+    pub url: Option<String>,
+    /// The status of the URL retrieval
+    pub status: Option<UrlContextStatus>,
+}
+
+/// Status of URL context retrieval
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum UrlContextStatus {
+    Success,
+    Error,
+    Paywall,
+    Unsafe,
+}
+
+/// Arguments for Google search call
+#[skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GoogleSearchArguments {
+    /// Web search queries
+    pub queries: Option<Vec<String>>,
+}
+
+/// Result data for Google search result
+#[skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GoogleSearchResultData {
+    /// URI reference of the search result
+    pub url: Option<String>,
+    /// Title of the search result
+    pub title: Option<String>,
+    /// Web content snippet
+    pub rendered_content: Option<String>,
+}
+
+/// Result data for file search result
+#[skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FileSearchResultData {
+    /// Search result title
+    pub title: Option<String>,
+    /// Search result text
+    pub text: Option<String>,
+    /// Name of the file search store
+    pub file_search_store: Option<String>,
+}
+
+/// Arguments for code execution call
+#[skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CodeExecutionArguments {
+    /// Programming language (currently only Python is supported)
+    pub language: Option<CodeExecutionLanguage>,
+    /// The code to be executed
+    pub code: Option<String>,
+}
+
+/// Supported languages for code execution
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeExecutionLanguage {
+    Python,
+}
+
+/// Image/video resolution options
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaResolution {
+    Low,
+    Medium,
+    High,
+    UltraHigh,
+}
+
+/// Supported image MIME types
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub enum ImageMimeType {
+    #[serde(rename = "image/png")]
+    Png,
+    #[serde(rename = "image/jpeg")]
+    Jpeg,
+    #[serde(rename = "image/webp")]
+    Webp,
+    #[serde(rename = "image/heic")]
+    Heic,
+    #[serde(rename = "image/heif")]
+    Heif,
+}
+
+impl ImageMimeType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ImageMimeType::Png => "image/png",
+            ImageMimeType::Jpeg => "image/jpeg",
+            ImageMimeType::Webp => "image/webp",
+            ImageMimeType::Heic => "image/heic",
+            ImageMimeType::Heif => "image/heif",
+        }
+    }
+}
+
+/// Supported audio MIME types
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub enum AudioMimeType {
+    #[serde(rename = "audio/wav")]
+    Wav,
+    #[serde(rename = "audio/mp3")]
+    Mp3,
+    #[serde(rename = "audio/aiff")]
+    Aiff,
+    #[serde(rename = "audio/aac")]
+    Aac,
+    #[serde(rename = "audio/ogg")]
+    Ogg,
+    #[serde(rename = "audio/flac")]
+    Flac,
+}
+
+impl AudioMimeType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AudioMimeType::Wav => "audio/wav",
+            AudioMimeType::Mp3 => "audio/mp3",
+            AudioMimeType::Aiff => "audio/aiff",
+            AudioMimeType::Aac => "audio/aac",
+            AudioMimeType::Ogg => "audio/ogg",
+            AudioMimeType::Flac => "audio/flac",
+        }
+    }
+}
+
+/// Supported document MIME types
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub enum DocumentMimeType {
+    #[serde(rename = "application/pdf")]
+    Pdf,
+}
+
+impl DocumentMimeType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DocumentMimeType::Pdf => "application/pdf",
+        }
+    }
+}
+
+/// Supported video MIME types
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub enum VideoMimeType {
+    #[serde(rename = "video/mp4")]
+    Mp4,
+    #[serde(rename = "video/mpeg")]
+    Mpeg,
+    #[serde(rename = "video/mov")]
+    Mov,
+    #[serde(rename = "video/avi")]
+    Avi,
+    #[serde(rename = "video/x-flv")]
+    Flv,
+    #[serde(rename = "video/mpg")]
+    Mpg,
+    #[serde(rename = "video/webm")]
+    Webm,
+    #[serde(rename = "video/wmv")]
+    Wmv,
+    #[serde(rename = "video/3gpp")]
+    ThreeGpp,
+}
+
+impl VideoMimeType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            VideoMimeType::Mp4 => "video/mp4",
+            VideoMimeType::Mpeg => "video/mpeg",
+            VideoMimeType::Mov => "video/mov",
+            VideoMimeType::Avi => "video/avi",
+            VideoMimeType::Flv => "video/x-flv",
+            VideoMimeType::Mpg => "video/mpg",
+            VideoMimeType::Webm => "video/webm",
+            VideoMimeType::Wmv => "video/wmv",
+            VideoMimeType::ThreeGpp => "video/3gpp",
+        }
+    }
+}
+
+// ============================================================================
+// Status Types
+// ============================================================================
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractionsStatus {
+    #[default]
+    InProgress,
+    RequiresAction,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+// ============================================================================
+// Usage Types
+// ============================================================================
+
+/// Token count by modality
+#[skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ModalityTokens {
+    pub modality: Option<ResponseModality>,
+    pub tokens: Option<u32>,
+}
+
+#[skip_serializing_none]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InteractionsUsage {
+    pub total_input_tokens: Option<u32>,
+    pub input_tokens_by_modality: Option<Vec<ModalityTokens>>,
+    pub total_cached_tokens: Option<u32>,
+    pub cached_tokens_by_modality: Option<Vec<ModalityTokens>>,
+    pub total_output_tokens: Option<u32>,
+    pub output_tokens_by_modality: Option<Vec<ModalityTokens>>,
+    pub total_tool_use_tokens: Option<u32>,
+    pub tool_use_tokens_by_modality: Option<Vec<ModalityTokens>>,
+    pub total_thought_tokens: Option<u32>,
+    pub total_tokens: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseModality {
+    Text,
+    Image,
+    Audio,
+}
+
+fn is_option_blank(v: Option<&String>) -> bool {
+    v.map(|s| s.trim().is_empty()).unwrap_or(true)
+}
+
+fn validate_interactions_request(req: &InteractionsRequest) -> Result<(), ValidationError> {
+    // Exactly one of model or agent must be provided
+    if is_option_blank(req.model.as_ref()) && is_option_blank(req.agent.as_ref()) {
+        return Err(ValidationError::new("model_or_agent_required"));
+    }
+    if !is_option_blank(req.model.as_ref()) && !is_option_blank(req.agent.as_ref()) {
+        return Err(invalid(
+            "model_and_agent_mutually_exclusive",
+            "Cannot set both model and agent. Provide exactly one.".to_string(),
+        ));
+    }
+
+    // response_mime_type is required when response_format is set
+    if req.response_format.is_some() && is_option_blank(req.response_mime_type.as_ref()) {
+        return Err(ValidationError::new("response_mime_type_required"));
+    }
+
+    // background mode is required for agent interactions, and only for agents
+    if !is_option_blank(req.agent.as_ref()) && !req.background {
+        return Err(invalid(
+            "agent_requires_background",
+            "Agent interactions require background mode to be enabled.".to_string(),
+        ));
+    }
+    if !is_option_blank(req.model.as_ref()) && req.background {
+        return Err(invalid(
+            "background_requires_agent",
+            "Background mode is only supported for agent interactions.".to_string(),
+        ));
+    }
+
+    // background and stream are mutually exclusive
+    if req.background && req.stream {
+        return Err(invalid(
+            "background_conflicts_with_stream",
+            "Cannot set both background and stream to true.".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_tools(tools: &[InteractionsTool]) -> Result<(), ValidationError> {
+    // FileSearch tool is not supported yet
+    if tools
+        .iter()
+        .any(|t| matches!(t, InteractionsTool::FileSearch { .. }))
+    {
+        return Err(ValidationError::new("file_search_tool_not_supported"));
+    }
+    // A function has a name
+    for (index, tool) in tools.iter().enumerate() {
+        if matches!(tool, InteractionsTool::Function(function) if function.name.is_empty()) {
+            return Err(empty_tool_name(&format!("tools[{index}].name")));
+        }
+    }
+    Ok(())
+}
+
+fn validate_input(input: &InteractionsInput) -> Result<(), ValidationError> {
+    // Reject empty input
+    let empty_msg = match input {
+        InteractionsInput::Text(s) if s.trim().is_empty() => Some("Input text cannot be empty"),
+        InteractionsInput::Content(content) if is_content_empty(content) => {
+            Some("Input content cannot be empty")
+        }
+        InteractionsInput::Contents(contents) if contents.is_empty() => {
+            Some("Input content array cannot be empty")
+        }
+        InteractionsInput::Contents(contents) if contents.iter().any(is_content_empty) => {
+            Some("Input content array contains empty content items")
+        }
+        InteractionsInput::Turns(turns) if turns.is_empty() => {
+            Some("Input turns array cannot be empty")
+        }
+        InteractionsInput::Turns(turns) if turns.iter().any(is_turn_empty) => {
+            Some("Input turns array contains empty turn items")
+        }
+        _ => None,
+    };
+    if let Some(msg) = empty_msg {
+        return Err(invalid("input_cannot_be_empty", msg.to_string()));
+    }
+
+    // Reject unsupported file search content
+    fn has_file_search_content(content: &Content) -> bool {
+        matches!(
+            content,
+            Content::FileSearchCall { .. } | Content::FileSearchResult { .. }
+        )
+    }
+
+    fn check_turn(turn: &Turn) -> bool {
+        if let Some(content) = &turn.content {
+            match content {
+                TurnContent::Contents(contents) => contents.iter().any(has_file_search_content),
+                TurnContent::Text(_) => false,
+            }
+        } else {
+            false
+        }
+    }
+
+    let has_file_search = match input {
+        InteractionsInput::Text(_) => false,
+        InteractionsInput::Content(content) => has_file_search_content(content),
+        InteractionsInput::Contents(contents) => contents.iter().any(has_file_search_content),
+        InteractionsInput::Turns(turns) => turns.iter().any(check_turn),
+    };
+
+    if has_file_search {
+        return Err(ValidationError::new("file_search_content_not_supported"));
+    }
+    Ok(())
+}
+
+fn is_content_empty(content: &Content) -> bool {
+    match content {
+        Content::Text { text, .. } => is_option_blank(text.as_ref()),
+        Content::Image { data, uri, .. }
+        | Content::Audio { data, uri, .. }
+        | Content::Document { data, uri, .. }
+        | Content::Video { data, uri, .. } => {
+            is_option_blank(data.as_ref()) && is_option_blank(uri.as_ref())
+        }
+        Content::CodeExecutionCall { id, .. }
+        | Content::UrlContextCall { id, .. }
+        | Content::GoogleSearchCall { id, .. } => is_option_blank(id.as_ref()),
+        Content::CodeExecutionResult { call_id, .. }
+        | Content::UrlContextResult { call_id, .. }
+        | Content::GoogleSearchResult { call_id, .. } => is_option_blank(call_id.as_ref()),
+        _ => false,
+    }
+}
+
+fn is_turn_empty(turn: &Turn) -> bool {
+    match &turn.content {
+        None => true,
+        Some(TurnContent::Text(s)) => s.trim().is_empty(),
+        Some(TurnContent::Contents(contents)) => {
+            contents.is_empty() || contents.iter().any(is_content_empty)
+        }
+    }
+}
+
+fn validate_stop_sequences(seqs: &[String]) -> Result<(), ValidationError> {
+    if seqs.len() > 5 {
+        return Err(invalid(
+            "too_many_stop_sequences",
+            "Maximum 5 stop sequences allowed".to_string(),
+        ));
+    }
+    if seqs.iter().any(|s| s.trim().is_empty()) {
+        return Err(invalid(
+            "stop_sequences_cannot_be_empty",
+            "Stop sequences cannot contain empty strings".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Audio content keeps its channel count and sample rate, video its
+    /// processing and name, and a text annotation its kind and that kind's
+    /// fields, as the public API writes them. An audio delta keeps its rate.
+    #[test]
+    fn content_keeps_the_audio_video_and_annotation_fields_the_public_api_added() {
+        let contents = serde_json::json!([
+            {"type": "audio", "data": "AAAA", "mime_type": "audio/wav", "channels": 1, "sample_rate": 24000},
+            {
+                "type": "video",
+                "uri": "https://example.com/clip.mp4",
+                "mime_type": "video/mp4",
+                "processing": {"type": "static", "fps": 2.0, "start_offset": "10s"},
+                "name": "clip"
+            },
+            {"type": "text", "text": "Paris is the capital of France.", "annotations": [
+                {
+                    "type": "url_citation",
+                    "start_index": 0,
+                    "end_index": 31,
+                    "url": "https://en.wikipedia.org/wiki/Paris",
+                    "title": "Paris"
+                },
+                {
+                    "type": "file_citation",
+                    "start_index": 0,
+                    "end_index": 5,
+                    "file_name": "atlas.pdf",
+                    "page_number": 12,
+                    "source": "fileSearchStores/atlas/documents/d1"
+                }
+            ]}
+        ]);
+        let request: InteractionsRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "input": contents, "store": false
+        }))
+        .unwrap();
+        let written = crate::common::to_value_exact(&request).unwrap();
+        assert_eq!(written["input"], contents);
+
+        let delta: Delta = serde_json::from_value(serde_json::json!({
+            "type": "audio", "data": "AAAA", "mime_type": "audio/wav", "channels": 2, "sample_rate": 48000
+        }))
+        .unwrap();
+        let written = serde_json::to_value(&delta).unwrap();
+        assert_eq!(
+            (written["channels"].clone(), written["sample_rate"].clone()),
+            (serde_json::json!(2), serde_json::json!(48000))
+        );
+    }
+
+    /// The tools the public API declares beside the ones the gateway knew
+    /// read, validate and are written back as sent: computer use, Google
+    /// Maps, retrieval, an MCP server's list of allowed tools, and Google
+    /// Search's search types.
+    #[test]
+    fn a_request_declaring_each_public_tool_writes_it_back_as_sent() {
+        let tools = serde_json::json!([
+            {
+                "type": "computer_use",
+                "environment": "browser",
+                "excluded_predefined_functions": ["drag_and_drop"],
+                "disabled_safety_policies": ["financial_transactions"],
+                "enable_prompt_injection_detection": true
+            },
+            {"type": "google_maps", "enable_widget": true, "latitude": 37.7749, "longitude": -122.4194},
+            {
+                "type": "retrieval",
+                "retrieval_types": ["vertex_ai_search"],
+                "vertex_ai_search_config": {"datastores": ["projects/p/locations/global/dataStores/d"]}
+            },
+            {
+                "type": "mcp_server",
+                "name": "weather",
+                "url": "https://mcp.example.com/mcp",
+                "allowed_tools": [{"mode": "validated", "tools": ["get_forecast"]}]
+            },
+            {"type": "google_search", "search_types": ["web_search", "image_search"]}
+        ]);
+        let request: InteractionsRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "input": "Find a cafe near the office.", "store": false, "tools": tools
+        }))
+        .unwrap();
+        assert!(request.validate().is_ok(), "{:?}", request.validate());
+        let written = crate::common::to_value_exact(&request).unwrap();
+        assert_eq!(written["tools"], tools);
+
+        let open_mode: InteractionsRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "input": "Find a cafe near the office.",
+            "store": false,
+            "tools": [{
+                "type": "mcp_server",
+                "name": "maps",
+                "allowed_tools": [{"mode": "a_mode_of_no_api", "tools": ["find_place"]}]
+            }],
+            "generation_config": {"tool_choice": "a_mode_of_no_api"}
+        }))
+        .unwrap();
+        let written = crate::common::to_value_exact(&open_mode).unwrap();
+        assert_eq!(
+            written["tools"][0]["allowed_tools"][0]["mode"],
+            "a_mode_of_no_api"
+        );
+        assert_eq!(
+            written["generation_config"]["tool_choice"],
+            "a_mode_of_no_api"
+        );
+    }
+
+    /// A modeled field's camelCase spelling fills the typed field, where the
+    /// gateway's checks read it, and leaves `other` empty; it is written back
+    /// for the upstream in snake_case. A body with both spellings of one field
+    /// is refused.
+    #[test]
+    fn a_modeled_fields_camel_case_spelling_fills_the_typed_field() {
+        let request: InteractionsRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "input": "hi", "store": false,
+            "systemInstruction": "be brief",
+            "responseFormat": {"type": "object"},
+            "responseMimeType": "application/json",
+            "generationConfig": {"temperature": 0.5},
+            "responseModalities": ["text"],
+            "previousInteractionId": "int_1"
+        }))
+        .unwrap();
+        assert!(request.other.is_empty(), "{:?}", request.other);
+        assert_eq!(request.system_instruction.as_deref(), Some("be brief"));
+        assert_eq!(
+            request.response_mime_type.as_deref(),
+            Some("application/json")
+        );
+        assert!(request.response_format.is_some());
+        assert!(request.generation_config.is_some());
+        assert!(request.response_modalities.is_some());
+        assert_eq!(request.previous_interaction_id.as_deref(), Some("int_1"));
+        let written = crate::common::to_value_exact(&request).unwrap();
+        assert_eq!(written["previous_interaction_id"], "int_1");
+        assert!(written.get("previousInteractionId").is_none(), "{written}");
+
+        let agent: InteractionsRequest = serde_json::from_value(serde_json::json!({
+            "agent": "deep-research", "input": "hi",
+            "agentConfig": {"type": "deep-research"}
+        }))
+        .unwrap();
+        assert!(agent.agent_config.is_some() && agent.other.is_empty());
+
+        let both = serde_json::from_value::<InteractionsRequest>(serde_json::json!({
+            "model": "m", "input": "hi",
+            "previous_interaction_id": "int_1", "previousInteractionId": "int_2"
+        }));
+        let error = both.expect_err("both spellings of one field").to_string();
+        assert!(error.contains("duplicate field"), "{error}");
+    }
+
+    /// A generation or agent config key's camelCase spelling fills its typed
+    /// field, as a top-level key's does, so it is checked there and written
+    /// back for the upstream in snake_case rather than dropped.
+    #[test]
+    fn a_config_keys_camel_case_spelling_fills_the_typed_field() {
+        let request: InteractionsRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "input": "hi",
+            "generationConfig": {
+                "topP": 0.5,
+                "stopSequences": ["END"],
+                "toolChoice": {"allowedTools": {"mode": "validated", "tools": ["f"]}},
+                "thinkingLevel": "low",
+                "thinkingSummaries": "auto",
+                "maxOutputTokens": 1,
+                "speechConfig": [{"voice": "Kore"}],
+                "imageConfig": {"aspectRatio": "16:9", "imageSize": "2K"}
+            }
+        }))
+        .unwrap();
+        let written = crate::common::to_value_exact(&request).unwrap();
+        assert_eq!(
+            written["generation_config"],
+            serde_json::json!({
+                "top_p": 0.5,
+                "stop_sequences": ["END"],
+                "tool_choice": {"allowed_tools": {"mode": "validated", "tools": ["f"]}},
+                "thinking_level": "low",
+                "thinking_summaries": "auto",
+                "max_output_tokens": 1,
+                "speech_config": [{"voice": "Kore"}],
+                "image_config": {"aspect_ratio": "16:9", "image_size": "2K"}
+            })
+        );
+
+        let agent: InteractionsRequest = serde_json::from_value(serde_json::json!({
+            "agent": "deep-research", "input": "hi",
+            "agentConfig": {"type": "deep-research", "thinkingSummaries": "auto"}
+        }))
+        .unwrap();
+        let written = crate::common::to_value_exact(&agent).unwrap();
+        assert_eq!(
+            written["agent_config"],
+            serde_json::json!({"type": "deep-research", "thinking_summaries": "auto"})
+        );
+
+        let zero: InteractionsRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "input": "hi",
+            "generationConfig": {"maxOutputTokens": 0}
+        }))
+        .unwrap();
+        let error = zero
+            .validate()
+            .expect_err("a zero token budget")
+            .to_string();
+        assert!(error.contains("max_output_tokens"), "{error}");
+    }
+
+    /// The request's fields the gateway does not model are written back for
+    /// the upstream as the client sent them: the continuation token of a
+    /// `store: false` client's next hop, the safety settings, the service
+    /// tier and the rest.
+    #[test]
+    fn a_request_keeps_the_fields_the_gateway_does_not_model() {
+        let fields = serde_json::json!({
+            "continuation_token": "tok_1",
+            "safety_settings": [{"type": "harassment", "threshold": "block_none"}],
+            "service_tier": "flex",
+            "webhook_config": {"uris": ["https://example.com/hook"]},
+            "environment": "remote",
+            "labels": {"team": "a"},
+            "cached_content": "cachedContents/1"
+        });
+        let mut body = serde_json::json!({"model": "m", "input": "hi", "store": false});
+        body.as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        let request: InteractionsRequest = serde_json::from_value(body).unwrap();
+        let written = crate::common::to_value_exact(&request).unwrap();
+        for (key, value) in fields.as_object().unwrap() {
+            assert_eq!(&written[key], value, "{key}");
+        }
+    }
+
+    fn refusal(result: Result<(), ValidationError>) -> (String, String) {
+        let err = result.expect_err("a refusal");
+        (
+            err.code.to_string(),
+            err.message.as_deref().unwrap_or("").to_string(),
+        )
+    }
+
+    /// A function declared with an empty name is refused with its place in
+    /// `tools`: no client can dispatch a call that names nothing. The place
+    /// counts every tool, the built-in one ahead of the functions too. A
+    /// named function and a built-in tool, which has no name, pass.
+    #[test]
+    fn a_function_tool_has_a_name() {
+        let tools = |names: &[&str]| -> Vec<InteractionsTool> {
+            let mut tools = vec![InteractionsTool::GoogleSearch { search_types: None }];
+            tools.extend(names.iter().map(|name| {
+                serde_json::from_value::<InteractionsTool>(
+                    serde_json::json!({"type": "function", "name": name}),
+                )
+                .expect("a function tool")
+            }));
+            tools
+        };
+        assert_eq!(
+            refusal(validate_tools(&tools(&["f", ""]))),
+            (
+                "empty_string".to_string(),
+                "Invalid 'tools[2].name': empty string. Expected a string with minimum length 1, \
+                 but got an empty string instead."
+                    .to_string()
+            )
+        );
+        assert!(validate_tools(&tools(&["f", "g"])).is_ok());
+    }
+
+    /// Each cross-field refusal keeps its code and its message.
+    #[test]
+    fn the_cross_field_refusals_keep_their_codes_and_messages() {
+        let agent = || InteractionsRequest {
+            agent: Some("deep-research".to_string()),
+            ..Default::default()
+        };
+        let cases = [
+            (
+                InteractionsRequest {
+                    model: Some("m".to_string()),
+                    agent: Some("a".to_string()),
+                    ..Default::default()
+                },
+                "model_and_agent_mutually_exclusive",
+                "Cannot set both model and agent. Provide exactly one.",
+            ),
+            (
+                InteractionsRequest {
+                    background: false,
+                    ..agent()
+                },
+                "agent_requires_background",
+                "Agent interactions require background mode to be enabled.",
+            ),
+            (
+                InteractionsRequest {
+                    model: Some("m".to_string()),
+                    background: true,
+                    ..Default::default()
+                },
+                "background_requires_agent",
+                "Background mode is only supported for agent interactions.",
+            ),
+            (
+                InteractionsRequest {
+                    background: true,
+                    stream: true,
+                    ..agent()
+                },
+                "background_conflicts_with_stream",
+                "Cannot set both background and stream to true.",
+            ),
+        ];
+        for (request, code, message) in cases {
+            assert_eq!(
+                refusal(validate_interactions_request(&request)),
+                (code.to_string(), message.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_input_is_refused_with_its_message() {
+        assert_eq!(
+            refusal(validate_input(&InteractionsInput::Text("  ".to_string()))),
+            (
+                "input_cannot_be_empty".to_string(),
+                "Input text cannot be empty".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn stop_sequences_are_refused_when_too_many_or_blank() {
+        let six: Vec<String> = (0..6).map(|i| format!("s{i}")).collect();
+        assert_eq!(
+            refusal(validate_stop_sequences(&six)),
+            (
+                "too_many_stop_sequences".to_string(),
+                "Maximum 5 stop sequences allowed".to_string()
+            )
+        );
+        assert_eq!(
+            refusal(validate_stop_sequences(&[
+                "ok".to_string(),
+                " ".to_string()
+            ])),
+            (
+                "stop_sequences_cannot_be_empty".to_string(),
+                "Stop sequences cannot contain empty strings".to_string()
+            )
+        );
+    }
+
+    /// The routing text joins every text piece with one space, empty pieces
+    /// and content-less turns included, and drops non-text content: the
+    /// shape `join(" ")` gave, which a request's prefix-cache hash depends on.
+    #[test]
+    fn the_routing_text_joins_each_text_with_one_space() {
+        let cases = [
+            (serde_json::json!("plain"), "plain"),
+            (serde_json::json!({"type": "text", "text": "one"}), "one"),
+            (serde_json::json!({"type": "image", "uri": "u"}), ""),
+            (
+                serde_json::json!([
+                    {"type": "text", "text": "a"},
+                    {"type": "image", "uri": "u"},
+                    {"type": "text"},
+                    {"type": "text", "text": ""},
+                    {"type": "text", "text": "b"}
+                ]),
+                "a  b",
+            ),
+            (
+                serde_json::json!([
+                    {"role": "user", "content": "first"},
+                    {"role": "model"},
+                    {"role": "user", "content": [{"type": "image", "uri": "u"}]},
+                    {"role": "user", "content": [{"type": "text", "text": "x"}, {"type": "text", "text": "y"}]}
+                ]),
+                "first   x y",
+            ),
+        ];
+        for (input, expected) in cases {
+            let request = InteractionsRequest {
+                input: serde_json::from_value(input.clone()).expect("an input"),
+                ..Default::default()
+            };
+            assert_eq!(request.extract_text_for_routing(), expected, "{input}");
+        }
+    }
+}

@@ -1,0 +1,633 @@
+//! gRPC clients for vLLM, TensorRT-LLM, MLX, TokenSpeed, and SGLang backends.
+//!
+//! This crate provides gRPC client implementations for communicating with
+//! the vLLM engine, TensorRT-LLM engine, MLX engine, TokenSpeed scheduler,
+//! and SGLang scheduler backends.
+
+/// The messages every engine's service shares (`common.proto`). The worker
+/// crate generates them; this is its module, at the path it had here.
+pub use smg_worker::common_proto;
+pub mod abort_on_drop;
+pub mod channel;
+pub mod codec;
+pub mod constraint_failure;
+pub mod engine_labels;
+pub mod engine_load;
+#[cfg(feature = "engine-port")]
+pub mod engine_port;
+mod framed;
+pub mod media_fault;
+pub mod media_identity;
+pub mod mlx_engine;
+pub mod request_deadline;
+mod request_fields;
+pub mod sglang_scheduler;
+pub mod tokenizer_bundle;
+pub mod tokenspeed_encoder;
+pub mod tokenspeed_scheduler;
+pub mod trtllm_service;
+pub mod vllm_engine;
+
+// Re-export clients
+use std::sync::Arc;
+
+pub use abort_on_drop::{AbortOnDropClient, AbortOnDropStream};
+pub use channel::{
+    connect_channel, connect_channel_with_timeout, dial_failure_without_peer,
+    is_keep_alive_timeout, is_transport_failure, keep_alive_timeout_status,
+    normalize_grpc_endpoint, Channel, DEFAULT_CONNECT_TIMEOUT,
+};
+pub use constraint_failure::{
+    constraint_failed_status, constraint_refused_status, is_constraint_failure,
+    is_constraint_refusal, CONSTRAINT_FAILED_METADATA_KEY, CONSTRAINT_REFUSED_METADATA_KEY,
+};
+/// The HTTP/2 layer under the channels, re-exported for callers that build
+/// or classify the transport faults [`is_transport_failure`] recognises.
+pub use h2;
+pub use media_fault::{media_code, stamp_media_code, WorkerMediaFault, MEDIA_CODE_METADATA_KEY};
+pub use mlx_engine::{proto as mlx_proto, MlxEngineClient};
+pub use request_deadline::{is_request_timeout, RequestDeadline};
+pub use request_fields::{FormatSetAside, OutputConstraint};
+pub use sglang_scheduler::{
+    proto as sglang_proto, SglangGenerateRequestOptions, SglangSchedulerClient,
+};
+pub use tokenspeed_encoder::{tokenspeed_encoder_proto, TokenSpeedEncoderClient};
+pub use tokenspeed_scheduler::{tokenspeed_proto, TokenSpeedSchedulerClient};
+use tonic::{codegen::http::uri::PathAndQuery, metadata::MetadataMap};
+pub use trtllm_service::{proto as trtllm_proto, TrtllmServiceClient};
+pub use vllm_engine::{proto as vllm_proto, VllmEngineClient};
+
+/// Shared `get_tokenizer()` implementation for all engine clients.
+///
+/// Each engine's generated proto client has a `get_tokenizer` RPC method
+/// with identical signature (using common proto types). This macro provides
+/// the wrapper that calls `collect_bundle_from_rpc` with the standard
+/// timeout and chunk extraction.
+macro_rules! impl_get_tokenizer {
+    () => {
+        pub async fn get_tokenizer(
+            &self,
+        ) -> Result<
+            $crate::tokenizer_bundle::StreamBundle,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            use $crate::common_proto::GetTokenizerRequest;
+            let request = tonic::Request::new(GetTokenizerRequest {});
+            let mut client = self.client.clone();
+            $crate::tokenizer_bundle::collect_bundle_from_rpc(
+                client.get_tokenizer(request),
+                |chunk| (chunk.data, chunk.sha256),
+                std::time::Duration::from_secs(120),
+            )
+            .await
+        }
+    };
+}
+pub(crate) use impl_get_tokenizer;
+
+/// Extra local-deadline margin for `flush_cache` on top of the timeout
+/// forwarded to the backend. The servicer bounds its own scheduler
+/// round-trip at `max(30, timeout_s + 10)` seconds, so the margin must
+/// cover that budget plus transport overhead.
+pub const FLUSH_RPC_DEADLINE_MARGIN: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// Local deadline for profile start/stop RPCs. Stopping a profile can take
+/// a long time while the backend serializes large traces.
+pub const PROFILE_RPC_DEADLINE: std::time::Duration = std::time::Duration::from_secs(630);
+
+/// Local deadline for the fire-and-forget abort RPC issued from
+/// [`abort_on_drop::AbortOnDropStream`]'s `Drop`. The abort is a tiny unary RPC,
+/// but it runs in a detached task no caller can cancel; bounding it stops those
+/// tasks from accumulating without limit against a wedged backend — which is
+/// exactly when streams are mass-dropped (clients time out and disconnect).
+pub const ABORT_RPC_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Shared cache-flush RPC with tracing and a bounded local deadline.
+macro_rules! impl_flush_cache {
+    () => {
+        /// Flush the KV cache on the backend scheduler.
+        ///
+        /// `timeout_s` is forwarded to the backend: 0 = flush immediately
+        /// (fails if requests are in flight), >0 = wait up to that many
+        /// seconds for the scheduler to go idle first.
+        pub async fn flush_cache(
+            &self,
+            timeout_s: f32,
+        ) -> Result<$crate::common_proto::FlushCacheResponse, tonic::Status> {
+            tracing::debug!("Requesting cache flush (timeout_s={timeout_s})");
+            let mut request =
+                tonic::Request::new($crate::common_proto::FlushCacheRequest { timeout_s });
+            if let Err(e) = self.trace_injector.inject(request.metadata_mut()) {
+                tracing::warn!("Failed to inject trace context: {}", e);
+            }
+            let deadline = std::time::Duration::from_secs_f32(timeout_s.max(0.0))
+                + $crate::FLUSH_RPC_DEADLINE_MARGIN;
+            let mut client = self.client.clone();
+            let response = tokio::time::timeout(deadline, client.flush_cache(request))
+                .await
+                .map_err(|_| {
+                    tonic::Status::deadline_exceeded(format!(
+                        "FlushCache did not complete within {deadline:?}"
+                    ))
+                })??;
+            Ok(response.into_inner())
+        }
+    };
+}
+pub(crate) use impl_flush_cache;
+
+/// Shared admin RPCs for engines supporting both cache flush and profiling.
+macro_rules! impl_admin_ops {
+    () => {
+        $crate::impl_flush_cache!();
+
+        /// Start the profiler on the backend scheduler.
+        pub async fn start_profile(
+            &self,
+            req: $crate::common_proto::StartProfileRequest,
+        ) -> Result<$crate::common_proto::ProfileResponse, tonic::Status> {
+            tracing::debug!("Requesting profile start");
+            let mut request = tonic::Request::new(req);
+            if let Err(e) = self.trace_injector.inject(request.metadata_mut()) {
+                tracing::warn!("Failed to inject trace context: {}", e);
+            }
+            let mut client = self.client.clone();
+            let response =
+                tokio::time::timeout($crate::PROFILE_RPC_DEADLINE, client.start_profile(request))
+                    .await
+                    .map_err(|_| {
+                        tonic::Status::deadline_exceeded(format!(
+                            "StartProfile did not complete within {:?}",
+                            $crate::PROFILE_RPC_DEADLINE
+                        ))
+                    })??;
+            Ok(response.into_inner())
+        }
+
+        /// Stop the profiler on the backend scheduler and export traces.
+        pub async fn stop_profile(
+            &self,
+        ) -> Result<$crate::common_proto::ProfileResponse, tonic::Status> {
+            tracing::debug!("Requesting profile stop");
+            let mut request = tonic::Request::new($crate::common_proto::StopProfileRequest {});
+            if let Err(e) = self.trace_injector.inject(request.metadata_mut()) {
+                tracing::warn!("Failed to inject trace context: {}", e);
+            }
+            let mut client = self.client.clone();
+            let response =
+                tokio::time::timeout($crate::PROFILE_RPC_DEADLINE, client.stop_profile(request))
+                    .await
+                    .map_err(|_| {
+                        tonic::Status::deadline_exceeded(format!(
+                            "StopProfile did not complete within {:?}",
+                            $crate::PROFILE_RPC_DEADLINE
+                        ))
+                    })??;
+            Ok(response.into_inner())
+        }
+    };
+}
+pub(crate) use impl_admin_ops;
+
+/// The largest `KvEventBatch` a KV event stream decodes, in place of tonic's
+/// 4 MiB default. A batch carries its blocks' token ids, and a servicer's
+/// state snapshot is cut into chunks of 2,048 blocks: about 4.8 MB at
+/// 1,152-token blocks, which a subscriber at the default limit failed on at
+/// every reconnect. 64 MiB covers such a chunk at any block size an engine
+/// uses while still bounding what one message may allocate.
+pub const KV_EVENT_MAX_DECODING_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
+
+/// Shared `subscribe_kv_events()` implementation for all engine clients.
+///
+/// Each engine's generated proto client has a `subscribe_kv_events` RPC method
+/// with identical signature (using common proto types). This macro provides
+/// the wrapper that returns a `tonic::Streaming<KvEventBatch>`, decoding up to
+/// [`KV_EVENT_MAX_DECODING_MESSAGE_SIZE`] per message.
+macro_rules! impl_subscribe_kv_events {
+    () => {
+        /// Subscribe to KV cache events from the backend.
+        /// Returns a long-lived server-streaming response. The servicer's
+        /// load records (`KvEventBatch.load`) start with the publisher's
+        /// first batch; a caller that skips `load_only` batches before any
+        /// sequence check can have them from the subscription on through
+        /// [`Self::subscribe_kv_events_with_load_records`].
+        pub async fn subscribe_kv_events(
+            &self,
+            start_sequence_number: u64,
+        ) -> Result<tonic::Streaming<$crate::common_proto::KvEventBatch>, tonic::Status> {
+            self.subscribe_kv_events_asking(start_sequence_number, false)
+                .await
+        }
+
+        /// [`Self::subscribe_kv_events`] asking the servicer for its load
+        /// records before the publisher's first batch
+        /// (`SubscribeKvEventsRequest.load_records_before_first_batch`):
+        /// `load_only` batches numbered 0 arrive from the subscription on,
+        /// the engine's silence on its first request among them. The caller
+        /// must skip `load_only` batches before any sequence check: one that
+        /// dedupes by `sequence_number` alone would take the publisher's
+        /// first batch for a repeat of them, and belongs on
+        /// [`Self::subscribe_kv_events`].
+        pub async fn subscribe_kv_events_with_load_records(
+            &self,
+            start_sequence_number: u64,
+        ) -> Result<tonic::Streaming<$crate::common_proto::KvEventBatch>, tonic::Status> {
+            self.subscribe_kv_events_asking(start_sequence_number, true)
+                .await
+        }
+
+        /// The servicer's load records alone (`SubscribeKvEventsRequest.
+        /// loads_only`): `load_only` batches numbered 0 from the
+        /// subscription on, one per data-parallel rank at the record's
+        /// cadence, no events. A servicer that predates the field streams
+        /// its events too; the caller drops them.
+        pub async fn subscribe_load_records(
+            &self,
+        ) -> Result<tonic::Streaming<$crate::common_proto::KvEventBatch>, tonic::Status> {
+            self.subscribe($crate::common_proto::SubscribeKvEventsRequest {
+                start_sequence_number: 0,
+                load_records_before_first_batch: true,
+                loads_only: true,
+            })
+            .await
+        }
+
+        async fn subscribe_kv_events_asking(
+            &self,
+            start_sequence_number: u64,
+            load_records_before_first_batch: bool,
+        ) -> Result<tonic::Streaming<$crate::common_proto::KvEventBatch>, tonic::Status> {
+            self.subscribe($crate::common_proto::SubscribeKvEventsRequest {
+                start_sequence_number,
+                load_records_before_first_batch,
+                loads_only: false,
+            })
+            .await
+        }
+
+        async fn subscribe(
+            &self,
+            request: $crate::common_proto::SubscribeKvEventsRequest,
+        ) -> Result<tonic::Streaming<$crate::common_proto::KvEventBatch>, tonic::Status> {
+            let request = tonic::Request::new(request);
+            let mut client = self
+                .client
+                .clone()
+                .max_decoding_message_size($crate::KV_EVENT_MAX_DECODING_MESSAGE_SIZE);
+            let response = client.subscribe_kv_events(request).await?;
+            Ok(response.into_inner())
+        }
+    };
+}
+pub(crate) use impl_subscribe_kv_events;
+
+/// Trait for injecting trace context into gRPC metadata.
+///
+/// Implement this trait to enable distributed tracing across gRPC calls.
+/// The default implementation is a no-op.
+pub trait TraceInjector: Send + Sync {
+    /// Inject trace context into the given metadata map.
+    ///
+    /// Returns `Ok(())` on success, or an error if injection fails.
+    fn inject(
+        &self,
+        metadata: &mut MetadataMap,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+}
+
+/// A no-op trace injector that does nothing.
+#[derive(Clone, Default)]
+pub struct NoopTraceInjector;
+
+impl TraceInjector for NoopTraceInjector {
+    fn inject(
+        &self,
+        _metadata: &mut MetadataMap,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+}
+
+/// Type alias for a boxed trace injector.
+pub type BoxedTraceInjector = Arc<dyn TraceInjector>;
+
+/// Every engine's streaming `generate` call, its response messages decoded
+/// straight into their box: prost implements `Message` for `Box<M>`, so the
+/// decoder builds each message once on the heap and every layer above it
+/// moves a pointer. The generated client's call yields the message by value,
+/// which the first reader copied into a box and each reader after it moved
+/// whole; the path, the method extension and the codec are the generated
+/// call's own.
+pub(crate) async fn boxed_generate<Req, Resp>(
+    grpc: &mut tonic::client::Grpc<Channel>,
+    mut request: tonic::Request<Req>,
+    service: &'static str,
+    path: &'static str,
+) -> Result<tonic::Streaming<Box<Resp>>, tonic::Status>
+where
+    Req: prost::Message + Send + Sync + 'static,
+    Resp: prost::Message + Default + Send + Sync + 'static,
+{
+    grpc.ready()
+        .await
+        .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {e}")))?;
+    request
+        .extensions_mut()
+        .insert(tonic::GrpcMethod::new(service, "Generate"));
+    let codec = codec::SizedProstCodec::<Req, Box<Resp>>::default();
+    let response = grpc
+        .server_streaming(request, PathAndQuery::from_static(path), codec)
+        .await?;
+    Ok(response.into_inner())
+}
+
+/// Two strings compared byte by byte in a `const` context: the engine
+/// clients pin their generate path's service literal to the generated
+/// service name at compile time with it.
+pub(crate) const fn service_name_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Generates the boilerplate that every engine client shares: the two
+/// `connect` constructors, `with_trace_injector`, `generate` (the streaming
+/// call whose response aborts the request when dropped), and the three
+/// "standard" RPCs (`health_check`, `get_model_info`, `get_server_info`)
+/// whose request/response types are uniform across the generated proto
+/// crates.
+///
+/// `$proto` is the invoking module's generated proto module (`proto`, or
+/// another name), where `GenerateRequest`, `HealthCheckRequest` and the
+/// other request types are read from. `$proto_client` is the fully-qualified
+/// path of the generated tonic client type (which `Self` wraps).
+/// `$display_name` is the human-readable name used in the connect log line.
+/// `$service` is the fully-qualified gRPC service name, the one the
+/// generated client puts on the `Generate` path and method extension;
+/// `$generated_service` is the generated server module's `SERVICE_NAME`,
+/// and the macro compares the two at compile time, so a literal that
+/// drifts from its proto does not build (the path is assembled with
+/// `concat!`, which needs the literal).
+/// The invoking module defines the `AbortOnDropStream` alias `generate`
+/// returns (`crate::AbortOnDropStream<Box<$proto::GenerateResponse>, Self>`).
+///
+/// Each engine's `impl` block invokes this once and then adds engine-
+/// specific RPCs (`abort_request`, `embed`, etc.) below.
+macro_rules! impl_engine_client_basics {
+    ($proto:ident, $proto_client:path, $display_name:literal, $service:literal, $generated_service:expr) => {
+        /// Create a new client and connect to the backend.
+        pub async fn connect(
+            endpoint: &str,
+        ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+            Self::connect_with_trace_injector(
+                endpoint,
+                std::sync::Arc::new($crate::NoopTraceInjector),
+            )
+            .await
+        }
+
+        /// Create a new client with a custom trace injector.
+        pub async fn connect_with_trace_injector(
+            endpoint: &str,
+            trace_injector: $crate::BoxedTraceInjector,
+        ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+            let channel = $crate::channel::connect_channel(endpoint).await?;
+            // After the dial, so the line names the peer as the channel does
+            // (host and port): the endpoint as given may carry userinfo.
+            tracing::debug!(
+                "Connected to {} gRPC server at {}",
+                $display_name,
+                channel.peer()
+            );
+            let client = <$proto_client>::new(channel.clone());
+            Ok(Self {
+                client,
+                trace_injector,
+                channel,
+            })
+        }
+
+        /// The client's own channel, the one its generated stub rides; a
+        /// request sent as body frames drives it directly.
+        pub fn channel(&self) -> &$crate::channel::Channel {
+            &self.channel
+        }
+
+        /// Set or replace the trace injector.
+        #[must_use]
+        pub fn with_trace_injector(mut self, trace_injector: $crate::BoxedTraceInjector) -> Self {
+            self.trace_injector = trace_injector;
+            self
+        }
+
+        /// Submit a generation request; the returned stream aborts the request
+        /// when it is dropped before `mark_completed()`, so a client that goes
+        /// away mid-stream does not leave the engine generating.
+        ///
+        /// The request is wrapped for the wire before the future exists, so the
+        /// future holds it once, as the call's own request, not again as an
+        /// argument and a local kept across the await. The dispatch boxes this
+        /// future for every request, so the largest engine's request sets the
+        /// box's size class on every path: keep this a plain fn, not an async fn.
+        ///
+        /// The trace context is injected when the future is first polled, from
+        /// the span active then, so an instrumented future's span is the parent.
+        /// The clients whose wire has a `generate_framed` (the request's large
+        /// tensors as body frames; the gateway's call on those wires) keep the
+        /// same shape there: the request becomes its frames before the future
+        /// exists.
+        pub fn generate(
+            &self,
+            req: $proto::GenerateRequest,
+        ) -> impl std::future::Future<Output = Result<AbortOnDropStream, tonic::Status>> + '_ {
+            let request_id = req.request_id.clone();
+            let mut grpc = tonic::client::Grpc::new(self.channel.clone());
+            let mut request = tonic::Request::new(req);
+            async move {
+                // W3C trace context into the gRPC metadata for distributed tracing,
+                // read when the future first runs so an instrumented future's span
+                // is the parent.
+                if let Err(e) = self.trace_injector.inject(request.metadata_mut()) {
+                    tracing::warn!("Failed to inject trace context: {}", e);
+                }
+                const _: () = assert!(
+                    $crate::service_name_eq($service, $generated_service),
+                    "the generate path's service name is not the generated service's name"
+                );
+                let stream =
+                    $crate::boxed_generate::<$proto::GenerateRequest, $proto::GenerateResponse>(
+                        &mut grpc,
+                        request,
+                        $service,
+                        concat!("/", $service, "/Generate"),
+                    )
+                    .await?;
+                Ok(AbortOnDropStream::new(stream, request_id, self.clone()))
+            }
+        }
+
+        /// Perform a health check.
+        pub async fn health_check(&self) -> Result<$proto::HealthCheckResponse, tonic::Status> {
+            tracing::debug!("Sending health check request");
+            let request = tonic::Request::new($proto::HealthCheckRequest {});
+            let mut client = self.client.clone();
+            let response = client.health_check(request).await?;
+            tracing::debug!("Health check response received");
+            Ok(response.into_inner())
+        }
+
+        /// Get model information.
+        pub async fn get_model_info(&self) -> Result<$proto::GetModelInfoResponse, tonic::Status> {
+            tracing::debug!("Requesting model info");
+            let request = tonic::Request::new($proto::GetModelInfoRequest {});
+            let mut client = self.client.clone();
+            let response = client.get_model_info(request).await?;
+            tracing::debug!("Model info response received");
+            Ok(response.into_inner())
+        }
+
+        /// Get server information.
+        pub async fn get_server_info(
+            &self,
+        ) -> Result<$proto::GetServerInfoResponse, tonic::Status> {
+            tracing::debug!("Requesting server info");
+            let request = tonic::Request::new($proto::GetServerInfoRequest {});
+            let mut client = self.client.clone();
+            let response = client.get_server_info(request).await?;
+            tracing::debug!("Server info response received");
+            Ok(response.into_inner())
+        }
+    };
+}
+pub(crate) use impl_engine_client_basics;
+
+/// The abort-on-drop hook of a client whose `abort_request` takes a reason:
+/// a dropped stream aborts with "Stream dropped".
+macro_rules! impl_abort_for_drop_with_reason {
+    ($client:ty) => {
+        impl $crate::AbortOnDropClient for $client {
+            fn abort_for_drop(
+                self,
+                request_id: String,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<(), tonic::Status>> + Send>,
+            > {
+                Box::pin(async move {
+                    self.abort_request(request_id, "Stream dropped".to_string())
+                        .await
+                })
+            }
+        }
+    };
+}
+pub(crate) use impl_abort_for_drop_with_reason;
+
+/// The abort of a client whose wire carries request ids alone: the reason
+/// stays in the signature the abort-on-drop hook calls and is not sent.
+macro_rules! impl_abort_without_reason {
+    ($proto:ident) => {
+        /// Abort a request
+        pub async fn abort_request(
+            &self,
+            request_id: String,
+            _reason: String,
+        ) -> Result<(), tonic::Status> {
+            tracing::debug!("Sending abort request for {}", request_id);
+            let request = tonic::Request::new($proto::AbortRequest {
+                request_ids: vec![request_id.clone()],
+            });
+
+            let mut client = self.client.clone();
+            let _response = client.abort(request).await?;
+            tracing::debug!("Abort response received for {}", request_id);
+            Ok(())
+        }
+    };
+}
+pub(crate) use impl_abort_without_reason;
+
+/// The embedding RPC with the trace context injected into its metadata.
+macro_rules! impl_embed {
+    ($proto:ident) => {
+        /// Submit an embedding request
+        pub async fn embed(
+            &self,
+            req: $proto::EmbedRequest,
+        ) -> Result<$proto::EmbedResponse, tonic::Status> {
+            let mut client = self.client.clone();
+            let mut request = tonic::Request::new(req);
+
+            if let Err(e) = self.trace_injector.inject(request.metadata_mut()) {
+                tracing::warn!("Failed to inject trace context: {}", e);
+            }
+
+            let response = client.embed(request).await?;
+            Ok(response.into_inner())
+        }
+    };
+}
+pub(crate) use impl_embed;
+
+/// A polled answer's named values as its wire states them: the whole list,
+/// each entry by the worker crate's one read of an entry. The load monitor
+/// holds the list to the report's bounds and counts what leaves it, as it
+/// does the list of a poll over HTTP, so nothing is dropped here unseen.
+pub(crate) fn stated_values(
+    values: &[common_proto::NamedValue],
+) -> Vec<openai_protocol::worker::NamedValue> {
+    values.iter().map(Into::into).collect()
+}
+
+/// The load conversions of a wire whose `SchedulerLoad` carries a rank's poll
+/// figures alone: field for field, the measured input capacity where the
+/// servicer reports one, every other canonical field absent. A wire whose
+/// message has the named values passes the list's field, and the snapshot
+/// takes the list as the answer states it ([`stated_values`]).
+macro_rules! impl_rank_load_conversions {
+    ($proto:ident $(, $values:ident)?) => {
+        impl From<$proto::SchedulerLoad> for openai_protocol::worker::SchedulerLoadSnapshot {
+            fn from(load: $proto::SchedulerLoad) -> Self {
+                Self {
+                    dp_rank: load.dp_rank,
+                    num_running_reqs: load.num_running_reqs,
+                    num_waiting_reqs: load.num_waiting_reqs,
+                    num_waiting_uncached_tokens: load.num_waiting_uncached_tokens,
+                    num_total_reqs: load.num_total_reqs,
+                    num_used_tokens: load.num_used_tokens,
+                    max_total_num_tokens: load.max_total_num_tokens,
+                    token_usage: load.token_usage,
+                    gen_throughput: load.gen_throughput,
+                    prefill_throughput: load.prefill_throughput,
+                    cache_hit_rate: load.cache_hit_rate,
+                    utilization: load.utilization,
+                    max_running_requests: load.max_running_requests,
+                    $(values: $crate::stated_values(&load.$values),)?
+                    ..Default::default()
+                }
+            }
+        }
+
+        impl From<$proto::GetLoadsResponse> for openai_protocol::worker::WorkerLoadResponse {
+            fn from(resp: $proto::GetLoadsResponse) -> Self {
+                Self {
+                    timestamp: resp.timestamp,
+                    version: resp.version,
+                    dp_rank_count: resp.dp_rank_count,
+                    loads: resp.loads.into_iter().map(Into::into).collect(),
+                    aggregate: None,
+                    sampled_at: None,
+                }
+            }
+        }
+    };
+}
+pub(crate) use impl_rank_load_conversions;

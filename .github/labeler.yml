@@ -1,0 +1,132 @@
+# Label configuration for actions/labeler
+# See: https://github.com/actions/labeler
+
+python-bindings:
+  - changed-files:
+      - any-glob-to-any-file: 'bindings/python/**/*'
+
+documentation:
+  - changed-files:
+      - any-glob-to-any-file:
+          - '**/*.md'
+          - 'docs/**/*'
+
+dependencies:
+  - changed-files:
+      - any-glob-to-any-file:
+          - '**/Cargo.toml'
+          - '**/Cargo.lock'
+          - '**/pyproject.toml'
+
+ci:
+  - changed-files:
+      - any-glob-to-any-file: '.github/**/*'
+
+docker:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'docker/**/*'
+          - '**/Dockerfile'
+
+grpc:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'crates/grpc_client/**/*'
+          - 'crates/worker/proto/**/*'
+          - 'grpc_servicer/**/*'
+          - 'model_gateway/src/routers/grpc/**/*'
+
+mcp:
+  - changed-files:
+      - any-glob-to-any-file: 'crates/mcp/**/*'
+
+tokenizer:
+  - changed-files:
+      - any-glob-to-any-file: 'crates/tokenizer/**/*'
+
+tool-parser:
+  - changed-files:
+      - any-glob-to-any-file: 'crates/tool_parser/**/*'
+
+reasoning-parser:
+  - changed-files:
+      - any-glob-to-any-file: 'crates/reasoning_parser/**/*'
+
+response-template:
+  - changed-files:
+      - any-glob-to-any-file: 'crates/response_template/**/*'
+
+symphony:
+  - changed-files:
+      - any-glob-to-any-file: 'crates/symphony/**/*'
+
+wasm:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'crates/wasm/**/*'
+          - 'model_gateway/src/wasm/**/*'
+
+auth:
+  - changed-files:
+      - any-glob-to-any-file: 'crates/auth/**/*'
+
+data-connector:
+  - changed-files:
+      - any-glob-to-any-file: 'crates/data_connector/**/*'
+
+multimodal:
+  - changed-files:
+      - any-glob-to-any-file: 'crates/multimodal/**/*'
+
+protocols:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'crates/protocols/**/*'
+          - 'crates/worker/**/*'
+
+workflow:
+  - changed-files:
+      - any-glob-to-any-file: 'crates/workflow/**/*'
+
+kv-index:
+  - changed-files:
+      - any-glob-to-any-file: 'crates/kv_index/**/*'
+
+mesh:
+  - changed-files:
+      - any-glob-to-any-file: 'crates/mesh/**/*'
+
+model-gateway:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'model_gateway/**/*'
+          - 'crates/service_discovery/**/*'
+
+openai:
+  - changed-files:
+      - any-glob-to-any-file: 'model_gateway/src/routers/openai/**/*'
+
+anthropic:
+  - changed-files:
+      - any-glob-to-any-file: 'model_gateway/src/routers/anthropic/**/*'
+
+gemini:
+  - changed-files:
+      - any-glob-to-any-file: 'model_gateway/src/routers/gemini/**/*'
+
+realtime-api:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'crates/protocols/src/realtime_*'
+          - 'crates/protocols/src/builders/realtime/**/*'
+          - 'model_gateway/src/routers/openai/realtime/**/*'
+
+benchmarks:
+  - changed-files:
+      - any-glob-to-any-file: 'model_gateway/benches/**/*'
+
+tests:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'e2e_test/**/*'
+          - '**/tests/**/*'

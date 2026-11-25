@@ -1,0 +1,13 @@
+name: 'Setup TRT-LLM Backend'
+description: 'Create Python venv and install TensorRT-LLM pre-release wheel from PyPI.'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup Python venv
+      shell: bash
+      run: bash scripts/ci_setup_python_venv.sh
+
+    - name: Install TRT-LLM
+      shell: bash
+      run: bash scripts/ci_install_trtllm.sh

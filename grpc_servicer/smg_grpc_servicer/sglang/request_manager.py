@@ -1,0 +1,1524 @@
+"""
+gRPC Request Manager - Orchestrates request lifecycle without tokenization.
+Mimics TokenizerManager's state management and ZMQ communication patterns.
+"""
+
+import asyncio
+import copy
+import dataclasses
+import inspect
+import logging
+import os
+import signal
+import sys
+import threading
+import uuid
+from collections.abc import AsyncGenerator
+from contextlib import aclosing
+from traceback import format_exc as get_exception_traceback
+from typing import Any
+
+import grpc
+import zmq
+import zmq.asyncio
+from sglang.srt.managers.io_struct import (
+    AbortReq,
+    BatchEmbeddingOutput,
+    BatchTokenIDOutput,
+    FlushCacheReqOutput,
+    GetInternalStateReqOutput,
+    HealthCheckOutput,
+    ProfileReqOutput,
+    TokenizedEmbeddingReqInput,
+    TokenizedGenerateReqInput,
+)
+from sglang.srt.managers.load_snapshot import LoadSnapshot, create_load_snapshot_reader
+from sglang.srt.observability.req_time_stats import (
+    APIServerReqTimeStats,
+    calibrate_time_diff,
+    real_time,
+)
+from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.utils import get_or_create_event_loop, kill_process_tree
+from sglang.srt.utils.network import get_zmq_socket
+
+from smg_grpc_servicer.sglang.compat import SchedulerOutputAdapter, get_disaggregation_types
+from smg_grpc_servicer.trace_context import trace_headers
+
+DisaggregationMode, _ = get_disaggregation_types()
+
+logger = logging.getLogger(__name__)
+
+
+def _validate_token_ids_logprobs(values: list[list[float]], token_ids: list[list[int]]) -> None:
+    """Reject a selected-score payload that would lose entries when zipped."""
+    try:
+        if len(values) != len(token_ids):
+            raise ValueError(
+                "Malformed selected-token logprobs: values and IDs have different row counts"
+            )
+        if any(len(row_values) != len(row_ids) for row_values, row_ids in zip(values, token_ids)):
+            raise ValueError(
+                "Malformed selected-token logprobs: a row has different values and IDs lengths"
+            )
+    except TypeError as exc:
+        # A missing or scalar row is a request error too. Letting TypeError
+        # escape the shared batch handler would also strand valid siblings.
+        raise ValueError(
+            "Malformed selected-token logprobs: values and IDs must contain candidate rows"
+        ) from exc
+
+
+class _GrpcCommunicator:
+    """
+    Communicator for request/response patterns with scheduler.
+
+    Thread-safe and handles the async request/response cycle with proper
+    timeout handling to prevent hangs if the scheduler becomes unresponsive.
+    """
+
+    DEFAULT_TIMEOUT = 30.0  # seconds
+
+    def __init__(self, sender: zmq.Socket, fan_out: int = 1):
+        self._sender = sender
+        self._fan_out = fan_out
+        self._result_event: asyncio.Event | None = None
+        self._result_values: list[Any] | None = None
+        self._lock = asyncio.Lock()
+
+    async def __call__(self, obj, timeout: float = DEFAULT_TIMEOUT) -> list[Any]:
+        """
+        Send request and wait for response(s).
+
+        Args:
+            obj: Request object to send to scheduler
+            timeout: Maximum time to wait for response (seconds)
+
+        Returns:
+            List of response objects from scheduler(s)
+
+        Raises:
+            asyncio.TimeoutError: If no response within timeout
+        """
+        async with self._lock:
+            # Initialize state BEFORE sending to avoid race condition
+            self._result_event = asyncio.Event()
+            self._result_values = []
+
+            # Send request to scheduler
+            if obj:
+                self._sender.send_pyobj(obj)
+
+            try:
+                # Wait for response(s) with timeout
+                await asyncio.wait_for(self._result_event.wait(), timeout=timeout)
+                return self._result_values
+            finally:
+                # Always clean up state
+                self._result_event = None
+                self._result_values = None
+
+    def handle_recv(self, recv_obj: Any):
+        """
+        Handle received response from scheduler.
+
+        Called by handle_loop when a matching response type is received.
+        Safe to call even if no request is pending (will be ignored).
+        """
+        if self._result_values is not None and self._result_event is not None:
+            self._result_values.append(recv_obj)
+            if len(self._result_values) >= self._fan_out:
+                self._result_event.set()
+
+
+class GrpcSignalHandler:
+    """Minimal signal handler for gRPC server - delegates real crash handling to scheduler."""
+
+    def __init__(self, grpc_manager):
+        self.grpc_manager = grpc_manager
+
+    def sigterm_handler(self, signum=None, frame=None):
+        """Handle SIGTERM by gracefully shutting down gRPC server."""
+        logger.warning(f"SIGTERM received. {signum=} {frame=}. Shutting down gRPC server...")
+        self.grpc_manager.gracefully_exit = True
+
+    def running_phase_sigquit_handler(self, signum=None, frame=None):
+        """Handle SIGQUIT from failed scheduler process."""
+        logger.error(
+            "Received SIGQUIT from scheduler process. Scheduler failed, shutting down gRPC server."
+        )
+        logger.info("Note: Crash dumps are handled by the scheduler process, not the gRPC server.")
+        # Just exit cleanly - the scheduler handles crash dumps
+        kill_process_tree(os.getpid(), include_parent=True)
+
+
+@dataclasses.dataclass
+class GrpcReqState:
+    """State tracking for a gRPC request."""
+
+    # Request identification
+    request_id: str
+    grpc_context: grpc.aio.ServicerContext | None
+
+    # Communication
+    out_queue: asyncio.Queue
+    finished: bool
+    event: asyncio.Event
+    obj: TokenizedGenerateReqInput | TokenizedEmbeddingReqInput
+
+    # Metrics (same as TokenizerManager's ReqState)
+    time_stats: APIServerReqTimeStats
+    last_completion_tokens: int = 0
+    ttft_observed: bool = False
+    abort_observed: bool = False
+    log_metrics: bool = True
+
+    # Streaming state
+    stream_finished: bool = False
+    input_logprobs_sent: bool = False  # Track if input logprobs were sent in streaming
+
+    # Token accumulation (for non-streaming)
+    output_ids: list[int] = dataclasses.field(default_factory=list)
+    input_token_logprobs_val: list[float] = dataclasses.field(default_factory=list)
+    input_token_logprobs_idx: list[int] = dataclasses.field(default_factory=list)
+    output_token_logprobs_val: list[float] = dataclasses.field(default_factory=list)
+    output_token_logprobs_idx: list[int] = dataclasses.field(default_factory=list)
+    input_top_logprobs_val: list[list[float]] = dataclasses.field(default_factory=list)
+    input_top_logprobs_idx: list[list[int]] = dataclasses.field(default_factory=list)
+    output_top_logprobs_val: list[list[float]] = dataclasses.field(default_factory=list)
+    output_top_logprobs_idx: list[list[int]] = dataclasses.field(default_factory=list)
+    output_token_ids_logprobs_val: list[list[float]] = dataclasses.field(default_factory=list)
+    output_token_ids_logprobs_idx: list[list[int]] = dataclasses.field(default_factory=list)
+
+    # Session state
+    session_id: str | None = None
+    is_session_request: bool = False
+
+
+class GrpcRequestManager:
+    """
+    Manages gRPC request lifecycle, mimicking TokenizerManager's orchestration
+    behaviors without tokenization.
+    """
+
+    def __init__(
+        self,
+        server_args: ServerArgs,
+        port_args: PortArgs,
+        bootstrap_server=None,
+    ):
+        """Initialize the gRPC request manager."""
+        self.server_args = server_args
+        self.port_args = port_args
+
+        # ZMQ Communication Setup (same pattern as TokenizerManager)
+        self.context = zmq.asyncio.Context(2)
+
+        # Socket for receiving outputs from scheduler
+        # If skip_tokenizer_init mode, scheduler sends outputs to tokenizer_ipc_name.
+        self.recv_ipc_name = (
+            port_args.tokenizer_ipc_name
+            if server_args.skip_tokenizer_init
+            else port_args.detokenizer_ipc_name
+        )
+        self.recv_from_scheduler = get_zmq_socket(
+            self.context, zmq.PULL, self.recv_ipc_name, bind=True
+        )
+
+        # Communicator responses (ProfileReqOutput, FlushCacheReqOutput, ...)
+        # always arrive on tokenizer_ipc_name via the scheduler's
+        # send_to_tokenizer path. In skip_tokenizer_init mode
+        # recv_from_scheduler already binds that endpoint, so generation
+        # outputs and communicator responses share one socket; otherwise a
+        # second socket is needed for communicator responses.
+        if server_args.skip_tokenizer_init:
+            self.recv_from_tokenizer = None
+        else:
+            self.recv_from_tokenizer = get_zmq_socket(
+                self.context, zmq.PULL, port_args.tokenizer_ipc_name, bind=True
+            )
+
+        # Socket for sending requests to scheduler
+        self.send_to_scheduler = get_zmq_socket(
+            self.context, zmq.PUSH, port_args.scheduler_input_ipc_name, bind=True
+        )
+
+        # State Management (from TokenizerManager)
+        self.rid_to_state: dict[str, GrpcReqState] = {}
+        self.output_adapter = SchedulerOutputAdapter(allow_empty_rows=True)
+        self.asyncio_tasks: set = set()
+        self.gracefully_exit = False
+        self.no_create_loop = False
+        self.event_loop = None
+
+        # Pause/Resume Control
+        self.is_pause = False
+        self.is_pause_cond = asyncio.Condition()
+
+        # Metrics. SGLang's gRPC entrypoint sets up the multiprocess
+        # registry before constructing this manager; its HTTP sidecar scrapes it.
+        self.last_receive_tstamp = real_time()
+        self.metrics_collector = None
+        if server_args.enable_metrics:
+            # Keep Prometheus initialization behind --enable-metrics and after
+            # the entrypoint has configured PROMETHEUS_MULTIPROC_DIR.
+            from sglang.srt.observability.metrics_collector import TokenizerMetricsCollector
+
+            labels = {
+                "model_name": server_args.served_model_name,
+                "engine_type": DisaggregationMode.to_engine_type(server_args.disaggregation_mode),
+            }
+            if getattr(server_args, "enable_priority_scheduling", False):
+                labels["priority"] = ""
+            for label in (
+                getattr(server_args, "tokenizer_metrics_allowed_custom_labels", None) or []
+            ):
+                labels[label] = ""
+            labels.update(getattr(server_args, "extra_metric_labels", None) or {})
+            self.metrics_collector = TokenizerMetricsCollector(
+                server_args=server_args,
+                labels=labels,
+                bucket_time_to_first_token=server_args.bucket_time_to_first_token,
+                bucket_e2e_request_latency=server_args.bucket_e2e_request_latency,
+                bucket_inter_token_latency=server_args.bucket_inter_token_latency,
+            )
+            # Collector versions differ in streaming labels and optional log
+            # fields. Resolve optional arguments once, not on every output.
+            self._ttft_metric_parameters = inspect.signature(
+                self.metrics_collector.observe_time_to_first_token
+            ).parameters
+            self._finished_metric_parameters = inspect.signature(
+                self.metrics_collector.observe_one_finished_request
+            ).parameters
+
+        # Crash dump for debugging
+        self.crash_dump_request_list = []
+        self.crash_dump_performed = False
+
+        # disaggregation mode
+        self.disaggregation_mode = DisaggregationMode(server_args.disaggregation_mode)
+        # Tracing: each request's trace starts from the Router's context in the
+        # call's metadata (as the tokenizer manager starts it from an HTTP
+        # request's headers), see `_req_stats_init`.
+        self.enable_trace = _tracing_enabled()
+
+        # Bootstrap server (passed from serve_grpc, not started here)
+        self.bootstrap_server = bootstrap_server
+
+        # Schedulers publish per-dp-rank LoadSnapshots (SHM; zmq for
+        # multi-node DP). This manager fills sglang's TokenizerManager role.
+        # sglang 0.5.18 dropped the server_args parameter; the reader now
+        # derives dp_size from the process-global parallel config itself.
+        self.load_snapshot_reader = create_load_snapshot_reader(
+            port_args, caller="TokenizerManager"
+        )
+
+        # Communicators for request/response patterns with scheduler
+        # Note: These must be initialized after send_to_scheduler socket is created
+        self.profile_communicator = _GrpcCommunicator(
+            self.send_to_scheduler, fan_out=server_args.dp_size
+        )
+        self.flush_cache_communicator = _GrpcCommunicator(
+            self.send_to_scheduler, fan_out=server_args.dp_size
+        )
+        self.get_internal_state_communicator = _GrpcCommunicator(
+            self.send_to_scheduler, fan_out=server_args.dp_size
+        )
+
+        logger.info(
+            f"GrpcRequestManager initialized with ZMQ IPC: "
+            f"recv={self.recv_ipc_name}, "
+            f"send={port_args.scheduler_input_ipc_name}"
+        )
+        if self.bootstrap_server:
+            logger.info(
+                f"Bootstrap server initialized for disaggregation mode: "
+                f"{server_args.disaggregation_mode}"
+            )
+
+    async def generate_request(
+        self,
+        obj: TokenizedGenerateReqInput,
+        request_id: str | None = None,
+        grpc_context: grpc.aio.ServicerContext | None = None,
+    ) -> AsyncGenerator[dict | list[dict], None]:
+        """
+        Submit a generation request to the scheduler with n>1 parallel sampling support.
+
+        This method implements the same two-phase approach as tokenizer_manager.py:
+        1. Phase 1: Send prefix caching request (max_new_tokens=0)
+        2. Phase 2: Send n generation requests that reuse the cached prefix
+
+        Yields individual responses for streaming, or aggregated responses for non-streaming.
+        """
+        n = getattr(obj.sampling_params, "n", 1)
+
+        if n <= 1:
+            # Closing this stream closes the handler with it: a consumer that
+            # leaves after an output (the health probe does, on its first)
+            # has the request's state released before its close returns,
+            # not when the garbage collector finalizes the abandoned handler.
+            async with aclosing(
+                self._handle_single_request(obj, request_id, grpc_context)
+            ) as responses:
+                async for response in responses:
+                    yield response
+            return
+
+        # N>1 handling - two-phase approach
+        logger.debug(f"Multiple sampling request (n={n}), using two-phase approach")
+
+        # Generate base request ID if not provided
+        if request_id is None:
+            base_request_id = f"grpc-{uuid.uuid4().hex}"
+        else:
+            base_request_id = request_id
+
+        # Phase 1: Cache the common prefix
+        logger.debug(f"Phase 1: Caching prefix for request {base_request_id}")
+        prefix_obj = copy.copy(obj)
+        prefix_obj.sampling_params = copy.copy(obj.sampling_params)
+        prefix_obj.sampling_params.max_new_tokens = 0  # Prefill-only
+        prefix_obj.sampling_params.n = 1  # Don't replicate prefix request
+
+        # Send prefix caching request and consume response
+        async for _ in self._handle_single_request(
+            prefix_obj, f"{base_request_id}-prefix", grpc_context, log_metrics=False
+        ):
+            # Consume prefix response (usually just one chunk with finish_reason)
+            pass
+
+        logger.debug(f"Phase 1 completed: Prefix cached for {base_request_id}")
+
+        # Phase 2: Generate n parallel requests
+        logger.debug(f"Phase 2: Generating {n} parallel requests")
+        generators = []
+        request_ids = []
+
+        for i in range(n):
+            # Create individual generation request
+            gen_obj = copy.copy(obj)
+            gen_obj.sampling_params = copy.copy(obj.sampling_params)
+            gen_obj.sampling_params.n = 1  # Each request generates 1 response
+
+            gen_request_id = f"{base_request_id}-{i}"
+            request_ids.append(gen_request_id)
+
+            # Start generation request
+            generators.append(self._handle_single_request(gen_obj, gen_request_id, grpc_context))
+
+        # Handle response aggregation
+        is_stream = getattr(obj, "stream", False)
+
+        if not is_stream:
+            # Non-streaming: collect all responses and return as batch
+            logger.debug(f"Non-streaming mode: collecting {n} responses")
+            responses = []
+            for generator in generators:
+                async for response in generator:
+                    responses.append(response)
+            yield responses  # Return all responses as a batch
+        else:
+            # Streaming mode: multiplex responses with index for ordering
+            logger.debug(f"Streaming mode: multiplexing {n} streams")
+            rid_to_index = {rid: i for i, rid in enumerate(request_ids)}
+            # The sub-requests still running, by their handler generator.
+            live = dict(zip(generators, request_ids))
+
+            # Create async tasks for all generators
+            task_map = {}
+            for generator in generators:
+                task = asyncio.create_task(generator.__anext__())
+                task_map[task] = generator
+
+            # Process responses as they arrive. The consumer may leave at any
+            # point (the client cancelled, the stream was closed downstream):
+            # ``asyncio.wait`` does not cancel the tasks it waits on, so the
+            # sub-requests still running are aborted and closed on the way out,
+            # as a single request's cancel aborts it.
+            try:
+                while task_map:
+                    done, _ = await asyncio.wait(
+                        task_map.keys(), return_when=asyncio.FIRST_COMPLETED
+                    )
+
+                    for task in done:
+                        generator = task_map.pop(task)
+                        try:
+                            response = await task
+
+                            # Add index for client-side ordering
+                            if isinstance(response, dict):
+                                response_rid = response.get("request_id", "")
+                                if response_rid in rid_to_index:
+                                    response["index"] = rid_to_index[response_rid]
+
+                            yield response
+
+                            # Create next task for this generator
+                            next_task = asyncio.create_task(generator.__anext__())
+                            task_map[next_task] = generator
+
+                        except StopAsyncIteration:
+                            # This generator is finished
+                            live.pop(generator, None)
+            finally:
+                if live:
+                    await self._abort_sub_requests(live, task_map)
+
+    async def _abort_sub_requests(
+        self,
+        live: dict[AsyncGenerator, str],
+        task_map: dict[asyncio.Task, AsyncGenerator],
+    ) -> None:
+        """Abort the sub-requests of a multiplexed n>1 stream whose consumer left
+        while they were still running, and close their handlers.
+
+        A handler waiting on the scheduler has a pending task: cancelling it
+        delivers the cancel to the handler, which runs its own path (abort at
+        the scheduler, cleanup, the root span ended). A handler parked at its
+        yield, its output read by the consumer or not yet read, is past the
+        point a cancel reaches: its abort is sent here, then the handler is
+        closed and cleans up as it does on any exit.
+        """
+        task_of = {generator: task for task, generator in task_map.items()}
+        pending = [task for task in task_of.values() if not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.wait(pending)
+        for generator, request_id in live.items():
+            task = task_of.get(generator)
+            if task is not None and not task.cancelled() and task.exception() is not None:
+                # the handler finished or failed on its own (StopAsyncIteration
+                # when the loop had not consumed its end yet); the exception is
+                # retrieved here, so the loop does not log it
+                pass
+            # The request's own state decides: a handler that took the cancel
+            # (pending, or cancelled before it resumed: the cancel is thrown
+            # in at its ``yield``) removed it on its abort path; a handler
+            # parked at its ``yield`` with no task, or whose task already
+            # completed with an unread output, is still registered and is
+            # aborted here.
+            if request_id in self.rid_to_state:
+                await self.abort_request(request_id)
+            await generator.aclose()
+
+    async def _handle_single_request(
+        self,
+        obj: TokenizedGenerateReqInput,
+        request_id: str | None = None,
+        grpc_context: grpc.aio.ServicerContext | None = None,
+        *,
+        log_metrics: bool = True,
+    ):
+        """Handle a single request - core implementation without n>1 logic."""
+        # Generate request ID if not provided
+        if request_id is None:
+            request_id = f"grpc-{uuid.uuid4().hex}"
+
+        obj.rid = request_id
+
+        self._req_stats_init(obj, grpc_context)
+        state = self.rid_to_state[request_id]
+        state.log_metrics = (
+            log_metrics
+            and getattr(obj, "log_metrics", True)
+            and getattr(getattr(obj, "sampling_params", None), "max_new_tokens", None) != 0
+            and not request_id.startswith(("HEALTH_CHECK", "WARMUP_", "smg-warmup-"))
+        )
+        self.record_request_for_crash_dump(obj)
+
+        try:
+            # Send to scheduler - let exceptions bubble up to grpc_server.py
+            state.time_stats.set_api_server_dispatch_time()
+            await self._send_to_scheduler(obj)
+            state.time_stats.set_api_server_dispatch_finish_time()
+
+            is_stream = getattr(obj, "stream", False)
+
+            while True:
+                try:
+                    response = await state.out_queue.get()
+
+                    if is_stream:
+                        yield response
+
+                    # Non-streaming: yield final response with accumulated tokens from state
+                    if isinstance(response, dict) and response.get("finished", False):
+                        if not is_stream:
+                            final_response = response.copy()
+                            final_response["token_ids"] = state.output_ids
+                            yield final_response
+                        break
+
+                except asyncio.CancelledError:
+                    # Task was cancelled by gRPC framework when client disconnected
+                    logger.info(f"Request {request_id} cancelled by client")
+                    await self.abort_request(request_id)
+                    raise  # Re-raise to let gRPC server handle cleanup
+
+        finally:
+            # Always clean up request state when exiting
+            self._cleanup_request_state(request_id)
+
+    def _cleanup_request_state(self, request_id: str):
+        """Drop the request's local state (the scheduler is not notified) and,
+        when no terminal output finished its time stats, finish them here: the
+        client cancelled mid-stream, the scheduler refused or aborted the
+        request, or the dispatch failed. The finish ends the request's root
+        trace span and the slices still open under it, as the terminal output
+        would have; a span left open never reaches the collector and keeps the
+        request's trace context alive."""
+        self.output_adapter.forget(request_id)
+        state = self.rid_to_state.pop(request_id, None)
+        if state is not None and not state.time_stats.finished_time:
+            state.time_stats.set_finished_time()
+
+    async def embedding_request(
+        self,
+        obj: TokenizedEmbeddingReqInput,
+        request_id: str | None = None,
+    ) -> asyncio.Future:
+        """
+        Submit an embedding request to the scheduler.
+        Returns a future that will contain the embedding result.
+        """
+        # Generate request ID if not provided
+        if request_id is None:
+            request_id = f"grpc-embed-{uuid.uuid4().hex}"
+
+        obj.rid = request_id
+
+        self._req_stats_init(obj)
+        state = self.rid_to_state[request_id]
+
+        # Create future for result
+        future = asyncio.Future()
+
+        # Send to scheduler
+        try:
+            state.time_stats.set_api_server_dispatch_time()
+            await self._send_to_scheduler(obj)
+            state.time_stats.set_api_server_dispatch_finish_time()
+        except Exception as e:
+            self._cleanup_request_state(request_id)
+            future.set_exception(e)
+            return future
+
+        # Wait for result in background
+        async def wait_for_result():
+            try:
+                await state.event.wait()
+                result = await state.out_queue.get()
+                future.set_result(result)
+            except Exception as e:
+                future.set_exception(e)
+            finally:
+                self._cleanup_request_state(request_id)
+
+        asyncio.create_task(wait_for_result())
+        return future
+
+    async def abort_request(self, request_id: str, finished_reason: dict | None = None) -> bool:
+        """Abort a running request.
+
+        Wake local consumers and dispatch an abort to the scheduler.
+
+        The return value reports dispatch success, not engine termination.
+        """
+        # Skip aborting health check requests (they clean themselves up)
+        if request_id.startswith("HEALTH_CHECK"):
+            return False
+
+        # A running scheduler request need not return AbortReq. Finish locally
+        # before dispatch, even if dispatch fails; the consumer owns cleanup.
+        await self._handle_abort_req(AbortReq(rid=request_id, finished_reason=finished_reason))
+
+        abort_req = AbortReq(rid=request_id)
+        try:
+            await self._send_to_scheduler(abort_req)
+            logger.debug(f"Sent abort to scheduler for request {request_id}")
+        except Exception as e:
+            logger.error(f"Failed to send abort request to scheduler: {e}")
+            return False
+
+        return True
+
+    async def handle_loop(self):
+        """
+        Main event loop - processes outputs from scheduler.
+        Mimics TokenizerManager's handle_loop.
+        """
+        while not self.gracefully_exit:
+            try:
+                # Receive from scheduler
+                recv_obj = await self.recv_from_scheduler.recv_pyobj()
+                self.last_receive_tstamp = real_time()
+
+                # Check for pause (optimized: check flag before acquiring lock)
+                if self.is_pause:
+                    async with self.is_pause_cond:
+                        while self.is_pause:
+                            await self.is_pause_cond.wait()
+
+                # Handle different output types
+                if isinstance(recv_obj, BatchTokenIDOutput):
+                    await self._handle_batch_output(recv_obj)
+                elif isinstance(recv_obj, BatchEmbeddingOutput):
+                    await self._handle_embedding_output(recv_obj)
+                elif isinstance(recv_obj, HealthCheckOutput):
+                    await self._handle_health_check_output(recv_obj)
+                elif isinstance(recv_obj, AbortReq):
+                    await self._handle_abort_req(recv_obj)
+                elif self._dispatch_communicator_output(recv_obj):
+                    # Communicator responses arrive here in skip_tokenizer_init
+                    # mode, where this socket is bound to tokenizer_ipc_name.
+                    pass
+                else:
+                    logger.warning(f"Unknown output type: {type(recv_obj)}")
+
+            except zmq.error.Again:
+                # Timeout, check if we should exit
+                if self.gracefully_exit:
+                    break
+                continue
+            except zmq.error.ZMQError as e:
+                # Socket closed or other ZMQ error - exit cleanly if shutting down
+                if self.gracefully_exit:
+                    logger.debug(f"ZMQ recv interrupted during shutdown: {e}")
+                    break
+                logger.error(f"ZMQ error in handle loop: {e}\n{get_exception_traceback()}")
+                break
+            except Exception as e:
+                logger.error(f"Handle loop error: {e}\n{get_exception_traceback()}")
+                if self.gracefully_exit:
+                    break
+
+    def _dispatch_communicator_output(self, recv_obj) -> bool:
+        """Route a communicator response from the scheduler to its communicator.
+
+        Returns True when the object was a recognized communicator response.
+        """
+        if isinstance(recv_obj, ProfileReqOutput):
+            self.profile_communicator.handle_recv(recv_obj)
+        elif isinstance(recv_obj, FlushCacheReqOutput):
+            self.flush_cache_communicator.handle_recv(recv_obj)
+        elif isinstance(recv_obj, GetInternalStateReqOutput):
+            self.get_internal_state_communicator.handle_recv(recv_obj)
+        else:
+            return False
+        return True
+
+    async def _handle_tokenizer_loop(self):
+        """Process outputs from the scheduler's send_to_tokenizer path.
+
+        The scheduler sends communicator responses (ProfileReqOutput,
+        FlushCacheReqOutput, ...) and busy-path health signals directly to
+        tokenizer_ipc_name, not through the detokenizer. This loop only runs
+        when recv_from_tokenizer is a dedicated socket — in skip_tokenizer_init
+        mode those responses arrive on recv_from_scheduler and are dispatched
+        by handle_loop instead.
+        """
+        while not self.gracefully_exit:
+            try:
+                recv_obj = await self.recv_from_tokenizer.recv_pyobj()
+                if isinstance(recv_obj, HealthCheckOutput):
+                    self.last_receive_tstamp = real_time()
+                    if getattr(recv_obj, "rid", None):
+                        await self._handle_health_check_output(recv_obj)
+                elif isinstance(recv_obj, AbortReq):
+                    await self._handle_abort_req(recv_obj)
+                elif not self._dispatch_communicator_output(recv_obj):
+                    logger.warning(f"Unknown type on tokenizer socket: {type(recv_obj)}")
+            except zmq.error.Again:
+                if self.gracefully_exit:
+                    break
+                continue
+            except zmq.error.ZMQError as e:
+                if self.gracefully_exit:
+                    logger.debug(f"ZMQ recv interrupted during shutdown: {e}")
+                    break
+                logger.error(f"ZMQ error in tokenizer loop: {e}\n{get_exception_traceback()}")
+                break
+            except Exception as e:
+                logger.error(f"Tokenizer loop error: {e}\n{get_exception_traceback()}")
+                if self.gracefully_exit:
+                    break
+
+    def _convert_logprob_style(
+        self,
+        state: GrpcReqState,
+        batch_out: BatchTokenIDOutput,
+        batch_index: int,
+    ):
+        """
+        Convert and accumulate logprobs from batch output to state.
+        Follows the same logic as tokenizer_manager.convert_logprob_style.
+        """
+        selected_values = getattr(batch_out, "output_token_ids_logprobs_val", None) or []
+        selected_ids = getattr(batch_out, "output_token_ids_logprobs_idx", None) or []
+        if selected_values or selected_ids:
+            batch_size = len(batch_out.rids)
+            if len(selected_values) != batch_size or len(selected_ids) != batch_size:
+                raise ValueError(
+                    "Malformed selected-token logprobs: batch columns do not match request count"
+                )
+            _validate_token_ids_logprobs(
+                selected_values[batch_index] or [], selected_ids[batch_index] or []
+            )
+
+        # Each column is independent: prefill-only scoring may have a selected
+        # candidate row with neither input nor sampled-token logprobs.
+        columns = [
+            "input_token_logprobs_val",
+            "input_token_logprobs_idx",
+            "output_token_logprobs_val",
+            "output_token_logprobs_idx",
+            "output_token_ids_logprobs_val",
+            "output_token_ids_logprobs_idx",
+        ]
+        if state.obj.top_logprobs_num > 0:
+            columns.extend(
+                (
+                    "input_top_logprobs_val",
+                    "input_top_logprobs_idx",
+                    "output_top_logprobs_val",
+                    "output_top_logprobs_idx",
+                )
+            )
+        for name in columns:
+            column = getattr(batch_out, name, None)
+            if column and batch_index < len(column) and column[batch_index]:
+                getattr(state, name).extend(column[batch_index])
+
+    async def _handle_batch_output(self, batch_out: BatchTokenIDOutput):
+        """Deliver generation output, terminating affected requests on invalid batches."""
+        try:
+            rows, prompts, cached = self.output_adapter.read(batch_out)
+        except Exception as exc:
+            # Dropping a rejected terminal batch would leave consumers waiting
+            # forever. The batch cannot be split reliably after normalization
+            # fails, so terminate every active member and stop remaining decode.
+            logger.exception("Failed to normalize scheduler generation output")
+            reason = {"type": "abort", "message": str(exc), "status_code": 500}
+            for rid in batch_out.rids:
+                self.output_adapter.forget(rid)
+                state = self.rid_to_state.get(rid)
+                if state is not None and not state.finished:
+                    await self.abort_request(rid, finished_reason=reason)
+            return
+        # Collect all queue.put() tasks for parallel execution
+        put_tasks = []
+        cleanup_tasks = []
+
+        # Process each request in the batch
+        for i, rid in enumerate(batch_out.rids):
+            if rid not in self.rid_to_state:
+                self.output_adapter.forget(rid)
+                continue
+
+            state = self.rid_to_state[rid]
+
+            # Skip if already aborted/finished locally (client cancelled)
+            if state.finished:
+                self.output_adapter.forget(rid)
+                logger.debug(f"Skipping output for aborted request {rid}")
+                continue
+
+            # Extract output for this request
+            prompt_tokens = prompts[i]
+            completion_tokens = batch_out.completion_tokens[i] if batch_out.completion_tokens else 0
+            cached_tokens = cached[i]
+            reasoning_tokens_list = getattr(batch_out, "reasoning_tokens", None)
+            reasoning_tokens = reasoning_tokens_list[i] if reasoning_tokens_list else 0
+            token_ids = rows[i]
+
+            # A retracted prefill can emit a nonterminal zero-token output.
+            # Preserve the previous output timestamp until ITL has been observed,
+            # and do not mistake that output for the first generated token.
+            first_output_time = None
+            if completion_tokens > 0 and state.time_stats.first_token_time == 0.0:
+                state.time_stats.set_first_token_time()
+                first_output_time = state.time_stats.first_token_time
+
+            finished = batch_out.finished_reasons[i] is not None
+            finish_reason = batch_out.finished_reasons[i] if batch_out.finished_reasons[i] else None
+
+            output_data = {
+                "request_id": rid,
+                "token_ids": token_ids,
+                "finished": finished,
+                "meta_info": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "cached_tokens": cached_tokens,
+                    "reasoning_tokens": reasoning_tokens,
+                    "finish_reason": finish_reason,
+                },
+            }
+
+            # Scheduler counters are cumulative snapshots, not per-chunk deltas.
+            # Only forward actual engine counters; verify counts cannot determine
+            # proposal totals when speculative decoding uses adaptive draft sizes.
+            for key in ("spec_num_correct_drafts", "spec_num_proposed_drafts"):
+                counters = getattr(batch_out, key, None)
+                if counters is not None and i < len(counters) and counters[i] is not None:
+                    # Proto scalar defaults cannot distinguish unknown accepted from
+                    # measured zero. Proposals alone would falsely imply all rejected.
+                    if (
+                        key == "spec_num_proposed_drafts"
+                        and "spec_num_correct_drafts" not in output_data["meta_info"]
+                    ):
+                        continue
+                    output_data["meta_info"][key] = counters[i]
+
+            # Accumulate logprobs (following tokenizer_manager pattern)
+            # Use getattr for safe access - not all request types have return_logprob
+            # (e.g., TokenizedEmbeddingReqInput)
+            if getattr(state.obj, "return_logprob", False):
+                try:
+                    self._convert_logprob_style(state, batch_out, i)
+                except ValueError as exc:
+                    # Raising out of this loop would strand the waiting client.
+                    # Finish with an engine error and stop any remaining decode.
+                    reason = {"type": "abort", "message": str(exc), "status_code": 500}
+                    if not finished:
+                        await self.abort_request(rid, finished_reason=reason)
+                    else:
+                        await self._handle_abort_req(AbortReq(rid=rid, finished_reason=reason))
+                    continue
+
+            # Send input logprobs based if available
+            if (
+                getattr(state.obj, "return_logprob", False)
+                and state.obj.logprob_start_len >= 0
+                and state.input_token_logprobs_val
+            ):
+                if state.obj.stream and not state.input_logprobs_sent:
+                    # Streaming: send input logprobs once in first chunk that has them
+                    output_data["input_logprobs"] = {
+                        "token_logprobs_val": state.input_token_logprobs_val,
+                        "token_logprobs_idx": state.input_token_logprobs_idx,
+                        "top_logprobs_val": state.input_top_logprobs_val,
+                        "top_logprobs_idx": state.input_top_logprobs_idx,
+                    }
+                    state.input_logprobs_sent = True
+                elif not state.obj.stream and output_data["finished"]:
+                    # Non-streaming: send input logprobs in final chunk
+                    output_data["input_logprobs"] = {
+                        "token_logprobs_val": state.input_token_logprobs_val,
+                        "token_logprobs_idx": state.input_token_logprobs_idx,
+                        "top_logprobs_val": state.input_top_logprobs_val,
+                        "top_logprobs_idx": state.input_top_logprobs_idx,
+                    }
+
+            # Send output logprobs if available
+            if getattr(state.obj, "return_logprob", False) and (
+                (
+                    batch_out.output_token_logprobs_val
+                    and i < len(batch_out.output_token_logprobs_val)
+                )
+                or state.output_token_ids_logprobs_val
+            ):
+                if state.obj.stream:
+                    # For streaming: send incremental logprobs (only new tokens in this chunk)
+                    # NOTE: this is different than TokenizerManager, which always accumulates
+                    def get_part(attr_name):
+                        source_list = getattr(batch_out, attr_name, None)
+                        return (
+                            (source_list[i] or []) if source_list and i < len(source_list) else []
+                        )
+
+                    output_data["output_logprobs"] = {
+                        "token_logprobs_val": get_part("output_token_logprobs_val"),
+                        "token_logprobs_idx": get_part("output_token_logprobs_idx"),
+                        "top_logprobs_val": get_part("output_top_logprobs_val"),
+                        "top_logprobs_idx": get_part("output_top_logprobs_idx"),
+                        "token_ids_logprobs_val": get_part("output_token_ids_logprobs_val"),
+                        "token_ids_logprobs_idx": get_part("output_token_ids_logprobs_idx"),
+                    }
+                    if finished and state.output_token_ids_logprobs_val:
+                        # The final stream chunk stays incremental. Complete
+                        # carries every selected row accumulated for the request.
+                        output_data["complete_token_ids_logprobs"] = {
+                            "token_ids_logprobs_val": state.output_token_ids_logprobs_val,
+                            "token_ids_logprobs_idx": state.output_token_ids_logprobs_idx,
+                        }
+                elif output_data["finished"]:
+                    # Non-streaming: send cumulative output logprobs in final chunk
+                    output_data["output_logprobs"] = {
+                        "token_logprobs_val": state.output_token_logprobs_val,
+                        "token_logprobs_idx": state.output_token_logprobs_idx,
+                        "top_logprobs_val": state.output_top_logprobs_val,
+                        "top_logprobs_idx": state.output_top_logprobs_idx,
+                        "token_ids_logprobs_val": state.output_token_ids_logprobs_val,
+                        "token_ids_logprobs_idx": state.output_token_ids_logprobs_idx,
+                    }
+
+            # Update state for accumulation
+            if output_data["token_ids"]:
+                state.output_ids.extend(output_data["token_ids"])
+
+            # Add queue.put() to parallel task list
+            put_tasks.append(state.out_queue.put(output_data))
+
+            # Handle completion
+            if output_data["finished"]:
+                state.finished = True
+                # A first-and-final batch has no decode interval. Reuse its
+                # arrival time rather than fabricating request-level TPOT.
+                state.time_stats.set_finished_time(ts=first_output_time)
+                state.stream_finished = True
+                state.event.set()
+
+                # Remove from tracking after a delay
+                async def cleanup(request_id):
+                    await asyncio.sleep(5.0)
+                    if request_id in self.rid_to_state:
+                        del self.rid_to_state[request_id]
+
+                cleanup_tasks.append(asyncio.create_task(cleanup(rid)))
+
+            try:
+                self._collect_generation_metrics(state, output_data, batch_out, i)
+            except Exception:
+                # Observability must not prevent this or any sibling response.
+                logger.exception("Failed to collect generation metrics for request %s", rid)
+
+        # Execute all queue.put() operations in parallel
+        if put_tasks:
+            await asyncio.gather(*put_tasks, return_exceptions=True)
+
+    def _request_metric_labels(self, state, collector):
+        labels = dict(collector.labels)
+        for key, value in (getattr(state.obj, "custom_labels", None) or {}).items():
+            if key in labels:
+                labels[key] = value
+        if "priority" in labels and getattr(state.obj, "priority", None) is not None:
+            labels["priority"] = str(state.obj.priority)
+        return labels
+
+    def _collect_aborted_metrics(self, state):
+        collector = self.metrics_collector
+        if collector is None or not state.log_metrics or state.abort_observed:
+            return
+        observe_abort = getattr(collector, "observe_one_aborted_request", None)
+        if observe_abort is not None:
+            try:
+                observe_abort(self._request_metric_labels(state, collector))
+            except Exception:
+                # Metrics must never interrupt cancellation or terminal delivery.
+                logger.exception("Failed to record abort metrics for request %s", state.request_id)
+            else:
+                state.abort_observed = True
+
+    def _collect_generation_metrics(self, state, output_data, batch_out, index):
+        """Record worker-local generation metrics using SGLang's collector.
+
+        The clock starts in _req_stats_init, not at router ingress. ITL is
+        token-weighted, matching the HTTP worker's TPOT dashboard definition.
+        """
+        collector = self.metrics_collector
+        if collector is None or not state.log_metrics:
+            return
+
+        meta = output_data["meta_info"]
+        reason = meta["finish_reason"]
+        # Cancellations/errors must not be counted as normal completions.
+        # Already-finished states are skipped by _handle_batch_output.
+        if output_data.get("error") or (isinstance(reason, dict) and reason.get("type") == "abort"):
+            self._collect_aborted_metrics(state)
+            return
+
+        labels = self._request_metric_labels(state, collector)
+
+        completion_tokens = meta["completion_tokens"]
+        if self.disaggregation_mode != DisaggregationMode.PREFILL:
+            if not state.ttft_observed and completion_tokens > 0:
+                ttft_kwargs = {}
+                if "stream" in self._ttft_metric_parameters:
+                    ttft_kwargs["stream"] = bool(state.obj.stream)
+                collector.observe_time_to_first_token(
+                    labels, state.time_stats.get_first_token_latency(), **ttft_kwargs
+                )
+                state.ttft_observed = True
+                state.last_completion_tokens = completion_tokens
+            elif state.ttft_observed:
+                num_new_tokens = completion_tokens - state.last_completion_tokens
+                if num_new_tokens > 0:
+                    collector.observe_inter_token_latency(
+                        labels, state.time_stats.get_interval(), num_new_tokens
+                    )
+                    state.time_stats.set_last_time()
+                    state.last_completion_tokens = completion_tokens
+
+        if output_data["finished"]:
+            sampling = state.obj.sampling_params
+            has_grammar = any(
+                getattr(sampling, name, None)
+                for name in ("json_schema", "regex", "ebnf", "structural_tag")
+            )
+            cache_details = getattr(batch_out, "cached_tokens_details", None)
+            stats = getattr(batch_out, "request_stats", None)
+            request_stats = stats[index] if stats and index < len(stats) else None
+            finished_kwargs = {}
+            if "is_streaming" in self._finished_metric_parameters:
+                finished_kwargs["is_streaming"] = bool(state.obj.stream)
+            if "first_token_time" in self._finished_metric_parameters:
+                finished_kwargs["first_token_time"] = state.time_stats.get_first_token_latency()
+            if "spec_verify_ct" in self._finished_metric_parameters:
+                spec_verify_ct = getattr(batch_out, "spec_verify_ct", None)
+                finished_kwargs["spec_verify_ct"] = (
+                    spec_verify_ct[index] if spec_verify_ct and index < len(spec_verify_ct) else 0
+                )
+            if "time_per_output_token" in self._finished_metric_parameters:
+                finished_kwargs["time_per_output_token"] = (
+                    state.time_stats.get_time_per_output_token(completion_tokens)
+                    if self.disaggregation_mode != DisaggregationMode.PREFILL
+                    and isinstance(reason, dict)
+                    and reason.get("type") in ("stop", "length")
+                    else None
+                )
+            # Reuse the completion hook so E2E and its companion request/token
+            # counters have the same population and buckets as the HTTP worker.
+            collector.observe_one_finished_request(
+                labels=labels,
+                prompt_tokens=meta["prompt_tokens"],
+                generation_tokens=completion_tokens,
+                cached_tokens=meta["cached_tokens"],
+                e2e_latency=state.time_stats.get_e2e_latency(),
+                has_grammar=has_grammar,
+                cached_tokens_details=(
+                    request_stats.cached_tokens_details
+                    if request_stats is not None
+                    else cache_details[index]
+                    if cache_details
+                    else None
+                ),
+                **finished_kwargs,
+            )
+
+    async def _handle_embedding_output(self, batch_out: BatchEmbeddingOutput):
+        """Handle batch embedding output from scheduler."""
+        # Embedding outputs are terminal: no request counts survive this batch.
+        try:
+            prompts, _ = SchedulerOutputAdapter().read_usage(batch_out)
+        except Exception as exc:
+            # Embeddings are terminal, so no scheduler abort is needed.
+            logger.exception("Failed to normalize scheduler embedding output")
+            reason = {"type": "abort", "message": str(exc), "status_code": 500}
+            for rid in batch_out.rids:
+                await self._handle_abort_req(AbortReq(rid=rid, finished_reason=reason))
+            return
+        for i, rid in enumerate(batch_out.rids):
+            if rid not in self.rid_to_state:
+                continue
+
+            state = self.rid_to_state[rid]
+            if state.finished:
+                continue
+
+            # Create result
+            result = {
+                "request_id": rid,
+                "embedding": batch_out.embeddings[i],
+                "prompt_tokens": prompts[i],
+                "finish_reason": (
+                    batch_out.finished_reasons[i] if batch_out.finished_reasons else None
+                ),
+            }
+
+            # Send result
+            await state.out_queue.put(result)
+
+            # Mark as finished
+            state.finished = True
+            state.time_stats.set_finished_time()
+            state.event.set()
+
+    async def _handle_health_check_output(self, health_out: HealthCheckOutput):
+        """Handle health check output from scheduler."""
+        rid = health_out.rid
+
+        if rid not in self.rid_to_state:
+            logger.warning(f"Health check output for unknown request: {rid}")
+            return
+
+        state = self.rid_to_state[rid]
+
+        # Create health check result
+        result = {
+            "request_id": rid,
+            "healthy": True,  # If we got a response, scheduler is healthy
+            "output_text": (health_out.output_str if hasattr(health_out, "output_str") else ""),
+            "finish_reason": (
+                health_out.finish_reason if hasattr(health_out, "finish_reason") else "stop"
+            ),
+        }
+
+        # Send result
+        await state.out_queue.put(result)
+
+        # Mark as finished
+        state.finished = True
+        state.time_stats.set_finished_time()
+        state.event.set()
+
+    async def _handle_abort_req(self, recv_obj: AbortReq):
+        """Handle abort request from scheduler.
+
+        The scheduler sends AbortReq back to notify us that a request was aborted,
+        either due to explicit abort_request() call or scheduler-initiated abort
+        (priority preemption, queue full, KV cache pressure, etc).
+        """
+        # Skip health check requests
+        if recv_obj.rid.startswith("HEALTH_CHECK"):
+            return
+
+        # Check if request still exists
+        self.output_adapter.forget(recv_obj.rid)
+        if recv_obj.rid not in self.rid_to_state:
+            logger.debug(
+                f"Abort request for {recv_obj.rid} not in local state (may have already finished or not started yet)"
+            )
+            return
+
+        state = self.rid_to_state[recv_obj.rid]
+        if state.finished:
+            return
+        self._collect_aborted_metrics(state)
+
+        # Mark as finished; a scheduler-initiated abort ends the request's
+        # root span here, once (a client cancel ended it in abort_request).
+        if self.enable_trace and not state.finished:
+            state.time_stats.set_finished_time()
+        state.finished = True
+        state.stream_finished = True
+
+        # Create abort response
+        if recv_obj.finished_reason:
+            # Scheduler provided a specific finish reason (e.g., priority preemption, queue full)
+            abort_response = {
+                "request_id": recv_obj.rid,
+                "error": recv_obj.finished_reason.get("message", "Request aborted"),
+                "finished": True,
+                "meta_info": {
+                    "id": recv_obj.rid,
+                    "finish_reason": recv_obj.finished_reason,
+                },
+            }
+        else:
+            # Generic abort (e.g., explicit abort_request call)
+            abort_response = {
+                "request_id": recv_obj.rid,
+                "error": "Request aborted",
+                "finished": True,
+                "meta_info": {
+                    "id": recv_obj.rid,
+                    "finish_reason": {
+                        "type": "abort",
+                        "message": "Abort before prefill",
+                    },
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                },
+            }
+
+        # Send abort notification to output queue
+        await state.out_queue.put(abort_response)
+
+        # Wake up any waiting coroutines
+        state.event.set()
+
+        logger.debug(f"Handled abort request for {recv_obj.rid}")
+
+    async def _send_to_scheduler(self, obj):
+        """Send an object to the scheduler via ZMQ."""
+        try:
+            self.send_to_scheduler.send_pyobj(obj)
+        except Exception as e:
+            logger.error(f"Failed to send to scheduler: {e}")
+            raise
+
+    def record_request_for_crash_dump(self, obj):
+        """Record request for potential crash dump."""
+        if len(self.crash_dump_request_list) < 100:
+            self.crash_dump_request_list.append(
+                {
+                    "time": real_time(),
+                    "request_id": getattr(obj, "rid", "unknown"),
+                    "type": type(obj).__name__,
+                }
+            )
+
+    async def shutdown(self):
+        """Gracefully shutdown the request manager."""
+        logger.info("Shutting down GrpcRequestManager")
+        self.gracefully_exit = True
+
+        # Cancel all asyncio tasks FIRST - this will interrupt blocked recv() calls
+        for task in list(self.asyncio_tasks):
+            if not task.done():
+                task.cancel()
+
+        # Give tasks a moment to process cancellation
+        if self.asyncio_tasks:
+            await asyncio.gather(*list(self.asyncio_tasks), return_exceptions=True)
+
+        # Cancel all pending requests
+        for rid, state in list(self.rid_to_state.items()):
+            if not state.finished:
+                await state.out_queue.put({"error": "Server shutting down", "shutdown": True})
+                state.finished = True
+                state.event.set()
+
+        # Wait for tasks to complete
+        if self.asyncio_tasks:
+            await asyncio.gather(*list(self.asyncio_tasks), return_exceptions=True)
+
+        # Shutdown bootstrap server if running
+        if self.bootstrap_server:
+            logger.info("Shutting down bootstrap server")
+            try:
+                if hasattr(self.bootstrap_server, "shutdown"):
+                    if asyncio.iscoroutinefunction(self.bootstrap_server.shutdown):
+                        await self.bootstrap_server.shutdown()
+                    else:
+                        self.bootstrap_server.shutdown()
+            except Exception as e:
+                logger.warning(f"Error shutting down bootstrap server: {e}")
+
+        try:
+            self.load_snapshot_reader.close()
+        except Exception as e:
+            logger.warning(f"Error closing load snapshot reader: {e}")
+
+        # Close ZMQ sockets
+        self.recv_from_scheduler.close()
+        if self.recv_from_tokenizer is not None:
+            self.recv_from_tokenizer.close()
+        self.send_to_scheduler.close()
+
+        # Terminate the ZMQ context - this is critical for asyncio loop to exit cleanly
+        self.context.term()
+
+        logger.info("GrpcRequestManager shutdown complete")
+
+    def get_server_info(self) -> dict[str, Any]:
+        """Get server information for health checks."""
+        return {
+            "active_requests": len(self.rid_to_state),
+            "paused": self.is_pause,
+            "last_receive_time": self.last_receive_tstamp,
+        }
+
+    async def get_loads(self, include: list[str], dp_rank: int | None = None) -> list[LoadSnapshot]:
+        """
+        Get load metrics from the schedulers' published LoadSnapshots.
+
+        Args:
+            include: List of metric sections to include (core, memory, spec, lora, disagg, queues, all)
+            dp_rank: Optional DP rank filter (None for all ranks)
+
+        Returns:
+            List of LoadSnapshot objects, one per scheduler/DP rank
+        """
+        sections = set(include) if include else {"all"}
+        invalid = sections - LoadSnapshot.VALID_SECTIONS
+        if invalid:
+            raise ValueError(
+                f"Invalid include sections: {sorted(invalid)}. "
+                f"Valid options: {sorted(LoadSnapshot.VALID_SECTIONS)}"
+            )
+
+        snapshots = self.load_snapshot_reader.read_all()
+        if dp_rank is not None:
+            snapshots = [s for s in snapshots if s.dp_rank == dp_rank]
+        if "all" not in sections:
+            for snapshot in snapshots:
+                if "memory" not in sections:
+                    snapshot.memory = None
+                if "spec" not in sections:
+                    snapshot.speculative = None
+                if "lora" not in sections:
+                    snapshot.lora = None
+                if "disagg" not in sections:
+                    snapshot.disaggregation = None
+                if "queues" not in sections:
+                    snapshot.queues = None
+        return snapshots
+
+    # Communicators that callers may address through send_communicator_req.
+    _PUBLIC_COMMUNICATORS = frozenset(
+        {
+            "profile_communicator",
+            "flush_cache_communicator",
+            "get_internal_state_communicator",
+        }
+    )
+
+    async def send_communicator_req(self, req, communicator_name: str, timeout: float = 30.0):
+        """Send a request to the scheduler via a named communicator and return responses.
+
+        This is the generic transport method for request/response patterns that
+        go through the scheduler's send_to_tokenizer path (profile, flush_cache,
+        get_internal_state, ...). Business logic (request construction, response
+        interpretation) belongs in the caller — sglang's HTTP sidecar relies on
+        this exact signature, so treat it as a public contract.
+
+        Args:
+            req: The request object to send to the scheduler.
+            communicator_name: Attribute name of the communicator
+                (e.g. "profile_communicator").
+            timeout: Timeout in seconds for the scheduler round-trip.
+
+        Returns:
+            List of response objects from the scheduler(s), one per DP rank.
+
+        Raises:
+            ValueError: If communicator_name is not a known communicator.
+            TimeoutError: If the scheduler does not respond within timeout.
+        """
+        if communicator_name not in self._PUBLIC_COMMUNICATORS:
+            raise ValueError(
+                f"Unknown communicator '{communicator_name}'. "
+                f"Allowed: {sorted(self._PUBLIC_COMMUNICATORS)}"
+            )
+        self.auto_create_handle_loop()
+        communicator = getattr(self, communicator_name)
+        return await communicator(req, timeout=timeout)
+
+    def auto_create_handle_loop(self):
+        """Automatically create and start the handle_loop task, matching TokenizerManager pattern."""
+        if self.no_create_loop:
+            return
+
+        self.no_create_loop = True
+        loop = get_or_create_event_loop()
+        self.asyncio_tasks.add(loop.create_task(print_exception_wrapper(self.handle_loop)))
+        if self.recv_from_tokenizer is not None:
+            self.asyncio_tasks.add(
+                loop.create_task(print_exception_wrapper(self._handle_tokenizer_loop))
+            )
+
+        self.event_loop = loop
+
+        # We only add signal handler when the tokenizer manager is in the main thread
+        # due to the CPython limitation.
+        if threading.current_thread() is threading.main_thread():
+            signal_handler = GrpcSignalHandler(self)
+            loop.add_signal_handler(signal.SIGTERM, signal_handler.sigterm_handler)
+            # Update the signal handler for the process. It overrides the sigquit handler in the launch phase.
+            loop.add_signal_handler(signal.SIGQUIT, signal_handler.running_phase_sigquit_handler)
+
+        self.asyncio_tasks.add(loop.create_task(print_exception_wrapper(self.sigterm_watchdog)))
+
+    async def sigterm_watchdog(self):
+        """Watchdog to handle SIGTERM gracefully, matching TokenizerManager pattern."""
+        while not self.gracefully_exit:
+            await asyncio.sleep(1.0)
+
+    def _req_stats_init(
+        self,
+        obj: TokenizedGenerateReqInput | TokenizedEmbeddingReqInput,
+        grpc_context: grpc.ServicerContext | None = None,
+    ):
+        calibrate_time_diff()
+        # Create and register request state
+        # TODO: support log_request
+        time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
+        if self.enable_trace:
+            # The request's trace starts from the Router's W3C context in the
+            # call's metadata, as the tokenizer manager starts it from an HTTP
+            # request's headers: the engine's spans for the request become
+            # children of the Router's span.
+            metadata = grpc_context.invocation_metadata() if grpc_context is not None else ()
+            time_stats.init_trace_ctx(
+                obj.rid, getattr(obj, "bootstrap_room", None), trace_headers(metadata)
+            )
+        state = GrpcReqState(
+            request_id=obj.rid,
+            grpc_context=grpc_context,
+            out_queue=asyncio.Queue(),
+            finished=False,
+            event=asyncio.Event(),
+            obj=obj,
+            time_stats=time_stats,
+        )
+
+        # Track session if needed
+        if hasattr(obj, "session_params") and obj.session_params:
+            state.session_id = obj.session_params.session_id
+            state.is_session_request = True
+
+        self.rid_to_state[obj.rid] = state
+        time_stats.set_created_time()
+        if self.enable_trace:
+            # The Router tokenized upstream: the tokenize slice the stats open
+            # with ends at once. The scheduler takes the stats over on its copy
+            # of the request, as it does behind the tokenizer manager, so its
+            # slices join the same trace.
+            time_stats.set_tokenize_finish_time()
+            obj.time_stats = time_stats
+
+
+def _tracing_enabled() -> bool:
+    """Whether the engine was started with tracing (``--enable-trace``), from
+    the runtime context this process published."""
+    try:
+        from sglang.srt.runtime_context import get_observability
+    except ImportError:  # an SGLang without the observability bag: no tracing
+        return False
+    return bool(get_observability().enable_trace)
+
+
+def init_request_tracing(thread_label: str = "gRPC Servicer") -> bool:
+    """Initialize SGLang's tracing in this process when the engine was started
+    with it, as SGLang's own HTTP frontend does in the process that fills the
+    tokenizer manager's role: the request manager starts each request's trace
+    (`GrpcRequestManager._req_stats_init`). Returns whether tracing is on."""
+    if not _tracing_enabled():
+        return False
+    try:
+        from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
+        from sglang.srt.runtime_context import get_disagg, get_observability
+    except ImportError as e:  # an SGLang without the tracing modules
+        logger.warning(f"Request tracing unavailable in this SGLang: {e}")
+        return False
+
+    observability = get_observability()
+    try:
+        process_tracing_init(
+            observability.otlp_traces_endpoint,
+            observability.otlp_service_name,
+            trace_modules=observability.trace_modules,
+        )
+    except RuntimeError as e:
+        # SGLang reports a missing OpenTelemetry or a collector it cannot
+        # reach this way; the servicer serves without request traces.
+        logger.warning(f"Request tracing not started: {e}")
+        return False
+    mode = get_disagg().disaggregation_mode
+    if mode == "prefill":
+        thread_label = "Prefill " + thread_label
+    elif mode == "decode":
+        thread_label = "Decode " + thread_label
+    trace_set_thread_info(thread_label)
+    return True
+
+
+async def print_exception_wrapper(func):
+    """
+    Sometimes an asyncio function does not print exception.
+    We do another wrapper to handle the exception.
+    """
+    try:
+        await func()
+    except Exception:
+        traceback = get_exception_traceback()
+        logger.error(f"GrpcRequestManager hit an exception: {traceback}")
+        if hasattr(func, "__self__") and isinstance(func.__self__, GrpcRequestManager):
+            func.__self__.dump_requests_before_crash()
+        kill_process_tree(os.getpid(), include_parent=True)
+        sys.exit(1)

@@ -1,0 +1,523 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "global": {
+      "properties": {
+        "image": {
+          "properties": {
+            "tag": {
+              "type": ["string", "null"],
+              "description": "The router's image tag, and a worker's that names none of its own. A tag is text: a tag of digits alone is quoted. A number is not rendered as written: 1.10 is read as 1.1."
+            }
+          }
+        }
+      }
+    },
+    "router": {
+      "type": "object",
+      "properties": {
+        "policy": {
+          "type": "string",
+          "enum": [
+            "random",
+            "round_robin",
+            "passthrough",
+            "cache_aware",
+            "power_of_two",
+            "least_load",
+            "manual",
+            "consistent_hashing",
+            "prefix_hash",
+            "bucket"
+          ]
+        },
+        "parser": { "type": "string", "enum": ["", "legacy", "symphony"] },
+        "mmTurbojpeg": {
+          "type": "string",
+          "enum": ["prefer", "require"],
+          "description": "What the gateway does when libjpeg-turbo cannot be loaded (--mm-turbojpeg). require refuses to start; prefer decodes JPEGs with the pure-Rust fallback, whose pixels differ from the engine's, and sets smg_mm_turbojpeg_available to 0."
+        },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "maxConcurrentRequests": {
+          "type": "integer",
+          "description": "In-flight requests the gateway admits before shedding with 429 or 503 (--max-concurrent-requests), each permit held for the whole response. -1 derives the bound from the host (1024 per available core, at least 4096); 0 lifts the bound; a positive value is the bound."
+        },
+        "replicas": { "type": "integer", "minimum": 1 },
+        "progressDeadlineSeconds": { "type": "integer", "minimum": 1 },
+        "disaggregation": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "mode": { "type": "string", "enum": ["", "pd", "epd"] },
+            "prefillPolicy": {
+              "type": "string",
+              "enum": [
+                "",
+                "random",
+                "round_robin",
+                "passthrough",
+                "cache_aware",
+                "power_of_two",
+                "least_load",
+                "manual",
+                "consistent_hashing",
+                "prefix_hash",
+                "bucket"
+              ]
+            },
+            "decodePolicy": {
+              "type": "string",
+              "enum": [
+                "",
+                "random",
+                "round_robin",
+                "passthrough",
+                "cache_aware",
+                "power_of_two",
+                "least_load",
+                "manual",
+                "consistent_hashing",
+                "prefix_hash"
+              ]
+            },
+            "encodePolicy": {
+              "type": "string",
+              "enum": ["", "random", "round_robin", "consistent_hashing"]
+            },
+            "prefill": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["url"],
+                "properties": {
+                  "url": { "type": "string", "minLength": 1 },
+                  "bootstrapPort": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 }
+                }
+              }
+            },
+            "decode": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["url"],
+                "properties": { "url": { "type": "string", "minLength": 1 } }
+              }
+            },
+            "encode": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["url"],
+                "properties": {
+                  "url": { "type": "string", "minLength": 1 },
+                  "bootstrapPort": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 }
+                }
+              }
+            }
+          }
+        },
+        "discovery": {
+          "type": "object",
+          "properties": {
+            "provider": {
+              "type": "string",
+              "enum": ["", "kubernetes", "file", "slurm", "consul"]
+            },
+            "checkIntervalSecs": { "type": ["integer", "null"], "minimum": 1 },
+            "kubernetes": {
+              "type": "object",
+              "properties": {
+                "clusterWide": { "type": "boolean" },
+                "namespace": { "type": "string" },
+                "selector": { "type": "string" },
+                "prefillSelector": { "type": "string" },
+                "decodeSelector": { "type": "string" },
+                "encodeSelector": { "type": "string" },
+                "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+                "modelIdFrom": { "type": "string" }
+              }
+            },
+            "file": {
+              "type": "object",
+              "properties": {
+                "configMap": {
+                  "type": "object",
+                  "properties": {
+                    "name": { "type": "string" },
+                    "key": { "type": "string" }
+                  }
+                },
+                "path": { "type": "string" }
+              }
+            },
+            "slurm": {
+              "type": "object",
+              "properties": {
+                "jobNames": { "type": "array", "items": { "type": "string" } },
+                "encodeJobNames": { "type": "array", "items": { "type": "string" } },
+                "prefillJobNames": { "type": "array", "items": { "type": "string" } },
+                "decodeJobNames": { "type": "array", "items": { "type": "string" } },
+                "port": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+                "bootstrapPort": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+                "user": { "type": "string" },
+                "account": { "type": "string" },
+                "partition": { "type": "string" }
+              }
+            },
+            "consul": {
+              "type": "object",
+              "properties": {
+                "service": { "type": "string" },
+                "address": { "type": "string" },
+                "datacenter": { "type": "string" },
+                "token": {
+                  "type": "object",
+                  "properties": {
+                    "existingSecret": { "type": "string" },
+                    "secretKey": { "type": "string" }
+                  }
+                },
+                "tls": {
+                  "type": "object",
+                  "properties": {
+                    "existingSecret": { "type": "string" },
+                    "secretKeys": {
+                      "type": "object",
+                      "properties": {
+                        "caCert": { "type": "string" },
+                        "clientCert": { "type": "string" },
+                        "clientKey": { "type": "string" }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "adminPort": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+        "adminHost": { "type": ["string", "null"] },
+        "adminService": {
+          "type": "object",
+          "properties": {
+            "type": { "type": "string" },
+            "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+            "annotations": { "type": "object" }
+          }
+        },
+        "tenantRateLimit": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "configMap": {
+              "type": "object",
+              "properties": {
+                "name": { "type": "string" },
+                "key": { "type": "string", "minLength": 1 }
+              }
+            }
+          }
+        },
+        "priorityScheduler": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "configMap": {
+              "type": "object",
+              "properties": {
+                "name": { "type": "string" },
+                "key": { "type": "string", "minLength": 1 }
+              }
+            }
+          }
+        },
+        "service": {
+          "type": "object",
+          "properties": {
+            "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+          }
+        },
+        "metrics": {
+          "type": "object",
+          "properties": {
+            "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+          }
+        },
+        "autoscaling": {
+          "type": "object",
+          "properties": {
+            "minReplicas": { "type": "integer", "minimum": 1 },
+            "maxReplicas": { "type": "integer", "minimum": 1 },
+            "targetCPUUtilizationPercentage": { "type": "integer", "minimum": 1, "maximum": 100 }
+          }
+        }
+      }
+    },
+    "auth": {
+      "type": "object",
+      "properties": {
+        "rateLimitTokensPerSecond": { "type": "integer" },
+        "controlPlane": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "existingSecret": { "type": "string" },
+            "apiKeys": { "type": "string" },
+            "secretKey": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    },
+    "history": {
+      "type": "object",
+      "properties": {
+        "backend": {
+          "type": "string",
+          "enum": ["none", "memory", "postgres", "redis", "oracle"]
+        },
+        "postgres": {
+          "type": "object",
+          "properties": {
+            "url": { "type": "string" },
+            "existingSecret": { "type": "string" },
+            "secretKey": { "type": "string" },
+            "poolMax": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "redis": {
+          "type": "object",
+          "properties": {
+            "url": { "type": "string" },
+            "existingSecret": { "type": "string" },
+            "secretKey": { "type": "string" },
+            "poolMax": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "oracle": {
+          "type": "object",
+          "properties": {
+            "dsn": { "type": "string" },
+            "user": { "type": "string" },
+            "password": { "type": "string" },
+            "existingSecret": { "type": "string" },
+            "secretKeys": {
+              "type": "object",
+              "properties": {
+                "dsn": { "type": "string" },
+                "user": { "type": "string" },
+                "password": { "type": "string" }
+              }
+            },
+            "poolMax": { "type": "integer", "minimum": 1 }
+          }
+        }
+      }
+    },
+    "policyController": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "if": {
+        "required": ["enabled"],
+        "properties": { "enabled": { "const": true } }
+      },
+      "then": {
+        "required": [
+          "replicas",
+          "ports",
+          "service",
+          "logging",
+          "runtimeWorkerThreads",
+          "podDisruptionBudget",
+          "securityContext",
+          "livenessProbe",
+          "readinessProbe",
+          "shutdownGracePeriodSeconds",
+          "terminationGraceMarginSeconds"
+        ],
+        "if": {
+          "required": ["specStoreClaim"],
+          "properties": { "specStoreClaim": { "type": "string", "minLength": 1 } }
+        },
+        "else": {
+          "required": ["spec"],
+          "properties": { "spec": { "type": "object", "minProperties": 1 } }
+        },
+        "properties": {
+          "replicas": { "type": "integer" },
+          "ports": {
+            "type": "object",
+            "required": ["gateway", "control", "replication", "admin"],
+            "properties": {
+              "gateway": { "type": "integer" },
+              "control": { "type": "integer" },
+              "replication": { "type": "integer" },
+              "admin": { "type": "integer" }
+            }
+          },
+          "service": {
+            "type": "object",
+            "required": ["type"],
+            "properties": { "type": { "type": "string" } }
+          },
+          "logging": {
+            "type": "object",
+            "required": ["level"],
+            "properties": { "level": { "type": "string" } }
+          },
+          "runtimeWorkerThreads": { "type": "integer" },
+          "podDisruptionBudget": {
+            "type": "object",
+            "required": ["minAvailable"],
+            "properties": { "minAvailable": { "type": ["integer", "string"] } }
+          },
+          "securityContext": { "type": "object" },
+          "livenessProbe": {
+            "type": "object",
+            "required": ["path", "initialDelaySeconds", "periodSeconds"],
+            "properties": {
+              "path": { "type": "string" },
+              "initialDelaySeconds": { "type": "integer" },
+              "periodSeconds": { "type": "integer" }
+            }
+          },
+          "readinessProbe": {
+            "type": "object",
+            "required": ["path", "initialDelaySeconds", "periodSeconds"],
+            "properties": {
+              "path": { "type": "string" },
+              "initialDelaySeconds": { "type": "integer" },
+              "periodSeconds": { "type": "integer" }
+            }
+          },
+          "shutdownGracePeriodSeconds": { "type": "integer" },
+          "terminationGraceMarginSeconds": { "type": "integer" }
+        }
+      },
+      "properties": {
+        "enabled": { "type": ["boolean", "null"] },
+        "image": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "registry": { "type": ["string", "null"] },
+            "repository": { "type": ["string", "null"] },
+            "tag": { "type": ["string", "null"] }
+          }
+        },
+        "replicas": { "type": ["integer", "null"], "minimum": 1 },
+        "election": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": ["boolean", "null"] },
+            "leaseName": {
+              "type": ["string", "null"],
+              "maxLength": 253,
+              "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+            }
+          }
+        },
+        "spec": { "type": ["object", "null"] },
+        "specStoreClaim": {
+          "type": ["string", "null"],
+          "maxLength": 253,
+          "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+        },
+        "ports": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "gateway": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+            "control": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+            "replication": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+            "admin": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 }
+          }
+        },
+        "identityAsTold": {
+          "description": "Nothing is verified on a listener named here: whoever reaches its port acts as any principal of its scopes.",
+          "type": ["array", "null"],
+          "uniqueItems": true,
+          "items": { "type": "string", "enum": ["gateway", "control", "replication"] }
+        },
+        "service": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "type": ["string", "null"], "minLength": 1 },
+            "annotations": { "type": ["object", "null"] }
+          }
+        },
+        "logging": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "level": { "type": ["string", "null"], "enum": ["debug", "info", "warn", "error", null] },
+            "json": { "type": ["boolean", "null"] }
+          }
+        },
+        "resources": { "type": ["object", "null"] },
+        "runtimeWorkerThreads": { "type": ["integer", "null"], "minimum": 0, "maximum": 4096 },
+        "nodeSelector": { "type": ["object", "null"] },
+        "tolerations": { "type": ["array", "null"] },
+        "affinity": { "type": ["object", "null"] },
+        "podAnnotations": { "type": ["object", "null"] },
+        "podLabels": { "type": ["object", "null"] },
+        "extraArgs": { "type": ["array", "null"] },
+        "extraEnv": { "type": ["array", "null"] },
+        "podDisruptionBudget": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": ["boolean", "null"] },
+            "minAvailable": { "type": ["integer", "string", "null"], "minLength": 1 }
+          }
+        },
+        "securityContext": { "type": ["object", "null"] },
+        "livenessProbe": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "path": { "type": ["string", "null"], "minLength": 1 },
+            "initialDelaySeconds": { "type": ["integer", "null"], "minimum": 0 },
+            "periodSeconds": { "type": ["integer", "null"], "minimum": 1 }
+          }
+        },
+        "readinessProbe": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "path": { "type": ["string", "null"], "minLength": 1 },
+            "initialDelaySeconds": { "type": ["integer", "null"], "minimum": 0 },
+            "periodSeconds": { "type": ["integer", "null"], "minimum": 1 }
+          }
+        },
+        "shutdownGracePeriodSeconds": { "type": ["integer", "null"], "minimum": 1 },
+        "shutdownSettleSeconds": { "type": ["integer", "null"], "minimum": 0 },
+        "terminationGraceMarginSeconds": { "type": ["integer", "null"], "minimum": 0 }
+      }
+    },
+    "workers": {
+      "items": {
+        "properties": {
+          "image": {
+            "properties": {
+              "tag": {
+                "type": ["string", "null"],
+                "description": "The worker's image tag; none takes the router's. A tag is text: a tag of digits alone is quoted."
+              }
+            }
+          },
+          "terminationGracePeriodSeconds": {
+            "type": ["integer", "null"],
+            "minimum": 0,
+            "description": "Seconds the kubelet waits between SIGTERM and SIGKILL on the worker's pod; none is 90, enough for the servicer's drain. A whole number of seconds: a duration such as 90s is refused, not read as 0."
+          }
+        }
+      }
+    }
+  }
+}
