@@ -1,0 +1,195 @@
+# System Overview (C4-lite)
+
+**Goal:** give a quick, stable picture of PulsePlate architecture and the key enforced invariants.
+
+## Anchors (stable)
+
+- [Canonical entrypoint](#canonical-entrypoint)
+- [Routing map](#routing-map-source-of-truth)
+- [iOS adaptive navigation shell](#ios-adaptive-navigation-shell)
+- [FitChef support handoff](#fitchef-support-handoff-pr-2320-landed)
+- [FitChef support outcome ledger](#fitchef-support-outcome-ledger)
+- [OpenAPI generation mode](#openapi-generation-mode-current)
+
+## Containers / Modules (high level)
+
+- **Clients**
+  - `frontend/` (React): thin HTTP adapter + OpenAPI-generated types
+  - `ios/` (SwiftUI): thin HTTP adapter (`APIClient`) + MVVM UI
+- **Backend**
+  - `app/` (FastAPI adapters): routers, schemas, middleware, bootstrap
+  - `core/` (domain): BMI engine, nutrition logic, i18n, business rules
+  - `core/ai/` (canonical AI bounded-context entry seam): runtime preparation, provider loading, transparency ownership
+  - `providers/` (LLM providers): Grok/Ollama/Pico/Stub (env-selected via `llm.py`)
+- **Infra**
+  - DB: PostgreSQL (prod canonical), SQLite (dev/test fallback)
+  - External APIs (USDA/OpenFoodFacts/LLM, etc.)
+
+## Canonical entrypoint
+
+- Runtime and OpenAPI generation use `app/main.py` as the canonical ASGI entrypoint (`uvicorn app.main:app`).
+- `app/bootstrap/application.py` constructs the sole production FastAPI
+  singleton; `app/main.py` imports and composes it. `legacy_app.py` only
+  re-exports the same object for compatibility.
+
+## Routing map (source of truth)
+
+See: `docs/architecture/backend_routing_map.md` (evidence-driven router registration map).
+
+## iOS adaptive navigation shell
+
+The iOS presentation shell has one closed five-section inventory in the stable
+order `Home / BMI / Today / Progress / Profile`. `AppSection` owns identity,
+localization keys, and SF Symbols; `RootTabs` owns one `TabView(selection:)`
+with stable tags. It applies `sidebarAdaptable` on iOS 18 and keeps the default
+system tab presentation on iOS 17. Labels resolve through the app-selected
+`LocalizationManager.currentLanguage` in EN/RU/ES.
+
+Home and BMI retain their external stacks in `RootTabs`. Today, Progress, and
+Profile remain direct children with their existing self-owned stacks, so the
+shell does not add redundant navigation containers. Today uses its existing
+stack's localized inline navigation title, keeping its subtitle and footer in
+their existing content positions. Weekly Progress is
+navigation-neutral and reachable exactly once beneath Progress. Technical
+destinations in Profile and Today are compile-gated under `#if DEBUG`; Today's
+Release fallback opens Profile. Diagnostics never become a top-level tab.
+
+Progress owns the `HealthKitManager` used by its Weekly child as a session-scoped
+`StateObject`. Recreated Weekly destinations observe the same injected reference
+while that Progress container remains alive. Request/query behavior stays in the
+existing manager; the retained request-completion state is not proof of per-type
+HealthKit read permission and does not survive a destroyed parent or app relaunch.
+Progress state labels and actions also use the app-selected localization manager.
+
+The manually managed Debug and Release plists explicitly select the existing
+`LaunchScreen` storyboard, declare iPhone/iPad orientation arrays and the existing
+single-scene lifecycle, and provide the existing Health read-purpose fallback.
+All four source `Info*.plist` files are excluded from synchronized app resources;
+the built application uses its processed canonical `Info.plist`. Source settings
+alone do not establish the effective bundle metadata or native viewport behavior.
+
+This remains a thin presentation shell. It owns no backend, OpenAPI, DTO,
+entitlement, billing, calculation, or persistence authority.
+
+Evidence:
+
+- `ios/PulsePlate/Models/AppSection.swift:3-52`
+- `ios/PulsePlate/Views/RootTabs.swift:4-58`
+- `ios/PulsePlate/Views/PlateView.swift:203-204`
+- `ios/PulsePlate/Views/ProgressView.swift:4`
+- `ios/PulsePlate/Views/ProgressView.swift:285`
+- `ios/PulsePlate/Views/WeeklyProgressView.swift:4`
+- `ios/PulsePlate/Models/HealthKitManager.swift:37`
+- `ios/PulsePlate/Views/ProfileView.swift:5`
+- `ios/PulsePlate/Views/ProfileView.swift:101`
+- `ios/PulsePlateTests/AppNavigationShellTests.swift:233`
+- `ios/PulsePlate/Info-Debug.plist:19`
+- `ios/PulsePlate/Info-Release.plist:25`
+- `ios/PulsePlate.xcodeproj/project.pbxproj:54`
+- `ios/PulsePlateTests/AppNavigationShellTests.swift:580`
+- `ios/PulsePlateTests/AppNavigationShellTests.swift:642`
+
+## FitChef support handoff (PR #2320 landed)
+
+PR #2320 landed the dedicated PRO descriptor-only handoff route and exact
+bootstrap registrar on 2026-08-25 at
+`f95a329d899d5ac4fa73f198e90cfed44d0fc45c`. This is repository runtime and
+OpenAPI truth, not deployment or value evidence; utility remains unmeasured and
+the descriptor grants no navigation, execution, or plan-mutation authority. See
+the [canonical FitChef support-handoff routing subsection](backend_routing_map.md#canonical-fitchef-support-handoff-pr-2320-landed)
+for backend ownership, guard order, OpenAPI, and no-execution boundaries.
+
+## FitChef support outcome ledger
+
+The additive `POST /api/v1/pro/fitchef/recommend/outcome` path accepts one
+strict, bounded, authenticated client assertion and persists it under a
+credential-derived bigint subject. `app/main.py` owns a separate exact
+one-member route-family registrar; `app/routers/fitchef_structured.py` owns
+auth/rate/flag/parser admission; `app/services/fitchef_support_outcomes.py`
+owns race-safe replay/conflict behavior; and PostgreSQL forced RLS plus exact
+SQLite predicates own isolation. The feature defaults off and introduces no
+public history, plan, AI/provider, navigation, or causal authority. See the
+[routing evidence](backend_routing_map.md#canonical-fitchef-support-outcome-ledger)
+and the [semantic contract](../contracts/FITCHEF_STRUCTURED_COACH_CONTRACT.md#support-outcome-ledger-contract).
+
+## Architecture diagram (Mermaid)
+
+```mermaid
+flowchart LR
+  subgraph Clients
+    FE[frontend/ (React)]
+    IOS[ios/ (SwiftUI)]
+  end
+
+  subgraph Backend
+    ENTRY[app/main.py (canonical entrypoint)]
+  FACTORY[app/bootstrap/application.py (constructor)]
+  LEG[legacy_app.py (compat aliases)]
+  API[app/ (routers + bootstrap)]
+  CORE[core/ (domain engine)]
+  AI[core/ai/ (AI bounded-context seam)]
+  LLM[llm.py (provider factory)]
+  PROV[providers/ (LLM adapters)]
+  end
+
+  DB[(DB)]
+  EXT[(External APIs / LLM)]
+
+  FE -->|HTTP (OpenAPI types)| ENTRY
+  IOS -->|HTTP (thin client)| ENTRY
+
+  FACTORY -->|provides singleton| ENTRY
+  FACTORY -->|provides compatibility alias| LEG
+  ENTRY -->|applies ordered composition| API
+
+  API -->|delegates business rules| CORE
+  LEG -->|/insight thin adapters| AI
+  AI -->|lazy provider loading| LLM
+  LLM --> PROV
+
+  CORE --> DB
+  PROV --> EXT
+```
+
+## OpenAPI generation mode (current)
+
+OpenAPI generator runs in **full-schema mode** (schema-only mode removed in PR-631).
+
+**Evidence (file:line):**
+- Anchor (stable): `scripts/generate_openapi.py -> main()` (FULL schema mode + env pinning)
+  - Evidence: `scripts/generate_openapi.py:94`
+- Anchor (stable): `tests/test_openapi_determinism.py -> test_openapi_and_schema_ts_are_deterministic()`
+  - Evidence: `tests/test_openapi_determinism.py:17`
+
+Historical ADR: `docs/architecture/ADR-002-openapi-schema-only-mode.md` (superseded).
+
+## Enforced invariants (selected, evidence-driven)
+
+- **One BMI Engine**
+  - BMI formulas/thresholds must live in `core/bmi/*` only; guards:
+    - `tests/test_bmi_canonical_guard.py:26-77`
+    - `tests/test_no_bmi_math_outside_core.py:31-54`
+- **Import hygiene / no dynamic module loading**
+  - Tests forbid `sys.path.insert` and dynamic import execution patterns; guard:
+    - `tests/test_import_hygiene_guard.py:12-41`
+- **OpenAPI determinism**
+  - `make openapi` must be deterministic; guard:
+    - Anchor (stable): `tests/test_openapi_determinism.py -> test_openapi_and_schema_ts_are_deterministic()`
+      - Evidence: `tests/test_openapi_determinism.py:17` (hash comparison)
+- **Rate limiting for expensive endpoints**
+  - LLM/exports endpoints must be rate-limited and have deterministic 429 tests; rate limiting is proxy-aware and privacy-friendly.
+- **AI bounded-context entry seam**
+  - `/api/v1/insight` and `/insight` remain legacy compatibility endpoints, but runtime preparation/provider selection now enters through `core/ai/*` while traced execution stays in `app/services/*`.
+  - Evidence:
+    - `legacy_app.py:2251-2275`
+    - `core/ai/insight_runtime.py:142-187`
+    - `app/services/insight_application_service.py:35-94`
+
+## Maintenance rule
+
+Checklist (lightweight):
+- [ ] If you change any of the following, update this doc **or** state “no system-overview update needed” in the PR description:
+- entrypoint (`uvicorn ...`)
+- tier namespaces (`/api/v1/bmi/*`, `/api/v1/pro/*`, `/api/v1/vip/*`)
+- rate-limit wiring for LLM/exports
+- OpenAPI generation mode (schema-only vs full schema)

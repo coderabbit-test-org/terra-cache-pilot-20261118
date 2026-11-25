@@ -1,0 +1,152 @@
+{
+  "schema_version": "1.0",
+  "identity_slug": "experiment-runner",
+  "display_name": "PulsePlate Experiment Runner",
+  "git_attribution": {
+    "name": "PulsePlate Experiment Runner",
+    "email": "pulseplate@pm.me",
+    "co_author_trailer": "Co-authored-by: PulsePlate Experiment Runner <pulseplate@pm.me>",
+    "purpose": "public_attribution_only",
+    "forbidden_placeholder_emails": [
+      "runner@example.com"
+    ]
+  },
+  "authority_boundary": {
+    "merge_rights": "none",
+    "can_claim_merge_readiness": false,
+    "can_resolve_review_threads": false,
+    "can_push_without_human_review": false,
+    "allowed_commit_context": "repo_local_pr_lane_only"
+  },
+  "contribution_attribution": {
+    "basis": "material_evidence_contribution",
+    "oracle_only_artifact_can_require_coauthor": true,
+    "mutated_paths_do_not_control_attribution": true,
+    "requires_canonical_trailer_when_coauthor_required": true,
+    "coauthor_not_required_when": [
+      "runner_only_launched",
+      "artifact_rejected",
+      "artifact_unused",
+      "not_applicable_recorded"
+    ]
+  },
+  "validator_mutation_boundary": {
+    "status": "threat_model_only",
+    "active_mutation_access": false,
+    "requires_later_security_pr": true,
+    "allowlisted_validator_scripts": [],
+    "forbidden_surface_prefixes": [
+      "AGENTS.md",
+      ".github/workflows/",
+      ".env",
+      ".env.",
+      "docs/orchestration/",
+      "docs/review/",
+      "fixtures/",
+      "scripts/ci/",
+      "scripts/orchestration/check_merge_ready.py",
+      "scripts/orchestration/check_review_threads_disposition.py",
+      "tests/"
+    ],
+    "rollback_notes_required": true,
+    "identity_checks_required": true
+  },
+  "cryptographic_boundary": {
+    "status": "operator_managed_external",
+    "verified_account_required": true,
+    "commit_signing_required_for_autonomous_production_commits": true,
+    "allowed_signing_methods": [
+      "ssh",
+      "gpg",
+      "github_app_verified_signature"
+    ],
+    "private_key_material_allowed_in_repo": false,
+    "repo_must_not_generate_private_keys": true,
+    "repo_must_not_store_signing_secrets": true
+  },
+  "notification_boundary": {
+    "git_email_is_delivery_channel": false,
+    "experiment_result_delivery": "experiment_notify_explicit_sink_only",
+    "default_sink": "local_artifact",
+    "v1_email_recipient": "pulseplate@pm.me"
+  },
+  "github_app_dispatch": {
+    "status": "selected_repo_workflow_dispatch_boundary",
+    "source": "externally_minted_installation",
+    "repository_scope": "runtime_allowlist_selected_repositories",
+    "requires_repo_allowlist": true,
+    "requires_installation_class_for_cross_repo": true,
+    "requires_actions_write": true,
+    "private_pilot_capability_gate": "read_only_report_consumed_by_private_pilot_state",
+    "private_pilot_requires_pull_requests_read": true,
+    "private_pilot_requires_checks_read": true,
+    "private_pilot_actions_write_required_for_readonly": false,
+    "private_pilot_workflow_dispatch": "optional_actions_write_only",
+    "private_pilot_app_settings_mutation": false,
+    "private_pilot_readiness_projection": "label_only_operator_evidence",
+    "private_pilot_activation_evidence_loop": "redacted_manual_smoke_contract_only",
+    "private_pilot_manual_smoke_operations": "local_validate_import_report_only",
+    "activation_evidence_artifact_scope": "local_redacted_contract_only",
+    "operator_ledger_evidence_loop": "local_report_projection_only",
+    "evidence_graph_admission_status": "contract_only_not_runtime",
+    "workflow_file": "experiment-runner-dispatch.yml",
+    "workflow_ref": "main",
+    "can_dispatch_repository_events": false,
+    "can_dispatch_arbitrary_workflow": false,
+    "can_mint_installation_tokens": false,
+    "can_mutate_pull_requests": false,
+    "can_mutate_review_threads": false,
+    "can_merge_pull_requests": false,
+    "can_write_contents": false,
+    "can_write_workflows": false,
+    "can_enable_semantic_cache_runtime": false,
+    "can_administer": false,
+    "can_manage_sensitive_store": false
+  },
+  "slack_identity": {
+    "status": "operator_notification_boundary_defined",
+    "purpose": "ops_notification_and_operator_command_boundary_only",
+    "not_cryptographic_identity": true,
+    "security_pr_status": "implemented_in_this_pr",
+    "delivery_credential_source": "external",
+    "channel_allowlist_source": "runtime_env",
+    "default_enabled": false,
+    "requires_socket_auth_boundary": true,
+    "requires_bot_token_secret_boundary": true,
+    "requires_channel_allowlist": true,
+    "requires_user_allowlist": true,
+    "requires_fixed_workflow_dispatch": true,
+    "requires_explicit_dispatch_opt_in": true,
+    "requires_hash_only_audit": true,
+    "requires_audit_artifact": true,
+    "requires_runtime_presence_diagnostics": true,
+    "requires_audit_retention_policy": true,
+    "requires_redacted_messages": true,
+    "requires_rate_limit": true,
+    "requires_timeout": true,
+    "requires_idempotency": true,
+    "allowed_sinks": [
+      "experiment_notify_slack_explicit_sink",
+      "experiment_slack_socket_operator_bridge"
+    ],
+    "operator_bridge_sink": "experiment_slack_socket_operator_bridge",
+    "operator_command_boundary": {
+      "status": "socket_mode_dry_run_bridge",
+      "default_dispatch_mode": "dry_run",
+      "live_socket_default_enabled": false,
+      "requires_github_runtime_auth": true,
+      "github_runtime_auth_source": "runtime_env",
+      "can_dispatch_arbitrary_workflow": false,
+      "can_dispatch_without_operator_opt_in": false,
+      "can_create_pull_requests": false,
+      "can_run_shell_commands": false
+    },
+    "forbidden_authority": {
+      "public_git_identity": false,
+      "merge_rights": "none",
+      "can_claim_merge_readiness": false,
+      "can_resolve_review_threads": false,
+      "can_push_without_human_review": false
+    }
+  }
+}

@@ -1,0 +1,2285 @@
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+
+import pytest
+
+import scripts.ci.check_docs_phase1_gates as docs_phase1
+import scripts.ci.check_philosophy_source_corpus_index as corpus
+from scripts.ci.check_philosophy_source_corpus_index import (
+    DEFAULT_GATE_REPORT,
+    DEFAULT_INDEX,
+    DEFAULT_ROADMAP,
+    DEFAULT_SCHEMA,
+    validate_file_contents,
+    validate_new_file_contents,
+    validate_philosophy_source_corpus_index,
+    validate_touched_paths,
+)
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+REL_INDEX = "docs/orchestration/contracts/PHILOSOPHY_SOURCE_CORPUS_INDEX.json"
+REL_SCHEMA = "docs/orchestration/contracts/PHILOSOPHY_SOURCE_CORPUS_INDEX.schema.json"
+
+
+def _fixture_git(repo: Path, *args: str, allow_replacement_control: bool = False) -> bytes:
+    git = shutil.which("git", path=os.defpath)
+    assert git is not None and Path(git).is_absolute() and Path(git).is_file()
+    fixture_env = {
+        "PATH": os.defpath,
+        "HOME": str(repo),
+        "LC_ALL": "C",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_ALLOW_PROTOCOL": "file",
+    }
+    if allow_replacement_control:
+        assert args[:1] == ("show",)
+        del fixture_env["GIT_NO_REPLACE_OBJECTS"]
+    completed = subprocess.run(
+        [
+            git,
+            "-c",
+            f"core.hooksPath={os.devnull}",
+            "-c",
+            "init.templateDir=",
+            "-C",
+            str(repo),
+            *args,
+        ],
+        check=True,
+        capture_output=True,
+        env=fixture_env,
+        stdin=subprocess.DEVNULL,
+        timeout=30,
+    )
+    return completed.stdout.strip()
+
+
+def _corpus_diff_fixture(repo: Path, base_data: bytes, head_data: bytes) -> str:
+    _fixture_git(repo, "init", "--quiet")
+    artifact = repo / "docs" / "evidence" / "changed.md"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(base_data)
+    _fixture_git(repo, "add", ".")
+    _fixture_git(
+        repo,
+        "-c",
+        "user.name=CI Test",
+        "-c",
+        "user.email=ci@example.test",
+        "commit",
+        "--quiet",
+        "-m",
+        "base",
+    )
+    base_ref = _fixture_git(repo, "rev-parse", "HEAD").decode("ascii")
+    artifact.write_bytes(head_data)
+    _fixture_git(repo, "add", ".")
+    _fixture_git(
+        repo,
+        "-c",
+        "user.name=CI Test",
+        "-c",
+        "user.email=ci@example.test",
+        "commit",
+        "--quiet",
+        "-m",
+        "head",
+    )
+    return base_ref
+
+
+def _read(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
+def _index() -> dict[str, object]:
+    loaded = json.loads(_read(DEFAULT_INDEX))
+    assert isinstance(loaded, dict)
+    return loaded
+
+
+def _schema() -> dict[str, object]:
+    loaded = json.loads(_read(DEFAULT_SCHEMA))
+    assert isinstance(loaded, dict)
+    return loaded
+
+
+def _validate(
+    index: dict[str, object] | None = None,
+    *,
+    schema_text: str | None = None,
+    roadmap_text: str | None = None,
+    gate_report_text: str | None = None,
+) -> list[str]:
+    index_text = (
+        json.dumps(index, ensure_ascii=False, indent=2) + "\n"
+        if index is not None
+        else _read(DEFAULT_INDEX)
+    )
+    return validate_philosophy_source_corpus_index(
+        index_text=index_text,
+        schema_text=schema_text or _read(DEFAULT_SCHEMA),
+        roadmap_text=roadmap_text or _read(DEFAULT_ROADMAP),
+        gate_report_text=gate_report_text or _read(DEFAULT_GATE_REPORT),
+    )
+
+
+def _copy_source_corpus_companions(tmp_path: Path) -> None:
+    for relpath in docs_phase1.PHILOSOPHY_SOURCE_CORPUS_INPUTS:
+        source = REPO_ROOT / relpath
+        destination = tmp_path / relpath
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+
+
+def test_philosophy_source_corpus_index_is_current() -> None:
+    assert _validate() == []
+
+
+def test_philosophy_source_corpus_index_phase1_docs_gate_route() -> None:
+    assert docs_phase1.check_docs_phase1_guards(markdown_files=[REL_INDEX, REL_SCHEMA]) == []
+
+
+def test_philosophy_source_corpus_index_rejects_missing_source() -> None:
+    index = _index()
+    sources = index["sources"]
+    assert isinstance(sources, list)
+    index["sources"] = sources[:-1]
+
+    errors = _validate(index)
+
+    assert any("sources must contain 6 entries" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_rejects_duplicate_source_id() -> None:
+    index = _index()
+    sources = index["sources"]
+    assert isinstance(sources, list)
+    duplicate = dict(sources[1])
+    duplicate["source_id"] = sources[0]["source_id"]
+    sources[1] = duplicate
+
+    errors = _validate(index)
+
+    assert any("duplicate source_id" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_rejects_source_order_drift() -> None:
+    index = _index()
+    sources = index["sources"]
+    assert isinstance(sources, list)
+    sources[0], sources[1] = sources[1], sources[0]
+
+    errors = _validate(index)
+
+    assert any("sources must be sorted and complete" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_rejects_page_count_drift() -> None:
+    index = _index()
+    sources = index["sources"]
+    assert isinstance(sources, list)
+    first = dict(sources[0])
+    first["page_count"] = 23
+    sources[0] = first
+
+    errors = _validate(index)
+
+    assert any("analytic_linguistic_audit.page_count must be 22" in error for error in errors)
+    assert any("sources page_count sum must be 102" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_rejects_aggregate_count_type_drift() -> None:
+    index = _index()
+    index["source_count"] = 6.0
+    index["total_pages"] = 102.0
+
+    errors = _validate(index)
+
+    assert any("source_count must be integer 6" in error for error in errors)
+    assert any("total_pages must be integer 102" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_rejects_sha256_drift() -> None:
+    index = _index()
+    sources = index["sources"]
+    assert isinstance(sources, list)
+    first = dict(sources[0])
+    first["sha256"] = "0" * 64
+    sources[0] = first
+
+    errors = _validate(index)
+
+    assert any(
+        "analytic_linguistic_audit.sha256 must match verified PDF hash" in error for error in errors
+    )
+
+
+def test_philosophy_source_corpus_index_rejects_non_object_source_item() -> None:
+    index = _index()
+    sources = index["sources"]
+    assert isinstance(sources, list)
+    sources.append(42)
+
+    errors = _validate(index)
+
+    assert any("sources[6] must be an object" in error for error in errors)
+    assert any("sources must contain 6 entries" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_rejects_source_family_drift() -> None:
+    index = _index()
+    sources = index["sources"]
+    assert isinstance(sources, list)
+    first = dict(sources[0])
+    first["source_family"] = "generic_philosophy"
+    sources[0] = first
+
+    errors = _validate(index)
+
+    assert any(
+        "analytic_linguistic_audit.source_family must be analytic_linguistic_audit" in error
+        for error in errors
+    )
+
+
+def test_philosophy_source_corpus_index_rejects_language_drift() -> None:
+    index = _index()
+    sources = index["sources"]
+    assert isinstance(sources, list)
+    first = dict(sources[0])
+    first["language"] = "en"
+    sources[0] = first
+
+    errors = _validate(index)
+
+    assert any("analytic_linguistic_audit.language must be ru" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_rejects_source_scalar_type_drift() -> None:
+    index = _index()
+    sources = index["sources"]
+    assert isinstance(sources, list)
+    first = dict(sources[0])
+    first["title"] = 123
+    sources[0] = first
+
+    errors = _validate(index)
+
+    assert any("analytic_linguistic_audit.title must be a string" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_rejects_source_text_min_length_drift() -> None:
+    index = _index()
+    sources = index["sources"]
+    assert isinstance(sources, list)
+    first = dict(sources[0])
+    first["summary"] = "short"
+    first["future_handoff"] = "later"
+    sources[0] = first
+
+    errors = _validate(index)
+
+    assert any(
+        "analytic_linguistic_audit.summary must be at least 40 characters" in error
+        for error in errors
+    )
+    assert any(
+        "analytic_linguistic_audit.future_handoff must be at least 20 characters" in error
+        for error in errors
+    )
+
+
+def test_philosophy_source_corpus_index_rejects_source_array_type_drift() -> None:
+    index = _index()
+    sources = index["sources"]
+    assert isinstance(sources, list)
+    first = dict(sources[0])
+    rails = list(first["discipline_rails"])
+    rails.append(123)
+    first["discipline_rails"] = rails
+    sources[0] = first
+
+    errors = _validate(index)
+
+    assert any(
+        "analytic_linguistic_audit.discipline_rails must contain only strings" in error
+        for error in errors
+    )
+
+
+def test_philosophy_source_corpus_index_rejects_theme_array_type_drift() -> None:
+    index = _index()
+    sources = index["sources"]
+    assert isinstance(sources, list)
+    first = dict(sources[0])
+    themes = list(first["theme_families"])
+    themes.append(123)
+    first["theme_families"] = themes
+    sources[0] = first
+
+    errors = _validate(index)
+
+    assert any(
+        "analytic_linguistic_audit.theme_families must contain only strings" in error
+        for error in errors
+    )
+
+
+def test_philosophy_source_corpus_index_rejects_linked_anchor_array_type_drift() -> None:
+    index = _index()
+    sources = index["sources"]
+    assert isinstance(sources, list)
+    first = dict(sources[0])
+    anchors = list(first["linked_repo_anchors"])
+    anchors.append({"unexpected": "anchor"})
+    first["linked_repo_anchors"] = anchors
+    sources[0] = first
+
+    errors = _validate(index)
+
+    assert any(
+        "analytic_linguistic_audit.linked_repo_anchors must contain only strings" in error
+        for error in errors
+    )
+
+
+def test_philosophy_source_corpus_index_rejects_generic_theme_collapse() -> None:
+    index = _index()
+    sources = index["sources"]
+    assert isinstance(sources, list)
+    first = dict(sources[0])
+    first["theme_families"] = ["generic"]
+    sources[0] = first
+
+    errors = _validate(index)
+
+    assert any(
+        "analytic_linguistic_audit.theme_families missing required themes" in error
+        for error in errors
+    )
+    assert any("source corpus missing global theme coverage" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_rejects_missing_interdisciplinary_rail() -> None:
+    index = _index()
+    sources = index["sources"]
+    assert isinstance(sources, list)
+    leibniz = dict(sources[1])
+    leibniz["discipline_rails"] = ["philosophy"]
+    sources[1] = leibniz
+
+    errors = _validate(index)
+
+    assert any(
+        "leibniz_information_theory.discipline_rails missing required disciplines" in error
+        for error in errors
+    )
+    assert any("source corpus missing global discipline coverage" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_rejects_non_enum_discipline_rail() -> None:
+    index = _index()
+    sources = index["sources"]
+    assert isinstance(sources, list)
+    first = dict(sources[0])
+    rails = list(first["discipline_rails"])
+    rails.append("totally_invalid_rail")
+    first["discipline_rails"] = rails
+    sources[0] = first
+
+    errors = _validate(index)
+
+    assert any(
+        "analytic_linguistic_audit.discipline_rails contains non-canonical disciplines" in error
+        for error in errors
+    )
+
+
+def test_philosophy_source_corpus_index_rejects_missing_wellness_boundary() -> None:
+    index = _index()
+    source_policy = index["source_policy"]
+    assert isinstance(source_policy, dict)
+    policy = dict(source_policy)
+    del policy["wellness_boundary"]
+    index["source_policy"] = policy
+
+    errors = _validate(index)
+
+    assert any("source_policy.wellness_boundary must be" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_rejects_therapy_positioning() -> None:
+    index = _index()
+    sources = index["sources"]
+    assert isinstance(sources, list)
+    cbt_row = dict(sources[2])
+    cbt_row["future_handoff"] = "Use as therapeutic CBT design evidence after review."
+    sources[2] = cbt_row
+
+    errors = _validate(index)
+
+    assert any("forbidden medical/therapy positioning: therapeutic" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_rejects_absolute_local_paths() -> None:
+    index = _index()
+    sources = index["sources"]
+    assert isinstance(sources, list)
+    first = dict(sources[0])
+    local_path = "/" + "Users/example/Downloads/source.pdf"
+    first["summary"] = local_path
+    sources[0] = first
+
+    errors = _validate(index)
+
+    assert any("forbidden local path" in error for error in errors)
+    assert all(local_path not in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_rejects_credential_like_urls() -> None:
+    index = _index()
+    basis = index["research_basis"]
+    assert isinstance(basis, list)
+    first = dict(basis[0])
+    amz_credential = "X-" + "Amz-" + "Credential"
+    credential_url = f"https://example.test/file.pdf?{amz_credential}=abcdefghijklmnop"
+    first["url"] = credential_url
+    basis[0] = first
+
+    errors = _validate(index)
+
+    assert any("credential-like token" in error for error in errors)
+    assert all(amz_credential not in error for error in errors)
+    assert all(credential_url not in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_rejects_arbitrary_research_https_url() -> None:
+    index = _index()
+    basis = index["research_basis"]
+    assert isinstance(basis, list)
+    first = dict(basis[0])
+    first["url"] = "https://example.test/source"
+    basis[0] = first
+
+    errors = _validate(index)
+
+    assert any(
+        "sep_socrates.url must be https://plato.stanford.edu/entries/socrates/" in error
+        for error in errors
+    )
+
+
+def test_philosophy_source_corpus_index_rejects_missing_research_boundary_note() -> None:
+    index = _index()
+    basis = index["research_basis"]
+    assert isinstance(basis, list)
+    first = dict(basis[0])
+    del first["boundary_note"]
+    basis[0] = first
+
+    errors = _validate(index)
+
+    assert any("sep_socrates missing required keys: ['boundary_note']" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_rejects_duplicate_research_id() -> None:
+    index = _index()
+    basis = index["research_basis"]
+    assert isinstance(basis, list)
+    duplicate = dict(basis[1])
+    duplicate["id"] = basis[0]["id"]
+    basis[1] = duplicate
+
+    errors = _validate(index)
+
+    assert any("research_basis ids must be unique" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_rejects_runtime_flag_activation() -> None:
+    index = _index()
+    sources = index["sources"]
+    assert isinstance(sources, list)
+    first = dict(sources[0])
+    flags = dict(first["runtime_flags"])
+    flags["cache_read_allowed"] = True
+    first["runtime_flags"] = flags
+    sources[0] = first
+
+    errors = _validate(index)
+
+    assert any("cache_read_allowed must be false" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_rejects_schema_runtime_flag_const_drift() -> None:
+    schema = _schema()
+    properties = schema["properties"]
+    assert isinstance(properties, dict)
+    sources = properties["sources"]
+    assert isinstance(sources, dict)
+    items = sources["items"]
+    assert isinstance(items, dict)
+    item_properties = items["properties"]
+    assert isinstance(item_properties, dict)
+    runtime_flags = item_properties["runtime_flags"]
+    assert isinstance(runtime_flags, dict)
+    runtime_properties = runtime_flags["properties"]
+    assert isinstance(runtime_properties, dict)
+    cache_read = runtime_properties["cache_read_allowed"]
+    assert isinstance(cache_read, dict)
+    del cache_read["const"]
+
+    errors = _validate(schema_text=json.dumps(schema, ensure_ascii=False, indent=2) + "\n")
+
+    assert any(
+        "schema properties.sources.items.properties.runtime_flags.properties."
+        "cache_read_allowed.const must be False" in error
+        for error in errors
+    )
+
+
+def test_philosophy_source_corpus_index_rejects_schema_boolean_const_type_drift() -> None:
+    schema = _schema()
+    properties = schema["properties"]
+    assert isinstance(properties, dict)
+    runtime_allowed = properties["runtime_allowed"]
+    assert isinstance(runtime_allowed, dict)
+    runtime_allowed["const"] = 0
+
+    errors = _validate(schema_text=json.dumps(schema, ensure_ascii=False, indent=2) + "\n")
+
+    assert any("schema properties.runtime_allowed.const must be False" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_rejects_schema_integer_const_type_drift() -> None:
+    schema = _schema()
+    properties = schema["properties"]
+    assert isinstance(properties, dict)
+    source_count = properties["source_count"]
+    assert isinstance(source_count, dict)
+    source_count["const"] = 6.0
+
+    errors = _validate(schema_text=json.dumps(schema, ensure_ascii=False, indent=2) + "\n")
+
+    assert any("schema properties.source_count.const must be 6" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_rejects_schema_sources_type_drift() -> None:
+    schema = _schema()
+    properties = schema["properties"]
+    assert isinstance(properties, dict)
+    sources = properties["sources"]
+    assert isinstance(sources, dict)
+    sources["type"] = "integer"
+
+    errors = _validate(schema_text=json.dumps(schema, ensure_ascii=False, indent=2) + "\n")
+
+    assert any("schema sources.type must be array" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_rejects_schema_page_count_minimum_drift() -> None:
+    schema = _schema()
+    properties = schema["properties"]
+    assert isinstance(properties, dict)
+    sources = properties["sources"]
+    assert isinstance(sources, dict)
+    items = sources["items"]
+    assert isinstance(items, dict)
+    item_properties = items["properties"]
+    assert isinstance(item_properties, dict)
+    page_count = item_properties["page_count"]
+    assert isinstance(page_count, dict)
+    del page_count["minimum"]
+
+    errors = _validate(schema_text=json.dumps(schema, ensure_ascii=False, indent=2) + "\n")
+
+    assert any(
+        "schema sources.items.properties.page_count.minimum must be 1" in error for error in errors
+    )
+
+
+def test_philosophy_source_corpus_index_rejects_schema_numeric_keyword_type_drift() -> None:
+    schema = _schema()
+    properties = schema["properties"]
+    assert isinstance(properties, dict)
+    sources = properties["sources"]
+    assert isinstance(sources, dict)
+    items = sources["items"]
+    assert isinstance(items, dict)
+    item_properties = items["properties"]
+    assert isinstance(item_properties, dict)
+    page_count = item_properties["page_count"]
+    assert isinstance(page_count, dict)
+    page_count["minimum"] = True
+    summary = item_properties["summary"]
+    assert isinstance(summary, dict)
+    summary["minLength"] = 40.0
+
+    errors = _validate(schema_text=json.dumps(schema, ensure_ascii=False, indent=2) + "\n")
+
+    assert any(
+        "schema sources.items.properties.page_count.minimum must be 1" in error for error in errors
+    )
+    assert any(
+        "schema sources.items.properties.summary.minLength must be 40" in error for error in errors
+    )
+
+
+def test_philosophy_source_corpus_index_rejects_schema_source_pattern_drift() -> None:
+    schema = _schema()
+    properties = schema["properties"]
+    assert isinstance(properties, dict)
+    sources = properties["sources"]
+    assert isinstance(sources, dict)
+    items = sources["items"]
+    assert isinstance(items, dict)
+    item_properties = items["properties"]
+    assert isinstance(item_properties, dict)
+    source_id = item_properties["source_id"]
+    assert isinstance(source_id, dict)
+    source_id["pattern"] = ".*"
+    sha256 = item_properties["sha256"]
+    assert isinstance(sha256, dict)
+    del sha256["pattern"]
+
+    errors = _validate(schema_text=json.dumps(schema, ensure_ascii=False, indent=2) + "\n")
+
+    assert any(
+        "schema sources.items.properties.source_id.pattern drifted" in error for error in errors
+    )
+    assert any(
+        "schema sources.items.properties.sha256.pattern drifted" in error for error in errors
+    )
+
+
+def test_philosophy_source_corpus_index_rejects_schema_source_min_length_drift() -> None:
+    schema = _schema()
+    properties = schema["properties"]
+    assert isinstance(properties, dict)
+    sources = properties["sources"]
+    assert isinstance(sources, dict)
+    items = sources["items"]
+    assert isinstance(items, dict)
+    item_properties = items["properties"]
+    assert isinstance(item_properties, dict)
+    summary = item_properties["summary"]
+    assert isinstance(summary, dict)
+    summary["minLength"] = 1
+    handoff = item_properties["future_handoff"]
+    assert isinstance(handoff, dict)
+    del handoff["minLength"]
+
+    errors = _validate(schema_text=json.dumps(schema, ensure_ascii=False, indent=2) + "\n")
+
+    assert any(
+        "schema sources.items.properties.summary.minLength must be 40" in error for error in errors
+    )
+    assert any(
+        "schema sources.items.properties.future_handoff.minLength must be 20" in error
+        for error in errors
+    )
+
+
+def test_philosophy_source_corpus_index_rejects_schema_source_scalar_type_drift() -> None:
+    schema = _schema()
+    properties = schema["properties"]
+    assert isinstance(properties, dict)
+    sources = properties["sources"]
+    assert isinstance(sources, dict)
+    items = sources["items"]
+    assert isinstance(items, dict)
+    item_properties = items["properties"]
+    assert isinstance(item_properties, dict)
+    title = item_properties["title"]
+    assert isinstance(title, dict)
+    title["type"] = "integer"
+
+    errors = _validate(schema_text=json.dumps(schema, ensure_ascii=False, indent=2) + "\n")
+
+    assert any(
+        "schema properties.sources.items.properties.title.type must be string" in error
+        for error in errors
+    )
+
+
+def test_philosophy_source_corpus_index_rejects_schema_runtime_flags_type_drift() -> None:
+    schema = _schema()
+    properties = schema["properties"]
+    assert isinstance(properties, dict)
+    sources = properties["sources"]
+    assert isinstance(sources, dict)
+    items = sources["items"]
+    assert isinstance(items, dict)
+    item_properties = items["properties"]
+    assert isinstance(item_properties, dict)
+    runtime_flags = item_properties["runtime_flags"]
+    assert isinstance(runtime_flags, dict)
+    runtime_flags["type"] = "integer"
+
+    errors = _validate(schema_text=json.dumps(schema, ensure_ascii=False, indent=2) + "\n")
+
+    assert any("schema runtime_flags.type must be object" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_rejects_schema_runtime_flag_boolean_type_drift() -> None:
+    schema = _schema()
+    properties = schema["properties"]
+    assert isinstance(properties, dict)
+    sources = properties["sources"]
+    assert isinstance(sources, dict)
+    items = sources["items"]
+    assert isinstance(items, dict)
+    item_properties = items["properties"]
+    assert isinstance(item_properties, dict)
+    runtime_flags = item_properties["runtime_flags"]
+    assert isinstance(runtime_flags, dict)
+    runtime_properties = runtime_flags["properties"]
+    assert isinstance(runtime_properties, dict)
+    cache_read = runtime_properties["cache_read_allowed"]
+    assert isinstance(cache_read, dict)
+    cache_read["type"] = "string"
+
+    errors = _validate(schema_text=json.dumps(schema, ensure_ascii=False, indent=2) + "\n")
+
+    assert any(
+        "schema properties.sources.items.properties.runtime_flags.properties."
+        "cache_read_allowed.type must be boolean" in error
+        for error in errors
+    )
+
+
+def test_philosophy_source_corpus_index_rejects_schema_top_level_const_type_drift() -> None:
+    schema = _schema()
+    properties = schema["properties"]
+    assert isinstance(properties, dict)
+    runtime_allowed = properties["runtime_allowed"]
+    assert isinstance(runtime_allowed, dict)
+    runtime_allowed["type"] = "string"
+
+    errors = _validate(schema_text=json.dumps(schema, ensure_ascii=False, indent=2) + "\n")
+
+    assert any(
+        "schema properties.runtime_allowed.type must be boolean" in error for error in errors
+    )
+
+
+def test_philosophy_source_corpus_index_rejects_schema_uri_drift() -> None:
+    schema = _schema()
+    schema["$schema"] = "https://json-schema.org/draft/2019-09/schema"
+
+    errors = _validate(schema_text=json.dumps(schema, ensure_ascii=False, indent=2) + "\n")
+
+    assert any(
+        "schema $schema must be https://json-schema.org/draft/2020-12/schema" in error
+        for error in errors
+    )
+
+
+def test_philosophy_source_corpus_index_rejects_schema_semantic_markers_type_drift() -> None:
+    schema = _schema()
+    properties = schema["properties"]
+    assert isinstance(properties, dict)
+    semantic_markers = properties["semantic_cache_markers"]
+    assert isinstance(semantic_markers, dict)
+    semantic_markers["type"] = "array"
+
+    errors = _validate(schema_text=json.dumps(schema, ensure_ascii=False, indent=2) + "\n")
+
+    assert any("schema semantic_cache_markers.type must be object" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_rejects_schema_semantic_marker_boolean_type_drift() -> None:
+    schema = _schema()
+    properties = schema["properties"]
+    assert isinstance(properties, dict)
+    semantic_markers = properties["semantic_cache_markers"]
+    assert isinstance(semantic_markers, dict)
+    marker_properties = semantic_markers["properties"]
+    assert isinstance(marker_properties, dict)
+    runtime_allowed_false = marker_properties["runtime_allowed_false"]
+    assert isinstance(runtime_allowed_false, dict)
+    runtime_allowed_false["type"] = "string"
+
+    errors = _validate(schema_text=json.dumps(schema, ensure_ascii=False, indent=2) + "\n")
+
+    assert any(
+        "schema properties.semantic_cache_markers.properties.runtime_allowed_false.type "
+        "must be boolean" in error
+        for error in errors
+    )
+
+
+def test_philosophy_source_corpus_index_rejects_schema_source_policy_type_drift() -> None:
+    schema = _schema()
+    properties = schema["properties"]
+    assert isinstance(properties, dict)
+    source_policy = properties["source_policy"]
+    assert isinstance(source_policy, dict)
+    source_policy["type"] = "array"
+
+    errors = _validate(schema_text=json.dumps(schema, ensure_ascii=False, indent=2) + "\n")
+
+    assert any("schema source_policy.type must be object" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_rejects_schema_source_policy_value_type_drift() -> None:
+    schema = _schema()
+    properties = schema["properties"]
+    assert isinstance(properties, dict)
+    source_policy = properties["source_policy"]
+    assert isinstance(source_policy, dict)
+    policy_properties = source_policy["properties"]
+    assert isinstance(policy_properties, dict)
+    authority = policy_properties["authority"]
+    assert isinstance(authority, dict)
+    authority["type"] = "integer"
+
+    errors = _validate(schema_text=json.dumps(schema, ensure_ascii=False, indent=2) + "\n")
+
+    assert any(
+        "schema properties.source_policy.properties.authority.type must be string" in error
+        for error in errors
+    )
+
+
+def test_philosophy_source_corpus_index_rejects_schema_research_basis_type_drift() -> None:
+    schema = _schema()
+    properties = schema["properties"]
+    assert isinstance(properties, dict)
+    research_basis = properties["research_basis"]
+    assert isinstance(research_basis, dict)
+    research_basis["type"] = "object"
+
+    errors = _validate(schema_text=json.dumps(schema, ensure_ascii=False, indent=2) + "\n")
+
+    assert any("schema research_basis.type must be array" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_rejects_schema_research_basis_item_type_drift() -> None:
+    schema = _schema()
+    properties = schema["properties"]
+    assert isinstance(properties, dict)
+    research_basis = properties["research_basis"]
+    assert isinstance(research_basis, dict)
+    items = research_basis["items"]
+    assert isinstance(items, dict)
+    items["type"] = "array"
+
+    errors = _validate(schema_text=json.dumps(schema, ensure_ascii=False, indent=2) + "\n")
+
+    assert any("schema research_basis.items.type must be object" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_rejects_schema_research_basis_use_type_drift() -> None:
+    schema = _schema()
+    properties = schema["properties"]
+    assert isinstance(properties, dict)
+    research_basis = properties["research_basis"]
+    assert isinstance(research_basis, dict)
+    items = research_basis["items"]
+    assert isinstance(items, dict)
+    item_properties = items["properties"]
+    assert isinstance(item_properties, dict)
+    use = item_properties["use"]
+    assert isinstance(use, dict)
+    use["type"] = "integer"
+
+    errors = _validate(schema_text=json.dumps(schema, ensure_ascii=False, indent=2) + "\n")
+
+    assert any(
+        "schema properties.research_basis.items.properties.use.type must be string" in error
+        for error in errors
+    )
+
+
+def test_philosophy_source_corpus_index_rejects_schema_research_basis_cardinality_drift() -> None:
+    schema = _schema()
+    properties = schema["properties"]
+    assert isinstance(properties, dict)
+    research_basis = properties["research_basis"]
+    assert isinstance(research_basis, dict)
+    del research_basis["maxItems"]
+
+    errors = _validate(schema_text=json.dumps(schema, ensure_ascii=False, indent=2) + "\n")
+
+    assert any("schema research_basis.maxItems must be 6" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_rejects_schema_research_basis_float_bounds() -> None:
+    schema = _schema()
+    properties = schema["properties"]
+    assert isinstance(properties, dict)
+    research_basis = properties["research_basis"]
+    assert isinstance(research_basis, dict)
+    research_basis["minItems"] = 6.0
+
+    errors = _validate(schema_text=json.dumps(schema, ensure_ascii=False, indent=2) + "\n")
+
+    assert any("schema research_basis.minItems must be 6" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_rejects_schema_sources_float_bounds() -> None:
+    schema = _schema()
+    properties = schema["properties"]
+    assert isinstance(properties, dict)
+    sources = properties["sources"]
+    assert isinstance(sources, dict)
+    sources["maxItems"] = 6.0
+
+    errors = _validate(schema_text=json.dumps(schema, ensure_ascii=False, indent=2) + "\n")
+
+    assert any("schema sources.maxItems must be 6" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_rejects_schema_repo_truth_link_type_drift() -> None:
+    schema = _schema()
+    properties = schema["properties"]
+    assert isinstance(properties, dict)
+    repo_truth_links = properties["repo_truth_links"]
+    assert isinstance(repo_truth_links, dict)
+    items = repo_truth_links["items"]
+    assert isinstance(items, dict)
+    items["type"] = "number"
+
+    errors = _validate(schema_text=json.dumps(schema, ensure_ascii=False, indent=2) + "\n")
+
+    assert any("schema repo_truth_links.items.type must be string" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_rejects_schema_source_array_item_type_drift() -> None:
+    schema = _schema()
+    properties = schema["properties"]
+    assert isinstance(properties, dict)
+    sources = properties["sources"]
+    assert isinstance(sources, dict)
+    items = sources["items"]
+    assert isinstance(items, dict)
+    item_properties = items["properties"]
+    assert isinstance(item_properties, dict)
+    theme_families = item_properties["theme_families"]
+    assert isinstance(theme_families, dict)
+    theme_items = theme_families["items"]
+    assert isinstance(theme_items, dict)
+    theme_items["type"] = "integer"
+
+    errors = _validate(schema_text=json.dumps(schema, ensure_ascii=False, indent=2) + "\n")
+
+    assert any(
+        "schema sources.items.properties.theme_families.items.type must be string" in error
+        for error in errors
+    )
+
+
+def test_philosophy_source_corpus_index_rejects_schema_research_url_type_drift() -> None:
+    schema = _schema()
+    properties = schema["properties"]
+    assert isinstance(properties, dict)
+    research_basis = properties["research_basis"]
+    assert isinstance(research_basis, dict)
+    items = research_basis["items"]
+    assert isinstance(items, dict)
+    item_properties = items["properties"]
+    assert isinstance(item_properties, dict)
+    url = item_properties["url"]
+    assert isinstance(url, dict)
+    url["type"] = "integer"
+
+    errors = _validate(schema_text=json.dumps(schema, ensure_ascii=False, indent=2) + "\n")
+
+    assert any(
+        "schema properties.research_basis.items.properties.url.type must be string" in error
+        for error in errors
+    )
+
+
+def test_philosophy_source_corpus_index_rejects_schema_research_url_format_drift() -> None:
+    schema = _schema()
+    properties = schema["properties"]
+    assert isinstance(properties, dict)
+    research_basis = properties["research_basis"]
+    assert isinstance(research_basis, dict)
+    items = research_basis["items"]
+    assert isinstance(items, dict)
+    item_properties = items["properties"]
+    assert isinstance(item_properties, dict)
+    url = item_properties["url"]
+    assert isinstance(url, dict)
+    del url["format"]
+
+    errors = _validate(schema_text=json.dumps(schema, ensure_ascii=False, indent=2) + "\n")
+
+    assert any(
+        "schema research_basis.items.properties.url.format must be uri" in error for error in errors
+    )
+
+
+def test_philosophy_source_corpus_index_rejects_schema_out_of_scope_cardinality_drift() -> None:
+    schema = _schema()
+    properties = schema["properties"]
+    assert isinstance(properties, dict)
+    out_of_scope_paths = properties["out_of_scope_paths"]
+    assert isinstance(out_of_scope_paths, dict)
+    out_of_scope_paths["minItems"] = 8
+
+    errors = _validate(schema_text=json.dumps(schema, ensure_ascii=False, indent=2) + "\n")
+
+    assert any("schema out_of_scope_paths.minItems must be 14" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_rejects_schema_scope_array_float_bounds() -> None:
+    schema = _schema()
+    properties = schema["properties"]
+    assert isinstance(properties, dict)
+    repo_truth_links = properties["repo_truth_links"]
+    assert isinstance(repo_truth_links, dict)
+    repo_truth_links["maxItems"] = 9.0
+
+    errors = _validate(schema_text=json.dumps(schema, ensure_ascii=False, indent=2) + "\n")
+
+    assert any("schema repo_truth_links.maxItems must be 9" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_rejects_roadmap_marker_drift() -> None:
+    roadmap_text = _read(DEFAULT_ROADMAP).replace(
+        "SEMANTIC_CACHE_ALLOWED_RUNTIME: false",
+        "SEMANTIC_CACHE_ALLOWED_RUNTIME: true",
+    )
+
+    errors = _validate(roadmap_text=roadmap_text)
+
+    assert any("SEMANTIC_CACHE_ALLOWED_RUNTIME must be false" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_rejects_roadmap_local_path_leak() -> None:
+    local_path = "/" + "tmp/source.pdf"
+    roadmap_text = _read(DEFAULT_ROADMAP) + f"\noperator source: {local_path}\n"
+
+    errors = _validate(roadmap_text=roadmap_text)
+
+    assert any(
+        "semantic-cache roadmap: forbidden local path or credential-like token" in error
+        for error in errors
+    )
+
+
+def test_philosophy_source_corpus_index_rejects_gate_report_credential_leak() -> None:
+    credential_param = "X-" + "Amz-" + "Credential"
+    gate_report_text = (
+        _read(DEFAULT_GATE_REPORT)
+        + f"\nartifact_url: https://example.test/file.pdf?{credential_param}=abcdefghijklmnop\n"
+    )
+
+    errors = _validate(gate_report_text=gate_report_text)
+
+    assert any(
+        "gate-open precondition report: forbidden local path or credential-like token" in error
+        for error in errors
+    )
+
+
+def test_philosophy_source_corpus_index_rejects_runtime_touched_paths() -> None:
+    errors = validate_touched_paths(["core/insight/philosophical_runtime.py"])
+
+    assert errors == [
+        "core/insight/philosophical_runtime.py: PR-5 is docs/governance/test-only; "
+        "forbidden runtime path core/insight/**"
+    ]
+
+
+def test_philosophy_source_corpus_index_treats_option_like_paths_as_files(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    result = corpus.main(["--check", "--files", "--help", "app/pr5_runtime.py"])
+
+    assert result == 1
+    assert (
+        "app/pr5_runtime.py: PR-5 is docs/governance/test-only; " "forbidden runtime path app/**"
+    ) in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("head_data", "has_new_match"),
+    [
+        (b"old=/" + b"tmp/recorded.pdf\nsafe=added\n", False),
+        (b"old=/" + b"tmp/recorded.pdf\nnew=/" + b"tmp/recorded.pdf\n", True),
+        (b"old=/" + b"tmp/recorded.pdf\nnew=/" + b"tmp/new.pdf\n", True),
+    ],
+)
+def test_source_corpus_differential_counts_new_forbidden_occurrences(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    head_data: bytes,
+    has_new_match: bool,
+) -> None:
+    base_ref = _corpus_diff_fixture(tmp_path, b"old=/" + b"tmp/recorded.pdf\n", head_data)
+    monkeypatch.setattr(corpus, "REPO_ROOT", tmp_path)
+
+    errors = validate_new_file_contents(["docs/evidence/changed.md"], base_ref=base_ref)
+
+    assert bool(errors) is has_new_match
+    if has_new_match:
+        assert "new forbidden local path or credential-like token" in errors[0]
+        assert "/" + "tmp/" not in errors[0]
+
+
+def test_source_corpus_differential_ignores_git_replacement_objects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = "docs/evidence/changed.md"
+    head_data = b"new=/" + b"tmp/new-source.pdf\n"
+    base_ref = _corpus_diff_fixture(tmp_path, b"safe=base\n", head_data)
+    head_tree = _fixture_git(tmp_path, "rev-parse", "HEAD^{tree}").decode("ascii")
+    replacement = _fixture_git(
+        tmp_path,
+        "-c",
+        "user.name=CI Test",
+        "-c",
+        "user.email=ci@example.test",
+        "commit-tree",
+        head_tree,
+        "-m",
+        "replacement",
+    ).decode("ascii")
+    _fixture_git(tmp_path, "replace", base_ref, replacement)
+    assert (
+        _fixture_git(tmp_path, "show", f"{base_ref}:{path}", allow_replacement_control=True)
+        == head_data.strip()
+    )
+    monkeypatch.setattr(corpus, "REPO_ROOT", tmp_path)
+
+    assert (
+        "new forbidden local path or credential-like token"
+        in validate_new_file_contents([path], base_ref=base_ref)[0]
+    )
+
+
+@pytest.mark.parametrize("head_data", [b"\x89PNG\x00payload", b"%PDF-1.7\nplain-ascii-header\n"])
+def test_source_corpus_differential_fails_on_bad_base_or_binary_head(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, head_data: bytes
+) -> None:
+    base_ref = _corpus_diff_fixture(tmp_path, b"safe=base\n", head_data)
+    monkeypatch.setattr(corpus, "REPO_ROOT", tmp_path)
+    path = "docs/evidence/changed.md"
+
+    assert "full lowercase commit SHA" in validate_new_file_contents([path], base_ref="bad")[0]
+    assert (
+        "Git cat-file object check failed"
+        in validate_new_file_contents([path], base_ref="f" * 40)[0]
+    )
+    assert (
+        "binary or ambiguous text encoding"
+        in validate_new_file_contents([path], base_ref=base_ref)[0]
+    )
+
+
+def test_source_corpus_git_failure_does_not_echo_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def failed_git(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(
+            args=["git"],
+            returncode=128,
+            stdout=b"",
+            stderr=b"fatal: /" + b"Users/example/private-source was rejected",
+        )
+
+    monkeypatch.setattr(corpus.subprocess, "run", failed_git)
+    with pytest.raises(ValueError) as exc:
+        corpus._corpus_git_bytes("cat-file", "-e", "f" * 40)
+
+    assert "Git cat-file object check failed (exit 128)" in str(exc.value)
+    assert "/" + "Users/example/private-source" not in str(exc.value)
+
+
+def test_source_corpus_differential_allows_unrelated_safe_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fixture_git(tmp_path, "init", "--quiet")
+    original = tmp_path / "docs" / "evidence" / "old.md"
+    original.parent.mkdir(parents=True)
+    original.write_text("safe\n", encoding="utf-8")
+    _fixture_git(tmp_path, "add", ".")
+    _fixture_git(
+        tmp_path,
+        "-c",
+        "user.name=CI Test",
+        "-c",
+        "user.email=ci@example.test",
+        "commit",
+        "--quiet",
+        "-m",
+        "base",
+    )
+    base_ref = _fixture_git(tmp_path, "rev-parse", "HEAD").decode("ascii")
+    _fixture_git(tmp_path, "mv", "docs/evidence/old.md", "docs/evidence/new.md")
+    _fixture_git(
+        tmp_path,
+        "-c",
+        "user.name=CI Test",
+        "-c",
+        "user.email=ci@example.test",
+        "commit",
+        "--quiet",
+        "-m",
+        "rename",
+    )
+    monkeypatch.setattr(corpus, "REPO_ROOT", tmp_path)
+
+    assert (
+        validate_new_file_contents(
+            ["docs/evidence/old.md", "docs/evidence/new.md"], base_ref=base_ref
+        )
+        == []
+    )
+
+
+@pytest.mark.parametrize("operation", ["rename", "copy"])
+def test_source_corpus_differential_rejects_canonical_rename_or_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    _fixture_git(tmp_path, "init", "--quiet")
+    original_path = REL_INDEX
+    original = tmp_path / original_path
+    original.parent.mkdir(parents=True)
+    original.write_text("safe canonical corpus\n", encoding="utf-8")
+    _fixture_git(tmp_path, "add", ".")
+    _fixture_git(
+        tmp_path,
+        "-c",
+        "user.name=CI Test",
+        "-c",
+        "user.email=ci@example.test",
+        "commit",
+        "--quiet",
+        "-m",
+        "base",
+    )
+    base_ref = _fixture_git(tmp_path, "rev-parse", "HEAD").decode("ascii")
+    copied_path = "docs/evidence/copied-index.json"
+    copied = tmp_path / copied_path
+    copied.parent.mkdir(parents=True)
+    if operation == "rename":
+        _fixture_git(tmp_path, "mv", original_path, copied_path)
+    else:
+        copied.write_bytes(original.read_bytes())
+        _fixture_git(tmp_path, "add", copied_path)
+    _fixture_git(
+        tmp_path,
+        "-c",
+        "user.name=CI Test",
+        "-c",
+        "user.email=ci@example.test",
+        "commit",
+        "--quiet",
+        "-m",
+        operation,
+    )
+    monkeypatch.setattr(corpus, "REPO_ROOT", tmp_path)
+
+    assert (
+        "rename/copy ambiguity"
+        in validate_new_file_contents([original_path, copied_path], base_ref=base_ref)[0]
+    )
+
+
+def test_source_corpus_differential_keeps_symlink_target_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fixture_git(tmp_path, "init", "--quiet")
+    artifact = tmp_path / "docs" / "evidence" / "changed.md"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text("safe\n", encoding="utf-8")
+    _fixture_git(tmp_path, "add", ".")
+    _fixture_git(
+        tmp_path,
+        "-c",
+        "user.name=CI Test",
+        "-c",
+        "user.email=ci@example.test",
+        "commit",
+        "--quiet",
+        "-m",
+        "base",
+    )
+    base_ref = _fixture_git(tmp_path, "rev-parse", "HEAD").decode("ascii")
+    artifact.unlink()
+    artifact.symlink_to("/" + "tmp/private-source.pdf")
+    _fixture_git(tmp_path, "add", ".")
+    _fixture_git(
+        tmp_path,
+        "-c",
+        "user.name=CI Test",
+        "-c",
+        "user.email=ci@example.test",
+        "commit",
+        "--quiet",
+        "-m",
+        "symlink",
+    )
+    monkeypatch.setattr(corpus, "REPO_ROOT", tmp_path)
+
+    errors = validate_new_file_contents(["docs/evidence/changed.md"], base_ref=base_ref)
+    assert any("symlink target must not be an absolute local path" in error for error in errors)
+
+
+def test_source_corpus_cli_uses_base_before_terminal_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base_ref = _corpus_diff_fixture(
+        tmp_path,
+        b"old=/" + b"tmp/recorded.pdf\n",
+        b"old=/" + b"tmp/recorded.pdf\nsafe=added\n",
+    )
+    monkeypatch.setattr(corpus, "REPO_ROOT", tmp_path)
+
+    assert (
+        corpus.main(["--check", "--base-ref", base_ref, "--files", "docs/evidence/changed.md"]) == 0
+    )
+
+
+@pytest.mark.parametrize("late_option", ["--check", "--index", "--schema=other.json", "--base-ref"])
+def test_philosophy_source_corpus_index_rejects_configuration_after_files(
+    late_option: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as exc:
+        corpus.main(["--check", "--files", late_option])
+
+    assert exc.value.code == 2
+    assert "configuration options must precede terminal --files" in capsys.readouterr().err
+
+
+def test_philosophy_source_corpus_index_accepts_pr5_governance_paths() -> None:
+    errors = validate_touched_paths(
+        [
+            REL_INDEX,
+            REL_SCHEMA,
+            "scripts/ci/check_philosophy_source_corpus_index.py",
+            "tests/test_philosophy_source_corpus_index.py",
+        ]
+    )
+
+    assert errors == []
+
+
+def test_philosophy_source_corpus_index_rejects_repo_truth_link_drift() -> None:
+    index = _index()
+    index["repo_truth_links"] = ["docs/roadmap/BACKLOG_LEDGER.md"]
+
+    errors = _validate(index)
+
+    assert any(
+        "repo_truth_links must match the PR-5 canonical repo truth list" in error
+        for error in errors
+    )
+
+
+def test_philosophy_source_corpus_index_rejects_non_string_repo_truth_link() -> None:
+    index = _index()
+    links = index["repo_truth_links"]
+    assert isinstance(links, list)
+    links.append(42)
+
+    errors = _validate(index)
+
+    assert any("repo_truth_links must contain only strings" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_rejects_out_of_scope_path_drift() -> None:
+    index = _index()
+    paths = list(corpus.FORBIDDEN_RUNTIME_PATHS)
+    paths.remove("providers/**")
+    index["out_of_scope_paths"] = paths
+
+    errors = _validate(index)
+
+    assert any(
+        "out_of_scope_paths must match the PR-5 no-runtime path boundary" in error
+        for error in errors
+    )
+
+
+def test_philosophy_source_corpus_index_rejects_non_string_out_of_scope_path() -> None:
+    index = _index()
+    paths = index["out_of_scope_paths"]
+    assert isinstance(paths, list)
+    paths.append(42)
+
+    errors = _validate(index)
+
+    assert any("out_of_scope_paths must contain only strings" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_rejects_non_object_research_basis_item() -> None:
+    index = _index()
+    basis = index["research_basis"]
+    assert isinstance(basis, list)
+    basis.append(42)
+
+    errors = _validate(index)
+
+    assert any("research_basis[6] must be an object" in error for error in errors)
+    assert any("research_basis must contain 6 sources" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_rejects_source_policy_constant_drift() -> None:
+    index = _index()
+    policy = index["source_policy"]
+    assert isinstance(policy, dict)
+    policy["authority"] = "pdf_is_runtime_truth"
+
+    errors = _validate(index)
+
+    assert any(
+        "source_policy.authority must be operator_pdf_design_evidence_repo_truth_wins" in error
+        for error in errors
+    )
+
+
+def test_philosophy_source_corpus_index_scans_touched_artifact_contents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifact = tmp_path / REL_INDEX
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text("leak=" + "/" + "tmp/source.pdf\n", encoding="utf-8")
+    monkeypatch.setattr(corpus, "REPO_ROOT", tmp_path)
+
+    errors = validate_file_contents([REL_INDEX])
+
+    assert any("forbidden local path" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_rejects_generic_posix_local_path_leak(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifact = tmp_path / REL_INDEX
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text("leak=" + "/" + "opt/work/source.pdf\n", encoding="utf-8")
+    monkeypatch.setattr(corpus, "REPO_ROOT", tmp_path)
+
+    errors = validate_file_contents([REL_INDEX])
+
+    assert any("forbidden local path" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_preserves_touched_path_edge_spaces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rel_path = "docs/evidence/ source artifact.txt "
+    artifact = tmp_path / rel_path
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text("leak=" + "/" + "tmp/source.pdf\n", encoding="utf-8")
+    monkeypatch.setattr(corpus, "REPO_ROOT", tmp_path)
+
+    errors = validate_file_contents([rel_path])
+
+    assert any("forbidden local path" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_allows_repo_neutral_absolute_routes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifact = tmp_path / "docs" / "roadmap" / "BACKLOG_LEDGER.md"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text(
+        "route=" + "/" + "api/v1/pro/session\nsink=" + "/" + "dev/null\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(corpus, "REPO_ROOT", tmp_path)
+
+    errors = validate_file_contents(["docs/roadmap/BACKLOG_LEDGER.md"])
+
+    assert errors == []
+
+
+def test_philosophy_source_corpus_index_allows_non_file_route_literals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifact = tmp_path / "docs" / "evidence" / "routes.md"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text(
+        "route=" + "/" + "health/db\nlegacy=" + "/" + "insight\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(corpus, "REPO_ROOT", tmp_path)
+
+    errors = validate_file_contents(["docs/evidence/routes.md"])
+
+    assert errors == []
+
+
+def test_philosophy_source_corpus_index_rejects_file_like_api_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifact = tmp_path / REL_INDEX
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text("leak=" + "/" + "api/private/source.pdf\n", encoding="utf-8")
+    monkeypatch.setattr(corpus, "REPO_ROOT", tmp_path)
+
+    errors = validate_file_contents([REL_INDEX])
+
+    assert any("forbidden local path" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_allows_repo_neutral_infra_literals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifact = tmp_path / "docs" / "roadmap" / "BACKLOG_LEDGER.md"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text(
+        "\n".join(
+            [
+                "cache=~" + "/" + ".cache/pip",
+                "config=~" + "/" + ".codex/config.toml",
+                "xcode=" + "/" + "Applications/Xcode_26.2.app/Contents/Developer",
+                "stdout=" + "/" + "dev/stdout",
+                "staging=" + "/" + "srv/pulseplate-staging",
+                "venv=" + "/" + "opt/venv/lib/python",
+                "lib=" + "/" + "usr/local/lib/python",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(corpus, "REPO_ROOT", tmp_path)
+
+    errors = validate_file_contents(["docs/roadmap/BACKLOG_LEDGER.md"])
+
+    assert errors == []
+
+
+def test_philosophy_source_corpus_index_rejects_tilde_prefixed_secret_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifact = tmp_path / REL_INDEX
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text("token=~" + "sk-" + "a" * 16 + "\n", encoding="utf-8")
+    monkeypatch.setattr(corpus, "REPO_ROOT", tmp_path)
+
+    errors = validate_file_contents([REL_INDEX])
+
+    assert any("credential-like token" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_allows_tilde_prefixed_path_match(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifact = tmp_path / REL_INDEX
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text("cache=~" + "/" + ".cache/pip\n", encoding="utf-8")
+    monkeypatch.setattr(corpus, "REPO_ROOT", tmp_path)
+
+    errors = validate_file_contents([REL_INDEX])
+
+    assert errors == []
+
+
+def test_philosophy_source_corpus_index_allows_credential_identifier_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifact = tmp_path / "docs" / "evidence" / "credential-fields.md"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text(
+        "fields: AWS_ACCESS_KEY_ID, access_key_id, secret_access_key\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(corpus, "REPO_ROOT", tmp_path)
+
+    errors = validate_file_contents(["docs/evidence/credential-fields.md"])
+
+    assert errors == []
+
+
+def test_philosophy_source_corpus_index_rejects_credential_identifier_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifact = tmp_path / REL_INDEX
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text(
+        "AWS_SECRET_ACCESS_KEY=" + "abcdefghijklmnop\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(corpus, "REPO_ROOT", tmp_path)
+
+    errors = validate_file_contents([REL_INDEX])
+
+    assert any("credential-like token" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_scans_past_allowed_posix_match(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifact = tmp_path / REL_INDEX
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text(
+        "shebang=" + "/" + "usr/bin/env\nleak=" + "/" + "opt/work/source.pdf\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(corpus, "REPO_ROOT", tmp_path)
+
+    errors = validate_file_contents([REL_INDEX])
+
+    assert any("forbidden local path" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_preserves_backslash_touched_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rel_path = "docs/evidence/leak\\artifact.txt"
+    artifact = tmp_path / rel_path
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text("leak=" + "/" + "tmp/source.pdf\n", encoding="utf-8")
+    monkeypatch.setattr(corpus, "REPO_ROOT", tmp_path)
+
+    errors = validate_file_contents([rel_path])
+
+    assert any("forbidden local path" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_rejects_non_c_windows_local_path_leak(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifact = tmp_path / REL_INDEX
+    artifact.parent.mkdir(parents=True)
+    bs = chr(92)
+    artifact.write_text(
+        "leak=" + "D:" + bs + "Users" + bs + "alice" + bs + "source.pdf\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(corpus, "REPO_ROOT", tmp_path)
+
+    errors = validate_file_contents([REL_INDEX])
+
+    assert any("forbidden local path" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_rejects_windows_tmp_local_path_leak(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifact = tmp_path / REL_INDEX
+    artifact.parent.mkdir(parents=True)
+    bs = chr(92)
+    artifact.write_text("leak=" + "D:" + bs + "tmp" + bs + "source.pdf\n", encoding="utf-8")
+    monkeypatch.setattr(corpus, "REPO_ROOT", tmp_path)
+
+    errors = validate_file_contents([REL_INDEX])
+
+    assert any("forbidden local path" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_rejects_unc_local_path_leak(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifact = tmp_path / REL_INDEX
+    artifact.parent.mkdir(parents=True)
+    bs = chr(92)
+    artifact.write_text(
+        "leak=" + bs * 2 + "server" + bs + "share" + bs + "source.pdf\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(corpus, "REPO_ROOT", tmp_path)
+
+    errors = validate_file_contents([REL_INDEX])
+
+    assert any("forbidden local path" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_scans_broken_symlink_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifact = tmp_path / "docs" / "evidence" / "leaky-link.txt"
+    artifact.parent.mkdir(parents=True)
+    artifact.symlink_to("/" + "tmp/source.pdf")
+    monkeypatch.setattr(corpus, "REPO_ROOT", tmp_path)
+
+    errors = validate_file_contents(["docs/evidence/leaky-link.txt"])
+
+    assert any("symlink target must not be an absolute local path" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_does_not_read_escaping_symlink_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root = tmp_path / "repo"
+    artifact = repo_root / "docs" / "evidence" / "leaky-link.txt"
+    outside = tmp_path / "outside-source.txt"
+    artifact.parent.mkdir(parents=True)
+    outside.write_text("leak=" + "/" + "tmp/source.pdf\n", encoding="utf-8")
+    artifact.symlink_to("../../../outside-source.txt")
+    monkeypatch.setattr(corpus, "REPO_ROOT", repo_root)
+
+    errors = validate_file_contents(["docs/evidence/leaky-link.txt"])
+
+    assert any("symlink target escapes repo root" in error for error in errors)
+    assert not any("forbidden local path" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_skips_binary_touched_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifact = tmp_path / "docs" / "evidence" / "figure.png"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"\x89PNG\r\n\x1a\n\x00binary")
+    monkeypatch.setattr(corpus, "REPO_ROOT", tmp_path)
+
+    errors = validate_file_contents(["docs/evidence/figure.png"])
+
+    assert errors == []
+
+
+def test_philosophy_source_corpus_index_scans_cp1251_text_artifact_contents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifact = tmp_path / REL_INDEX
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(
+        ("\u0443\u0442\u0435\u0447\u043a\u0430=" + "/" + "tmp/source.pdf\n").encode("cp1251")
+    )
+    monkeypatch.setattr(corpus, "REPO_ROOT", tmp_path)
+
+    errors = validate_file_contents([REL_INDEX])
+
+    assert any("forbidden local path" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_scans_windows1252_text_artifact_contents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifact = tmp_path / REL_INDEX
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(("leak=\u201c" + "/" + "tmp/source.pdf\n").encode("cp1252"))
+    monkeypatch.setattr(corpus, "REPO_ROOT", tmp_path)
+
+    errors = validate_file_contents([REL_INDEX])
+
+    assert any("forbidden local path" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_scans_utf16_text_artifact_contents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifact = tmp_path / REL_INDEX
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(("leak=" + "/" + "tmp/source.pdf\n").encode("utf-16"))
+    monkeypatch.setattr(corpus, "REPO_ROOT", tmp_path)
+
+    errors = validate_file_contents([REL_INDEX])
+
+    assert any("forbidden local path" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_scans_bomless_utf16le_text_artifact_contents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifact = tmp_path / REL_INDEX
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(("leak=" + "/" + "tmp/source.pdf\n").encode("utf-16-le"))
+    monkeypatch.setattr(corpus, "REPO_ROOT", tmp_path)
+
+    errors = validate_file_contents([REL_INDEX])
+
+    assert any("forbidden local path" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_scans_bomless_utf16be_text_artifact_contents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifact = tmp_path / REL_INDEX
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(("leak=" + "/" + "tmp/source.pdf\n").encode("utf-16-be"))
+    monkeypatch.setattr(corpus, "REPO_ROOT", tmp_path)
+
+    errors = validate_file_contents([REL_INDEX])
+
+    assert any("forbidden local path" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_scans_utf32_text_artifact_contents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifact = tmp_path / REL_INDEX
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(("leak=" + "/" + "tmp/source.pdf\n").encode("utf-32"))
+    monkeypatch.setattr(corpus, "REPO_ROOT", tmp_path)
+
+    errors = validate_file_contents([REL_INDEX])
+
+    assert any("forbidden local path" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_scans_bomless_utf32be_text_artifact_contents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifact = tmp_path / REL_INDEX
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(("leak=" + "/" + "tmp/source.pdf\n").encode("utf-32-be"))
+    monkeypatch.setattr(corpus, "REPO_ROOT", tmp_path)
+
+    errors = validate_file_contents([REL_INDEX])
+
+    assert any("forbidden local path" in error for error in errors)
+
+
+def test_philosophy_source_corpus_index_phase1_docs_gate_rejects_page_count_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _copy_source_corpus_companions(tmp_path)
+    index_path = tmp_path / REL_INDEX
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    assert isinstance(index, dict)
+    sources = index["sources"]
+    assert isinstance(sources, list)
+    first = dict(sources[0])
+    first["page_count"] = 23
+    sources[0] = first
+    index_path.write_text(json.dumps(index, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    monkeypatch.setattr(docs_phase1, "REPO_ROOT", tmp_path)
+
+    errors = docs_phase1.check_docs_phase1_guards(markdown_files=[REL_INDEX])
+
+    assert any(
+        error.startswith(f"{REL_INDEX}: analytic_linguistic_audit.page_count must be 22")
+        for error in errors
+    )
+
+
+@pytest.mark.parametrize("fault", ["timeout", "launch"])
+def test_corpus_git_exception_drops_private_child_context(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], fault: str
+) -> None:
+    secret = "synthetic-private-corpus-marker"
+
+    def fail(*args: object, **kwargs: object) -> None:
+        if fault == "timeout":
+            raise subprocess.TimeoutExpired([secret], 30, output=secret, stderr=secret)
+        raise OSError(secret)
+
+    monkeypatch.setattr(corpus.subprocess, "run", fail)
+    with pytest.raises(
+        ValueError, match="^source corpus Git cat-file object check unavailable$"
+    ) as caught:
+        corpus._corpus_git_bytes("cat-file", "-e", "a" * 40)
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    assert secret not in str(caught.value) + repr(caught.value.args)
+    assert capsys.readouterr() == ("", "")
+
+
+def _maintenance_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[str, list[str]]:
+    """A real Git tree with all canonical artifacts and a separate changed runtime path."""
+    for name in corpus.SOURCE_CORPUS_PATHS:
+        relative = name.decode("utf-8")
+        target = tmp_path / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes((REPO_ROOT / relative).read_bytes())
+        target.chmod(0o644)
+    runtime = tmp_path / "app/maintenance.py"
+    runtime.parent.mkdir()
+    runtime.write_text("safe = 1\n")
+    _fixture_git(tmp_path, "init", "--quiet")
+    _maintenance_commit(tmp_path)
+    base = _fixture_git(tmp_path, "rev-parse", "HEAD").decode("ascii")
+    runtime.write_text("safe = 2\n")
+    _maintenance_commit(tmp_path)
+    monkeypatch.setattr(corpus, "REPO_ROOT", tmp_path)
+    arguments = ["--check", "--base-ref", base]
+    for flag, original in (
+        ("--index", DEFAULT_INDEX),
+        ("--schema", DEFAULT_SCHEMA),
+        ("--roadmap", DEFAULT_ROADMAP),
+        ("--gate-report", DEFAULT_GATE_REPORT),
+    ):
+        arguments.extend([flag, str(tmp_path / original.relative_to(REPO_ROOT))])
+    return base, arguments
+
+
+def _maintenance_commit(repo: Path) -> None:
+    _fixture_git(repo, "add", ".")
+    _fixture_git(
+        repo,
+        "-c",
+        "user.name=CI Test",
+        "-c",
+        "user.email=ci@example.test",
+        "commit",
+        "--quiet",
+        "-m",
+        "bounded corpus fixture",
+    )
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        'integrity="sha512-aaaa+' + "/public/path/digest" + '"\n',
+        'member="src/__tests__' + "/fixtures/example.yaml" + '"\n',
+        'metadata="quote' + "\\\\value\\nsynthetic" + '"\n',
+        'tool="' + "/synthetic/bin/tool" + '"\n',
+    ],
+)
+def test_corpus_maintenance_preserves_legacy_full_scan_without_runtime_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, content: str
+) -> None:
+    base, arguments = _maintenance_fixture(tmp_path, monkeypatch)
+    target = tmp_path / "app/maintenance.py"
+    target.write_text(content)
+    _maintenance_commit(tmp_path)
+    assert corpus.main([*arguments, "--files", "app/maintenance.py"]) == 0
+    # Direct full scanning still rejects the same exact lexical evidence.
+    assert validate_new_file_contents(["app/maintenance.py"], base_ref=base)
+    no_base = [value for value in arguments]
+    position = no_base.index("--base-ref")
+    del no_base[position : position + 2]
+    assert corpus.main([*no_base, "--files", "app/maintenance.py"]) == 1
+
+
+@pytest.mark.parametrize("family", ("signed_url", "aws_key", "query_token", "provider"))
+def test_corpus_maintenance_keeps_credentials_on_noncorpus_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    family: str,
+) -> None:
+    _base, arguments = _maintenance_fixture(tmp_path, monkeypatch)
+    assert corpus.main([*arguments, "--files", "app/maintenance.py"]) == 0
+    value = {
+        "signed_url": "X-" + "Amz-Signature=" + "a" * 20,
+        "aws_key": "AWS_" + "ACCESS_KEY_ID=" + "b" * 20,
+        "query_token": "token" + "=" + "c" * 20,
+        "provider": "sk" + "-" + "d" * 20,
+    }[family]
+    (tmp_path / "app/maintenance.py").write_text(value + "\n")
+    _maintenance_commit(tmp_path)
+    assert corpus.main([*arguments, "--files", "app/maintenance.py"]) == 1
+    output = capsys.readouterr().out
+    assert "app/maintenance.py: new forbidden local path or credential-like token" in output
+    assert value not in output
+
+
+@pytest.mark.parametrize("canonical", sorted(path.decode() for path in corpus.SOURCE_CORPUS_PATHS))
+def test_corpus_actual_delta_attaches_scope_even_when_omitted_from_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    canonical: str,
+) -> None:
+    _base, arguments = _maintenance_fixture(tmp_path, monkeypatch)
+    assert corpus.main([*arguments, "--files", "app/maintenance.py"]) == 0
+    artifact = tmp_path / canonical
+    artifact.write_bytes(artifact.read_bytes() + b"\n")
+    _maintenance_commit(tmp_path)
+    assert corpus.main([*arguments, "--files", "app/maintenance.py"]) == 1
+    assert "app/maintenance.py: PR-5 is docs/governance/test-only" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("fault", ("dirty", "mode", "symlink", "hardlink", "parent-alias"))
+def test_corpus_maintenance_requires_actual_regular_canonical_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    fault: str,
+) -> None:
+    _base, arguments = _maintenance_fixture(tmp_path, monkeypatch)
+    assert corpus.main([*arguments, "--files", "app/maintenance.py"]) == 0
+    artifact = tmp_path / REL_INDEX
+    if fault == "dirty":
+        artifact.write_bytes(artifact.read_bytes() + b"\n")
+    elif fault == "mode":
+        artifact.chmod(0o755)
+    elif fault == "parent-alias":
+        parent = artifact.parent
+        saved = tmp_path / "saved-contracts"
+        parent.rename(saved)
+        parent.symlink_to(saved, target_is_directory=True)
+    else:
+        saved = tmp_path / "saved-index"
+        artifact.rename(saved)
+        if fault == "symlink":
+            artifact.symlink_to(saved)
+        else:
+            artifact.hardlink_to(saved)
+    assert corpus.main([*arguments, "--files", "app/maintenance.py"]) == 1
+    output = capsys.readouterr().out
+    assert "canonical corpus" in output or "validated corpus bytes" in output
+
+
+def test_corpus_alternate_artifact_input_cannot_grant_maintenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _base, arguments = _maintenance_fixture(tmp_path, monkeypatch)
+    assert corpus.main([*arguments, "--files", "app/maintenance.py"]) == 0
+    alternate = tmp_path / "alternate-index.json"
+    alternate.write_bytes((tmp_path / REL_INDEX).read_bytes())
+    arguments[arguments.index("--index") + 1] = str(alternate)
+    assert corpus.main([*arguments, "--files", "app/maintenance.py"]) == 1
+    assert "app/maintenance.py: PR-5 is docs/governance/test-only" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("operation", ("copy", "rename"))
+def test_corpus_maintenance_does_not_hide_canonical_moves(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    operation: str,
+) -> None:
+    _base, arguments = _maintenance_fixture(tmp_path, monkeypatch)
+    assert corpus.main([*arguments, "--files", "app/maintenance.py"]) == 0
+    source = tmp_path / REL_INDEX
+    destination = tmp_path / "docs/copied-index.json"
+    if operation == "copy":
+        destination.write_bytes(source.read_bytes())
+    else:
+        source.rename(destination)
+        # Preserve current file availability as a dirty copy so the Git move is decisive.
+    _maintenance_commit(tmp_path)
+    if operation == "rename":
+        source.write_bytes(destination.read_bytes())
+    assert corpus.main([*arguments, "--files", "app/maintenance.py"]) == 1
+    assert "rename/copy ambiguity" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("fault", ("outside", "absent", "binary", "symlink", "bad-base"))
+def test_corpus_maintenance_keeps_all_changed_file_structural_checks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    fault: str,
+) -> None:
+    _base, arguments = _maintenance_fixture(tmp_path, monkeypatch)
+    assert corpus.main([*arguments, "--files", "app/maintenance.py"]) == 0
+    target = "app/maintenance.py"
+    expected = {
+        "outside": "escapes repo root",
+        "absent": "absent from both exact Git trees",
+        "binary": "binary or ambiguous text encoding",
+        "symlink": "symlink",
+        "bad-base": "full lowercase commit SHA",
+    }[fault]
+    if fault == "outside":
+        target = "../outside.py"
+    elif fault == "absent":
+        target = "app/missing.py"
+    elif fault == "bad-base":
+        arguments[arguments.index("--base-ref") + 1] = "HEAD"
+    else:
+        path = tmp_path / target
+        if fault == "binary":
+            path.write_bytes(b"\x7fELF\x00")
+        else:
+            path.unlink()
+            path.symlink_to("/" + "outside/private")
+        _maintenance_commit(tmp_path)
+    assert corpus.main([*arguments, "--files", target]) == 1
+    assert expected in capsys.readouterr().out
+
+
+def test_corpus_maintenance_always_checks_complete_canonical_privacy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _base, arguments = _maintenance_fixture(tmp_path, monkeypatch)
+    assert corpus.main([*arguments, "--files", "app/maintenance.py"]) == 0
+    roadmap = tmp_path / DEFAULT_ROADMAP.relative_to(REPO_ROOT)
+    roadmap.write_text(roadmap.read_text() + "\nsource=" + "/" + "private/corpus.pdf\n")
+    assert corpus.main([*arguments, "--files", "app/maintenance.py"]) == 1
+    assert "semantic-cache roadmap: forbidden local path" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("state", ("missing", "symlink", "executable"))
+def test_corpus_canonical_base_transition_cannot_be_maintenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    state: str,
+) -> None:
+    _base, arguments = _maintenance_fixture(tmp_path, monkeypatch)
+    assert corpus.main([*arguments, "--files", "app/maintenance.py"]) == 0
+    artifact = tmp_path / REL_INDEX
+    original = artifact.read_bytes()
+    if state == "executable":
+        artifact.chmod(0o755)
+    else:
+        artifact.unlink()
+        if state == "symlink":
+            artifact.symlink_to("historical-alias.json")
+    _maintenance_commit(tmp_path)
+    arguments[arguments.index("--base-ref") + 1] = _fixture_git(
+        tmp_path, "rev-parse", "HEAD"
+    ).decode("ascii")
+    if artifact.is_symlink():
+        artifact.unlink()
+    artifact.write_bytes(original)
+    artifact.chmod(0o644)
+    _maintenance_commit(tmp_path)
+    assert corpus.main([*arguments, "--files", "app/maintenance.py"]) == 1
+    expected = (
+        "base alias is ambiguous" if state == "symlink" else "PR-5 is docs/governance/test-only"
+    )
+    assert expected in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("state", ("missing", "executable"))
+def test_corpus_current_head_requires_every_regular_canonical_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    state: str,
+) -> None:
+    _base, arguments = _maintenance_fixture(tmp_path, monkeypatch)
+    assert corpus.main([*arguments, "--files", "app/maintenance.py"]) == 0
+    artifact = tmp_path / REL_INDEX
+    original = artifact.read_bytes()
+    if state == "missing":
+        artifact.unlink()
+    else:
+        artifact.chmod(0o755)
+    _maintenance_commit(tmp_path)
+    if state == "missing":
+        # Valid dirty bytes cannot replace a missing committed canonical member.
+        artifact.write_bytes(original)
+        artifact.chmod(0o644)
+    assert corpus.main([*arguments, "--files", "app/maintenance.py"]) == 1
+    assert "requires a regular head artifact" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("fault", ("invalid-head", "head-drift", "unreadable"))
+def test_corpus_maintenance_rejects_unavailable_current_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    fault: str,
+) -> None:
+    _base, arguments = _maintenance_fixture(tmp_path, monkeypatch)
+    assert corpus.main([*arguments, "--files", "app/maintenance.py"]) == 0
+    original = corpus._corpus_git_bytes
+    reads = 0
+
+    def git(*args: str) -> bytes:
+        nonlocal reads
+        if args[:1] == ("rev-parse",):
+            reads += 1
+            if fault == "unreadable":
+                raise OSError("synthetic-private-inspection")
+            if fault == "invalid-head":
+                return b"not-a-commit\n"
+            if reads == 2:
+                return b"f" * 40 + b"\n"
+        return original(*args)
+
+    monkeypatch.setattr(corpus, "_corpus_git_bytes", git)
+    assert corpus.main([*arguments, "--files", "app/maintenance.py"]) == 1
+    output = capsys.readouterr().out
+    expected = {
+        "invalid-head": "head identity is unavailable",
+        "head-drift": "head changed during inspection",
+        "unreadable": "file inspection unavailable: OSError",
+    }[fault]
+    assert expected in output and "synthetic-private-inspection" not in output
+
+
+@pytest.mark.parametrize("permissions", (0o444, 0o640))
+def test_corpus_maintenance_accepts_readable_nonexecutable_canonical_permissions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, permissions: int
+) -> None:
+    _base, arguments = _maintenance_fixture(tmp_path, monkeypatch)
+    assert corpus.main([*arguments, "--files", "app/maintenance.py"]) == 0
+    artifact = tmp_path / REL_INDEX
+    artifact.chmod(permissions)
+    try:
+        assert corpus.main([*arguments, "--files", "app/maintenance.py"]) == 0
+    finally:
+        artifact.chmod(0o644)
+
+
+@pytest.mark.parametrize("fault", ("local_path", "credential", "runtime"))
+def test_corpus_valid_docs_only_delta_retains_full_content_and_scope_checks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    fault: str,
+) -> None:
+    _base, arguments = _maintenance_fixture(tmp_path, monkeypatch)
+    # Advance the trusted base so this new PR delta contains only documentation.
+    arguments[arguments.index("--base-ref") + 1] = _fixture_git(
+        tmp_path, "rev-parse", "HEAD"
+    ).decode("ascii")
+    relative_roadmap = DEFAULT_ROADMAP.relative_to(REPO_ROOT).as_posix()
+    roadmap = tmp_path / relative_roadmap
+    roadmap.write_text(roadmap.read_text() + "\nCorpus metadata remains reference evidence.\n")
+    document = tmp_path / "docs/maintenance.md"
+    document.write_text("Bounded documentation update.\n")
+    _maintenance_commit(tmp_path)
+    paths = [relative_roadmap, "docs/maintenance.md"]
+    assert corpus.main([*arguments, "--files", *paths]) == 0
+    capsys.readouterr()
+
+    if fault == "runtime":
+        (tmp_path / "app/maintenance.py").write_text("safe = 3\n")
+        paths.append("app/maintenance.py")
+        expected = "app/maintenance.py: PR-5 is docs/governance/test-only"
+    else:
+        value = (
+            "/" + "private/corpus-update.pdf" if fault == "local_path" else "token" + "=" + "z" * 20
+        )
+        document.write_text(document.read_text() + value + "\n")
+        expected = "docs/maintenance.md: new forbidden local path or credential-like token"
+    _maintenance_commit(tmp_path)
+    assert corpus.main([*arguments, "--files", *paths]) == 1
+    assert expected in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("phase", ("after_applicability", "during_walker"))
+def test_corpus_maintenance_rejects_head_mutation_across_applicability_and_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    phase: str,
+) -> None:
+    _base, arguments = _maintenance_fixture(tmp_path, monkeypatch)
+    assert corpus.main([*arguments, "--files", "app/maintenance.py"]) == 0
+    capsys.readouterr()
+    frozen = _fixture_git(tmp_path, "rev-parse", "HEAD").decode("ascii")
+    mutated = False
+    observed_scan_refs: list[str] = []
+    original_applicability = corpus._canonical_corpus_changed
+    original_tree = corpus._corpus_tree_blob
+
+    def mutate_head() -> None:
+        nonlocal mutated
+        assert not mutated
+        roadmap = tmp_path / DEFAULT_ROADMAP.relative_to(REPO_ROOT)
+        roadmap.write_text(roadmap.read_text() + "\nA concurrent canonical change.\n")
+        _maintenance_commit(tmp_path)
+        assert _fixture_git(tmp_path, "rev-parse", "HEAD").decode("ascii") != frozen
+        mutated = True
+
+    def applicability(
+        base_ref: str, supplied: tuple[Path, ...], validated: tuple[str, ...], *, head_ref: str
+    ) -> bool:
+        changed = original_applicability(base_ref, supplied, validated, head_ref=head_ref)
+        assert not changed and head_ref == frozen
+        if phase == "after_applicability":
+            mutate_head()
+        return changed
+
+    def tree(ref: str, path: str) -> tuple[str, bytes] | None:
+        if path == "app/maintenance.py":
+            observed_scan_refs.append(ref)
+            if phase == "during_walker" and not mutated:
+                mutate_head()
+        return original_tree(ref, path)
+
+    monkeypatch.setattr(corpus, "_canonical_corpus_changed", applicability)
+    monkeypatch.setattr(corpus, "_corpus_tree_blob", tree)
+    assert corpus.main([*arguments, "--files", "app/maintenance.py"]) == 1
+    assert mutated
+    assert observed_scan_refs == [_base, frozen]
+    assert capsys.readouterr().out.splitlines() == [
+        "ERROR: philosophy source corpus index check failed:",
+        "- source corpus head changed during inspection",
+    ]

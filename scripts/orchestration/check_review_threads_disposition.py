@@ -1,0 +1,1560 @@
+#!/usr/bin/env python3
+"""
+Guard: resolved review threads must have explicit Disposition records in canonical artifact.
+
+Strict mode: every resolved thread must be listed under **Fixed in Commit Mapping**
+in docs/review/PR_<N>_FIXED_MAPPING.md with Disposition (FIXED | NOT-A-BUG | DEFERRED)
+and proof (Commit / Evidence / Backlog).
+
+Auth modes:
+- Local default: advisory; without usable `gh` auth the script may SKIP (exit 0).
+- Local strict: pass --require-auth and export GH_TOKEN before any GraphQL.
+- CI strict: CI=true requires GH_TOKEN before any GraphQL.
+
+Canonical GraphQL token: GH_TOKEN. GITHUB_TOKEN alone does not satisfy the strict
+disposition preflight, although other PR gates may still use it for REST/API access.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess  # nosec B404: bounded gh and local Git subprocess calls (remove-by: 2027-02-01, ref: PR-985)
+import sys
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Mapping, cast
+from urllib.parse import urlencode
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts.orchestration.review_mapping_artifact import (
+    extract_fixed_mapping_section as _artifact_extract_fixed_mapping,
+    parse_canonical_fingerprint_records,
+    parse_fixed_mapping_entries,
+    read_mapping_artifact,
+    review_seal_version,
+    validate_fixed_mapping_section,
+)
+from scripts.orchestration.pr_commit_identity import (
+    _MAX_REVIEW_THREAD_PAGES,
+    CommitIdentityError,
+    CommitRefKind,
+    PrSnapshot,
+    RepositoryCommitRef,
+    ReviewExecutionRef,
+    ReviewThreadEvidence,
+    assert_snapshot_unchanged,
+    classify_commit_ref,
+    fetch_pr_snapshot,
+    fetch_review_threads,
+    is_ancestor,
+)
+from scripts.orchestration.pr_review_evidence import (
+    TRIGGER_ONLY_COMMIT_SUBJECT_RE,
+    ReviewEvidenceError,
+    parse_embedded_review_seal,
+    review_thread_inventory,
+    validated_duplicate_reply_urls,
+)
+
+DISPOSITION_RE = re.compile(r"Disposition:\s*(FIXED|NOT-A-BUG|DEFERRED)", re.IGNORECASE)
+_LINE_RE_FLAGS = re.IGNORECASE | re.MULTILINE
+COMMIT_RE = re.compile(r"^Commit:\s*(.*)$", _LINE_RE_FLAGS)
+EVIDENCE_RE = re.compile(r"^Evidence:\s*(.+)$", _LINE_RE_FLAGS)
+BACKLOG_RE = re.compile(r"^Backlog:\s*(.+)$", _LINE_RE_FLAGS)
+REASON_RE = re.compile(r"^Reason:\s*(.+)$", _LINE_RE_FLAGS)
+
+
+@dataclass(frozen=True)
+class ResolvedThreadRef:
+    url: str
+    source: str
+    is_resolved: bool
+    created_at: str  # ISO 8601 from GraphQL (first comment createdAt)
+    author_login: str = ""
+    original_commit_sha: str | None = None
+
+
+# Timeout for gh CLI calls to avoid hanging CI (CodeRabbit/Cubic).
+_RUN_TIMEOUT_SEC = 60
+_GIT_TIMEOUT_SEC = 15
+_CODEX_CONNECTOR_GRAPHQL_LOGIN = "chatgpt-codex-connector"
+
+# Mapping line: "- https://... -> sha" or "- https://...#anchor -> sha"
+_MAPPING_LINE_RE = re.compile(r"^\s*-\s*(https://[^\s]+)\s*->\s*([a-f0-9]{7,40})\b", re.IGNORECASE)
+# Relaxed: match mapping-like lines to validate SHA (catches "- url -> notasha")
+_MAPPING_LINE_RELAXED_RE = re.compile(r"^\s*-\s*(https://[^\s]+)\s*->\s*(\S+)", re.IGNORECASE)
+_REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+
+def _gh_path() -> str:
+    """Resolved path to gh CLI (B607 / Sourcery: no partial path in subprocess)."""
+    path = shutil.which("gh")
+    if not path or not Path(path).is_absolute():
+        raise RuntimeError("gh CLI not found in PATH")
+    return path
+
+
+def _run(cmd: list[str]) -> str:
+    operations = {
+        ("gh", "auth", "token"): "auth token",
+        ("gh", "pr", "view", "--json", "number", "-q", ".number"): "PR number",
+        ("gh", "repo", "view", "--json", "owner", "-q", ".owner.login"): "repository owner",
+        ("gh", "repo", "view", "--json", "name", "-q", ".name"): "repository name",
+    }
+    operation = operations.get(tuple(cmd))
+    if operation is None and cmd[:2] == ["gh", "api"]:
+        repository = r"repos/(?!\.{1,2}/)[A-Za-z0-9_.-]+/(?!\.{1,2}/)[A-Za-z0-9_.-]+/"
+        if len(cmd) == 3 and re.fullmatch(repository + r"pulls/[1-9][0-9]*", cmd[-1]):
+            operation = "pull request"
+        elif len(cmd) == 5 and cmd[2:4] == ["--paginate", "--slurp"]:
+            for suffix, category in (
+                (r"compare/[0-9a-fA-F]{7,40}\.\.\.[0-9a-fA-F]{7,40}\?per_page=100", "compare"),
+                (
+                    r"activity\?ref=(?:[A-Za-z0-9._~+-]|%[0-9A-F]{2})+&activity_type=push&per_page=100",
+                    "activity",
+                ),
+                (r"events\?per_page=100", "events"),
+            ):
+                if re.fullmatch(repository + suffix, cmd[-1]):
+                    operation = category
+                    break
+    if operation is None:
+        raise RuntimeError("Unsupported gh operation")
+    argv = [_gh_path(), *cmd[1:]]
+    try:
+        result = subprocess.run(  # nosec B603: closed gh commands with validated dynamic REST operands and bounded diagnostics (remove-by: 2027-02-01, ref: PR-985)
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=_RUN_TIMEOUT_SEC,
+        )
+    except subprocess.TimeoutExpired:
+        failure = "timeout"
+    except (OSError, UnicodeError):
+        failure = "transport failure"
+    else:
+        if result.returncode == 0:
+            return result.stdout
+        failure = f"exit {result.returncode}"
+    raise RuntimeError(f"gh {operation}: {failure}")
+
+
+def _decode_gh_json(raw: str) -> Any:
+    try:
+        return json.loads(raw)
+    except (ValueError, RecursionError):
+        pass
+    raise RuntimeError("Malformed gh JSON response")
+
+
+def _parse_iso_datetime(value: str) -> datetime:
+    """
+    Parse ISO 8601 datetime from GitHub/GraphQL or git (%cI).
+    Supports trailing 'Z'.
+    """
+    v = value.strip()
+    if v.endswith("Z"):
+        v = v[:-1] + "+00:00"
+    dt = datetime.fromisoformat(v)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+# Allow only git rev format (7–40 hex chars) so argv is safe (Sourcery / injection)
+_GIT_SHA_RE = re.compile(r"^[a-f0-9]{7,40}$", re.IGNORECASE)
+
+
+def _commit_metadata(commit_sha: str, field: str) -> bytes:
+    """Read one selected commit's exclusion/chronology data in the CLI checkout."""
+    spelling = commit_sha.strip()
+    if not re.fullmatch(r"[0-9A-Fa-f]{7,40}", spelling):
+        raise RuntimeError("Invalid commit SHA format")
+    formats = {
+        "time": ["-s", "--format=%cI"],
+        "subject": ["-s", "--format=%s"],
+        "files": ["--name-only", "-z", "--pretty=format:"],
+    }
+    options = formats[field]
+    git = shutil.which("git", path=os.defpath)
+    if (
+        not git
+        or not Path(git).is_absolute()
+        or not os.access(git, os.X_OK)
+        or not Path(git).is_file()
+    ):
+        raise RuntimeError("Local Git executable unavailable")
+    environment = {
+        "PATH": os.defpath,
+        "LC_ALL": "C",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+
+    def query(*args: str) -> bytes:
+        try:
+            result = subprocess.run(  # nosec B603: absolute git binary checks metadata with fixed operands (remove-by: 2027-02-01, ref: PR-985)
+                [
+                    git,
+                    "--no-pager",
+                    "--no-replace-objects",
+                    "-c",
+                    "core.warnAmbiguousRefs=true",
+                    "-c",
+                    "advice.objectNameWarning=true",
+                    *args,
+                ],
+                cwd=REPO_ROOT,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=_GIT_TIMEOUT_SEC,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            failure = "Local Git metadata query timed out"
+        except OSError:
+            failure = "Local Git metadata query could not execute"
+        else:
+            if result.returncode == 0 and not result.stderr:
+                return result.stdout
+            failure = "Local Git metadata query failed or was ambiguous"
+        raise RuntimeError(failure)
+
+    if query("rev-parse", "--show-toplevel") != os.fsencode(REPO_ROOT.resolve()) + b"\n":
+        raise RuntimeError("Local Git checkout mismatch")
+    shallow = b""
+    for leaf in (("info/grafts", "shallow") if field == "files" else ("info/grafts",)):
+        raw_path = query("rev-parse", "--git-path", leaf)
+        if (
+            not raw_path.endswith(b"\n")
+            or not raw_path[:-1]
+            or any(ch in raw_path[:-1] for ch in (b"\n", b"\r", b"\x00"))
+        ):
+            raise RuntimeError("Local Git history metadata path is invalid")
+        path = REPO_ROOT / os.fsdecode(raw_path[:-1])
+        try:
+            if leaf == "info/grafts":
+                path.lstat()
+                raise RuntimeError("Local Git grafts preclude metadata verification")
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    raise RuntimeError("Invalid local Git shallow boundary")
+                with os.fdopen(fd, "rb", closefd=False) as stream:
+                    shallow = stream.read(4 * 1024**2 + 1)
+            finally:
+                os.close(fd)
+        except FileNotFoundError:
+            if leaf == "shallow":
+                shallow = b""
+        except OSError:
+            raise RuntimeError("Local Git history metadata unavailable") from None
+    boundaries = shallow.splitlines()
+    if (
+        len(shallow) > 4 * 1024**2
+        or len(set(boundaries)) != len(boundaries)
+        or any(not re.fullmatch(rb"[0-9a-f]{40}", row) for row in boundaries)
+    ):
+        raise RuntimeError("Invalid local Git shallow boundary")
+    unique = query("rev-parse", "--disambiguate=" + spelling.lower())
+    if not re.fullmatch(rb"[0-9a-f]{40}\n", unique) or not unique.startswith(
+        spelling.lower().encode("ascii")
+    ):
+        raise RuntimeError("Local commit object is missing or ambiguous")
+    oid = unique[:-1].decode("ascii")
+    if (
+        any(
+            query("rev-parse", "--verify", "--end-of-options", name) != unique
+            for name in dict.fromkeys((spelling, spelling.lower()))
+        )
+        or query("cat-file", "-t", oid) != b"commit\n"
+        or unique[:-1] in boundaries
+    ):
+        raise RuntimeError("Local commit identity or parent evidence is unavailable")
+    return query(
+        "show",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-notes",
+        "--no-show-signature",
+        "--no-color",
+        "--no-decorate",
+        *options,
+        oid,
+        "--",
+    )
+
+
+def _git_commit_time_iso(commit_sha: str) -> str:
+    raw = _commit_metadata(commit_sha, "time")
+    if re.fullmatch(
+        rb"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+        rb"(?:Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])\n",
+        raw,
+    ):
+        value = raw[:-1].decode("ascii")
+        if value.endswith("Z"):
+            value = value[:-1] + "+00:00"
+        try:
+            datetime.fromisoformat(value)
+        except ValueError:
+            pass
+        else:
+            return value
+    raise RuntimeError("Invalid local commit timestamp")
+
+
+def _git_commit_subject(commit_sha: str) -> str:
+    raw = _commit_metadata(commit_sha, "subject")
+    if raw.endswith(b"\n") and not any(ch in raw[:-1] for ch in (b"\r", b"\n", b"\x00")):
+        try:
+            return raw[:-1].decode("utf-8")
+        except UnicodeDecodeError:
+            pass
+    raise RuntimeError("Invalid local commit subject")
+
+
+def _git_changed_files(commit_sha: str) -> list[str]:
+    raw = _commit_metadata(commit_sha, "files")
+    if not raw:
+        return []
+    if not raw.endswith(b"\x00") or any(not name for name in raw[:-1].split(b"\x00")):
+        raise RuntimeError("Invalid local commit path inventory")
+    return [os.fsdecode(name) for name in raw[:-1].split(b"\x00")]
+
+
+def _check_trigger_only_mapping(
+    resolved_threads: list[ResolvedThreadRef],
+    fixed_mapping_section: str,
+) -> list[str]:
+    """
+    Validate that each mapped SHA is not trigger-only (empty commit or rerun/trigger subject).
+    Returns list of violation messages; empty if all pass.
+    """
+    mapping = _parse_mapping_section(fixed_mapping_section)
+    violations: list[str] = []
+    for t in resolved_threads:
+        sha = mapping.get(t.url)
+        if not sha:
+            continue
+        changed_files = _git_changed_files(sha)
+        if not changed_files:
+            violations.append(
+                f"{t.url}: mapped to {sha} but commit is EMPTY (no changed files). "
+                "Trigger-only commits are not valid FIXED proof."
+            )
+            continue
+        subject = _git_commit_subject(sha)
+        if TRIGGER_ONLY_COMMIT_SUBJECT_RE.search(subject):
+            violations.append(
+                f"{t.url}: mapped to {sha} but commit subject looks like CI rerun/trigger "
+                "and cannot serve as FIXED proof."
+            )
+    return violations
+
+
+def _parse_mapping_section(section: str) -> dict[str, str]:
+    """
+    Parse Fixed in Commit Mapping section into thread-specific URL -> sha mappings.
+
+    Supports both:
+    - explicit mapping lines: "- https://... -> sha"
+    - inline FIXED blocks with "Commit: <sha>"
+    """
+    mapping: dict[str, str] = {}
+    for block in _iter_disposition_blocks(section):
+        mapping.update(_block_mapping_entries(block))
+        if _block_disposition(block) != "FIXED":
+            continue
+        commit_value = _block_commit_value(block) or ""
+        if not _GIT_SHA_RE.match(commit_value):
+            continue
+        for thread_url in _block_thread_urls(block):
+            mapping.setdefault(thread_url, commit_value)
+    return mapping
+
+
+def _iter_disposition_blocks(section: str) -> list[str]:
+    """Split mapping section into contiguous non-empty disposition blocks."""
+
+    blocks: list[str] = []
+    current: list[str] = []
+    for raw_line in section.splitlines():
+        line = raw_line.rstrip()
+        if not line.strip():
+            if current:
+                blocks.append("\n".join(current))
+                current = []
+            continue
+        current.append(line)
+    if current:
+        blocks.append("\n".join(current))
+    return blocks
+
+
+def _url_in_block(block: str, url: str) -> bool:
+    """True when a block contains the exact thread URL."""
+
+    url_pattern = re.escape(url) + r"(?![0-9a-zA-Z])"
+    return any(re.search(url_pattern, line) for line in block.splitlines())
+
+
+def _block_has_disposition_and_proof(block: str) -> bool:
+    """True when a block carries the disposition-specific proof markers."""
+
+    disposition = _block_disposition(block)
+    if disposition == "FIXED":
+        return bool(_block_commit_value(block) is not None and EVIDENCE_RE.search(block))
+    if disposition == "NOT-A-BUG":
+        return bool(EVIDENCE_RE.search(block) and REASON_RE.search(block))
+    if disposition == "DEFERRED":
+        return bool(BACKLOG_RE.search(block))
+    return False
+
+
+def _is_mapping_only_block(block: str) -> bool:
+    """True for URL mapping blocks without their own detail headers."""
+
+    detail_prefixes = ("Disposition:", "Commit:", "Evidence:", "Backlog:")
+    lines = [line.strip() for line in block.splitlines() if line.strip()]
+    if not lines:
+        return False
+    if any(line.startswith(detail_prefixes) for line in lines):
+        return False
+    return all(line.startswith("- http") for line in lines)
+
+
+def _block_commit_value(block: str) -> str | None:
+    """Return the normalized Commit value from a block, if present."""
+
+    for raw_line in block.splitlines():
+        match = COMMIT_RE.search(raw_line.strip())
+        if match:
+            return match.group(1).strip()
+    return None
+
+
+def _block_mapping_entries(block: str) -> dict[str, str]:
+    """Parse mapping entries from a single block only."""
+
+    mapping: dict[str, str] = {}
+    for line in block.splitlines():
+        match = _MAPPING_LINE_RE.search(line.strip())
+        if not match:
+            continue
+        mapping[match.group(1).strip()] = match.group(2)
+    return mapping
+
+
+def _block_thread_urls(block: str) -> list[str]:
+    """Extract thread-specific GitHub URLs referenced by bullet lines in a block."""
+
+    urls: list[str] = []
+    url_re = re.compile(
+        r"^\s*-\s*(https://github\.com/[^/\s]+/[^/\s]+/pull/\d+#(?:discussion_r\d+|pullrequestreview-\d+))\b"
+    )
+    for line in block.splitlines():
+        match = url_re.search(line.strip())
+        if match:
+            urls.append(match.group(1).strip())
+    return urls
+
+
+def _block_disposition(block: str) -> str | None:
+    """Return normalized disposition for a contiguous block, if present."""
+
+    for line in block.splitlines():
+        match = DISPOSITION_RE.search(line.strip())
+        if match:
+            return match.group(1).upper()
+    return None
+
+
+def _validate_fixed_commit_blocks(section: str) -> list[str]:
+    """Return validation errors for FIXED blocks with invalid Commit proof."""
+
+    errors: list[str] = []
+    blocks = _iter_disposition_blocks(section)
+    for index, block in enumerate(blocks):
+        if _block_disposition(block) != "FIXED":
+            continue
+        value = _block_commit_value(block)
+        if value is None:
+            errors.append(
+                "FIXED block missing Commit proof "
+                "(must be 7–40 hex chars or 'see mapping entries below')"
+            )
+            continue
+        if not value:
+            errors.append(
+                "Invalid Commit value in FIXED block: empty "
+                "(must be 7–40 hex chars or 'see mapping entries below')"
+            )
+            continue
+        if _GIT_SHA_RE.match(value):
+            continue
+        if value.lower() != "see mapping entries below":
+            errors.append(
+                f"Invalid Commit value in FIXED block: {value!r} "
+                "(must be 7–40 hex chars or 'see mapping entries below')"
+            )
+            continue
+        if index + 1 >= len(blocks) or not _is_mapping_only_block(blocks[index + 1]):
+            errors.append(
+                "FIXED block uses 'Commit: see mapping entries below' but has no "
+                "following mapping block with '- <thread_url> -> <sha>' entries"
+            )
+            continue
+        mapping_entries = _block_mapping_entries(blocks[index + 1])
+        if not mapping_entries:
+            errors.append(
+                "FIXED block uses 'Commit: see mapping entries below' but the "
+                "following mapping block has no valid SHA mappings"
+            )
+            continue
+        missing_urls = [
+            thread_url
+            for thread_url in _block_thread_urls(block)
+            if thread_url not in mapping_entries
+        ]
+        if missing_urls:
+            missing_display = ", ".join(missing_urls)
+            errors.append(
+                "FIXED block uses 'Commit: see mapping entries below' but the "
+                f"following mapping block is missing SHA mappings for: {missing_display}"
+            )
+    return errors
+
+
+def _check_commit_after_comment(
+    resolved_threads: list[ResolvedThreadRef],
+    section: str,
+    *,
+    _git_commit_time_fn: Any = None,
+    commit_time_by_sha: Mapping[str, str | None] | None = None,
+) -> list[str]:
+    """
+    For each resolved thread with a mapped SHA, require commit_time > comment_time.
+    Returns list of violation messages (empty if all pass).
+    _git_commit_time_fn(sha) -> ISO str for tests; default _git_commit_time_iso.
+    """
+    get_commit_time = _git_commit_time_fn or _git_commit_time_iso
+    mapping_by_url = _parse_mapping_section(section)
+    violations: list[str] = []
+    for t in resolved_threads:
+        sha = mapping_by_url.get(t.url)
+        if not sha:
+            # Thread may be FIXED (needs SHA) or NOT-A-BUG/DEFERRED (Evidence/Backlog only); only FIXED with -> sha is checked here
+            continue
+        if not t.created_at:
+            violations.append(
+                f"{t.url}: missing comment timestamp (cannot verify commit-after-comment)"
+            )
+            continue
+        try:
+            thread_created = _parse_iso_datetime(t.created_at)
+            if commit_time_by_sha is None:
+                commit_iso = get_commit_time(sha)
+            else:
+                commit_iso = commit_time_by_sha.get(sha)
+                if not commit_iso:
+                    raise RuntimeError(
+                        f"commit {sha} lacks server-side pushedDate or immutable "
+                        "repository push timestamp evidence"
+                    )
+            commit_dt = _parse_iso_datetime(commit_iso)
+            if commit_dt <= thread_created:
+                violations.append(
+                    f"{t.url}: mapped to {sha} but commit_time={commit_iso} <= comment_time={t.created_at} "
+                    "(commit must be after comment; fix code first, then map)"
+                )
+        except RuntimeError as e:
+            violations.append(f"{t.url}: {e}")
+    return violations
+
+
+def _validated_server_timestamp(value: object, *, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError(f"{label} is missing a server timestamp")
+    try:
+        _parse_iso_datetime(value)
+    except ValueError as exc:
+        raise RuntimeError(f"{label} has a malformed server timestamp") from exc
+    return value
+
+
+def _repository_activity_push_timestamp(activity: dict[str, object]) -> str:
+    """Return the immutable push timestamp across GitHub activity schema variants."""
+
+    timestamp = activity.get("timestamp")
+    pushed_at = activity.get("pushed_at")
+    if timestamp is not None and pushed_at is not None:
+        validated_timestamp = _validated_server_timestamp(
+            timestamp,
+            label="GitHub repository push activity timestamp",
+        )
+        validated_pushed_at = _validated_server_timestamp(
+            pushed_at,
+            label="GitHub repository push activity pushed_at",
+        )
+        if _parse_iso_datetime(validated_timestamp) != _parse_iso_datetime(validated_pushed_at):
+            raise RuntimeError("GitHub repository push activity has conflicting timestamps")
+        return validated_pushed_at
+    return _validated_server_timestamp(
+        pushed_at if pushed_at is not None else timestamp,
+        label="GitHub repository push activity",
+    )
+
+
+def _next_page_cursor(info: dict[str, Any], seen: set[str], label: str) -> str | None:
+    more = info.get("hasNextPage")
+    if type(more) is not bool:
+        raise RuntimeError(f"{label} pagination is malformed")
+    cursor = info.get("endCursor")
+    if "endCursor" not in info or (
+        cursor is not None and (not isinstance(cursor, str) or not cursor.strip())
+    ):
+        raise RuntimeError(f"{label} cursor is malformed")
+    if not more:
+        return None
+    if not isinstance(cursor, str) or cursor in seen:
+        raise RuntimeError(f"{label} cursor is missing or repeated")
+    seen.add(cursor)
+    return cursor
+
+
+def _fetch_pr_force_push_boundaries(
+    *,
+    repository: str,
+    pr_number: int,
+) -> list[tuple[str | None, str, str]]:
+    """Return server-authored before/after boundaries for PR force-push events."""
+
+    owner, name = repository.split("/", 1)
+    query = """
+    query($owner:String!, $name:String!, $pr:Int!, $after:String) {
+      repository(owner:$owner, name:$name) {
+        pullRequest(number:$pr) {
+          timelineItems(
+            first: 100,
+            after: $after,
+            itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT]
+          ) {
+            nodes {
+              ... on HeadRefForcePushedEvent {
+                createdAt
+                beforeCommit { oid }
+                afterCommit { oid }
+              }
+            }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      }
+    }
+    """
+    after: str | None = None
+    seen: set[str] = set()
+    boundaries: list[tuple[str | None, str, str]] = []
+    while True:
+        data = _graphql(
+            query,
+            {"owner": owner, "name": name, "pr": pr_number, "after": after},
+        )
+        repo_data = data.get("repository")
+        pull_request = repo_data.get("pullRequest") if isinstance(repo_data, dict) else None
+        timeline = pull_request.get("timelineItems") if isinstance(pull_request, dict) else None
+        if not isinstance(timeline, dict):
+            raise RuntimeError("GitHub force-push timeline response is malformed")
+        nodes = timeline.get("nodes")
+        page_info = timeline.get("pageInfo")
+        if not isinstance(nodes, list) or not isinstance(page_info, dict):
+            raise RuntimeError("GitHub force-push timeline page is malformed")
+        for node in nodes:
+            if not isinstance(node, dict):
+                raise RuntimeError("GitHub force-push timeline node is malformed")
+            before_commit = node.get("beforeCommit")
+            after_commit = node.get("afterCommit")
+            before_sha = (
+                str(before_commit.get("oid") or "").lower()
+                if isinstance(before_commit, dict)
+                else ""
+            )
+            after_sha = (
+                str(after_commit.get("oid") or "").lower() if isinstance(after_commit, dict) else ""
+            )
+            if _GIT_SHA_RE.fullmatch(after_sha) is None:
+                continue
+            if before_sha and _GIT_SHA_RE.fullmatch(before_sha) is None:
+                raise RuntimeError("GitHub force-push beforeCommit is malformed")
+            boundaries.append(
+                (
+                    before_sha or None,
+                    after_sha,
+                    _validated_server_timestamp(
+                        node.get("createdAt"),
+                        label="GitHub HeadRefForcePushedEvent",
+                    ),
+                )
+            )
+        after = _next_page_cursor(page_info, seen, "GitHub force-push timeline")
+        if after is None:
+            break
+    return boundaries
+
+
+def _fetch_compare_commit_shas(
+    *,
+    repository: str,
+    before_sha: str,
+    after_sha: str,
+) -> frozenset[str]:
+    """Return commits GitHub proves were introduced between two exact heads."""
+
+    compare_pages = _decode_gh_json(
+        _run(
+            [
+                "gh",
+                "api",
+                "--paginate",
+                "--slurp",
+                f"repos/{repository}/compare/{before_sha}...{after_sha}?per_page=100",
+            ]
+        )
+    )
+    if not isinstance(compare_pages, list):
+        raise RuntimeError("GitHub compare response is malformed")
+    introduced: set[str] = set()
+    for page in compare_pages:
+        if not isinstance(page, dict) or not isinstance(page.get("commits"), list):
+            raise RuntimeError("GitHub compare page is malformed")
+        for commit in page["commits"]:
+            sha = str(commit.get("sha") or "").lower() if isinstance(commit, dict) else ""
+            if _GIT_SHA_RE.fullmatch(sha) is None:
+                raise RuntimeError("GitHub compare commit identity is malformed")
+            introduced.add(sha)
+    return frozenset(introduced)
+
+
+def _fetch_server_commit_times(
+    *,
+    snapshot: PrSnapshot,
+    repository: str,
+    pr_number: int,
+    mapped_shas: frozenset[str],
+) -> dict[str, str | None]:
+    """Resolve server-observed PR commit times without trusting local git dates."""
+
+    if _REPOSITORY_RE.fullmatch(repository) is None:
+        raise RuntimeError(f"Invalid repository identity: {repository!r}")
+    for sha in mapped_shas:
+        if _GIT_SHA_RE.fullmatch(sha) is None:
+            raise RuntimeError(f"Invalid mapped commit SHA: {sha!r}")
+
+    times: dict[str, str | None] = {commit.sha: commit.pushed_at for commit in snapshot.commits}
+    missing = {sha for sha in mapped_shas if not times.get(sha)}
+    if not missing:
+        return times
+
+    pull_payload = _decode_gh_json(_run(["gh", "api", f"repos/{repository}/pulls/{pr_number}"]))
+    head = pull_payload.get("head") if isinstance(pull_payload, dict) else None
+    head_repo = head.get("repo") if isinstance(head, dict) else None
+    head_repository = head_repo.get("full_name") if isinstance(head_repo, dict) else None
+    head_ref = head.get("ref") if isinstance(head, dict) else None
+    if (
+        not isinstance(head_repository, str)
+        or _REPOSITORY_RE.fullmatch(head_repository) is None
+        or not isinstance(head_ref, str)
+        or not head_ref
+        or any(character in head_ref for character in "\r\n")
+    ):
+        raise RuntimeError("GitHub PR head repository/ref evidence is malformed")
+
+    commit_index = {commit.sha: index for index, commit in enumerate(snapshot.commits)}
+    expected_ref = f"refs/heads/{head_ref}"
+
+    activity_query = urlencode(
+        {
+            "ref": head_ref,
+            "activity_type": "push",
+            "per_page": 100,
+        }
+    )
+    activity_pages = _decode_gh_json(
+        _run(
+            [
+                "gh",
+                "api",
+                "--paginate",
+                "--slurp",
+                f"repos/{head_repository}/activity?{activity_query}",
+            ]
+        )
+    )
+    if not isinstance(activity_pages, list):
+        raise RuntimeError("GitHub repository activity response is malformed")
+    for page in activity_pages:
+        if not isinstance(page, list):
+            raise RuntimeError("GitHub repository activity page is malformed")
+        for activity in page:
+            if (
+                not isinstance(activity, dict)
+                or activity.get("activity_type") != "push"
+                or activity.get("ref") != expected_ref
+            ):
+                continue
+            activity_head = str(activity.get("after") or "").lower()
+            activity_before = str(activity.get("before") or "").lower()
+            head_index = commit_index.get(activity_head)
+            if head_index is None:
+                continue
+            if activity_before == snapshot.base_sha:
+                first_index = 0
+            elif activity_before in commit_index:
+                first_index = commit_index[activity_before] + 1
+            else:
+                # The exact activity head remains provable, but an unknown
+                # range boundary cannot timestamp intermediate commits.
+                first_index = head_index
+            if first_index > head_index:
+                continue
+            timestamp = _repository_activity_push_timestamp(activity)
+            for commit in snapshot.commits[first_index : head_index + 1]:
+                if commit.sha not in missing:
+                    continue
+                previous = times.get(commit.sha)
+                if previous is None or _parse_iso_datetime(timestamp) < _parse_iso_datetime(
+                    previous
+                ):
+                    times[commit.sha] = timestamp
+
+    missing = {sha for sha in missing if not times.get(sha)}
+    if not missing:
+        return times
+
+    event_pages = _decode_gh_json(
+        _run(
+            [
+                "gh",
+                "api",
+                "--paginate",
+                "--slurp",
+                f"repos/{head_repository}/events?per_page=100",
+            ]
+        )
+    )
+    if not isinstance(event_pages, list):
+        raise RuntimeError("GitHub repository events response is malformed")
+    for page in event_pages:
+        if not isinstance(page, list):
+            raise RuntimeError("GitHub repository events page is malformed")
+        for event in page:
+            if not isinstance(event, dict) or event.get("type") != "PushEvent":
+                continue
+            payload = event.get("payload")
+            if not isinstance(payload, dict) or payload.get("ref") != expected_ref:
+                continue
+            event_head = str(payload.get("head") or "").lower()
+            event_before = str(payload.get("before") or "").lower()
+            head_index = commit_index.get(event_head)
+            if head_index is None:
+                continue
+            if event_before == snapshot.base_sha:
+                first_index = 0
+            elif event_before in commit_index:
+                first_index = commit_index[event_before] + 1
+            else:
+                # The exact event head remains provable, but an unknown range
+                # boundary cannot timestamp intermediate commits.
+                first_index = head_index
+            if first_index > head_index:
+                continue
+            created_at = _validated_server_timestamp(
+                event.get("created_at"),
+                label="GitHub PushEvent",
+            )
+            for commit in snapshot.commits[first_index : head_index + 1]:
+                if commit.sha not in missing:
+                    continue
+                previous = times.get(commit.sha)
+                if previous is None or _parse_iso_datetime(created_at) < _parse_iso_datetime(
+                    previous
+                ):
+                    times[commit.sha] = created_at
+
+    missing = {sha for sha in missing if not times.get(sha)}
+    if not missing:
+        return times
+
+    for before_sha, event_head, created_at in _fetch_pr_force_push_boundaries(
+        repository=repository,
+        pr_number=pr_number,
+    ):
+        if event_head not in commit_index:
+            continue
+        introduced_shas = frozenset({event_head})
+        if before_sha is not None:
+            try:
+                introduced_shas |= _fetch_compare_commit_shas(
+                    repository=repository,
+                    before_sha=before_sha,
+                    after_sha=event_head,
+                )
+            except (json.JSONDecodeError, RuntimeError):
+                # The exact event head remains provable. Intermediate commits
+                # stay unproven and therefore fail closed at the consumer.
+                pass
+        for sha in introduced_shas:
+            if sha not in missing:
+                continue
+            previous = times.get(sha)
+            if previous is None or _parse_iso_datetime(created_at) < _parse_iso_datetime(previous):
+                times[sha] = created_at
+    return times
+
+
+def _get_pr_number(pr_number: int | None = None) -> int:
+    if pr_number is not None:
+        if pr_number <= 0:
+            raise RuntimeError(f"Invalid PR number: {pr_number!r} (must be > 0)")
+        return pr_number
+    out = _run(["gh", "pr", "view", "--json", "number", "-q", ".number"])
+    out = out.strip()
+    if not out.isdigit():
+        raise RuntimeError("Unable to detect PR number from gh output")
+    try:
+        return int(out)
+    except ValueError:
+        pass
+    raise RuntimeError("Unable to detect PR number from gh output")
+
+
+def _graphql(query: str, variables: dict[str, Any]) -> dict[str, Any]:
+    # Sourcery: no dynamic argv — pass body via stdin (static argv only)
+    body = json.dumps({"query": query, "variables": variables})
+    try:
+        result = subprocess.run(  # nosec B603: argv static; body via stdin only (remove-by: 2027-02-01, ref: PR-985)
+            [_gh_path(), "api", "graphql", "--input", "-"],
+            input=body,
+            capture_output=True,
+            text=True,
+            timeout=_RUN_TIMEOUT_SEC,
+        )
+    except subprocess.TimeoutExpired:
+        failure = "timeout"
+    except (OSError, UnicodeError):
+        failure = "transport failure"
+    else:
+        if result.returncode == 0:
+            payload = _decode_gh_json(result.stdout)
+            if (
+                isinstance(payload, dict)
+                and "errors" not in payload
+                and isinstance(payload.get("data"), dict)
+            ):
+                return cast(dict[str, Any], payload["data"])
+            failure = "invalid response"
+        else:
+            failure = f"exit {result.returncode}"
+    raise RuntimeError(f"gh graphql: {failure}")
+
+
+def _get_owner_repo() -> tuple[str, str]:
+    owner = _run(["gh", "repo", "view", "--json", "owner", "-q", ".owner.login"]).strip()
+    name = _run(["gh", "repo", "view", "--json", "name", "-q", ".name"]).strip()
+    if not owner or not name:
+        raise RuntimeError("Unable to detect owner/repo via gh repo view.")
+    return owner, name
+
+
+def _find_disposition_block_in_section(section: str, url: str) -> bool:
+    """
+    Thread-specific URL (full URL with anchor) must appear in section with Disposition + proof
+    (Commit/Evidence/Backlog) inside the same contiguous block separated by blank lines.
+    Use exact URL match to avoid substring false positives (e.g. discussion_r1 vs discussion_r10).
+    """
+    blocks = _iter_disposition_blocks(section)
+    for index, block in enumerate(blocks):
+        if not _url_in_block(block, url):
+            continue
+        if _block_has_disposition_and_proof(block):
+            if (
+                _block_disposition(block) == "FIXED"
+                and (_block_commit_value(block) or "").lower() == "see mapping entries below"
+            ):
+                next_block = blocks[index + 1] if index + 1 < len(blocks) else ""
+                return _is_mapping_only_block(next_block) and bool(
+                    _block_mapping_entries(next_block).get(url)
+                )
+            return True
+        if index == 0 or not _is_mapping_only_block(block):
+            continue
+        previous = blocks[index - 1]
+        if (
+            _block_has_disposition_and_proof(previous)
+            and (_block_commit_value(previous) or "").lower() == "see mapping entries below"
+            and _block_mapping_entries(block).get(url)
+        ):
+            return True
+    return False
+
+
+def _collect_resolved_threads(pr_number: int) -> list[ResolvedThreadRef]:
+    owner, repo = _get_owner_repo()
+
+    query = """
+    query($owner:String!, $repo:String!, $pr:Int!, $after:String) {
+      repository(owner:$owner, name:$repo) {
+        pullRequest(number:$pr) {
+          reviewThreads(first: 100, after: $after) {
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              isResolved
+              comments(first: 1) {
+                nodes { url createdAt author { login } }
+              }
+            }
+          }
+        }
+      }
+    }
+    """
+    after: str | None = None
+    resolved: list[ResolvedThreadRef] = []
+
+    seen: set[str] = set()
+    for _ in range(_MAX_REVIEW_THREAD_PAGES):
+        variables = {"owner": owner, "repo": repo, "pr": pr_number, "after": after}
+        data = _graphql(query, variables)
+        repository = data.get("repository")
+        pr = repository.get("pullRequest") if isinstance(repository, dict) else None
+        connection = pr.get("reviewThreads") if isinstance(pr, dict) else None
+        if not isinstance(connection, dict):
+            raise RuntimeError("GitHub review thread connection is malformed")
+        threads, page = connection.get("nodes"), connection.get("pageInfo")
+        if not isinstance(threads, list) or not isinstance(page, dict):
+            raise RuntimeError("GitHub review thread page is malformed")
+        for thread in threads:
+            if not isinstance(thread, dict) or type(thread.get("isResolved")) is not bool:
+                raise RuntimeError("GitHub review thread resolution state is malformed")
+            if not thread["isResolved"]:
+                continue
+            comments = thread.get("comments")
+            roots = comments.get("nodes") if isinstance(comments, dict) else None
+            if not isinstance(roots, list) or len(roots) != 1 or not isinstance(roots[0], dict):
+                raise RuntimeError("GitHub resolved review thread first comment is unavailable")
+            first = roots[0]
+            url = first.get("url")
+            if not isinstance(url, str) or not url.strip():
+                raise RuntimeError("GitHub resolved review thread URL is missing")
+            created_at = _validated_server_timestamp(
+                first.get("createdAt"), label="GitHub resolved review thread"
+            )
+            author = first.get("author")
+            login = author.get("login") if isinstance(author, dict) else None
+            if "author" not in first or (
+                author is not None and (not isinstance(login, str) or not login.strip())
+            ):
+                raise RuntimeError("GitHub resolved review thread author is malformed")
+            resolved.append(
+                ResolvedThreadRef(
+                    url=url,
+                    source="comment",
+                    is_resolved=True,
+                    created_at=created_at,
+                    author_login=login or "",
+                )
+            )
+        after = _next_page_cursor(page, seen, "GitHub review threads")
+        if after is None:
+            break
+    else:
+        raise RuntimeError("GitHub review threads exceeded the page limit")
+
+    uniq: dict[str, ResolvedThreadRef] = {r.url: r for r in resolved}
+    return list(uniq.values())
+
+
+def _resolved_threads_from_evidence(
+    threads: tuple[ReviewThreadEvidence, ...],
+) -> list[ResolvedThreadRef]:
+    """Return resolvable root comments from fully paginated thread evidence."""
+
+    resolved: list[ResolvedThreadRef] = []
+    for thread in threads:
+        if not thread.is_resolved or not thread.comments:
+            continue
+        first = thread.comments[0]
+        if first.author_login.strip().lower() == "github-advanced-security":
+            continue
+        resolved.append(
+            ResolvedThreadRef(
+                url=first.url,
+                source="comment",
+                is_resolved=True,
+                created_at=first.created_at,
+                author_login=first.author_login,
+                original_commit_sha=first.original_commit_sha,
+            )
+        )
+    return resolved
+
+
+def _assert_v1_review_snapshot_unchanged(
+    initial_threads: tuple[ReviewThreadEvidence, ...],
+    *,
+    snapshot: PrSnapshot,
+    repository: str,
+    token: str,
+) -> None:
+    final_threads = fetch_review_threads(repository, snapshot.pr_number, token=token)
+    if review_thread_inventory(final_threads) != review_thread_inventory(initial_threads):
+        raise CommitIdentityError(
+            "SNAPSHOT_CHANGED: review-thread inventory changed during validation"
+        )
+    assert_snapshot_unchanged(snapshot, token=token)
+
+
+def _check_real_commit_proofs(
+    resolved_threads: list[ResolvedThreadRef],
+    section: str,
+    *,
+    snapshot: PrSnapshot,
+    repository: str,
+    token: str,
+) -> list[str]:
+    """Prove every mapped FIX SHA and validate original review-commit identity."""
+
+    violations: list[str] = []
+    mapping = _parse_mapping_section(section)
+    live_head = RepositoryCommitRef(snapshot.head_sha, CommitRefKind.PR_HEAD)
+    snapshot_commits = {commit.sha: commit for commit in snapshot.commits}
+    classified: dict[str, RepositoryCommitRef | ReviewExecutionRef] = {}
+    ancestry: dict[tuple[str, str], bool] = {}
+
+    def classify(value: str) -> RepositoryCommitRef | ReviewExecutionRef:
+        normalized = value.strip().lower()
+        if normalized in classified:
+            return classified[normalized]
+        snapshot_commit = snapshot_commits.get(normalized)
+        if snapshot_commit is not None:
+            result: RepositoryCommitRef | ReviewExecutionRef = RepositoryCommitRef(
+                normalized,
+                (
+                    CommitRefKind.PR_HEAD
+                    if normalized == snapshot.head_sha
+                    else CommitRefKind.PR_COMMIT
+                ),
+                pushed_at=snapshot_commit.pushed_at,
+            )
+        else:
+            result = classify_commit_ref(normalized, snapshot, token=token)
+        classified[normalized] = result
+        return result
+
+    def ancestor(left: RepositoryCommitRef, right: RepositoryCommitRef) -> bool:
+        key = (left.sha, right.sha)
+        if key not in ancestry:
+            ancestry[key] = is_ancestor(
+                left,
+                right,
+                repository=repository,
+                token=token,
+            )
+        return ancestry[key]
+
+    for thread in resolved_threads:
+        fix_sha = mapping.get(thread.url)
+        if not fix_sha:
+            continue
+        fix = classify(fix_sha)
+        if not isinstance(fix, RepositoryCommitRef) or fix.kind not in {
+            CommitRefKind.PR_HEAD,
+            CommitRefKind.PR_COMMIT,
+        }:
+            violations.append(f"{thread.url}: mapped FIX SHA is not a real live PR commit")
+            continue
+        if not ancestor(fix, live_head):
+            violations.append(f"{thread.url}: mapped FIX SHA is not reachable from live head")
+            continue
+        if not thread.original_commit_sha:
+            continue
+        original = classify(thread.original_commit_sha)
+        trusted_connector_context = (
+            thread.author_login.strip().lower() == _CODEX_CONNECTOR_GRAPHQL_LOGIN
+        )
+        if isinstance(original, ReviewExecutionRef):
+            if original.kind is CommitRefKind.API_UNKNOWN:
+                violations.append(f"{thread.url}: original_commit_id identity is API_UNKNOWN")
+            elif not trusted_connector_context:
+                violations.append(
+                    f"{thread.url}: off-live-PR original_commit_id is trusted only for "
+                    "chatgpt-codex-connector review execution context"
+                )
+            # A trusted Connector-only unavailable ref is reviewer execution
+            # context, not graph proof. The real reachable mapped FIX remains required.
+            continue
+        if original.kind is CommitRefKind.REPO_COMMIT_OUTSIDE_PR:
+            # GitHub keeps repository-addressable originalCommit values on live
+            # review threads after a PR branch is rebased. That historical commit
+            # identifies review context only; the mapped FIX must still be a real
+            # current-PR commit reachable from the live head.
+            continue
+        if original.kind not in {CommitRefKind.PR_HEAD, CommitRefKind.PR_COMMIT}:
+            violations.append(f"{thread.url}: original_commit_id is not a real live PR commit")
+            continue
+        if not ancestor(original, fix):
+            violations.append(
+                f"{thread.url}: mapped FIX SHA does not descend from original_commit_id"
+            )
+            continue
+    return violations
+
+
+def _has_gh_auth() -> bool:
+    """True if gh CLI auth is actually usable for API calls."""
+    try:
+        result = subprocess.run(  # nosec B603: argv [_gh_path(), "auth", "status"]; no user input (remove-by: 2027-02-01, ref: PR-985)
+            [_gh_path(), "auth", "status"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return result.returncode == 0
+    except (OSError, UnicodeError, RuntimeError, subprocess.TimeoutExpired):
+        return False
+
+
+def _env_diagnostic() -> str:
+    """Return one-line env status (SET/MISSING only, no values)."""
+    keys = ("GH_TOKEN", "GITHUB_TOKEN", "GITHUB_PAT", "CI", "GITHUB_ACTIONS")
+    parts = [f"{k}={('SET' if (os.environ.get(k) or '').strip() else 'MISSING')}" for k in keys]
+    return " ".join(parts)
+
+
+def _github_api_token() -> str:
+    """Return an opaque token without logging or introspecting it."""
+
+    token = (os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or "").strip()
+    if token:
+        return token
+    token = _run(["gh", "auth", "token"]).strip()
+    if not token:
+        raise RuntimeError("GitHub API token is unavailable")
+    return token
+
+
+def _require_gh_token_preflight(require_auth: bool, in_ci: bool) -> None:
+    """
+    In local strict mode (--require-auth) or CI: require GH_TOKEN and gh auth status.
+    Exit 1 with diagnostic and fix commands before any GraphQL. Single source of
+    strict GraphQL auth: GH_TOKEN.
+    """
+    if not require_auth and not in_ci:
+        return
+    gh_token = (os.environ.get("GH_TOKEN") or "").strip()
+    if not gh_token:
+        print("ERROR: GH_TOKEN required for disposition guard (--require-auth or CI=true).")
+        print("       gh reads GH_TOKEN; GITHUB_TOKEN alone is not sufficient.")
+        print(f"       Env: {_env_diagnostic()}")
+        print("Fix (choose one):")
+        print('  export GH_TOKEN="$GITHUB_TOKEN"   # if GITHUB_TOKEN is set')
+        print('  export GH_TOKEN="$GITHUB_PAT"    # or from your PAT')
+        print("  Then: gh auth status")
+        sys.exit(1)
+    # GH_TOKEN set — verify gh can use it (preflight before GraphQL)
+    # Sourcery/B607: argv is [resolved_gh_path, "auth", "status"] — no user input
+    try:
+        argv = [_gh_path(), "auth", "status"]
+    except RuntimeError:
+        print("ERROR: gh CLI not found in PATH; required when GH_TOKEN is set.")
+        sys.exit(1)
+    try:
+        result = subprocess.run(  # nosec B603: argv from _gh_path()+static; no user input (remove-by: 2027-02-01, ref: PR-985)
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, UnicodeError, subprocess.TimeoutExpired) as exc:
+        print("ERROR: GH_TOKEN is set but gh auth status failed during strict preflight.")
+        print(f"       Env: {_env_diagnostic()}")
+        print(
+            "       Cause: timeout"
+            if isinstance(exc, subprocess.TimeoutExpired)
+            else "       Cause: transport failure"
+        )
+        print("  gh auth status  # run manually to see reason")
+    else:
+        if result.returncode == 0:
+            return
+        print("ERROR: GH_TOKEN is set but gh auth status failed. Fix env before running GraphQL.")
+        print(f"       Env: {_env_diagnostic()}")
+        print("  gh auth status  # run manually to see reason")
+        print(f"       Exit status: {result.returncode}")
+    sys.exit(1)
+
+
+def main() -> None:
+    """Validate resolved-thread dispositions and commit proofs through the CLI."""
+    parser = argparse.ArgumentParser(
+        description="Check resolved review threads have disposition in canonical artifact."
+    )
+    parser.add_argument(
+        "--pr-number",
+        type=int,
+        help="Explicit PR number for local/agent runs (otherwise use gh pr view on current branch).",
+    )
+    parser.add_argument(
+        "--require-auth",
+        action="store_true",
+        help=(
+            "Escalate local advisory mode to strict auth. Without this flag, local runs may "
+            "SKIP (exit 0) when gh auth is unavailable; CI is always strict."
+        ),
+    )
+    args = parser.parse_args()
+
+    in_ci = os.environ.get("CI") == "true"
+    if args.require_auth or in_ci:
+        # Strict preflight: require GH_TOKEN and gh auth status before any GraphQL
+        _require_gh_token_preflight(args.require_auth, in_ci)
+    else:
+        if not _has_gh_auth():
+            print("SKIP: no usable gh auth for advisory local run.")
+            print(
+                "      This is not merge-readiness evidence. "
+                "For strict parity use --require-auth with GH_TOKEN, or run gh auth login."
+            )
+            sys.exit(0)
+
+    pr_number = _get_pr_number(args.pr_number)
+    try:
+        artifact_text = read_mapping_artifact(pr_number)
+    except FileNotFoundError as e:
+        print(f"ERROR: {e}")
+        sys.exit(1)
+    try:
+        section = _artifact_extract_fixed_mapping(artifact_text)
+    except ReviewEvidenceError as exc:
+        print(f"ERROR: {exc}")
+        sys.exit(1)
+
+    # Reject invalid FIXED mappings: validate raw section for any "- url -> X" lines
+    for line in section.splitlines():
+        m = _MAPPING_LINE_RELAXED_RE.search(line.strip())
+        if m:
+            url_part, sha_part = m.group(1), m.group(2).strip()
+            if not _GIT_SHA_RE.match(sha_part):
+                print(
+                    f"ERROR: Invalid FIXED mapping in artifact: {url_part} -> {sha_part!r} "
+                    "(SHA must be 7–40 hex chars)"
+                )
+                sys.exit(1)
+
+    fixed_block_errors = _validate_fixed_commit_blocks(section)
+    if fixed_block_errors:
+        for error in fixed_block_errors:
+            print(f"ERROR: {error}")
+        sys.exit(1)
+    is_v1 = review_seal_version(artifact_text) == "v1"
+    v1_mapping_entries: dict[str, str] = {}
+    if is_v1:
+        semantic_mapping_errors = validate_fixed_mapping_section(section, require_full_shas=True)
+        if semantic_mapping_errors:
+            for error in semantic_mapping_errors:
+                print(f"ERROR: {error}")
+            sys.exit(1)
+        v1_mapping_entries = parse_fixed_mapping_entries(section)
+    snapshot: PrSnapshot | None = None
+    thread_evidence: tuple[ReviewThreadEvidence, ...] = ()
+    repository = ""
+    api_token: str | None = None
+    if is_v1:
+        try:
+            owner, repo_name = _get_owner_repo()
+            repository = f"{owner}/{repo_name}"
+            api_token = _github_api_token()
+            snapshot = fetch_pr_snapshot(repository, pr_number, token=api_token)
+            thread_evidence = fetch_review_threads(repository, pr_number, token=api_token)
+            resolved_threads = _resolved_threads_from_evidence(thread_evidence)
+        except (CommitIdentityError, OSError, RuntimeError) as exc:
+            print(f"ERROR: unable to establish live PR review evidence: {exc}")
+            sys.exit(1)
+    else:
+        resolved_threads = _collect_resolved_threads(pr_number)
+
+    if not resolved_threads:
+        if snapshot is not None:
+            if api_token is None:
+                print("ERROR: internal v1 context is missing GitHub API auth")
+                sys.exit(1)
+            try:
+                _assert_v1_review_snapshot_unchanged(
+                    thread_evidence,
+                    snapshot=snapshot,
+                    repository=repository,
+                    token=api_token,
+                )
+            except (CommitIdentityError, OSError) as exc:
+                print(f"ERROR: {exc}")
+                sys.exit(1)
+        print("OK: No resolved review threads found (nothing to enforce).")
+        sys.exit(0)
+
+    duplicate_covered_urls: set[str] = set()
+    if is_v1:
+        if snapshot is None or api_token is None:
+            print("ERROR: internal v1 context is incomplete")
+            sys.exit(1)
+        try:
+            seal = parse_embedded_review_seal(artifact_text)
+            records = parse_canonical_fingerprint_records(artifact_text, pr_number=pr_number)
+            duplicate_covered_urls = validated_duplicate_reply_urls(
+                candidate_urls={thread.url for thread in resolved_threads},
+                threads=thread_evidence,
+                fingerprint_records=records,
+                mapping_entries=v1_mapping_entries,
+                material_digest=seal["material"]["digest"],
+                material_head_sha=seal["material"]["material_head_sha"],
+                repo_root=REPO_ROOT,
+                snapshot=snapshot,
+                repository=repository,
+                token=api_token,
+            )
+        except (CommitIdentityError, ReviewEvidenceError, ValueError) as exc:
+            print(f"ERROR: invalid v1 duplicate-disposition evidence: {exc}")
+            sys.exit(1)
+
+    missing_refs: list[str] = []
+    missing_disposition: list[str] = []
+
+    for t in resolved_threads:
+        # Use exact URL match to avoid substring false positives (e.g. discussion_r1 vs r10)
+        if (
+            not re.search(re.escape(t.url) + r"(?![0-9a-zA-Z])", section)
+            and t.url not in duplicate_covered_urls
+        ):
+            missing_refs.append(t.url)
+            continue
+        if t.url in duplicate_covered_urls:
+            continue
+        if not _find_disposition_block_in_section(section, t.url):
+            missing_disposition.append(t.url)
+
+    if missing_refs or missing_disposition:
+        print("ERROR: Review disposition policy violated.\n")
+        if missing_refs:
+            print("Resolved threads missing from Fixed in Commit Mapping (must list URL there):")
+            for u in missing_refs:
+                print(f"  - {u}")
+            print()
+        if missing_disposition:
+            print(
+                "Resolved threads in section but missing Disposition + proof (Commit/Evidence/Backlog):"
+            )
+            for u in missing_disposition:
+                print(f"  - {u}")
+            print()
+        print("Fix: In Fixed in Commit Mapping, for each resolved thread add:")
+        print("  Disposition: FIXED | NOT-A-BUG | DEFERRED")
+        print("  and one of: Commit: / Evidence: / Backlog:")
+        sys.exit(1)
+
+    if is_v1:
+        if snapshot is None or api_token is None:
+            print("ERROR: internal v1 context is incomplete")
+            sys.exit(1)
+        try:
+            real_commit_violations = _check_real_commit_proofs(
+                resolved_threads,
+                section,
+                snapshot=snapshot,
+                repository=repository,
+                token=api_token,
+            )
+        except (CommitIdentityError, OSError) as exc:
+            print(f"ERROR: unable to prove FIXED commit identities: {exc}")
+            sys.exit(1)
+        if real_commit_violations:
+            print("ERROR: Real-commit proof policy violated.\n")
+            for violation in real_commit_violations:
+                print(f"  - {violation}")
+            sys.exit(1)
+
+    # Commit-after-comment guard: mapping must reference a commit made AFTER the comment
+    server_commit_times: Mapping[str, str | None] | None = None
+    if is_v1 and snapshot is not None:
+        try:
+            server_commit_times = _fetch_server_commit_times(
+                snapshot=snapshot,
+                repository=repository,
+                pr_number=pr_number,
+                mapped_shas=frozenset(_parse_mapping_section(section).values()),
+            )
+        except (json.JSONDecodeError, OSError, RuntimeError) as exc:
+            print(f"ERROR: unable to establish server-side commit timestamps: {exc}")
+            sys.exit(1)
+    commit_after_violations = _check_commit_after_comment(
+        resolved_threads,
+        section,
+        commit_time_by_sha=server_commit_times,
+    )
+    if commit_after_violations:
+        print(
+            "ERROR: Commit-after-comment policy violated. Map only commits made AFTER the comment.\n"
+        )
+        for v in commit_after_violations:
+            print(f"  - {v}")
+        print(
+            "\nFix: Make a code/doc fix commit, then add '- <thread_url> -> <commit_sha>' in Fixed in Commit Mapping."
+        )
+        sys.exit(1)
+
+    # Trigger-only mapping ban (P1): mapping to empty or rerun/trigger subject is not valid FIXED proof
+    trigger_violations = _check_trigger_only_mapping(resolved_threads, section)
+    if trigger_violations:
+        print("ERROR: Trigger-only commit policy violated. Map only real fix commits.\n")
+        for v in trigger_violations:
+            print(f"  - {v}")
+        print(
+            "\nFix: Do not map to empty commits or commits whose subject contains 'trigger ci' / 'rerun ci' / 'rerun checks'."
+        )
+        sys.exit(1)
+
+    if snapshot is not None:
+        if api_token is None:
+            print("ERROR: internal v1 context is missing GitHub API auth")
+            sys.exit(1)
+        try:
+            _assert_v1_review_snapshot_unchanged(
+                thread_evidence,
+                snapshot=snapshot,
+                repository=repository,
+                token=api_token,
+            )
+        except (CommitIdentityError, OSError) as exc:
+            print(f"ERROR: {exc}")
+            sys.exit(1)
+
+    print(
+        f"OK: All {len(resolved_threads)} resolved review threads have Disposition + proof and commit-after-comment."
+    )
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

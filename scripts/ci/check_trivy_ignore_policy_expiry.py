@@ -1,0 +1,590 @@
+from __future__ import annotations
+
+import glob
+import json
+import os
+import re
+from dataclasses import dataclass
+from datetime import UTC, datetime, date
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# Allow trailing content after the date (e.g. "(manual removal)").
+_EXPIRY_RE = re.compile(r"Suppression expires:\s*(\d{4}-\d{2}-\d{2})(?:\s|$)")
+_REVIEW_BY_RE = re.compile(r"Review-by:\s*(\d{4}-\d{2}-\d{2})(?:\s|$)")
+_CANONICAL_IGNORE_HEAD_LINE_RE = re.compile(r"[ \t]*ignore[ \t]+if[ \t]*\{[ \t]*(?:#.*)?")
+_DEFAULT_IGNORE_LINE_RE = re.compile(r"[ \t]*default[ \t]+ignore[ \t]*:=[ \t]*false[ \t]*(?:#.*)?")
+_RETIRED_REACT_ROUTER_RSC_ADVISORY = "GHSA-qwww-vcr4-c8h2"
+_CANONICAL_NEVER_IGNORE_POLICY = "package trivy\n\nimport rego.v1\n\ndefault ignore := false\n"
+
+
+@dataclass(frozen=True)
+class _RegoToken:
+    kind: str
+    value: str
+    literal_value: str | None
+    start: int
+    end: int
+    line: int
+    depth: int
+
+
+@dataclass(frozen=True)
+class _IgnoreBlock:
+    body: str
+    head_line: int
+
+
+def _tokenize_rego(
+    text: str,
+    *,
+    line_comments: list[tuple[int, str]] | None = None,
+) -> tuple[tuple[_RegoToken, ...], dict[int, int]]:
+    """Tokenize executable Rego while excluding comments and quoted/raw contents."""
+
+    tokens: list[_RegoToken] = []
+    brace_stack: list[int] = []
+    brace_pairs: dict[int, int] = {}
+    depth = 0
+    index = 0
+    line = 1
+    while index < len(text):
+        character = text[index]
+        if character in " \t\r":
+            index += 1
+            continue
+        if character == "\n":
+            line += 1
+            index += 1
+            continue
+        if character == "#":
+            newline = text.find("\n", index)
+            comment_end = len(text) if newline < 0 else newline
+            if line_comments is not None:
+                line_comments.append((line, text[index + 1 : comment_end]))
+            index = comment_end
+            continue
+        if character in {'"', "`"}:
+            quote = character
+            start = index
+            start_line = line
+            index += 1
+            escaped = False
+            while index < len(text):
+                character = text[index]
+                if quote == '"' and escaped:
+                    escaped = False
+                elif quote == '"' and character == "\\":
+                    escaped = True
+                elif character == quote:
+                    index += 1
+                    break
+                if character == "\n":
+                    line += 1
+                index += 1
+            else:
+                raise ValueError(f"unterminated string literal at line {start_line}")
+            raw_literal = text[start:index]
+            if quote == '"':
+                try:
+                    literal_value = json.loads(raw_literal)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        f"invalid quoted string at line {start_line}: {exc.msg}"
+                    ) from exc
+            else:
+                literal_value = raw_literal[1:-1]
+            tokens.append(
+                _RegoToken(
+                    kind="string",
+                    value=raw_literal,
+                    literal_value=literal_value,
+                    start=start,
+                    end=index,
+                    line=start_line,
+                    depth=depth,
+                )
+            )
+            continue
+        start = index
+        if character.isalpha() or character == "_":
+            index += 1
+            while index < len(text) and (text[index].isalnum() or text[index] == "_"):
+                index += 1
+            kind = "identifier"
+            value = text[start:index]
+        elif text.startswith(":=", index) or text.startswith("==", index):
+            index += 2
+            kind = "operator"
+            value = text[start:index]
+        else:
+            index += 1
+            kind = "symbol"
+            value = character
+        if value == "}" and not brace_stack:
+            raise ValueError(f"unexpected closing brace at line {line}")
+        token_index = len(tokens)
+        tokens.append(
+            _RegoToken(
+                kind=kind,
+                value=value,
+                literal_value=None,
+                start=start,
+                end=index,
+                line=line,
+                depth=depth,
+            )
+        )
+        if value == "{":
+            brace_stack.append(token_index)
+            depth += 1
+        elif value == "}":
+            opening_index = brace_stack.pop()
+            brace_pairs[opening_index] = token_index
+            depth -= 1
+    if brace_stack:
+        opening = tokens[brace_stack[-1]]
+        raise ValueError(f"unterminated block opened at line {opening.line}")
+    return tuple(tokens), brace_pairs
+
+
+def _inspect_ignore_policy_source(
+    text: str,
+) -> tuple[tuple[_IgnoreBlock, ...], tuple[int, ...]]:
+    """Extract canonical-head bodies and identify every unsupported ignore construct."""
+
+    tokens, brace_pairs = _tokenize_rego(text)
+    source_lines = text.splitlines()
+    ignore_blocks: list[_IgnoreBlock] = []
+    unsupported_lines: set[int] = set()
+    for index, token in enumerate(tokens):
+        if token.depth != 0 or token.kind != "identifier":
+            continue
+        previous = tokens[index - 1] if index else None
+        if token.value == "else" and not (
+            previous is not None and previous.value == "." and previous.line == token.line
+        ):
+            unsupported_lines.add(token.line)
+            continue
+        if token.value != "ignore":
+            continue
+        if previous is not None and previous.value == "." and previous.line == token.line:
+            continue
+        source_line = source_lines[token.line - 1]
+        if _DEFAULT_IGNORE_LINE_RE.fullmatch(source_line):
+            continue
+        if _CANONICAL_IGNORE_HEAD_LINE_RE.fullmatch(source_line):
+            if (
+                index + 2 < len(tokens)
+                and tokens[index + 1].value == "if"
+                and tokens[index + 1].line == token.line
+                and tokens[index + 2].value == "{"
+                and tokens[index + 2].line == token.line
+            ):
+                opening_index = index + 2
+                closing_index = brace_pairs.get(opening_index)
+                if closing_index is not None:
+                    ignore_blocks.append(
+                        _IgnoreBlock(
+                            body=text[tokens[opening_index].end : tokens[closing_index].start],
+                            head_line=token.line,
+                        )
+                    )
+                    continue
+        unsupported_lines.add(token.line)
+    return tuple(ignore_blocks), tuple(sorted(unsupported_lines))
+
+
+def _top_level_body_token_lines(body: str) -> tuple[tuple[_RegoToken, ...], ...]:
+    tokens, _brace_pairs = _tokenize_rego(body)
+    by_line: dict[int, list[_RegoToken]] = {}
+    for token in tokens:
+        if token.depth == 0:
+            by_line.setdefault(token.line, []).append(token)
+    return tuple(tuple(by_line[line]) for line in sorted(by_line))
+
+
+def _top_level_body_token_expressions(
+    body: str,
+) -> tuple[tuple[tuple[_RegoToken, ...], ...], ...]:
+    """Group multiline delimiters and ``with`` modifiers into full expressions."""
+
+    expressions: list[list[tuple[_RegoToken, ...]]] = []
+    delimiter_stack: list[str] = []
+    closing_delimiters = {")": "(", "]": "["}
+    for token_line in _top_level_body_token_lines(body):
+        if (delimiter_stack or token_line[0].value == "with") and expressions:
+            expressions[-1].append(token_line)
+        else:
+            expressions.append([token_line])
+        for token in token_line:
+            if token.value in {"(", "["}:
+                delimiter_stack.append(token.value)
+            elif token.value in closing_delimiters:
+                if delimiter_stack and delimiter_stack[-1] == closing_delimiters[token.value]:
+                    delimiter_stack.pop()
+                else:
+                    delimiter_stack.append("invalid")
+    return tuple(tuple(expression) for expression in expressions)
+
+
+def _direct_input_equality(tokens: tuple[_RegoToken, ...]) -> tuple[str, str] | None:
+    if len(tokens) != 5:
+        return None
+    if (
+        tokens[0].value == "input"
+        and tokens[1].value == "."
+        and tokens[2].kind == "identifier"
+        and tokens[3].value == "=="
+        and tokens[4].kind == "string"
+        and tokens[4].literal_value is not None
+    ):
+        return tokens[2].value, tokens[4].literal_value
+    if (
+        tokens[0].kind == "string"
+        and tokens[0].literal_value is not None
+        and tokens[1].value == "=="
+        and tokens[2].value == "input"
+        and tokens[3].value == "."
+        and tokens[4].kind == "identifier"
+    ):
+        return tokens[4].value, tokens[0].literal_value
+    return None
+
+
+def _with_modifier_targets(
+    tokens: tuple[_RegoToken, ...],
+) -> tuple[tuple[_RegoToken, ...], ...] | None:
+    """Return every complete chained ``with`` target, or fail closed."""
+
+    if not tokens or tokens[0].value != "with":
+        return None
+    modifier_starts = [index for index, token in enumerate(tokens) if token.value == "with"]
+    targets: list[tuple[_RegoToken, ...]] = []
+    for position, start in enumerate(modifier_starts):
+        end = modifier_starts[position + 1] if position + 1 < len(modifier_starts) else len(tokens)
+        modifier = tokens[start + 1 : end]
+        separator_index = next(
+            (index for index, token in enumerate(modifier) if token.value == "as"),
+            None,
+        )
+        if separator_index is None or separator_index == 0 or separator_index + 1 >= len(modifier):
+            return None
+        targets.append(modifier[:separator_index])
+    return tuple(targets)
+
+
+def _with_target_can_affect_input_field(
+    target: tuple[_RegoToken, ...],
+    field: str,
+) -> bool:
+    """Return whether a ``with`` target can replace the referenced input field."""
+
+    if not target or target[0].value != "input":
+        return False
+    if len(target) == 1:
+        return True
+    if target[1].value == ".":
+        if len(target) < 3 or target[2].kind != "identifier":
+            return True
+        return target[2].value == field
+    if target[1].value == "[":
+        if (
+            len(target) >= 4
+            and target[2].kind == "string"
+            and target[2].literal_value is not None
+            and target[3].value == "]"
+        ):
+            return target[2].literal_value == field
+        return True
+    return True
+
+
+def _direct_input_equality_expression(
+    token_lines: tuple[tuple[_RegoToken, ...], ...],
+) -> tuple[str, str] | None:
+    """Prove a direct equality only across its complete executable expression."""
+
+    if not token_lines:
+        return None
+    expression_tokens: list[_RegoToken] = []
+    modifier_lines: list[tuple[_RegoToken, ...]] = []
+    for tokens in token_lines:
+        if tokens[0].value == "with":
+            modifier_lines.append(tokens)
+        elif modifier_lines:
+            return None
+        else:
+            expression_tokens.extend(tokens)
+
+    while (
+        len(expression_tokens) >= 2
+        and expression_tokens[0].value == "("
+        and expression_tokens[-1].value == ")"
+    ):
+        depth = 0
+        outer_pair = True
+        for index, token in enumerate(expression_tokens):
+            if token.value == "(":
+                depth += 1
+            elif token.value == ")":
+                depth -= 1
+                if depth == 0 and index != len(expression_tokens) - 1:
+                    outer_pair = False
+                    break
+                if depth < 0:
+                    outer_pair = False
+                    break
+        if not outer_pair or depth != 0:
+            break
+        expression_tokens = expression_tokens[1:-1]
+
+    equality = _direct_input_equality(tuple(expression_tokens))
+    if equality is None:
+        return None
+    field, _value = equality
+    for modifier_tokens in modifier_lines:
+        targets = _with_modifier_targets(modifier_tokens)
+        if targets is None or any(
+            _with_target_can_affect_input_field(target, field) for target in targets
+        ):
+            return None
+    return equality
+
+
+def _ignore_block_can_match_react_router_target(body: str) -> bool:
+    """Reject unless executable equality proves this rule targets another advisory."""
+
+    for token_expression in _top_level_body_token_expressions(body):
+        equality = _direct_input_equality_expression(token_expression)
+        if equality is None:
+            continue
+        field, value = equality
+        if field == "VulnerabilityID" and value != _RETIRED_REACT_ROUTER_RSC_ADVISORY:
+            return False
+    return True
+
+
+def _read_rego_text(policy_file: Path) -> str:
+    """Read one Rego policy or raise a stable validation failure."""
+
+    try:
+        return policy_file.read_bytes().decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ValueError(f"Unable to read Trivy ignore policy {policy_file}: {exc}") from exc
+
+
+def _read_trivyignore_text(ignore_file: Path) -> str:
+    """Read the active Trivy ignore list or raise a stable validation failure."""
+
+    try:
+        return ignore_file.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ValueError(f"Unable to read Trivy ignore list {ignore_file}: {exc}") from exc
+
+
+def _validate_react_router_rsc_trivyignore_absent(
+    ignore_file: Path,
+    *,
+    text: str,
+) -> list[str]:
+    """Fail closed if the retired advisory is active in ``.trivyignore``."""
+
+    for line_number, raw_line in enumerate(text.splitlines(), start=1):
+        active_entry = raw_line.split("#", 1)[0].strip()
+        if not active_entry:
+            continue
+        vulnerability_id = active_entry.split(maxsplit=1)[0]
+        if vulnerability_id == _RETIRED_REACT_ROUTER_RSC_ADVISORY:
+            return [
+                f"Retired React Router suppression must remain absent from {ignore_file}:"
+                f"{line_number}; found {_RETIRED_REACT_ROUTER_RSC_ADVISORY}"
+            ]
+    return []
+
+
+def _validate_react_router_rsc_suppression_absent(
+    policy_file: Path,
+    *,
+    text: str,
+) -> list[str]:
+    """Fail closed if any ignore rule can suppress the retired advisory."""
+
+    try:
+        ignore_blocks, unsupported_lines = _inspect_ignore_policy_source(text)
+    except ValueError as exc:
+        return [f"Retired React Router suppression parsing failed in {policy_file}: {exc}"]
+    if unsupported_lines:
+        rendered_lines = ", ".join(str(line) for line in unsupported_lines)
+        return [
+            f"Retired React Router suppression guard in {policy_file} has unsupported top-level "
+            f"ignore rule syntax at line(s) {rendered_lines}; only 'default ignore := "
+            "false' and balanced 'ignore if {' blocks are permitted"
+        ]
+    target_capable_blocks = tuple(
+        block for block in ignore_blocks if _ignore_block_can_match_react_router_target(block.body)
+    )
+    if target_capable_blocks:
+        rendered_lines = ", ".join(str(block.head_line) for block in target_capable_blocks)
+        return [
+            f"Retired React Router suppression must remain absent from {policy_file}; "
+            f"ignore block(s) at line(s) {rendered_lines} can match "
+            f"{_RETIRED_REACT_ROUTER_RSC_ADVISORY}"
+        ]
+    return []
+
+
+def _read_rego_line_comments(text: str) -> tuple[tuple[int, str], ...]:
+    comments: list[tuple[int, str]] = []
+    _tokenize_rego(text, line_comments=comments)
+    return tuple(comments)
+
+
+def _parse_expiry(path: Path, *, text: str) -> date:
+    matches: list[date] = []
+    for line_number, comment in _read_rego_line_comments(text):
+        found = _EXPIRY_RE.search(comment)
+        if found:
+            try:
+                matches.append(date.fromisoformat(found.group(1)))
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid 'Suppression expires' date in {path}:{line_number}: "
+                    f"{found.group(1)} ({exc})"
+                ) from exc
+    if not matches:
+        raise ValueError(f"Missing 'Suppression expires: YYYY-MM-DD' in {path}")
+    if len(matches) > 1:
+        raise ValueError(
+            f"Multiple 'Suppression expires: YYYY-MM-DD' entries found in {path}; "
+            "expected exactly one expiry per policy file"
+        )
+    return matches[0]
+
+
+def _parse_review_by_dates(path: Path, *, text: str) -> list[tuple[int, date]]:
+    review_dates: list[tuple[int, date]] = []
+    for line_number, comment in _read_rego_line_comments(text):
+        found = _REVIEW_BY_RE.search(comment)
+        if found:
+            try:
+                review_dates.append((line_number, date.fromisoformat(found.group(1))))
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid 'Review-by' date in {path}:{line_number}: "
+                    f"{found.group(1)} ({exc})"
+                ) from exc
+    if not review_dates:
+        raise ValueError(f"Missing 'Review-by: YYYY-MM-DD' in {path}")
+    return review_dates
+
+
+def evaluate_policy_file(
+    policy_file: Path,
+    *,
+    today: date,
+    text: str | None = None,
+) -> list[str]:
+    try:
+        actual = _read_rego_text(policy_file)
+    except ValueError as exc:
+        return [str(exc)]
+    if text is not None and text != actual:
+        return [f"Trivy ignore policy text does not match its acquired file: {policy_file}"]
+    text = actual
+    if text == _CANONICAL_NEVER_IGNORE_POLICY:
+        return []
+
+    failures = _validate_react_router_rsc_suppression_absent(policy_file, text=text)
+    try:
+        expiry = _parse_expiry(policy_file, text=text)
+    except ValueError as exc:
+        failures.append(str(exc))
+        return failures
+
+    if today > expiry:
+        failures.append(
+            f"Expired Trivy ignore policy: {policy_file} (expired {expiry}, today {today})"
+        )
+
+    try:
+        review_by_dates = _parse_review_by_dates(policy_file, text=text)
+    except ValueError as exc:
+        failures.append(str(exc))
+        return failures
+
+    for line_number, review_by in review_by_dates:
+        if today > review_by:
+            failures.append(
+                f"Stale Trivy suppression review date: {policy_file}:{line_number} "
+                f"(review-by {review_by}, today {today})"
+            )
+    return failures
+
+
+def _resolve_policy_files(repo_root: Path) -> list[Path]:
+    env_path = os.environ.get("TRIVY_IGNORE_POLICY_PATH", "").strip()
+    if env_path:
+        # Allow comma-separated list (mirrors trivy-action inputs style).
+        paths = [p.strip() for p in env_path.split(",") if p.strip()]
+        resolved: list[Path] = []
+        for raw in paths:
+            if glob.has_magic(raw):
+                resolved.extend(sorted(repo_root.glob(raw)))
+                continue
+            resolved.append((repo_root / raw).resolve())
+        return resolved
+
+    trivy_dir = repo_root / "trivy"
+    return sorted(trivy_dir.glob("ignore-policy*.rego"))
+
+
+def main() -> int:
+    repo_root = REPO_ROOT
+    policy_files = _resolve_policy_files(repo_root)
+    trivyignore_file = repo_root / ".trivyignore"
+
+    missing_files = [p for p in policy_files if not p.exists()]
+    if missing_files:
+        print("ERROR: Trivy ignore policy file(s) not found:")
+        for p in missing_files:
+            print(f"- {p}")
+        return 1
+
+    if not policy_files:
+        print(
+            "ERROR: No Trivy ignore policy files found. "
+            "Set TRIVY_IGNORE_POLICY_PATH or add trivy/ignore-policy*.rego."
+        )
+        return 1
+
+    today = datetime.now(UTC).date()
+    failures: list[str] = []
+
+    try:
+        trivyignore_text = _read_trivyignore_text(trivyignore_file)
+    except ValueError as exc:
+        failures.append(str(exc))
+    else:
+        failures.extend(
+            _validate_react_router_rsc_trivyignore_absent(
+                trivyignore_file,
+                text=trivyignore_text,
+            )
+        )
+
+    for policy_file in policy_files:
+        failures.extend(evaluate_policy_file(policy_file, today=today))
+
+    if failures:
+        print("ERROR: Trivy ignore policy expiry check failed:")
+        for item in failures:
+            print(f"- {item}")
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,29 @@
+[flake8]
+max-line-length = 100
+extend-ignore = E203,E501
+
+# Per-file ignores
+per-file-ignores =
+    tests/*.py: E402,F811,F401,F841
+    tests_strict/*.py: E402
+    app/routers/__init__.py: E402
+    app.py: E402
+    scripts/*.py: E402
+    debug_*.py: E402
+
+exclude =
+    .git,
+    __pycache__,
+    .venv,
+    .venv-ci,
+    .venv_codex,
+    .claude,
+    venv,
+    env,
+    worktrees,
+    .pytest_cache,
+    .mypy_cache,
+    .ruff_cache,
+    releases/*,
+    node_modules,
+    tools/cybersecurity_skills

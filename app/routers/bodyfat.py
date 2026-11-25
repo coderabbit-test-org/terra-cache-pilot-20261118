@@ -1,0 +1,89 @@
+from __future__ import annotations
+
+from typing import Optional
+
+from fastapi import APIRouter
+from pydantic import BaseModel, Field, field_validator
+
+from core.bodyfat import estimate_all
+from core.i18n import normalize_lang, t
+
+BODYFAT_ROUTE_SPECS: tuple[tuple[str, str, bool], ...] = (("/api/v1/bodyfat", "POST", True),)
+
+
+class BodyFatRequest(BaseModel):
+    height_m: Optional[float] = Field(None, gt=0, description="Height in meters, must be positive")
+    weight_kg: Optional[float] = Field(None, gt=0, description="Weight in kg, must be positive")
+    age: Optional[int] = Field(None, ge=1, le=120, description="Age in years, 1..120")
+    gender: str
+    bmi: Optional[float] = Field(None, ge=0, le=100, description="BMI value, 0..100")
+    neck_cm: Optional[float] = Field(
+        None, gt=0, description="Neck circumference in cm, must be > 0"
+    )
+    waist_cm: Optional[float] = Field(
+        None, gt=0, description="Waist circumference in cm, must be > 0"
+    )
+    hip_cm: Optional[float] = Field(None, gt=0, description="Hip circumference in cm, must be > 0")
+    language: Optional[str] = "en"  # "en" | "ru" | "es"
+
+    @field_validator("gender")
+    @classmethod
+    def _validate_gender(cls, value: str) -> str:
+        v = value.strip().lower()
+        if v in {"male", "m", "man", "hombre", "masculino", "varon", "varón"}:
+            return "male"
+        if v in {"female", "f", "woman", "mujer", "femenino"}:
+            return "female"
+        raise ValueError(
+            "gender must be 'male' or 'female' (also accepts m/f, hombre/mujer, masculino/femenino)"
+        )
+
+
+class BodyFatLabels(BaseModel):
+    methods: str
+    median: str
+    units: str
+
+
+class BodyFatResponse(BaseModel):
+    methods: dict[str, float]
+    median: float | None
+    lang: str
+    labels: BodyFatLabels
+
+
+async def calc_bodyfat(req: BodyFatRequest) -> dict[str, object]:
+    lang = normalize_lang(req.language)
+    data: dict[str, object] = dict(req.model_dump(exclude_none=True))
+
+    # Convert meters to centimeters for core.bodyfat US Navy compatibility.
+    if req.height_m is not None:
+        data.setdefault("height_cm", req.height_m * 100.0)
+
+    if req.bmi is None and req.weight_kg is not None and req.height_m is not None:
+        data["bmi"] = req.weight_kg / (req.height_m**2)
+
+    result = estimate_all(data)
+
+    labels = {
+        "methods": t(lang, "bodyfat_methods"),
+        "median": t(lang, "bodyfat_median"),
+        "units": t(lang, "bodyfat_units_percent"),
+    }
+
+    return {
+        "methods": result["methods"],
+        "median": result["median"],
+        "lang": str(lang),
+        "labels": labels,
+    }
+
+
+router = APIRouter()
+router.post("/api/v1/bodyfat", response_model=BodyFatResponse)(calc_bodyfat)
+
+
+def get_router() -> APIRouter:
+    compat_router = APIRouter()
+    compat_router.post("/bodyfat", response_model=BodyFatResponse)(calc_bodyfat)
+    return compat_router

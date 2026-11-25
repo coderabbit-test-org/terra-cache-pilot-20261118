@@ -1,0 +1,288 @@
+/* Mascot messages */
+"mascot.plate.hint" = "Нажмите, чтобы настроить цели питания!";
+"mascot.home.welcome" = "Добро пожаловать в PulsePlate!";
+"mascot.progress.great" = "Отличный прогресс сегодня!";
+
+/* Adaptive Navigation Shell */
+"BMI" = "ИМТ";
+"navigation.tab.home" = "Главная";
+"navigation.tab.bmi" = "ИМТ";
+"navigation.tab.today" = "Сегодня";
+"navigation.tab.progress" = "Прогресс";
+"navigation.tab.profile" = "Профиль";
+"navigation.progress.weekly" = "Недельный прогресс";
+
+/* Settings */
+"settings_title" = "Настройки";
+"language_settings" = "Язык";
+
+/* Weekly Progress */
+"week_no_data" = "Данных за неделю нет";
+"axis_day" = "День";
+"week_chart_accessibility" = "График энергии за неделю";
+"weight_label" = "Вес";
+"unit_kg" = "кг";
+"health_permission_message" = "Разрешите доступ к Health для отображения питания и прогресса.";
+"week_refresh" = "Обновить неделю";
+"health_request" = "Запросить доступ к HealthKit";
+"week_title" = "Недельный прогресс";
+"healthkit_alert_title" = "Доступ к HealthKit";
+"ok_button" = "ОК";
+"weekly_progress_accessibility_line" = "%@: %d %@, %@ %d%@, %@ %d%@, %@ %d%@";
+
+/* Accessibility */
+"Home Screen" = "Главный экран";
+
+/* Language and Unit Localization */
+"language_name_en" = "Английский";
+"language_name_ru" = "Русский";
+"language_name_es" = "Испанский";
+"unit_kcal" = "ккал";
+"abbr_protein" = "Б";
+"abbr_fat" = "Ж";
+"abbr_carbs" = "У";
+"unit_gram" = "г";
+
+/* Profile View */
+"profile_language_section" = "Язык";
+"profile_language_value" = "Русский / Английский / Испанский";
+"profile_legal_section" = "Правовая информация";
+"profile_privacy_policy" = "Политика конфиденциальности";
+"profile_terms_of_use" = "Условия использования";
+"profile_screen_accessibility_label" = "Экран профиля";
+
+"pro.profile.header" = "Профиль питания";
+"pro.profile.sex" = "Пол";
+"pro.profile.age_years" = "Возраст (лет)";
+"pro.profile.height_cm" = "Рост (см)";
+"pro.profile.weight_kg" = "Вес (кг)";
+"pro.profile.activity" = "Активность";
+"pro.profile.goal" = "Цель";
+"pro.profile.footer" = "Эти данные помогают персонализировать ваш план питания на день.";
+
+"common.not_set" = "Не задано";
+"sex.female" = "Женский";
+"sex.male" = "Мужской";
+"activity.sedentary" = "Сидячая";
+"activity.light" = "Лёгкая";
+"activity.moderate" = "Умеренная";
+"activity.active" = "Активная";
+"activity.very_active" = "Очень активная";
+"goal.loss" = "Снижение";
+"goal.maintain" = "Поддержание";
+"goal.gain" = "Набор";
+
+"plate_issue_title_missing_pro_key" = "Нужен доступ PRO";
+"plate_issue_title_missing_profile" = "Нужен профиль";
+"plate_issue_title_unauthorized" = "Нет доступа";
+"plate_issue_title_forbidden" = "Доступ запрещён";
+"plate_issue_title_validation" = "Проверьте данные";
+"plate_issue_title_api_format" = "Ошибка сервера (HTTP %d)";
+"plate_issue_title_transport" = "Ошибка сети";
+"plate_issue_title_decoding" = "Неожиданный ответ";
+"plate_issue_title_unknown" = "Что-то пошло не так";
+
+"plate_issue_message_missing_pro_key" = "PRO недоступен на этом устройстве.";
+"plate_issue_message_missing_profile" = "Откройте профиль и укажите пол, возраст, рост и вес.";
+"plate_issue_message_unauthorized" = "Ваш PRO ключ отсутствует или неверный.";
+"plate_issue_message_forbidden" = "У вашего аккаунта нет доступа PRO.";
+"plate_issue_message_validation_generic" = "Некоторые данные выглядят некорректно. Проверьте профиль и попробуйте ещё раз.";
+"plate_issue_message_api_generic" = "Проблема на сервере. Попробуйте ещё раз.";
+"plate_issue_message_transport_generic" = "Не удалось подключиться к серверу. Проверьте интернет и попробуйте ещё раз.";
+"plate_issue_message_decoding_generic" = "Сервер вернул неожиданный ответ. Попробуйте ещё раз.";
+"plate_issue_message_unknown_generic" = "Произошла непредвиденная ошибка. Попробуйте ещё раз.";
+"plate.action.retry" = "Повторить";
+"plate.action.open_profile" = "Открыть профиль";
+"plate.action.pro_settings" = "Настройки PRO";
+
+/* Shopping List */
+"shopping_list_title" = "Список покупок";
+"shopping_list_empty_title" = "Нет продуктов";
+"shopping_list_empty_description" = "Ваш план не содержит покупок.";
+"shopping_list_error_title" = "Не удалось загрузить";
+"shopping_list_warnings_title" = "Предупреждения";
+"shopping_list_total_items_fmt" = "%d продуктов";
+"shopping_list_source_fmt" = "Источник: %@";
+"Error" = "Ошибка";
+
+/* Онбординг: Welcome (P0) */
+"onboarding.welcome.screen1.title" = "PulsePlate — питание без лишнего шума";
+"onboarding.welcome.screen1.body" = "Отслеживайте показатели, понимайте результат и держите план, который реально выполнять — спокойно и по шагам.";
+"onboarding.welcome.screen2.title" = "Как пользоваться";
+"onboarding.welcome.screen2.body" = "Начните с ИМТ, затем уточните через Plate и профиль PRO. Маленькие вводы → понятные следующие шаги.";
+"onboarding.welcome.cta.continue" = "Дальше";
+"onboarding.welcome.cta.back" = "Назад";
+"onboarding.welcome.cta.start" = "Начать";
+"onboarding.welcome.stepA11y" = "Шаг %d из %d";
+
+/* Home View */
+"home.navigation.title" = "Главная";
+"home.accessibility.screen_label" = "Экран главной";
+"home.state.loading.title" = "Готовим следующий шаг";
+"home.state.loading.detail" = "Проверяем доступ, прежде чем показать варианты планирования.";
+"home.state.free_ready.title" = "Рассчитайте ИМТ, чтобы начать";
+"home.state.free_ready.detail" = "Быстрый расчёт покажет вашу отправную точку.";
+"home.state.paid_needs_profile.title" = "Завершите настройку профиля";
+"home.state.paid_needs_profile.detail" = "Добавьте обязательные данные, прежде чем открывать варианты планирования.";
+"home.state.paid_ready.title" = "Начните с сегодняшнего дня";
+"home.state.paid_ready.detail" = "Откройте тарелку на сегодня или выберите другой шаг планирования.";
+"home.state.unavailable.title" = "Не удалось подтвердить доступ";
+"home.state.unavailable.detail" = "Повторите попытку или продолжите с ИМТ и профилем.";
+"home.action.bmi.title" = "Проверить ИМТ";
+"home.action.bmi.detail" = "Получите понятную отправную точку.";
+"home.action.complete_profile.title" = "Завершить настройку";
+"home.action.complete_profile.detail" = "Добавьте данные, нужные для планирования.";
+"home.action.profile.title" = "Профиль";
+"home.action.profile.detail" = "Проверьте данные для планирования.";
+"home.action.today.title" = "Тарелка на сегодня";
+"home.action.today.detail" = "Откройте экран питания на сегодня.";
+"home.action.progress.title" = "Прогресс";
+"home.action.progress.detail" = "Откройте экран прогресса.";
+"home.action.coach.title" = "FitChef Coach";
+"home.action.coach.detail" = "Выберите, с чего начать.";
+"home.action.week.title" = "Неделя";
+"home.action.week.detail" = "Откройте планирование на неделю.";
+"home.action.shopping.title" = "Список покупок";
+"home.action.shopping.detail" = "Соберите список из доступного недельного плана.";
+"home.action.retry.title" = "Повторить";
+"bmi.calculate.cta" = "Рассчитать";
+"bmi.calculate.loading" = "Расчет...";
+"plate.preview.title" = "Сегодняшняя тарелка";
+"plate.preview.subtitle" = "Визуализируйте свою тарелку. Добавьте приём пищи. Посмотрите состав.";
+"progress.summary.subtitle" = "Отслеживайте дневное питание и баланс питательных веществ.";
+"progress.nutrient_progress.title" = "Прогресс по питательным веществам";
+"progress.complete" = "дневной цели";
+"progress.label" = "Прогресс питания за день";
+"progress.loading" = "Загрузка данных прогресса...";
+"progress.empty.title" = "Нет данных о прогрессе";
+"progress.empty.detail" = "Настройте профиль и ключ доступа, затем обновите данные за сегодня.";
+"progress.action.refresh" = "Обновить";
+"progress.chart.nutrient_category" = "Категория питательных веществ";
+"progress.chart.completion" = "Выполнение";
+"plate.preview.add_meal" = "Добавить приём пищи";
+"plate.preview.view_details" = "Показать детали";
+"plate.segment.vegetables" = "Овощи";
+"plate.segment.protein" = "Белок";
+"plate.segment.carbs" = "Углеводы";
+"plate.segment.fats" = "Жиры";
+"appstore.paywall.navigation_title" = "PRO и VIP";
+"appstore.paywall.title" = "Открывайте ценность спокойно";
+"appstore.paywall.subtitle" = "Получите планирование питания, премиальные сводки и wellness-прогресс.";
+"appstore.paywall.section.plans" = "Тарифы";
+"appstore.paywall.restore" = "Восстановить покупки";
+"appstore.paywall.plan.monthly.title" = "PRO на месяц";
+"appstore.paywall.plan.monthly.price" = "Смотрите цену в App Store";
+"appstore.paywall.plan.monthly.badge" = "Гибкий выбор";
+"appstore.paywall.plan.yearly.title" = "VIP на год";
+"appstore.paywall.plan.yearly.price" = "Смотрите цену в App Store";
+"appstore.paywall.plan.yearly.badge" = "Лучшая цена";
+"appstore.health_permission.navigation_title" = "Доступ к Health";
+"appstore.health_permission.title" = "Доступ к Health без путаницы";
+"appstore.health_permission.subtitle" = "PulsePlate читает питание и вес из Health, чтобы показывать прогресс и планирование. Приложение не ставит диагноз и не лечит.";
+"appstore.health_permission.section" = "Что контролируете вы";
+"appstore.health_permission.cta" = "Посмотреть разрешения Health";
+"appstore.health_permission.bullet.read" = "Чтение записей о питании из Health.";
+"appstore.health_permission.bullet.progress" = "Показ недельного прогресса и динамики веса в PulsePlate.";
+"appstore.health_permission.bullet.optional" = "Доступ к Health остаётся опциональным и ориентированным на благополучие.";
+
+/* Shopping List */
+"shopping_list_no_plan_error" = "Сначала сгенерируйте недельный план, чтобы собрать список покупок.";
+
+/* AI Insight */
+"ai_insight.navigation.title" = "AI Insight";
+"ai_insight.hero.title" = "PRO AI Insight";
+"ai_insight.hero.subtitle" = "Одноразовая CBT-подсказка через каноничный PRO endpoint.";
+"ai_insight.input.title" = "Ваш вопрос";
+"ai_insight.input.placeholder" = "Опишите паттерн мыслей, блок в мотивации или wellness-задачу.";
+"ai_insight.input.counter_format" = "%d/%d";
+"ai_insight.submit" = "Сгенерировать insight";
+"ai_insight.submit.loading" = "Генерация...";
+"ai_insight.loading.title" = "Генерируем AI insight";
+"ai_insight.result.title" = "Ответ";
+"ai_insight.metadata.title" = "Метаданные надёжности";
+"ai_insight.metadata.confidence" = "Уверенность";
+"ai_insight.metadata.uncertainty" = "Неопределённость";
+"ai_insight.metadata.rag_used" = "RAG-контекст";
+"ai_insight.metadata.mode" = "Режим выполнения";
+"ai_insight.metadata.quota_state" = "Состояние квоты";
+"ai_insight.sources.title" = "Источники";
+"ai_insight.source.score_format" = "Оценка источника: %.0f%%";
+"ai_insight.warnings.title" = "Предупреждения";
+"ai_insight.boolean.yes" = "Да";
+"ai_insight.boolean.no" = "Нет";
+"ai_insight.mode.auto_safe" = "Auto-safe";
+"ai_insight.mode.review_required" = "Нужна проверка";
+"ai_insight.mode.blocked" = "Заблокирован";
+"ai_insight.quota_state.consumed" = "Списана";
+"ai_insight.quota_state.not_consumed" = "Не списана";
+"ai_insight.warning.rag_retrieval_failed" = "RAG-поиск не сработал, поэтому ответ может быть менее опорным.";
+"ai_insight.warning.source_content_redacted" = "Часть контента источников скрыта из соображений приватности.";
+"ai_insight.error.title" = "Не удалось загрузить AI insight";
+"ai_insight.error.empty_query" = "Введите вопрос перед запросом insight.";
+"ai_insight.error.query_too_long" = "Ограничьте вопрос %d символами.";
+"ai_insight.error.missing_key" = "PRO API key не настроен. Добавьте его в Debug Tools / Keychain.";
+"ai_insight.error.unauthorized" = "Нет авторизации (HTTP 401). Проверьте PRO API key.";
+"ai_insight.error.forbidden" = "Доступ запрещён (HTTP 403). Возможно, у аккаунта нет PRO-доступа.";
+"ai_insight.error.quota_exceeded" = "Месячная AI-квота исчерпана (HTTP 429). Попробуйте позже.";
+"ai_insight.error.validation_generic" = "Не удалось проверить этот вопрос. Переформулируйте его и попробуйте снова.";
+"ai_insight.error.unavailable" = "AI insight сейчас недоступен (HTTP 503).";
+"ai_insight.error.timeout" = "AI-провайдер превысил время ожидания (HTTP 504). Попробуйте ещё раз.";
+"ai_insight.error.api_format" = "Ошибка сервера (HTTP %d). Попробуйте позже.";
+"ai_insight.error.transport_generic" = "Не удалось связаться с сервером. Проверьте интернет и попробуйте ещё раз.";
+"ai_insight.error.decoding_generic" = "Сервер вернул неожиданный ответ. Попробуйте ещё раз.";
+"ai_insight.error.empty_response" = "AI-сервис вернул пустой ответ. Попробуйте ещё раз.";
+"ai_insight.error.unknown_generic" = "Произошла непредвиденная ошибка. Попробуйте ещё раз.";
+"ai_insight.retry" = "Повторить";
+
+/* AI Wellness Consent */
+"ai_consent.title" = "AI-помощник для здоровья";
+"ai_consent.header" = "Перед началом";
+"ai_consent.point.wellness_only" = "Эта функция предоставляет поддержку в сфере здорового образа жизни и питания.";
+"ai_consent.point.not_medical" = "Это не медицинская консультация, не постановка диагноза, не назначение лечения, не терапия и не кризисная поддержка.";
+"ai_consent.point.data_processing" = "Ваш вопрос будет отправлен на сервер приложения для обработки.";
+"ai_consent.point.no_emergency" = "Не отправляйте экстренные, кризисные или конфиденциальные медицинские данные.";
+"ai_consent.point.voluntary" = "Вы можете отказаться в любой момент. AI-анализ не будет запущен без вашего согласия.";
+"ai_consent.accept" = "Я понимаю";
+"ai_consent.decline" = "Не сейчас";
+
+/* FitChef Support Choice Preview */
+"fitchef.support_choice.question" = "С чего хотите начать?";
+"fitchef.support_choice.daily.title" = "Сегодня";
+"fitchef.support_choice.daily.detail" = "Сначала сосредоточиться на сегодняшнем дне.";
+"fitchef.support_choice.weekly.title" = "Неделя";
+"fitchef.support_choice.weekly.detail" = "Сначала посмотреть на ближайшие семь дней.";
+"fitchef.support_choice.agency" = "FitChef покажет оба варианта, а выбор останется за вами.";
+"fitchef.support_choice.confirm" = "Подтвердить выбор";
+"fitchef.support_choice.dismiss" = "Не сейчас";
+
+"fitchef.coach_hub.navigation.title" = "FitChef Coach";
+"fitchef.coach_hub.header.title" = "Как вы хотите продолжить?";
+"fitchef.coach_hub.header.description" = "Вы сами решаете, что делать дальше.";
+"fitchef.coach_hub.ai_guidance.title" = "Спросить FitChef";
+"fitchef.coach_hub.ai_guidance.detail" = "Задайте вопрос о благополучии и получите AI-подсказку.";
+"fitchef.coach_hub.ai_guidance.accessibility_hint" = "Открывает экран «Спросить FitChef».";
+"fitchef.coach_hub.planning_direction.title" = "С чего начать?";
+"fitchef.coach_hub.planning_direction.detail" = "Вы сами выбираете: «Сегодня» или «Неделя».";
+"fitchef.coach_hub.planning_direction.accessibility_hint" = "Открывает выбор «Сегодня» или «Неделя».";
+
+/* FitChef Support Outcome Flow */
+"fitchef.support_flow.loading" = "Готовим следующий шаг…";
+"fitchef.support_flow.result.title" = "На чем сосредоточиться";
+"fitchef.support_flow.result.target_label" = "Начать с";
+"fitchef.support_flow.result.target.daily" = "Сегодня";
+"fitchef.support_flow.result.target.weekly" = "Неделя";
+"fitchef.support_flow.result.boundary" = "Ничего не откроется и не изменится автоматически.";
+"fitchef.support_flow.result.response_notice" = "Выберите «Спасибо» или «Не сейчас». Ваш ответ будет сохранен.";
+"fitchef.support_flow.action.acknowledge" = "Спасибо";
+"fitchef.support_flow.action.dismiss" = "Не сейчас";
+"fitchef.support_flow.recording" = "Сохраняем ответ…";
+"fitchef.support_flow.recorded" = "Ответ сохранен.";
+"fitchef.support_flow.replayed" = "Этот ответ уже был сохранен.";
+"fitchef.support_flow.handoff_failed" = "Не удалось загрузить следующий шаг.";
+"fitchef.support_flow.unavailable" = "Сейчас этот вариант недоступен.";
+"fitchef.support_flow.outcome_retryable" = "Не удалось подтвердить, был ли сохранен ваш ответ. Повторите попытку, когда будете готовы.";
+"fitchef.support_flow.outcome_restart" = "Не удалось сохранить ответ. Закройте экран и начните заново.";
+"fitchef.support_flow.outcome_terminal" = "Не удалось сохранить ответ. Закройте этот экран.";
+"fitchef.support_flow.action.retry" = "Повторить";
+"fitchef.support_flow.action.close" = "Закрыть";
+"fitchef.support_flow.action.done" = "Готово";

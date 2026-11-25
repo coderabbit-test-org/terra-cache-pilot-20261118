@@ -1,0 +1,146 @@
+"""Guard test: keep the finite app facade distinct from retired legacy bindings.
+
+The package-level ``app`` facade retains its reviewed compatibility exports even
+when the transitional ``legacy_app`` module intentionally shrinks.
+"""
+
+import pytest
+
+
+def test_app_public_surface_smoke() -> None:
+    """Verify the finite app package facade exports its supported symbols."""
+    import app
+
+    # Core FastAPI instance
+    assert hasattr(app, "app"), "app.app (FastAPI instance) must be exported"
+
+    # Key legacy functions used across test suite
+    assert hasattr(app, "get_api_key"), "app.get_api_key must be exported"
+    assert hasattr(app, "lifespan"), "app.lifespan must be exported"
+
+    # Schemas commonly imported by tests
+    assert hasattr(app, "BMIRequest"), "app.BMIRequest must be exported"
+
+    # Internal utilities (used by legacy tests)
+    assert hasattr(app, "_is_truthy"), "app._is_truthy must be exported"
+    assert hasattr(app, "_macros_to_kcal"), "app._macros_to_kcal must be exported"
+
+    # Core utilities (added in import hygiene PR)
+    assert hasattr(app, "resolve_attr"), "app.resolve_attr must be exported"
+    assert hasattr(app, "make_weekly_menu"), "app.make_weekly_menu must be exported"
+    assert hasattr(app, "build_nutrition_targets"), "app.build_nutrition_targets must be exported"
+    assert hasattr(app, "get_update_scheduler"), "app.get_update_scheduler must be exported"
+    assert hasattr(app, "get_bodyfat_router"), "app.get_bodyfat_router must be exported"
+
+    # Visualization flags (optional but must be present)
+    assert hasattr(app, "MATPLOTLIB_AVAILABLE"), "app.MATPLOTLIB_AVAILABLE must be exported"
+    assert hasattr(
+        app, "generate_bmi_visualization"
+    ), "app.generate_bmi_visualization must be exported"
+
+    # Observability endpoints (for patch-based tests)
+    assert hasattr(app, "metrics"), "app.metrics must be exported (for patch('app.metrics'))"
+
+
+def test_canonical_lifespan_preserves_application_owned_app_identity() -> None:
+    import app
+    import app.main as app_main
+    import legacy_app
+    from app.bootstrap.lifespan import application_lifespan
+
+    assert app.lifespan is application_lifespan
+    assert "lifespan" not in vars(legacy_app)
+    assert app.app is app_main.app
+    assert app_main.app is legacy_app.app
+    assert legacy_app.app.router.lifespan_context is application_lifespan
+
+
+def test_scheduler_access_is_an_exact_compatibility_export() -> None:
+    import app
+    import legacy_app
+    from app.services import scheduler_access
+
+    assert app.get_update_scheduler is scheduler_access.get_update_scheduler
+    assert "get_update_scheduler" not in vars(legacy_app)
+
+
+def test_planning_exports_remain_canonical_only_on_the_app_package_facade() -> None:
+    import app
+    import legacy_app
+    from core.menu_engine import make_weekly_menu
+    from core.recommendations import build_nutrition_targets
+
+    assert app.make_weekly_menu is make_weekly_menu
+    assert app.build_nutrition_targets is build_nutrition_targets
+    assert not hasattr(legacy_app, "make_weekly_menu")
+    assert not hasattr(legacy_app, "build_nutrition_targets")
+
+
+def test_legacy_openapi_symbols_are_retired_with_canonical_owners_present() -> None:
+    import legacy_app
+    from app.bootstrap import openapi as canonical_openapi
+
+    symbol_names = (
+        "_OPENAPI_ALLOWED_PREFIXES",
+        "_OPENAPI_ALLOWED_EXACT",
+        "_is_openapi_public_path",
+        "_collect_schema_refs",
+        "_prune_unreferenced_schema_components",
+        "_build_canonical_openapi",
+        "_install_openapi_builder",
+    )
+
+    for symbol_name in symbol_names:
+        assert symbol_name not in vars(legacy_app)
+        with pytest.raises(AttributeError):
+            getattr(legacy_app, symbol_name)
+        assert getattr(canonical_openapi, symbol_name) is not None
+    assert isinstance(canonical_openapi._OPENAPI_ALLOWED_PREFIXES, tuple)
+    assert isinstance(canonical_openapi._OPENAPI_ALLOWED_EXACT, frozenset)
+    assert (
+        canonical_openapi._install_openapi_builder
+        is canonical_openapi.install_canonical_openapi_builder
+    )
+
+
+def test_app_legacy_facade_has_no_openapi_installation_side_effect() -> None:
+    import pathlib
+
+    app_init = pathlib.Path("app/__init__.py").read_text(encoding="utf-8")
+
+    assert 'getattr(legacy, "_install_openapi_builder"' not in app_init
+    assert "install_openapi_builder(legacy_app_instance)" not in app_init
+
+
+def test_no_dynamic_exec_module_in_app_package() -> None:
+    """Prevent regression to dynamic import patterns (spec.loader.exec_module).
+
+    Import hygiene PR #403 eliminated these anti-patterns. This test ensures
+    they never return.
+    """
+    import pathlib
+
+    app_init = pathlib.Path("app/__init__.py").read_text(encoding="utf-8")
+
+    # No dynamic module execution
+    assert "exec_module" not in app_init, "app/__init__.py must not use exec_module"
+    assert (
+        "spec_from_file_location" not in app_init
+    ), "app/__init__.py must not use spec_from_file_location"
+
+    # __getattr__ is allowed for finite lazy exports and canonical app access.
+
+
+def test_dockerfile_uses_legacy_app_not_app_py() -> None:
+    """Verify Dockerfile copies legacy_app.py (not app.py which was renamed)."""
+    import pathlib
+
+    dockerfile = pathlib.Path("Dockerfile").read_text(encoding="utf-8")
+
+    # Should copy legacy_app.py
+    assert "legacy_app.py" in dockerfile, "Dockerfile must COPY legacy_app.py"
+
+    # Should NOT copy app.py (renamed file)
+    assert (
+        "COPY --chown=pulseplate:pulseplate app.py" not in dockerfile
+    ), "Dockerfile must not COPY app.py (file renamed to legacy_app.py)"

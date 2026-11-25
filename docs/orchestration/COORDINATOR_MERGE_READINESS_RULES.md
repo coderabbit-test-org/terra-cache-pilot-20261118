@@ -1,0 +1,154 @@
+# Coordinator: Merge Readiness and Zero-Comments Policy
+
+**Purpose:** Canonical rules for agents (including coordinator) so that "0 comments" and "ready to merge" are never reported incorrectly. Merge is allowed **only** when both conditions below are satisfied.
+
+**Source of truth (policy):** `AGENTS.md` (section "PR merge readiness (hard rule)", ~line 31). This doc is the **operational** checklist and script reference for the coordinator and any agent performing merge-readiness verification.
+
+---
+
+## 1. Hard rule (no exceptions)
+
+- **Merge only when:**
+  1. **Zero unresolved review threads** (every review thread on the PR is resolved in GitHub UI).
+  2. **Zero unmapped actionable bot comments** (every bot comment that contains actionable items is listed in the canonical artifact `docs/review/PR_<N>_FIXED_MAPPING.md`).
+
+- **Do not merge when:**
+  - Any review thread is unresolved.
+  - Any bot (CodeRabbit, Sourcery, Cubic, etc.) has posted a comment/review that is "actionable" (e.g. "Actionable comments posted", "Potential issue", "Prompt for AI Agents") and that comment URL is **not** present in the canonical artifact `docs/review/PR_<N>_FIXED_MAPPING.md` with disposition proof that addresses it.
+
+---
+
+## 2. Why "0 unresolved threads" is not enough
+
+- **Mistake to avoid:** Saying "0 comments" or "ready to merge" based **only** on "unresolved threads = 0".
+- Threads can be marked "Resolved" in the UI before the fix is committed or before the comment is added to the mapping.
+- New bot comments can appear **after** your last check; a single check is a point-in-time result.
+- **Correct interpretation of "0 comments":**
+  **0 unresolved threads** **and** **every actionable bot comment is mapped** (and the mapping commit actually contains the fix). Verification must be re-run after the latest bot/review activity.
+
+---
+
+## 3. Verification script (canonical)
+
+The canonical operator entrypoint for merge governance in this repo is:
+
+```bash
+# From repo root, for strict local parity with CI.
+export GITHUB_TOKEN="..."
+export GH_TOKEN="${GITHUB_TOKEN}"
+python scripts/orchestration/check_merge_ready.py \
+  --pr-number <PR_NUMBER> \
+  --repo Katsiarynakavaleuskaya/PulsePlate \
+  --require-auth
+```
+
+Local mode semantics:
+- Default local runs may stay advisory for the disposition guard when `gh` auth is unavailable.
+- Add `--require-auth` only when you want strict local parity with CI.
+- CI is always strict for the disposition guard and requires `GH_TOKEN`.
+
+- **Exit 0:** Phase 2 body/artifact contract, merge-readiness checks, and disposition proof all pass → PR satisfies merge-governance policy at the time of the run.
+- **Exit 1:** At least one sub-gate failed → PR must **not** be merged until fixed; wrapper prints the failing gate names and their output.
+
+Underlying enforcement scripts remain canonical for their own domains:
+
+- `scripts/ci/check_pr_body_phase2_gates.py`
+- `scripts/ci/check_pr_merge_readiness.py`
+- `scripts/ci/check_current_head_pr_checks.py`
+- `scripts/orchestration/check_review_threads_disposition.py`
+
+**CI:** The same wrapper runs with `--event-path "$GITHUB_EVENT_PATH"`. For local/agent usage, use `--pr-number` and `--repo` instead.
+Raw `gh pr checks` output remains diagnostic only because it can include
+superseded historical failures after the latest PR head is already clean. The
+wrapper is the canonical filtered current-head view.
+When branch-protection metadata is unavailable, the current-head filter blocks
+only on canonical ordinary-PR `CI` signals and the aggregate `StatusContext`
+named `CI`; specialized lanes such as Docker/image, optional CI, iOS, and
+release-ops workflows remain visible but advisory.
+
+---
+
+## 4. Coordinator orchestration checklist (before saying "ready to merge" or "0 comments")
+
+1. **Run the wrapper** (section 3) for the PR.
+2. **If exit code is not 0:** Do **not** report "0 comments" or "ready to merge". Report the script output (unresolved count, UNMAPPED comment URLs, or blocking current-head checks) and instruct to fix and re-run.
+3. **If exit code is 0:** You may state that the PR satisfies the zero-comments policy **at the time of the run**. Prefer: "Orchestration merge-check passed: Phase 2, merge-readiness, current-head checks, and disposition proof are all green."
+4. **After new bot activity:** If the user or system reports new bot comments (e.g. CodeRabbit, Sourcery), **re-run the wrapper** before any merge decision; do not assume previous pass still holds.
+
+**Loop until zero:** Full cycle (commit → push → watch CI → new comment → fix → re-check) is in `RUNBOOK_AGENT.md` (sections "Pre-merge readiness pass" ~line 121, "Loop until zero comments (canonical cycle)" ~line 160). Repeat until script exit 0 and CI green.
+
+### Coordinator-owned PR lifecycle
+
+Before the final checklist above, coordinator should run the full PR lifecycle explicitly:
+
+1. **Initialize the PR correctly**
+   - Start with preflight and task analysis.
+   - Treat repo custom orchestration as the lane-start authority:
+     `check_preflight.py` -> `task_bootstrap.py` -> `agent-coordinator`.
+     Host/Codex preflight is supporting context only and must not be cited as
+     lane provenance.
+   - Record lane-start provenance in the PR body or fixed-mapping artifact:
+     `Packet: artifacts/orchestration/task_packets/<id>.json` or a narrow
+     documented exception for trivial docs cleanup, main cleanup, cache cleanup,
+     or an operator-declared emergency infrastructure repair. `Starter:
+     scripts/orchestration/start_pr_lane.sh` is supplemental evidence when
+     present, but cannot satisfy provenance alone. Missing provenance is
+     diagnostic dry-run in this hardening wave; malformed provenance is an
+     error because it creates false proof.
+   - Execute every role-agent pass assigned by the bootstrap packet/runbook in
+     declared order. `task_bootstrap.py` packet creation does not execute role
+     agents; missing role execution blocks readiness unless `agent-coordinator`
+     records an explicit disposition with evidence.
+   - Run `pulseplate-premortem-risk-review` and Experiment Runner oracle-only
+     evidence before PR open for every non-trivial PR. Premortem findings must
+     be fixed or dispositioned, and Experiment Runner artifact load/write
+     failures are infrastructure blockers rather than valid `Not applicable`
+     reasons.
+   - Open non-draft by default once scope, initial artifacts, and first local gates are coherent so bot review and current-head checks run.
+   - Use draft only with an explicit operator exception when review/check suppression is intentional.
+2. **Control each push cycle**
+   - Run the required local checks before pushing.
+   - Watch the latest-head CI run after pushing; do not reason from stale job history alone.
+3. **Control each review cycle**
+   - Treat each new human/bot review as new coordinator input.
+   - Fix code/docs first, then update `docs/review/PR_<N>_FIXED_MAPPING.md`, then refresh the optional PR-body mirror.
+4. **Control the merge cycle**
+   - Re-run the strict wrapper after the latest bot/review activity.
+   - Require zero actionable bot comments, zero blocking unresolved threads, green current-head checks, and the wait-window.
+
+This lifecycle is mandatory operating behavior, not just a recommendation. The final merge-readiness wrapper is the last step in the loop, not the whole loop.
+
+---
+
+## 5. PR body requirements (reminder)
+
+- `## Discussion Thread Pass` with checkboxes completed.
+- `### Fixed in Commit Mapping` present as a mirror section for human review.
+- `## Experiment Runner Evidence` with either a local result artifact path or an explicit `Not applicable:` reason. Non-trivial PRs must create oracle-only evidence by default; `Not applicable` requires a concrete reason. Artifact load/write failures are infrastructure blockers, not a valid `Not applicable` reason. Malformed evidence is a Phase2 error.
+- Premortem evidence showing `pulseplate-premortem-risk-review` ran on the
+  actual diff and every finding is `FIXED`, `NOT-A-BUG`, or `DEFERRED` with
+  evidence/backlog proof.
+- Bootstrap role-agent evidence showing the packet/runbook role order was run
+  in order; post-open PR review must include
+  `qa-engineer-agent -> bug-hunter -> security-auditor`, Codex Security diff
+  scan / finding discovery, and `pulseplate-pr-review` before readiness.
+- `## Lane Start Provenance` with a bootstrap packet or a narrow documented
+  exception. `start_pr_lane.sh` may be listed as supplemental evidence, but not
+  as the only proof. Missing provenance is diagnostic dry-run in this wave and
+  shows what would fail after promotion to a hard gate.
+- `## Merge Readiness` section.
+
+Canonical review-thread mappings live in `docs/review/PR_<N>_FIXED_MAPPING.md`. The PR body no longer needs late-cycle URL→SHA duplication once the canonical artifact exists.
+
+See `RUNBOOK_AGENT.md` (Pre-merge readiness pass ~line 121, Phase2 PR body gates).
+
+---
+
+## 6. References
+
+- **Policy:** `AGENTS.md` (PR merge readiness hard rule, ~line 31).
+- **Procedure:** `RUNBOOK_AGENT.md` (Pre-merge readiness pass ~line 121, Loop until zero ~line 160, Verify zero unresolved review threads).
+- **Canonical operator entrypoint:** `scripts/orchestration/check_merge_ready.py`.
+- **CI gate:** `scripts/ci/check_pr_merge_readiness.py` (merge-readiness sub-gate).
+- **Current-head filter:** `scripts/ci/check_current_head_pr_checks.py`.
+- **Phase2 body check:** `scripts/ci/check_pr_body_phase2_gates.py`.

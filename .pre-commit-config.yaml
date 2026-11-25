@@ -1,0 +1,230 @@
+repos:
+  # --- Generic hygiene hooks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-yaml
+      - id: end-of-file-fixer
+        # Automatically fixes missing trailing newlines (POSIX requirement)
+        # All text files must end with '\n' character
+      - id: trailing-whitespace
+        exclude: '\Afrontend/patches/go-jose-v3\.0\.5-CVE-2026-116587\.patch\Z'
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        exclude: ^deploy/postgres-pgvector/builder-apk-index\.tar\.gz$
+      - id: check-added-large-files
+        name: check signed PostgreSQL APK index size
+        files: ^deploy/postgres-pgvector/builder-apk-index\.tar\.gz$
+        args: [--maxkb=2048, --enforce-all]
+
+  # --- YAML lint: yamllint (style + structure)
+  - repo: https://github.com/adrienverge/yamllint
+    rev: v1.38.0
+    hooks:
+      - id: yamllint
+        name: yamllint (yaml lint)
+        args: [-c, .yamllint]
+        files: \.(yml|yaml)$
+        exclude: ^ios/\.build/
+
+  # --- Secrets scanning: detect-secrets (prevents accidental key leaks)
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+        name: detect-secrets (secrets scan)
+        require_serial: true
+        args: [--baseline, .secrets.baseline]
+        exclude: ^(ios/\.build/|\.venv/|\.venv-ci/|node_modules/|build/|dist/)  # generated/venv
+
+  # --- Python cache cleanup
+  - repo: local
+    hooks:
+      - id: clean-python-cache
+        name: clean-python-cache
+        entry: bash -c "find . -path ./.git -prune -o -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true; find . -path ./.git -prune -o -type f -name '*.pyc' -delete 2>/dev/null || true"
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]
+
+  # --- GitHub Actions workflow validation
+  - repo: https://github.com/python-jsonschema/check-jsonschema
+    rev: 0.36.0
+    hooks:
+      - id: check-github-workflows
+        name: check-github-workflows
+        files: ^\.github/workflows/.*\.(yml|yaml)$
+
+  # --- Code style: Black
+  - repo: https://github.com/psf/black
+    rev: 26.10.1
+    hooks:
+      - id: black
+        name: black (format)
+        language_version: python3
+        args: [--line-length=100]
+        files: ^(?!frontend/|\.claude/).+\.py$
+
+  # --- Lint: Ruff
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.4
+    hooks:
+      - id: ruff
+        name: ruff (lint, local)
+        files: ^(?!frontend/|\.claude/).+\.py$
+        # Keep Ruff compatible with Black by matching line length and ignoring E501
+        args:
+          - --fix
+          - --line-length=100
+          - --extend-ignore=E501
+      - id: ruff
+        name: ruff (type hints check)
+        files: ^(app/.*\.py|core/.*\.py|scripts/.*\.py|providers/.*\.py|(mcp_|setup_|update_|verify_).*\.py|(app|main|settings|secure_config|signed_links|llm|nutrition_core|nutrition_plate|bmi_core|bodyfat|bmi_visualization|legacy_app)\.py)$
+        # business_bayesian_analyzer is temporarily excluded as legacy analyzer code
+        # with staged type-hint refactor tracked separately.
+        exclude: ^core/(db|auto_repair|data_sanitizer|business_bayesian_analyzer)\.py$
+        # ANN* are tech-debt indicators (non-blocking). Keep signal, don't block commits.
+        args: [--select, ANN, --exit-zero, --line-length=100, --extend-ignore=E501]
+        stages: [pre-commit, pre-push]  # Run on both pre-commit and pre-push for immediate feedback
+
+  # --- Type checking: mypy
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v2.3.1
+    hooks:
+      - id: mypy
+        name: mypy (type-check, changed files)
+        stages: [pre-push]
+        additional_dependencies:
+          # Keep in sync with requirements.txt / pyproject.toml.
+          # Pre-commit mypy runs in an isolated env and needs runtime deps to avoid Any pollution.
+          - pydantic==2.13.4
+          - types-PyYAML==6.0.12.20260815
+        args:
+          - --pretty
+          - --show-error-codes
+          # Keep pre-push fast and PR-friendly: avoid failing pushes due to
+          # unrelated mypy issues in imported modules (full typing cleanup is tracked separately).
+          - --follow-imports=skip
+        files: ^(app/.*\.py|core/.*\.py|scripts/.*\.py|mcp_.*\.py|setup_.*\.py|update_.*\.py|verify_.*\.py|app\.py|main\.py|settings\.py|secure_config\.py|signed_links\.py|llm\.py|nutrition_core\.py|nutrition_plate\.py|bmi_core\.py|bodyfat\.py|bmi_visualization\.py|providers/.*\.py)$
+
+  # --- Security: bandit
+  - repo: https://github.com/PyCQA/bandit
+    rev: 1.9.4
+    hooks:
+      - id: bandit
+        name: bandit (security, changed files only)
+        stages: [pre-commit]
+        args:
+          - -q
+          - -c
+          - .bandit.yaml
+          - -r
+          - app
+          - core
+        # Explicitly exclude .claude/ and tests directories using regex
+        exclude: '^(\.claude/.*|tests/.*)'
+
+  # --- Vulnerabilities: pip-audit (replacement for safety)
+  - repo: https://github.com/pypa/pip-audit
+    rev: v2.10.1
+    hooks:
+      - id: pip-audit
+        name: pip-audit (pip vulns)
+        stages: [pre-push]
+        args:
+          - --requirement
+          - requirements.txt
+          - --no-deps
+          - --disable-pip
+          - --strict
+          - --timeout
+          - '60'
+
+  # --- Docstrings: pydocstyle (re-enabled on pre-push)
+  - repo: https://github.com/PyCQA/pydocstyle
+    rev: 6.3.0
+    hooks:
+      - id: pydocstyle
+        name: pydocstyle (docstrings)
+        files: ^(?!frontend/).+\.py$
+        stages: [manual]
+        args: [--convention=google]
+
+  # --- Commit message lint (commitizen)
+  - repo: https://github.com/commitizen-tools/commitizen
+    rev: v3.28.0
+    hooks:
+      - id: commitizen
+        name: commitizen check (conventional commits)
+        stages: [commit-msg]
+        additional_dependencies: []
+        # Expects a pyproject.toml with [tool.commitizen] config, otherwise uses defaults
+
+  # --- Local composite hooks (pre-push): strict gates before remote
+  - repo: local
+    hooks:
+      # Removed: check-trailing-newline (redundant with end-of-file-fixer)
+      # The end-of-file-fixer hook (line 13) already ensures POSIX compliance
+
+      # Removed: ruff-pre-push (redundant with ruff hook line 51-61)
+      # Type hint checks are already covered by main ruff hook
+
+      # frontend tests — run on pre-commit if frontend files changed
+      - id: frontend-tests
+        name: frontend tests (vitest)
+        entry: bash -c "cd frontend && npm run test:precommit"
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]
+        files: ^frontend/.*\.(ts|tsx|js|jsx)$
+
+      # backend tests — run on pre-commit and pre-push for changed Python files plus explicitly mapped cross-surface governance triggers
+      - id: backend-tests
+        name: backend tests (pytest, changed files)
+        entry: bash -c "PRE_COMMIT=1 bash scripts/run-backend-tests-pre-commit.sh"
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]
+        always_run: true
+        files: ^(?:(?!frontend/|\.claude/).+\.py|frontend/package(?:-lock)?\.json)$
+      - id: backend-tests-pre-push
+        name: backend tests (pytest, pre-push)
+        entry: >-
+          /usr/bin/env -u PRE_COMMIT -u MAKEFLAGS -u GNUMAKEFLAGS -u MFLAGS -u MAKEFILES
+          BACKEND_HOOK_REQUIRED_PUSH=1 SKIP_TESTS=0 make validate-changed
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
+        always_run: true  # Deletion-only pushes can supply no classified files.
+
+      # ios syntax check — run on pre-commit if iOS files changed (macOS only)
+      - id: ios-syntax-check
+        name: ios syntax check (swift)
+        entry: scripts/ci/check_ios_swift_syntax.sh
+        language: system
+        pass_filenames: true
+        stages: [pre-commit]
+        files: (?s)^ios/.*\.swift$
+
+      # bandit-full — full security scan with smart excludes
+      - id: bandit-full-pre-push
+        name: bandit (pre-push, full repo)
+        entry: bash -c "make bandit-full"
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
+
+      # docker-build-test — test Docker build before push (with timeout)
+      - id: docker-build-test
+        name: docker build test
+        entry: bash -c "set -o pipefail; if [ \"${RUN_DOCKER_BUILD_TEST:-}\" != \"true\" ]; then echo '⚠️  Skipping docker build test (set RUN_DOCKER_BUILD_TEST=true to enable)'; exit 0; fi; if timeout 900 make docker-build 2>&1 | tail -50; then echo '✅ Docker build successful'; else echo '⚠️  Docker build failed or timed out after 15 minutes - check logs above'; exit 1; fi"
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
+        files: ^(Dockerfile|\.dockerignore|docker-compose\.yaml|requirements\.txt|(app|core|scripts)/.*)
+
+ci:
+  autofix_commit_msg: "chore(pre-commit): auto-fix via pre-commit"
+  autofix_prs: true
+  skip: []
+  submodules: false

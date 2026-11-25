@@ -1,0 +1,1273 @@
+#!/usr/bin/env python3
+"""Run main-branch pytest shards without pytest-xdist."""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import errno
+import hashlib
+import importlib.util
+import math
+import os
+import signal
+import shutil
+import subprocess  # nosec B404: subprocess is required for bounded local shard isolation without shell (remove-by: 2027-01-25, ref: PR-1748)
+import sys
+import tempfile
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Mapping, Sequence
+
+DEFAULT_SHARD_COUNT = 2
+DEFAULT_MAX_PARALLEL = 2
+DEFAULT_FAULTHANDLER_TIMEOUT_SECONDS = 300
+DEFAULT_SHARD_TIMEOUT_SECONDS = 1800
+_CLEANUP_POLL_INTERVAL = 0.1
+DEFAULT_COVERAGE_TIMEOUT_SECONDS = 1200
+DEFAULT_ARTIFACT_LABEL = "pymain"
+JUNIT_FAMILY = "legacy"
+SLOW_MARK_EXPRESSION = "not slow"
+DEFAULT_MARK_EXPRESSION = SLOW_MARK_EXPRESSION
+DEFAULT_DURATIONS_MIN_SECONDS = "10.0"
+BAYESIAN_PERSIST_TRUTHY = {"1", "true", "yes", "on"}
+BAYESIAN_HISTORY_IO_DISABLED_ENV = "PULSEPLATE_DISABLE_BAYESIAN_HISTORY_IO"
+PYTEST_BASETEMP_ROOT_NAME = "pulseplate-main-test-shards"
+PYTEST_BASETEMP_FALLBACK_ROOT_NAME = "pulseplate-main-test-shards-external"
+POSIX_TEMP_ROOT = Path(os.sep) / "tmp"
+WINDOWS_TEMP_ROOT = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "Temp"
+SERIAL_MAIN_TEST_PATHS = frozenset({Path("tests/test_design_token_parity.py")})
+
+
+@dataclass(frozen=True)
+class TestFile:
+    """A pytest file with a deterministic balancing weight."""
+
+    path: Path
+    weight: int
+
+
+@dataclass
+class TestShard:
+    """A collection of pytest files assigned to one process."""
+
+    index: int
+    artifact_label: str = DEFAULT_ARTIFACT_LABEL
+    files: list[TestFile] = field(default_factory=list)
+    weight: int = 0
+
+    def add(self, test_file: TestFile) -> None:
+        self.files.append(test_file)
+        self.weight += test_file.weight
+
+    @property
+    def coverage_file(self) -> str:
+        return f".coverage.{self.artifact_label}-main-shard-{self.index}"
+
+    @property
+    def junit_file(self) -> str:
+        return f"tests/results-{self.artifact_label}-shard-{self.index}.xml"
+
+
+@dataclass
+class RunningShard:
+    """A live pytest shard subprocess owned directly by the parent runner."""
+
+    shard: TestShard
+    process: subprocess.Popen[bytes]
+    started_at: float
+    timeout_seconds: int
+    custody_lost: bool = False
+
+
+def build_test_file(repo_root: Path, test_path: Path) -> TestFile:
+    """Return the normalized shard metadata for one pytest file."""
+
+    return TestFile(
+        path=test_path.relative_to(repo_root),
+        weight=max(test_path.stat().st_size, 1),
+    )
+
+
+def discover_test_files(
+    repo_root: Path,
+    excluded_paths: frozenset[Path] = frozenset(),
+) -> list[TestFile]:
+    """Return all first-class pytest files for the main suite."""
+
+    tests_root = repo_root / "tests"
+    disabled_root = tests_root / "disabled_hypothesis"
+    discovered: list[TestFile] = []
+    for test_path in sorted(tests_root.rglob("test_*.py")):
+        if disabled_root in test_path.parents:
+            continue
+        relative_path = test_path.relative_to(repo_root)
+        if relative_path in excluded_paths:
+            continue
+        if any(part.startswith(".") for part in relative_path.parts):
+            continue
+        discovered.append(build_test_file(repo_root, test_path))
+    return discovered
+
+
+def discover_serial_test_files(repo_root: Path) -> list[TestFile]:
+    """Return tests that must run outside the process-parallel main shards."""
+
+    discovered: list[TestFile] = []
+    for relative_path in sorted(SERIAL_MAIN_TEST_PATHS):
+        test_path = repo_root / relative_path
+        if test_path.is_file():
+            discovered.append(build_test_file(repo_root, test_path))
+    return discovered
+
+
+def build_serial_shards(repo_root: Path, artifact_label: str) -> list[TestShard]:
+    """Build deterministic serial shard wrappers for global/toolchain tests."""
+
+    serial_tests = discover_serial_test_files(repo_root)
+    if not serial_tests:
+        return []
+    return [
+        TestShard(
+            index=0,
+            artifact_label=artifact_label,
+            files=serial_tests,
+            weight=sum(test_file.weight for test_file in serial_tests),
+        )
+    ]
+
+
+def normalize_python_label(value: str) -> str:
+    """Return a stable artifact label such as ``py312`` for a Python version."""
+
+    label = value.strip().lower()
+    if not label:
+        raise ValueError("python version label must not be empty")
+    if label.startswith("python-"):
+        label = label.removeprefix("python-")
+    if label.startswith("python"):
+        label = label.removeprefix("python")
+    if label.startswith("py"):
+        label = label.removeprefix("py")
+    label = label.replace(".", "").replace("_", "").replace("-", "")
+    if not label.isalnum():
+        raise ValueError(f"unsupported python version label: {value!r}")
+    return validate_artifact_label(f"py{label}")
+
+
+def validate_artifact_label(value: str) -> str:
+    """Return an explicit artifact label after path-safe validation."""
+
+    label = value.strip().lower()
+    if not label.startswith("py") or len(label) <= 2 or not label.isalnum():
+        raise ValueError(
+            "artifact label must start with 'py' and contain only ASCII letters or digits"
+        )
+    return label
+
+
+def validate_marker_expression(value: str) -> str:
+    """Return a non-empty single-line pytest mark expression."""
+
+    marker_expression = value.strip()
+    if not marker_expression:
+        raise ValueError("marker expression must not be empty")
+    if "\n" in marker_expression or "\r" in marker_expression:
+        raise ValueError("marker expression must be a single line")
+    return marker_expression
+
+
+def validate_single_line_option(value: str, *, option_name: str) -> str:
+    """Return a non-empty single-line CLI option value."""
+
+    option_value = value.strip()
+    if not option_value:
+        raise ValueError(f"{option_name} must not be empty")
+    if "\n" in option_value or "\r" in option_value:
+        raise ValueError(f"{option_name} must be a single line")
+    return option_value
+
+
+def validate_durations_min(value: str) -> str:
+    """Return a non-negative pytest durations-min value."""
+
+    durations_min = validate_single_line_option(value, option_name="durations-min")
+    try:
+        parsed_value = float(durations_min)
+    except ValueError as exc:
+        raise ValueError("durations-min must be numeric") from exc
+    if not math.isfinite(parsed_value) or parsed_value < 0:
+        raise ValueError("durations-min must be finite and non-negative")
+    return durations_min
+
+
+def partition_test_files(
+    test_files: Sequence[TestFile],
+    shard_count: int,
+    artifact_label: str = DEFAULT_ARTIFACT_LABEL,
+) -> list[TestShard]:
+    """Greedily balance files by size while keeping deterministic shard output."""
+
+    if shard_count < 1:
+        raise ValueError("shard_count must be >= 1")
+    if not test_files:
+        raise ValueError("no pytest files discovered")
+
+    effective_shard_count = min(shard_count, len(test_files))
+    shards = [
+        TestShard(index=index, artifact_label=artifact_label)
+        for index in range(1, effective_shard_count + 1)
+    ]
+    for test_file in sorted(test_files, key=lambda item: (-item.weight, str(item.path))):
+        shard = min(shards, key=lambda item: (item.weight, item.index))
+        shard.add(test_file)
+
+    for shard in shards:
+        shard.files.sort(key=lambda item: str(item.path))
+    return shards
+
+
+def external_temp_root(repo_root: Path) -> Path:
+    """Return a temp root that is guaranteed to live outside the repo tree."""
+
+    resolved_repo_root = repo_root.resolve()
+    candidates = [Path(tempfile.gettempdir())]
+    if os.name == "posix":
+        candidates.append(POSIX_TEMP_ROOT)
+    elif os.name == "nt":
+        candidates.append(WINDOWS_TEMP_ROOT)
+
+    for candidate in candidates:
+        resolved_candidate = candidate.resolve()
+        if not resolved_candidate.is_relative_to(resolved_repo_root):
+            return resolved_candidate
+
+    raise RuntimeError("unable to resolve pytest basetemp root outside repo")
+
+
+def shard_basetemp_dir(repo_root: Path, shard: TestShard) -> Path:
+    """Return a deterministic external pytest base temp directory for one shard."""
+
+    resolved_repo_root = repo_root.resolve()
+    repo_key = hashlib.sha256(str(resolved_repo_root).encode("utf-8")).hexdigest()[:12]
+    temp_root = external_temp_root(repo_root)
+    for root_name in (PYTEST_BASETEMP_ROOT_NAME, PYTEST_BASETEMP_FALLBACK_ROOT_NAME):
+        candidate = temp_root / root_name / repo_key / f"{shard.artifact_label}-shard-{shard.index}"
+        if not candidate.resolve().is_relative_to(resolved_repo_root):
+            return candidate
+    raise RuntimeError("unable to resolve pytest basetemp path outside repo")
+
+
+def pytest_cov_available() -> bool:
+    """Return whether the active interpreter can load pytest-cov."""
+
+    return importlib.util.find_spec("pytest_cov") is not None
+
+
+def build_pytest_args(
+    shard: TestShard,
+    repo_root: Path,
+    marker_expression: str = DEFAULT_MARK_EXPRESSION,
+    durations_min: str = DEFAULT_DURATIONS_MIN_SECONDS,
+    report_chars: str | None = None,
+) -> list[str]:
+    """Build one no-xdist pytest argv for a shard."""
+
+    marker_expression = validate_marker_expression(marker_expression)
+    durations_min = validate_durations_min(durations_min)
+    pytest_args = [
+        "-c",
+        "pyproject.toml",
+        "-p",
+        "no:xdist",
+        "-m",
+        marker_expression,
+        "--durations=25",
+        f"--durations-min={durations_min}",
+        "-o",
+        f"faulthandler_timeout={DEFAULT_FAULTHANDLER_TIMEOUT_SECONDS}",
+        "--basetemp",
+        str(shard_basetemp_dir(repo_root, shard)),
+        "--junitxml",
+        shard.junit_file,
+        "-o",
+        f"junit_family={JUNIT_FAMILY}",
+        *[str(test_file.path) for test_file in shard.files],
+    ]
+    if report_chars is not None:
+        pytest_args.extend(
+            ["-r", validate_single_line_option(report_chars, option_name="report-chars")]
+        )
+    if pytest_cov_available():
+        junit_index = pytest_args.index("--junitxml")
+        pytest_args[junit_index:junit_index] = ["--cov=.", "--cov-report="]
+    return pytest_args
+
+
+def bayesian_persist_enabled(base_env: Mapping[str, str]) -> bool:
+    """Return whether Bayesian history persistence is enabled for a shard run."""
+
+    return base_env.get("BAYESIAN_PERSIST", "").strip().lower() in BAYESIAN_PERSIST_TRUTHY
+
+
+def shard_bayesian_history_path(base_env: Mapping[str, str], shard: TestShard) -> str:
+    """Return a shard-local Bayesian history path to avoid process write races."""
+
+    raw_path = base_env.get("BAYESIAN_HISTORY_PATH", "test_execution_history.json").strip()
+    history_path = Path(raw_path or "test_execution_history.json")
+    shard_suffix = f"{shard.artifact_label}-shard-{shard.index}"
+    if history_path.stem.endswith(f"-{shard_suffix}"):
+        return str(history_path)
+    scoped_name = f"{history_path.stem}-{shard_suffix}{history_path.suffix}"
+    return str(history_path.with_name(scoped_name))
+
+
+def build_shard_env(base_env: dict[str, str], shard: TestShard, repo_root: Path) -> dict[str, str]:
+    """Return an isolated environment for one pytest shard."""
+
+    env = base_env.copy()
+    env.pop("PYTEST_XDIST_WORKER", None)
+    env["MAIN_TEST_SHARD"] = str(shard.index)
+    env["MAIN_TEST_SHARD_LABEL"] = shard.artifact_label
+    env["COVERAGE_FILE"] = str(repo_root / shard.coverage_file)
+    env["COV_CORE_DATAFILE"] = str(repo_root / shard.coverage_file)
+    env.setdefault("PYTEST_FAULTHANDLER_TIMEOUT_S", str(DEFAULT_FAULTHANDLER_TIMEOUT_SECONDS))
+    if bayesian_persist_enabled(base_env):
+        env["BAYESIAN_HISTORY_PATH"] = shard_bayesian_history_path(base_env, shard)
+        env[BAYESIAN_HISTORY_IO_DISABLED_ENV] = "1"
+    return env
+
+
+def shard_timeout_seconds(base_env: Mapping[str, str]) -> int:
+    """Return the watchdog timeout for one pytest shard subprocess."""
+
+    raw_value = base_env.get("MAIN_TEST_SHARD_TIMEOUT_SECONDS", "").strip()
+    if not raw_value:
+        return DEFAULT_SHARD_TIMEOUT_SECONDS
+    try:
+        timeout = int(raw_value)
+    except ValueError:
+        print(
+            f"MAIN_TEST_SHARD_TIMEOUT_INVALID value={raw_value!r} "
+            f"default={DEFAULT_SHARD_TIMEOUT_SECONDS}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return DEFAULT_SHARD_TIMEOUT_SECONDS
+    if timeout < 60:
+        print(
+            f"MAIN_TEST_SHARD_TIMEOUT_TOO_LOW value={timeout} "
+            f"default={DEFAULT_SHARD_TIMEOUT_SECONDS}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return DEFAULT_SHARD_TIMEOUT_SECONDS
+    return timeout
+
+
+def coverage_timeout_seconds(base_env: Mapping[str, str]) -> int:
+    """Return the watchdog timeout for one post-shard coverage phase."""
+
+    raw_value = base_env.get("MAIN_TEST_COVERAGE_TIMEOUT_SECONDS", "").strip()
+    if not raw_value:
+        return DEFAULT_COVERAGE_TIMEOUT_SECONDS
+    try:
+        timeout = int(raw_value)
+    except ValueError:
+        print(
+            f"MAIN_TEST_COVERAGE_TIMEOUT_INVALID value={raw_value!r} "
+            f"default={DEFAULT_COVERAGE_TIMEOUT_SECONDS}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return DEFAULT_COVERAGE_TIMEOUT_SECONDS
+    if timeout < 60:
+        print(
+            f"MAIN_TEST_COVERAGE_TIMEOUT_TOO_LOW value={timeout} "
+            f"default={DEFAULT_COVERAGE_TIMEOUT_SECONDS}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return DEFAULT_COVERAGE_TIMEOUT_SECONDS
+    return timeout
+
+
+def run_shard_child(
+    repo_root: Path,
+    shard: TestShard,
+    base_env: dict[str, str],
+    marker_expression: str = DEFAULT_MARK_EXPRESSION,
+    durations_min: str = DEFAULT_DURATIONS_MIN_SECONDS,
+    report_chars: str | None = None,
+) -> int:
+    """Run one pytest shard inside a disposable interpreter process."""
+
+    import pytest
+
+    shard_basetemp_dir(repo_root, shard).parent.mkdir(parents=True, exist_ok=True)
+    pytest_args = build_pytest_args(
+        shard,
+        repo_root,
+        marker_expression,
+        durations_min,
+        report_chars,
+    )
+    env = build_shard_env(base_env, shard, repo_root)
+    os.environ.pop("PYTEST_XDIST_WORKER", None)
+    os.environ.update(env)
+    os.chdir(repo_root)
+    print(
+        f"MAIN_TEST_SHARD_STARTED label={shard.artifact_label} index={shard.index} "
+        f"files={len(shard.files)} weight={shard.weight} junit={shard.junit_file}",
+        flush=True,
+    )
+    sys.argv = ["pytest"]
+    exit_code = pytest.main(pytest_args)
+    print(
+        f"MAIN_TEST_SHARD_FINISHED label={shard.artifact_label} "
+        f"index={shard.index} exit_code={exit_code}",
+        flush=True,
+    )
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(int(exit_code))
+
+
+def run_shard(
+    repo_root: Path,
+    shard: TestShard,
+    base_env: dict[str, str],
+    marker_expression: str = DEFAULT_MARK_EXPRESSION,
+    durations_min: str = DEFAULT_DURATIONS_MIN_SECONDS,
+    report_chars: str | None = None,
+    *,
+    pending_signal: list[int] | None = None,
+) -> int:
+    """Run one pytest shard in a child interpreter and return its exit code."""
+
+    pending = [] if pending_signal is None else pending_signal
+    previous = _install_shard_handlers(pending) if pending_signal is None else {}
+    try:
+        if pending:
+            raise SystemExit(128 + pending[0])
+        running_shard = start_shard_process(
+            repo_root,
+            shard,
+            base_env,
+            marker_expression,
+            durations_min,
+            report_chars,
+        )
+        return wait_for_shard_process(running_shard, pending)
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
+def build_shard_command(
+    repo_root: Path,
+    shard: TestShard,
+    marker_expression: str = DEFAULT_MARK_EXPRESSION,
+    durations_min: str = DEFAULT_DURATIONS_MIN_SECONDS,
+    report_chars: str | None = None,
+) -> list[str]:
+    """Build the explicit child-interpreter command for one shard."""
+
+    marker_expression = validate_marker_expression(marker_expression)
+    durations_min = validate_durations_min(durations_min)
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--repo-root",
+        str(repo_root),
+        "--artifact-label",
+        shard.artifact_label,
+        "--run-shard-index",
+        str(shard.index),
+        "--shard-weight",
+        str(shard.weight),
+        "--marker-expression",
+        marker_expression,
+        "--durations-min",
+        durations_min,
+    ]
+    if report_chars is not None:
+        command.extend(
+            [
+                "--report-chars",
+                validate_single_line_option(report_chars, option_name="report-chars"),
+            ]
+        )
+    for test_file in shard.files:
+        command.extend(["--shard-file", str(test_file.path)])
+    return command
+
+
+def start_shard_process(
+    repo_root: Path,
+    shard: TestShard,
+    base_env: dict[str, str],
+    marker_expression: str = DEFAULT_MARK_EXPRESSION,
+    durations_min: str = DEFAULT_DURATIONS_MIN_SECONDS,
+    report_chars: str | None = None,
+) -> RunningShard:
+    """Start one explicit shard subprocess and return its process metadata."""
+
+    env = build_shard_env(base_env, shard, repo_root)
+    command = build_shard_command(
+        repo_root,
+        shard,
+        marker_expression,
+        durations_min,
+        report_chars,
+    )
+    timeout = shard_timeout_seconds(base_env)
+    process = subprocess.Popen(  # nosec B603: argv uses the current Python interpreter and explicit repo-local shard runner without shell (remove-by: 2027-01-25, ref: PR-1748)
+        command,
+        cwd=repo_root,
+        env=env,
+        start_new_session=(os.name == "posix"),
+    )
+    return RunningShard(
+        shard=shard,
+        process=process,
+        started_at=time.monotonic(),
+        timeout_seconds=timeout,
+    )
+
+
+def _install_shard_handlers(pending: list[int]) -> dict[signal.Signals, Any]:
+    previous = {}
+    if os.name == "posix":
+        if signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL:
+            raise RuntimeError("Shard child wait ownership unavailable")
+
+        def record(signum: int, _frame: Any) -> None:
+            if not pending:
+                pending.append(signum)
+
+        try:
+            for signum in (signal.SIGTERM, signal.SIGINT):
+                previous[signum] = signal.signal(signum, record)
+        except BaseException:
+            for signum, handler in previous.items():
+                signal.signal(signum, handler)
+            raise
+    return previous
+
+
+class _ShardCensusNotStarted(RuntimeError):
+    """The census deadline elapsed before any native query was started."""
+
+
+class _TermPollDeferred(Exception):
+    """Only a fraction of an optional repeat poll remains before escalation."""
+
+
+def _shard_ps(
+    pid: int, selector: str, deadline: float, *, repeat_term_poll: bool = False
+) -> list[tuple[int, int, int, str]]:
+    """Query only the reserved leader or its group/session; require its direct-child witness."""
+    ps = shutil.which("ps", path=os.defpath)
+    if not ps or not os.path.isabs(ps):
+        raise RuntimeError("Shard group census unavailable")
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise _ShardCensusNotStarted("Shard group census unavailable")
+    if repeat_term_poll and remaining < _CLEANUP_POLL_INTERVAL:
+        raise _TermPollDeferred
+    observed = subprocess.run(  # nosec B603: system ps inspects the owned shard group with fixed fields and remaining deadline (remove-by: 2027-01-25, ref: PR-2494)
+        [ps, selector, str(pid), "-o", "pid=,ppid=,pgid=,stat="],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        timeout=remaining,
+        check=False,
+        env={"PATH": os.defpath, "LC_ALL": "C"},
+    )
+    if observed.returncode or observed.stderr:
+        raise RuntimeError("Shard group census failed")
+    rows = []
+    for line in observed.stdout.splitlines():
+        parts = line.split()
+        if len(parts) != 4 or not all(v.isdigit() for v in parts[:3]) or not parts[3][:1].isalpha():
+            raise RuntimeError("Shard group census malformed")
+        rows.append((int(parts[0]), int(parts[1]), int(parts[2]), parts[3].decode("ascii")))
+    leaders = [r for r in rows if r[0] == pid]
+    if len(leaders) != 1:
+        raise RuntimeError("Shard leader custody unavailable")
+    if leaders[0][1:3] != (os.getpid(), pid):
+        raise ChildProcessError("Shard leader custody lost")
+    return rows
+
+
+def _terminal_ready(process: subprocess.Popen[bytes], deadline: float) -> bool:
+    if os.name != "posix":
+        return process.poll() is not None
+    if process.returncode is not None or signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL:
+        raise ChildProcessError("Shard wait ownership lost")
+    if all(hasattr(os, name) for name in ("waitid", "P_PID", "WEXITED", "WNOHANG", "WNOWAIT")):
+        try:
+            result = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        except NotImplementedError:
+            pass
+        except OSError as exc:
+            if exc.errno not in (errno.ENOSYS, errno.ENOTSUP):
+                raise
+        else:
+            if result is not None and result.si_pid != process.pid:
+                raise ChildProcessError("Shard wait identity mismatch")
+            return result is not None
+    if deadline <= time.monotonic():
+        # A BSD point query needs time; do not start one beyond the watchdog.
+        return False
+    return _shard_ps(process.pid, "-p", deadline)[0][3].startswith("Z")
+
+
+def _ready_at_watchdog(shard: RunningShard, deadline: float) -> bool:
+    process = shard.process
+    try:
+        return _terminal_ready(process, deadline)
+    except ChildProcessError:
+        shard.custody_lost = True
+        print(
+            f"MAIN_TEST_SHARD_CLEANUP_FAILED pid={process.pid} type=ChildProcessError",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise
+    except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as error:
+        if time.monotonic() < deadline:
+            raise
+        print(
+            f"MAIN_TEST_SHARD_OBSERVATION_FAILED pid={process.pid} type={type(error).__name__}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return False
+
+
+def _cancel_shard(process: subprocess.Popen[bytes]) -> None:
+    try:
+        _terminate_process_group(process)
+    except (RuntimeError, OSError, subprocess.SubprocessError, ValueError) as exc:
+        print(
+            f"MAIN_TEST_SHARD_CLEANUP_FAILED pid={process.pid} type={type(exc).__name__}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def wait_for_shard_process(running_shard: RunningShard, pending: list[int]) -> int:
+    process = running_shard.process
+    deadline = running_shard.started_at + running_shard.timeout_seconds
+    settled = False
+    try:
+        while True:
+            if pending:
+                raise SystemExit(128 + pending[0])
+            if _ready_at_watchdog(running_shard, deadline) and not pending:
+                # Settlement selects the terminal status before the single consuming wait.
+                status = process.wait(timeout=max(0, deadline - time.monotonic()))
+                settled = True
+                return status
+            if pending:
+                raise SystemExit(128 + pending[0])
+            now = time.monotonic()
+            if now >= deadline:
+                log_shard_timeout(running_shard.shard, running_shard.timeout_seconds)
+                return 124
+            time.sleep(min(0.1, deadline - now))
+    finally:
+        if not settled and not running_shard.custody_lost:
+            _cancel_shard(process)
+
+
+def log_shard_timeout(shard: TestShard, timeout: int) -> None:
+    """Log timeout context for a shard and its selected files."""
+
+    print(
+        f"MAIN_TEST_SHARD_TIMEOUT_FAILED label={shard.artifact_label} "
+        f"index={shard.index} timeout_seconds={timeout}",
+        file=sys.stderr,
+        flush=True,
+    )
+    for test_file in shard.files:
+        print(
+            f"MAIN_TEST_SHARD_TIMEOUT_FILE label={shard.artifact_label} "
+            f"index={shard.index} path={test_file.path}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+    """Terminate a shard subprocess and its descendants without waiting for timeout."""
+
+    if os.name != "posix":
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=10)
+        return
+    if process.returncode is not None:
+        return
+    first_failure: RuntimeError | None = None
+
+    def record_failure(operation: str, error: Exception) -> None:
+        nonlocal first_failure
+        if first_failure is None:
+            first_failure = RuntimeError(f"Shard {sig.name} {operation}: {type(error).__name__}")
+
+    def readiness(deadline: float, operation: str) -> bool | None:
+        try:
+            return _terminal_ready(process, deadline)
+        except ChildProcessError:
+            raise  # ECHILD or a conflicting wait identity prohibits every later signal.
+        except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as error:
+            record_failure(operation, error)
+            return None
+
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        repeat_term_poll = False
+        started = time.monotonic()
+        deadline = started + 10
+        # Reserve room for the signal even when the optional ps probe stalls.
+        ready = readiness(min(deadline, started + 0.25), "initial readiness")
+        try:
+            if os.getpgid(process.pid) != process.pid or os.getsid(process.pid) != process.pid:
+                raise RuntimeError("Shard session identity mismatch")
+        except ProcessLookupError:
+            # Some kernels hide an exited leader. Only a positive direct-child
+            # witness can supplement the still-unreaped, originally isolated PID.
+            try:
+                _shard_ps(process.pid, "-p", min(deadline, time.monotonic() + 0.25))
+            except ChildProcessError:
+                raise
+            except (OSError, RuntimeError, subprocess.SubprocessError, ValueError):
+                process.wait(timeout=max(0, deadline - time.monotonic()))
+                raise RuntimeError("Shard group custody unconfirmed") from None
+        except (RuntimeError, OSError):
+            process.wait(timeout=max(0, deadline - time.monotonic()))
+            raise RuntimeError("Shard group custody unconfirmed") from None
+        try:
+            os.killpg(process.pid, sig)
+        except (ProcessLookupError, PermissionError) as error:
+            if not ready:
+                record_failure("signal", error)
+        while time.monotonic() < deadline:
+            ready = readiness(deadline, "readiness")
+            if ready is not False:
+                if time.monotonic() >= deadline:
+                    break
+                try:
+                    rows = _shard_ps(process.pid, "-g", deadline, repeat_term_poll=repeat_term_poll)
+                except ChildProcessError:
+                    raise
+                except _TermPollDeferred:
+                    time.sleep(max(0, deadline - time.monotonic()))
+                    continue
+                except _ShardCensusNotStarted as error:
+                    if time.monotonic() >= deadline:
+                        break  # Same whole-phase transition as the pre-query deadline check.
+                    record_failure("group census", error)
+                except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as error:
+                    record_failure("group census", error)
+                else:
+                    if all(
+                        state.startswith("Z") for _, _, group, state in rows if group == process.pid
+                    ):
+                        process.wait(timeout=max(0, deadline - time.monotonic()))
+                        if first_failure is not None:
+                            raise RuntimeError(
+                                "Shard cleanup observation was incomplete"
+                            ) from first_failure
+                        return
+                    repeat_term_poll = sig == signal.SIGTERM
+            time.sleep(min(_CLEANUP_POLL_INTERVAL, max(0, deadline - time.monotonic())))
+    process.wait(timeout=0)
+    raise RuntimeError("Shard group cleanup not verified within TERM/KILL limits")
+
+
+def _build_explicit_shard(args: argparse.Namespace, artifact_label: str) -> TestShard:
+    """Build the shard requested by a parent runner invocation."""
+
+    if args.run_shard_index is None:
+        raise ValueError("run_shard_index is required for explicit shard mode")
+    if not args.shard_file:
+        raise ValueError("at least one --shard-file is required for explicit shard mode")
+
+    shard = TestShard(
+        index=args.run_shard_index,
+        artifact_label=artifact_label,
+        weight=args.shard_weight,
+    )
+    for test_file in args.shard_file:
+        shard.files.append(TestFile(path=Path(test_file), weight=1))
+    return shard
+
+
+def run_coverage_command(
+    repo_root: Path,
+    args: Sequence[str],
+    coverage_main: Callable[[list[str]], int | None] | None = None,
+    timeout_seconds: int = DEFAULT_COVERAGE_TIMEOUT_SECONDS,
+) -> int:
+    """Run a coverage command after all pytest shards pass."""
+
+    if timeout_seconds < 1:
+        raise ValueError("coverage timeout must be >= 1")
+
+    if coverage_main is None:
+        env = os.environ.copy()
+        env.pop("COVERAGE_FILE", None)
+        env.pop("COV_CORE_DATAFILE", None)
+        try:
+            result = subprocess.run(  # nosec B603: argv uses sys.executable and coverage module without shell (remove-by: 2027-01-25, ref: PR-2020)
+                [sys.executable, "-m", "coverage", *args],
+                cwd=repo_root,
+                env=env,
+                check=False,
+                timeout=timeout_seconds,
+            )
+        except subprocess.TimeoutExpired:
+            print(
+                "MAIN_TEST_COVERAGE_COMMAND_TIMEOUT "
+                f"phase={args[0] if args else 'unknown'} timeout_seconds={timeout_seconds}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 124
+        return int(result.returncode)
+
+    old_cwd = Path.cwd()
+    old_coverage_file = os.environ.pop("COVERAGE_FILE", None)
+    old_cov_core_datafile = os.environ.pop("COV_CORE_DATAFILE", None)
+    try:
+        os.chdir(repo_root)
+        return int(coverage_main(list(args)) or 0)
+    finally:
+        if old_coverage_file is not None:
+            os.environ["COVERAGE_FILE"] = old_coverage_file
+        if old_cov_core_datafile is not None:
+            os.environ["COV_CORE_DATAFILE"] = old_cov_core_datafile
+        os.chdir(old_cwd)
+
+
+def remove_previous_outputs(repo_root: Path, shards: Sequence[TestShard]) -> None:
+    """Remove stale shard coverage and JUnit files before execution."""
+
+    labels = {shard.artifact_label for shard in shards}
+    for label in labels:
+        for coverage_file in repo_root.glob(f".coverage.{label}-main-shard-*"):
+            coverage_file.unlink()
+        for junit_file in (repo_root / "tests").glob(f"results-{label}-shard-*.xml"):
+            junit_file.unlink()
+    for shard in shards:
+        junit_path = repo_root / shard.junit_file
+        if junit_path.exists():
+            junit_path.unlink()
+    htmlcov_path = repo_root / "htmlcov"
+    if htmlcov_path.is_dir():
+        import shutil
+
+        shutil.rmtree(htmlcov_path)
+
+
+def collect_shard_results(
+    futures: Mapping[concurrent.futures.Future[int], int],
+) -> dict[int, int]:
+    """Collect shard results and preserve diagnostics for crashed worker processes."""
+
+    results: dict[int, int] = {}
+    for future, shard_index in futures.items():
+        try:
+            results[shard_index] = future.result()
+        except Exception as exc:
+            print(
+                f"MAIN_TEST_SHARD_EXCEPTION index={shard_index} "
+                f"type={type(exc).__name__} message={exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            results[shard_index] = 1
+    return results
+
+
+def _log_coverage_failure(phase: str, returncode: int) -> None:
+    """Log the coverage phase that failed after all shards completed."""
+
+    print(
+        f"MAIN_TEST_COVERAGE_{phase.upper()}_FAILED exit_code={returncode}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _log_coverage_phase_started(
+    phase: str,
+    args: Sequence[str],
+    timeout_seconds: int,
+) -> None:
+    """Log a coverage phase before running it so timeout context is visible."""
+
+    print(
+        f"MAIN_TEST_COVERAGE_{phase.upper()}_STARTED "
+        f"timeout_seconds={timeout_seconds} args={list(args)!r}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _log_coverage_phase_succeeded(phase: str) -> None:
+    """Log coverage phase success for post-shard diagnostics."""
+
+    print(
+        f"MAIN_TEST_COVERAGE_{phase.upper()}_SUCCEEDED",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def run_coverage_phase(
+    repo_root: Path,
+    phase: str,
+    args: Sequence[str],
+    timeout_seconds: int,
+) -> int:
+    """Run one coverage phase with start/success/failure diagnostics."""
+
+    _log_coverage_phase_started(phase, args, timeout_seconds)
+    status = run_coverage_command(repo_root, args, timeout_seconds=timeout_seconds)
+    if status != 0:
+        _log_coverage_failure(phase, status)
+        return status
+    _log_coverage_phase_succeeded(phase)
+    return 0
+
+
+def run_all_shards(
+    repo_root: Path,
+    shards: Sequence[TestShard],
+    max_parallel: int,
+    base_env: dict[str, str],
+    extra_coverage_files: Sequence[str] = (),
+    marker_expression: str = DEFAULT_MARK_EXPRESSION,
+    durations_min: str = DEFAULT_DURATIONS_MIN_SECONDS,
+    report_chars: str | None = None,
+    htmlcov: bool = False,
+) -> int:
+    """Run all shards, then combine and enforce coverage if all pass."""
+
+    if max_parallel < 1:
+        raise ValueError("max_parallel must be >= 1")
+    if not shards:
+        raise ValueError("at least one shard is required")
+    marker_expression = validate_marker_expression(marker_expression)
+    durations_min = validate_durations_min(durations_min)
+
+    results: dict[int, int] = {}
+    pending_shards = iter(shards)
+    failure_seen = False
+    running_shards: dict[int, RunningShard] = {}
+    pending: list[int] = []
+    previous_handlers = _install_shard_handlers(pending)
+    poll_interval_seconds = 0.25
+    try:
+
+        def submit_until_full() -> None:
+            while not pending and len(running_shards) < max_parallel:
+                try:
+                    shard = next(pending_shards)
+                except StopIteration:
+                    return
+                running_shards[shard.index] = start_shard_process(
+                    repo_root,
+                    shard,
+                    base_env,
+                    marker_expression,
+                    durations_min,
+                    report_chars,
+                )
+
+        submit_until_full()
+        while running_shards:
+            now = time.monotonic()
+            for shard_index, running_shard in list(running_shards.items()):
+                if pending:
+                    raise SystemExit(128 + pending[0])
+                deadline = running_shard.started_at + running_shard.timeout_seconds
+                if _ready_at_watchdog(running_shard, deadline) and not pending:
+                    exit_code = running_shard.process.wait(
+                        timeout=max(0, deadline - time.monotonic())
+                    )
+                    print(
+                        f"MAIN_TEST_SHARD_PROCESS_EXIT label={running_shard.shard.artifact_label} "
+                        f"index={shard_index} pid={running_shard.process.pid} "
+                        f"return_code={exit_code} "
+                        f"elapsed_seconds={now - running_shard.started_at:.3f}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    results[shard_index] = int(exit_code)
+                    del running_shards[shard_index]
+                    if exit_code != 0:
+                        failure_seen = True
+                        break
+                    continue
+                if pending:
+                    raise SystemExit(128 + pending[0])
+                elapsed = time.monotonic() - running_shard.started_at
+                if elapsed >= running_shard.timeout_seconds:
+                    _cancel_shard(running_shard.process)
+                    log_shard_timeout(running_shard.shard, running_shard.timeout_seconds)
+                    results[shard_index] = 124
+                    del running_shards[shard_index]
+                    failure_seen = True
+                    break
+
+            if pending and not failure_seen:
+                raise SystemExit(128 + pending[0])
+            if failure_seen:
+                for shard_index, running_shard in sorted(running_shards.items()):
+                    print(
+                        f"MAIN_TEST_SHARD_CANCELLED index={shard_index} reason=fail_fast",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    del running_shards[shard_index]
+                    _cancel_shard(running_shard.process)
+                running_shards.clear()
+                break
+
+            submit_until_full()
+            if running_shards:
+                time.sleep(poll_interval_seconds)
+    finally:
+        for running_shard in running_shards.values():
+            if not running_shard.custody_lost:
+                _cancel_shard(running_shard.process)
+        running_shards.clear()
+        for signum, previous_handler in previous_handlers.items():
+            signal.signal(signum, previous_handler)
+
+    if pending and not failure_seen:
+        raise SystemExit(128 + pending[0])
+    failing_shards = [
+        shard_index for shard_index, exit_code in sorted(results.items()) if exit_code != 0
+    ]
+    if failing_shards:
+        print(f"MAIN_TEST_SHARDS_FAILED shards={failing_shards}", file=sys.stderr)
+        return 1
+
+    coverage_timeout = coverage_timeout_seconds(base_env)
+    coverage_files = [*extra_coverage_files, *[shard.coverage_file for shard in shards]]
+    combine_status = run_coverage_phase(
+        repo_root,
+        "combine",
+        ["combine", *coverage_files],
+        coverage_timeout,
+    )
+    if combine_status != 0:
+        return combine_status
+    xml_status = run_coverage_phase(repo_root, "xml", ["xml"], coverage_timeout)
+    if xml_status != 0:
+        return xml_status
+    if htmlcov:
+        html_status = run_coverage_phase(repo_root, "html", ["html"], coverage_timeout)
+        if html_status != 0:
+            return html_status
+    return run_coverage_phase(
+        repo_root,
+        "report",
+        ["report", "-m", "--fail-under=97"],
+        coverage_timeout,
+    )
+
+
+def run_serial_shards(
+    repo_root: Path,
+    serial_shards: Sequence[TestShard],
+    base_env: dict[str, str],
+    marker_expression: str = DEFAULT_MARK_EXPRESSION,
+    durations_min: str = DEFAULT_DURATIONS_MIN_SECONDS,
+    report_chars: str | None = None,
+) -> int:
+    """Run global/toolchain tests sequentially before process-parallel shards."""
+
+    marker_expression = validate_marker_expression(marker_expression)
+    durations_min = validate_durations_min(durations_min)
+    pending: list[int] = []
+    previous = _install_shard_handlers(pending)
+    try:
+        for shard in serial_shards:
+            if pending:
+                raise SystemExit(128 + pending[0])
+            exit_code = run_shard(
+                repo_root,
+                shard,
+                base_env,
+                marker_expression,
+                durations_min,
+                report_chars,
+                pending_signal=pending,
+            )
+            if exit_code != 0:
+                print(
+                    f"MAIN_TEST_SERIAL_SHARD_FAILED label={shard.artifact_label} "
+                    f"index={shard.index} exit_code={exit_code}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return exit_code
+        if pending:
+            raise SystemExit(128 + pending[0])
+        return 0
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
+def parse_args(argv: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repo-root", type=Path, default=Path.cwd())
+    parser.add_argument("--shard-count", type=int, default=DEFAULT_SHARD_COUNT)
+    parser.add_argument("--max-parallel", type=int, default=DEFAULT_MAX_PARALLEL)
+    parser.add_argument(
+        "--python-version",
+        default=os.environ.get("MATRIX_PYTHON_VERSION"),
+        help="Python version used for artifact labels, for example 3.12 or 3.13.",
+    )
+    parser.add_argument(
+        "--artifact-label",
+        help="Override the normalized artifact label used for coverage and JUnit files.",
+    )
+    parser.add_argument(
+        "--list-shards",
+        action="store_true",
+        help="Print deterministic shard assignment without running pytest.",
+    )
+    parser.add_argument(
+        "--marker-expression",
+        default=DEFAULT_MARK_EXPRESSION,
+        help=(
+            "Pytest marker expression for shard execution. Defaults to the main-CI "
+            "contract 'not slow'."
+        ),
+    )
+    parser.add_argument(
+        "--durations-min",
+        default=DEFAULT_DURATIONS_MIN_SECONDS,
+        help="Value for pytest --durations-min. Defaults to the main-CI contract 10.0.",
+    )
+    parser.add_argument(
+        "--report-chars",
+        help="Optional pytest -r summary characters, for example fEsxXw.",
+    )
+    parser.add_argument(
+        "--htmlcov",
+        action="store_true",
+        help="Generate the htmlcov coverage report after coverage.xml succeeds.",
+    )
+    parser.add_argument(
+        "--run-shard-index",
+        type=int,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--shard-file",
+        action="append",
+        default=[],
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--shard-weight",
+        type=int,
+        default=0,
+        help=argparse.SUPPRESS,
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    repo_root = args.repo_root.resolve()
+    artifact_label = (
+        validate_artifact_label(args.artifact_label)
+        if args.artifact_label
+        else normalize_python_label(
+            args.python_version or f"{sys.version_info.major}.{sys.version_info.minor}"
+        )
+    )
+    if args.run_shard_index is not None:
+        shard = _build_explicit_shard(args, artifact_label)
+        return run_shard_child(
+            repo_root,
+            shard,
+            os.environ.copy(),
+            validate_marker_expression(args.marker_expression),
+            validate_durations_min(args.durations_min),
+            args.report_chars,
+        )
+
+    serial_shards = build_serial_shards(repo_root, artifact_label)
+    test_files = discover_test_files(repo_root, excluded_paths=SERIAL_MAIN_TEST_PATHS)
+    shards = partition_test_files(test_files, args.shard_count, artifact_label)
+
+    for serial_shard in serial_shards:
+        print(
+            f"MAIN_TEST_SERIAL_PLAN label={serial_shard.artifact_label} "
+            f"index={serial_shard.index} files={len(serial_shard.files)} "
+            f"weight={serial_shard.weight}",
+            flush=True,
+        )
+        if args.list_shards:
+            for test_file in serial_shard.files:
+                print(f"  {test_file.path}")
+
+    for shard in shards:
+        print(
+            f"MAIN_TEST_SHARD_PLAN label={shard.artifact_label} index={shard.index} "
+            f"files={len(shard.files)} weight={shard.weight}",
+            flush=True,
+        )
+        if args.list_shards:
+            for test_file in shard.files:
+                print(f"  {test_file.path}")
+
+    if args.list_shards:
+        return 0
+
+    all_shards = [*serial_shards, *shards]
+    remove_previous_outputs(repo_root, all_shards)
+    base_env = os.environ.copy()
+    marker_expression = validate_marker_expression(args.marker_expression)
+    durations_min = validate_durations_min(args.durations_min)
+    serial_status = run_serial_shards(
+        repo_root,
+        serial_shards,
+        base_env,
+        marker_expression,
+        durations_min,
+        args.report_chars,
+    )
+    if serial_status != 0:
+        return serial_status
+    return run_all_shards(
+        repo_root,
+        shards,
+        args.max_parallel,
+        base_env,
+        extra_coverage_files=[shard.coverage_file for shard in serial_shards],
+        marker_expression=marker_expression,
+        durations_min=durations_min,
+        report_chars=args.report_chars,
+        htmlcov=args.htmlcov,
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

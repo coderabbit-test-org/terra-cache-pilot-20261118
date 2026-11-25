@@ -1,0 +1,17 @@
+exclude_dirs:
+  - tests
+  - tests_strict
+  - .claude
+  - cache
+  - test_cache
+  - frontend/build
+  - htmlcov
+  - releases
+  - data
+  - external
+  - node_modules
+  - dist
+  - build
+  - .venv
+exclude:
+  - test_quick_check.py

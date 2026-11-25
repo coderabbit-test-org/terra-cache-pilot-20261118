@@ -1,0 +1,533 @@
+#!/usr/bin/env python3
+"""Mode-aware pre-flight auto-verification for orchestration workflow.
+
+Modes:
+- analyze: repo discovery / task analysis, dirty tree allowed
+- execute: implementation start, task scope must be isolated and routed
+- merge: merge-prep checks, requires local gate evidence
+"""
+
+from __future__ import annotations
+
+import shutil
+import subprocess  # nosec B404 # B404: fixed Git checks and current-interpreter consistency gate require subprocess; owned call sites individually reviewed (remove-by: 2027-01-31, ref: PR-main-nightly-nosec-ttl)
+import sys
+from pathlib import Path, PurePosixPath
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts.ci.check_private_python_proxy_health import (
+    DEFAULT_PACKAGES_HOST,
+    DEFAULT_SIMPLE_ROOT_PATH,
+    INDEX_ENV_VAR,
+    validate_index_url,
+)
+from scripts.orchestration.context_pack import (
+    collect_scoped_agents,
+    find_nearest_agents_file,
+    repo_relative_paths,
+)
+
+ROOT = REPO_ROOT
+GIT_BIN = shutil.which("git")
+if GIT_BIN is None:
+    raise RuntimeError("git executable not found on PATH")
+GIT_EXECUTABLE: str = GIT_BIN
+GIT_COMMAND_TIMEOUT_SECONDS = 30
+AGENT_CONSISTENCY_TIMEOUT_SECONDS = 120
+
+REQUIRED_FILES = [
+    "docs/orchestration/workflow.md",
+    "docs/orchestration/AGENT_CONTEXT_MAP.md",
+    "docs/orchestration/AGENT_CAPABILITY_MATRIX.md",
+    "docs/orchestration/AGENT_SKILL_ROUTING_POLICY.md",
+    "docs/orchestration/COORDINATOR_MERGE_READINESS_RULES.md",
+    "docs/roadmap/BACKLOG_LEDGER.md",
+    "AGENTS.md",
+]
+
+STATUS_HEAD_LINES = 10
+VALID_MODES = {"analyze", "execute", "merge"}
+CANONICAL_PYTHON_INDEX_URL = f"https://{DEFAULT_PACKAGES_HOST}{DEFAULT_SIMPLE_ROOT_PATH}"
+DEPENDENCY_SENSITIVE_PATH_PREFIXES = (
+    "requirements",
+    "constraints.txt",
+    "scripts/ci/install_locked_python_requirements.py",
+    "scripts/ci/check_private_python_proxy_health.py",
+    "scripts/ci/check_python_dependency_surfaces.py",
+    ".github/actions/python-setup/",
+    ".github/workflows/",
+)
+PRIVATE_INDEX_SCOPE_DEPENDENCY = "dependency-sensitive"
+PRIVATE_INDEX_SCOPE_NON_DEPENDENCY = "explicit-non-dependency"
+PRIVATE_INDEX_SCOPE_AMBIGUOUS = "ambiguous"
+NONCANONICAL_PRIVATE_PROXY_ROOT_ERROR_CODE = "noncanonical_private_proxy_root"
+SUPPRESSED_NON_DEPENDENCY_INDEX_ERROR_CODES = frozenset(
+    {
+        "public_index_url",
+        "unexpected_index_path",
+        "unexpected_packages_host",
+        NONCANONICAL_PRIVATE_PROXY_ROOT_ERROR_CODE,
+    }
+)
+
+
+def _run(
+    cmd: list[str], cwd: Path | None = None, *, timeout_seconds: int = GIT_COMMAND_TIMEOUT_SECONDS
+) -> tuple[int, str]:
+    """Return native status/text, or a sanitized 124 timeout result."""
+    if cmd and cmd[0] == "git":
+        cmd = [GIT_EXECUTABLE, *cmd[1:]]
+    try:
+        r = subprocess.run(  # nosec B603 # B603: resolved Git30s or sys.executable consistency120s; fixed callers, no shell, timeout124 (remove-by: 2027-01-31, ref: PR-main-nightly-nosec-ttl)
+            cmd,
+            cwd=cwd or ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        return 124, f"Preflight command timed out after {timeout_seconds} seconds"
+    out = (r.stdout or "") + ("\n" + r.stderr if r.stderr else "")
+    return r.returncode, out.rstrip()
+
+
+def _parse_dirty_paths(status_output: str) -> list[str]:
+    paths: list[str] = []
+    for line in status_output.splitlines():
+        if not line.strip():
+            continue
+        raw = line[3:].strip()
+        path_part = raw.split(" -> ", 1)[-1]
+        paths.append(path_part)
+    return sorted(set(paths))
+
+
+def check_sot_files() -> bool:
+    """Verify required SoT files exist. Return True if all present."""
+    missing = [f for f in REQUIRED_FILES if not (ROOT / f).exists()]
+    if missing:
+        print("FAIL: Required SoT files missing:")
+        for m in missing:
+            print(f"  - {m}")
+        return False
+    print("PASS: All required SoT files present")
+    return True
+
+
+def check_agent_consistency() -> bool:
+    """Verify routing/inventory/capability consistency."""
+
+    code, out = _run(
+        [sys.executable, "scripts/orchestration/check_agent_consistency.py"],
+        timeout_seconds=AGENT_CONSISTENCY_TIMEOUT_SECONDS,
+    )
+    if code != 0:
+        print("FAIL: agent consistency check failed")
+        print(out)
+        return False
+    print("PASS: agent consistency check")
+    return True
+
+
+def check_worktrees_untracked() -> bool:
+    """Verify worktrees/ is not tracked. Return True if clean."""
+    code, out = _run(["git", "ls-files", "worktrees"])
+    if code != 0:
+        print("FAIL: git ls-files worktrees failed")
+        print(out)
+        return False
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    if lines:
+        print("FAIL: worktrees/ must not be tracked. Tracked paths:")
+        for p in lines[:20]:
+            print(f"  - {p}")
+        if len(lines) > 20:
+            print(f"  ... and {len(lines) - 20} more")
+        return False
+    print("PASS: worktrees/ not tracked")
+    return True
+
+
+ARTIFACT_GITIGNORE_RULES = [
+    "artifacts/agent_runs/",
+    "artifacts/orchestration/",
+]
+
+
+def check_artifact_gitignore() -> bool:
+    """Warn if agent run artifacts are not gitignored. Soft guard (always returns True)."""
+    gitignore_path = ROOT / ".gitignore"
+    if not gitignore_path.exists():
+        print("WARNING: .gitignore not found; agent run artifacts may be committed")
+        return True
+    try:
+        content = gitignore_path.read_text(encoding="utf-8")
+    except OSError:
+        print("WARNING: Could not read .gitignore; agent run artifacts may be committed")
+        return True
+    for rule in ARTIFACT_GITIGNORE_RULES:
+        if rule not in content:
+            print(f"WARNING: {rule} not in .gitignore; agent run summaries may be committed")
+    return True
+
+
+def _role_dispatch_bridge_smoke() -> bool:
+    """Smoke-test role dispatch bridge entrypoints."""
+    import importlib.util
+
+    required_bridge = ROOT / "scripts" / "orchestration" / "role_dispatch_bridge.py"
+    compatibility_bridge = ROOT / "scripts" / "orchestration" / "qoder_dispatch_bridge.py"
+    ok = True
+
+    if not required_bridge.exists():
+        print(f"FAIL: required role_dispatch_bridge not found: {required_bridge}")
+        return False
+
+    for module_name, bridge, required in (
+        ("role_dispatch_bridge", required_bridge, True),
+        ("qoder_dispatch_bridge", compatibility_bridge, False),
+    ):
+        if not bridge.exists():
+            if required:
+                print(f"FAIL: required {module_name} not found: {bridge}")
+                ok = False
+            continue
+        spec = importlib.util.spec_from_file_location(module_name, bridge)
+        if not spec or not spec.loader:
+            message = f"{module_name}: spec/loader unavailable"
+            if required:
+                print(f"FAIL: {message}")
+                ok = False
+            else:
+                print(f"WARNING: {message}")
+            continue
+        try:
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+        except Exception as exc:  # noqa: BLE001
+            message = f"{module_name}: import failed: {exc}"
+            if required:
+                print(f"FAIL: {message}")
+                ok = False
+            else:
+                print(f"WARNING: compatibility {message}")
+            continue
+        suffix = "compatibility " if module_name == "qoder_dispatch_bridge" else ""
+        print(f"{module_name}: {suffix}importable \u2713")
+
+    return ok
+
+
+def check_working_tree_clean() -> bool:
+    """Verify working tree is clean. Return True if clean."""
+    code, out = _run(["git", "status", "--porcelain"])
+    if code != 0:
+        print("FAIL: git status failed")
+        print(out)
+        return False
+    lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    if lines:
+        print("FAIL: Working tree not clean. First lines:")
+        for ln in lines[:STATUS_HEAD_LINES]:
+            print(f"  {ln}")
+        if len(lines) > STATUS_HEAD_LINES:
+            print(f"  ... and {len(lines) - STATUS_HEAD_LINES} more")
+        return False
+    print("PASS: Working tree clean")
+    return True
+
+
+def check_task_scope_isolated(task_paths: list[str]) -> bool:
+    """Verify dirty tree is contained inside the explicit task scope."""
+
+    normalized_paths = repo_relative_paths(task_paths)
+    if not normalized_paths:
+        print("FAIL: execute/merge mode requires at least one --path")
+        return False
+
+    code, out = _run(["git", "status", "--porcelain"])
+    if code != 0:
+        print("FAIL: git status failed")
+        print(out)
+        return False
+
+    dirty_paths = _parse_dirty_paths(out)
+    outside_scope = [
+        path
+        for path in dirty_paths
+        if not any(
+            path == scope or path.startswith(f"{scope.rstrip('/')}/") for scope in normalized_paths
+        )
+    ]
+    if outside_scope:
+        print("FAIL: dirty paths outside explicit task scope:")
+        for path in outside_scope[:STATUS_HEAD_LINES]:
+            print(f"  - {path}")
+        if len(outside_scope) > STATUS_HEAD_LINES:
+            print(f"  ... and {len(outside_scope) - STATUS_HEAD_LINES} more")
+        return False
+
+    print("PASS: task scope isolated")
+    return True
+
+
+def check_scoped_agents_exist(task_paths: list[str]) -> bool:
+    """Verify nearest module AGENTS files exist for each candidate path."""
+
+    normalized_paths = repo_relative_paths(task_paths)
+    if not normalized_paths:
+        print("FAIL: preflight requires at least one --path to resolve scoped AGENTS")
+        return False
+
+    missing_resolution = [
+        path for path in normalized_paths if find_nearest_agents_file(path) is None
+    ]
+    if missing_resolution:
+        print("FAIL: nearest scoped AGENTS.md missing for candidate paths:")
+        for path in missing_resolution:
+            print(f"  - {path}")
+        return False
+
+    scoped_agents = collect_scoped_agents(normalized_paths)
+    missing = [path for path in scoped_agents if not (ROOT / path).is_file()]
+    if missing:
+        print("FAIL: resolved scoped AGENTS.md paths missing:")
+        for path in missing:
+            print(f"  - {path}")
+        return False
+
+    print("PASS: scoped AGENTS resolved")
+    return True
+
+
+def check_routing_readiness(primary: str, secondary: list[str], reviewer: str) -> bool:
+    """Verify explicit routing assignment exists for execute/merge mode."""
+
+    if not primary.strip():
+        print("FAIL: --primary is required in execute/merge mode")
+        return False
+    if not reviewer.strip():
+        print("FAIL: --reviewer is required in execute/merge mode")
+        return False
+    if reviewer.strip() == primary.strip():
+        print("FAIL: reviewer must be independent from primary")
+        return False
+    if len([agent for agent in secondary if agent.strip()]) > 2:
+        print("FAIL: maximum 2 secondary agents allowed")
+        return False
+    print("PASS: routing readiness")
+    return True
+
+
+def _is_dependency_sensitive_path(path: str) -> bool:
+    normalized_path = path.strip().strip("/")
+    if not normalized_path:
+        return False
+    path_parts = PurePosixPath(normalized_path).parts
+    for prefix in DEPENDENCY_SENSITIVE_PATH_PREFIXES:
+        normalized_prefix = prefix.strip().strip("/")
+        prefix_parts = PurePosixPath(normalized_prefix).parts
+        if (
+            normalized_prefix == "requirements"
+            and len(path_parts) == 1
+            and path_parts[0].startswith("requirements")
+        ):
+            return True
+        # Both exact/descendant paths and broad parent scopes are dependency-sensitive.
+        if path_parts[: len(prefix_parts)] == prefix_parts:
+            return True
+        if prefix_parts[: len(path_parts)] == path_parts:
+            return True
+    return False
+
+
+def _private_index_scope(task_paths: list[str]) -> str:
+    normalized_paths = repo_relative_paths(task_paths)
+    if not normalized_paths:
+        return PRIVATE_INDEX_SCOPE_AMBIGUOUS
+    if any(_is_dependency_sensitive_path(path) for path in normalized_paths):
+        return PRIVATE_INDEX_SCOPE_DEPENDENCY
+    return PRIVATE_INDEX_SCOPE_NON_DEPENDENCY
+
+
+def _private_index_error_code(error: ValueError) -> str:
+    return str(error).split(":", 1)[0].strip()
+
+
+def _private_index_should_fail(mode: str, scope: str) -> bool:
+    return mode in {"execute", "merge"} and scope != PRIVATE_INDEX_SCOPE_NON_DEPENDENCY
+
+
+def _private_index_should_suppress_warning(scope: str, error_code: str) -> bool:
+    return (
+        scope == PRIVATE_INDEX_SCOPE_NON_DEPENDENCY
+        and error_code in SUPPRESSED_NON_DEPENDENCY_INDEX_ERROR_CODES
+    )
+
+
+def _emit_private_index_diagnostic(
+    mode: str,
+    scope: str,
+    error_code: str,
+    message: str,
+) -> bool:
+    if _private_index_should_fail(mode, scope):
+        print(f"FAIL: {message}")
+        return False
+    if _private_index_should_suppress_warning(scope, error_code):
+        return True
+    print(f"WARNING: {message}")
+    return True
+
+
+def check_private_python_index_url_shape(mode: str, task_paths: list[str]) -> bool:
+    """Validate configured private Python index shape without network calls."""
+    import os
+
+    raw_index_url = os.environ.get(INDEX_ENV_VAR)
+    if raw_index_url is None:
+        return True
+    scope = _private_index_scope(task_paths)
+
+    try:
+        normalized_index_url = validate_index_url(raw_index_url)
+    except ValueError as exc:
+        error_code = _private_index_error_code(exc)
+        message = (
+            f"{INDEX_ENV_VAR} is set but does not match the canonical private "
+            f"proxy root shape ({type(exc).__name__}: {exc}). Expected "
+            f"{CANONICAL_PYTHON_INDEX_URL}"
+        )
+        return _emit_private_index_diagnostic(mode, scope, error_code, message)
+
+    if normalized_index_url != CANONICAL_PYTHON_INDEX_URL:
+        error_code = NONCANONICAL_PRIVATE_PROXY_ROOT_ERROR_CODE
+        message = (
+            f"{INDEX_ENV_VAR} normalized to a noncanonical private proxy root. "
+            f"{error_code}: expected {CANONICAL_PYTHON_INDEX_URL}"
+        )
+        return _emit_private_index_diagnostic(mode, scope, error_code, message)
+
+    print("PASS: private Python index URL shape")
+    return True
+
+
+def check_gate_evidence(files: list[str]) -> bool:
+    """Verify merge-mode local gate evidence artifacts exist and are non-empty."""
+
+    if not files:
+        print("FAIL: merge mode requires at least one --evidence-file")
+        return False
+
+    resolved_paths = [
+        Path(raw_path) if Path(raw_path).is_absolute() else ROOT / raw_path for raw_path in files
+    ]
+
+    missing = [
+        raw_path
+        for raw_path, resolved_path in zip(files, resolved_paths)
+        if not resolved_path.is_file()
+    ]
+    if missing:
+        print("FAIL: gate evidence files missing:")
+        for path in missing:
+            print(f"  - {path}")
+        return False
+
+    unreadable: list[str] = []
+    empty: list[str] = []
+    for raw_path, resolved_path in zip(files, resolved_paths):
+        try:
+            content = resolved_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            unreadable.append(raw_path)
+            continue
+        if not content.strip():
+            empty.append(raw_path)
+
+    if unreadable:
+        print("FAIL: gate evidence files must be readable UTF-8 text:")
+        for path in unreadable:
+            print(f"  - {path}")
+        return False
+
+    if empty:
+        print("FAIL: gate evidence files must be non-empty:")
+        for path in empty:
+            print(f"  - {path}")
+        return False
+
+    print("PASS: local gate evidence present")
+    return True
+
+
+def _parse_args(
+    argv: list[str] | None = None,
+) -> tuple[str, list[str], str, list[str], str, list[str]]:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="check_preflight",
+        description="Mode-aware orchestration preflight validator.",
+    )
+    parser.add_argument("--mode", default="analyze", choices=sorted(VALID_MODES))
+    parser.add_argument("--path", action="append", default=[])
+    parser.add_argument("--primary", default="")
+    parser.add_argument("--secondary", action="append", default=[])
+    parser.add_argument("--reviewer", default="")
+    parser.add_argument("--evidence-file", action="append", default=[])
+    args = parser.parse_args(argv)
+    return (
+        args.mode,
+        args.path,
+        args.primary,
+        args.secondary,
+        args.reviewer,
+        args.evidence_file,
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run all checks. Return 0 on PASS, 1 on FAIL."""
+    mode, task_paths, primary, secondary, reviewer, evidence_files = _parse_args(argv)
+    ok = True
+    ok &= check_sot_files()
+    ok &= check_worktrees_untracked()
+    ok &= check_agent_consistency()
+    check_artifact_gitignore()  # Soft guard: warning only, never fails
+    ok &= _role_dispatch_bridge_smoke()  # Role dispatch bridge import smoke-test
+    ok &= check_private_python_index_url_shape(mode, task_paths)
+
+    if mode == "analyze":
+        if task_paths:
+            ok &= check_scoped_agents_exist(task_paths)
+        else:
+            print("WARNING: analyze mode without --path skips scoped AGENTS resolution")
+        code, out = _run(["git", "status", "--porcelain"])
+        if code == 0 and out.strip():
+            print("INFO: analyze mode allows dirty working tree")
+        elif code == 0:
+            print("PASS: working tree clean")
+        else:
+            print("FAIL: git status failed")
+            print(out)
+            ok = False
+        return 0 if ok else 1
+
+    ok &= check_task_scope_isolated(task_paths)
+    ok &= check_scoped_agents_exist(task_paths)
+    ok &= check_routing_readiness(primary, secondary, reviewer)
+
+    if mode == "merge":
+        ok &= check_gate_evidence(evidence_files)
+        ok &= check_working_tree_clean()
+
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

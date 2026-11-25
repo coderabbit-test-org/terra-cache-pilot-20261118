@@ -1,0 +1,156 @@
+"""Extra main.py coverage tests focusing on helper functions and common edge cases.
+
+These tests are intentionally lightweight to avoid duplicating logic covered elsewhere,
+but they help stabilize coverage across helper functions and simple endpoints.
+"""
+
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+from fastapi.testclient import TestClient
+
+from core.utils import resolve_attr
+from tests.helpers.fast_update_stubs import patch_admin_get_update_scheduler
+
+
+@pytest.fixture(autouse=True)
+def _api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Install the API key before the canonical managed client starts."""
+    monkeypatch.setenv("API_KEY", "test-key")
+
+
+class TestAppHelperFunctions:
+    """Test standalone helper functions in main.py."""
+
+    def test_resolve_attr_utility(self):
+        # resolve_attr should pick attribute from candidates or return default
+        mock_mod = Mock()
+        mock_mod.answer = 42
+        val = resolve_attr("answer", "missing", [mock_mod])
+        assert val == 42
+        val2 = resolve_attr("nope", "fallback", [mock_mod])
+        assert val2 == "fallback"
+
+    def test_bmi_endpoint_visualization_flag_safe(self, client: TestClient) -> None:
+        # Ensure visualization key is added when include_chart=True
+        payload = {
+            "weight_kg": 70.0,
+            "height_m": 1.75,
+            "age": 30,
+            "gender": "male",
+            "pregnant": "no",
+            "athlete": "no",
+            "include_chart": True,
+        }
+        r = client.post("/bmi", json=payload)
+        assert r.status_code == 200
+        data = r.json()
+        assert "visualization" in data
+        # Visualization is generated and populated (available=True with chart_base64)
+        # or not available (available=False with error) - both are valid behaviors
+        viz = data["visualization"]
+        assert isinstance(viz.get("available"), bool)
+
+
+class TestEndpointsAndValidation:
+    def test_bmi_request_validation_edge_cases(self, client: TestClient) -> None:
+        # Extreme but valid values
+        data = {
+            "weight_kg": 30.0,
+            "height_m": 1.2,
+            "age": 99,
+            "gender": "female",
+            "pregnant": "no",
+            "athlete": "no",
+        }
+        assert client.post("/bmi", json=data).status_code == 200
+
+        data2 = {
+            "weight_kg": 300.0,
+            "height_m": 2.5,
+            "age": 99,
+            "gender": "male",
+            "pregnant": "no",
+            "athlete": "yes",
+        }
+        assert client.post("/bmi", json=data2).status_code == 200
+
+    def test_bmi_v1_success(self, client: TestClient) -> None:
+        payload = {"weight_kg": 70.0, "height_cm": 175.0, "group": "general"}
+        r = client.post("/api/v1/bmi", json=payload)
+        assert r.status_code == 200
+
+    def test_invalid_json_and_missing_fields(self, client: TestClient) -> None:
+        r = client.post("/bmi", content="not json", headers={"Content-Type": "application/json"})
+        assert r.status_code == 422
+
+        # Missing weight_kg
+        bad = {"height_m": 1.75, "age": 30, "gender": "male"}
+        assert client.post("/bmi", json=bad).status_code == 422
+
+    def test_invalid_types_and_enums(self, client: TestClient) -> None:
+        bad_type = {"weight_kg": "x", "height_m": 1.75, "age": 30, "gender": "male"}
+        assert client.post("/bmi", json=bad_type).status_code == 422
+
+        bad_enum = {
+            "weight_kg": 70.0,
+            "height_m": 1.75,
+            "age": 30,
+            "gender": "invalid",
+            "pregnant": "no",
+            "athlete": "no",
+        }
+        assert client.post("/bmi", json=bad_enum).status_code == 422
+
+    def test_admin_and_debug_endpoints(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The test environment explicitly enables the developer-only debug surface.
+        monkeypatch.setenv("APP_ENV", "test")
+        monkeypatch.setenv("ENVIRONMENT", "test")
+        r = client.get("/debug_env")
+        assert r.status_code == 200
+
+        class _Scheduler:
+            def get_status(self) -> dict[str, object]:
+                return {"scheduler": {"is_running": False}, "databases": {}}
+
+            async def force_update(self, source: str | None = None) -> dict[str, SimpleNamespace]:
+                return {
+                    "usda": SimpleNamespace(
+                        success=True,
+                        old_version="1.0",
+                        new_version="1.1",
+                        records_added=1,
+                        records_updated=0,
+                        records_removed=0,
+                        duration_seconds=0.01,
+                        errors=[],
+                    )
+                }
+
+        patch_admin_get_update_scheduler(monkeypatch, _Scheduler())
+        r1 = client.get("/api/v1/admin/db-status", headers={"X-API-Key": "test-key"})
+        assert r1.status_code == 200
+        assert r1.json() == {
+            "scheduler": {"is_running": False},
+            "databases": {},
+        }
+        r2 = client.post("/api/v1/admin/force-update", headers={"X-API-Key": "test-key"})
+        assert r2.status_code == 200
+        assert r2.json() == {
+            "message": "Force update completed for all sources",
+            "results": {
+                "usda": {
+                    "success": True,
+                    "old_version": "1.0",
+                    "new_version": "1.1",
+                    "records_added": 1,
+                    "records_updated": 0,
+                    "records_removed": 0,
+                    "duration_seconds": 0.01,
+                    "errors": [],
+                }
+            },
+        }

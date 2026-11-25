@@ -1,0 +1,12324 @@
+#!/usr/bin/env python3
+"""The finite Prometheus source producer and its existing image consumers.
+
+Go owns module semantics; Docker owns native layer application. The declared
+recipe is data for one constructor, never a Dockerfile or arbitrary OCI
+interpreter. Compilation is manual, hosted and bounded to the admitted pair.
+Metadata, synthetic format observations and real candidate evidence are distinct.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import copy
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import gzip
+import hashlib
+import io
+import json
+import os
+from pathlib import Path, PurePosixPath
+import platform
+import re
+import shutil
+import selectors
+import signal
+import ssl
+import stat
+import subprocess  # nosec B404 # B404: native producer, kernel census and authenticated CLI owners require the process API (remove-by: 2026-11-11, ref: PR-2494)
+import sys
+import tarfile
+import time
+from typing import Any, BinaryIO, cast
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, HTTPSHandler, ProxyHandler, Request, build_opener
+import uuid
+import zipfile
+import zlib
+
+REVISION = "5241a27fe3c6983549fccc32f6e65917408c63cd"
+TREE = "ffa0c7e9512071483f6c40a95aba9b97fbd86583"
+GO_VERSION = "go version go1.27.2 linux/amd64\n"
+RETAINED_GO_VERSION = "go version go1.27.3 linux/amd64\n"
+RETAINED_GO_VERSION_FILE = b"go1.27.3\ntime 2026-10-19T22:20:36Z\n"
+CURRENT_GO_VERSION = "go version go1.27.4 linux/amd64\n"
+CURRENT_GO_VERSION_FILE = b"go1.27.4\ntime 2026-11-02T20:36:20Z\n"
+HISTORICAL_BASE = "gcr.io/distroless/static-debian13@sha256:2293b36c7c9082bf4115aab724b4d2cddec82c8eba39bf27ac0517e159acf150"
+BASE = "gcr.io/distroless/static-debian13@sha256:433bb346cd0b6b8346462f879adaa4ac0fbb463a72901b46736ede4aeca3dadc"
+HISTORICAL_BASE_CONFIG = "sha256:55a757dc8ab862a4eb634c434261dcd26f17c186b54f7bce845404a335456110"
+BASE_CONFIG = "sha256:0a2f4c688090d2a660f55dec3808f6bb85246b9ec1f78ced5d43275a1fb2287d"
+
+# Exact acquired vendor graph, not a registry index or an arbitrary layer policy.
+SOURCE_DATE_EPOCH = 1790321138
+IMAGE_SCHEMA = "pulseplate.prometheus_image_manifest.v3"
+IMAGE_REPOSITORY = "ghcr.io/katsiarynakavaleuskaya/pulseplate"
+OCI_MANIFEST = "application/vnd.oci.image.manifest.v1+json"
+OCI_CONFIG = "application/vnd.oci.image.config.v1+json"
+OCI_LAYER = "application/vnd.oci.image.layer.v1.tar+gzip"
+DERIVED_LOCKS = {
+    "go.mod": "6e2dfa8d25b5cd3da5513334134e63549aff7e70915958f98893893c825d609e",
+    "go.sum": "673bf9d73e667b94aa125f5ac3987bfb4a26b7ccbe1b0e51e7de030bc45fcce5",
+}
+# Selected D209 input for the new transition; later output-pin adoption must not
+# move this historical baseline.
+XNET060_INCUMBENT_LOCKS = {
+    "go.mod": "d85af091d5bf9ba19f98e4d92e24b368d3e5537af086521ef10c7dd669695fd7",
+    "go.sum": "eaeb5e4f16a9edcab1aeeb2b1a90a0f85decbd0065b3bf63e03729d324f7fc1f",
+}
+DEFAULT_CONFIG_SHA256 = "aafcee2a237ad599327d07ed79e57ba1e57bdcf5a4bba6e3ba22eb09e25af479"
+ORAS_REVISION = "db9e29505c3059f2b8fde34ae8cae266c5c765e9"
+ORAS_TREE = "fa717b77576c315f859d3178977920f935533dee"
+ORAS_SOURCE_INVENTORY = "69577a4027743fd734c33c678cdc62c93de4392e65a75e41d6f9f2d9c92c75b9"
+ORAS_RAW_HEADERS = "6f59a7b473ab3f4a6e47c77169ae31258301c28d6c73192d1f692aa8ff180236"
+ORAS_LICENSE = "eccb04b94c71454ea03f00ecb518b997952c4f2f23aca50baab98230f5c8dc00"
+ORAS_LOCKS = {
+    "go.mod": "02f8c886457ca22d404a2c0f8ce90a2d98cc42350bd08ab1bd43a91b6f13760f",
+    "go.sum": "4f30ae58ea70de3be56e6befa2d9b737dc37379261fd812a8b51236a216d654f",
+}
+ORAS_COMMAND = "oras.land/oras/cmd/oras"
+ORAS_METADATA = (
+    "-X oras.land/oras/internal/version.Version=1.3.4 "
+    "-X oras.land/oras/internal/version.GitCommit=" + ORAS_REVISION + " "
+    "-X oras.land/oras/internal/version.BuildMetadata= "
+    "-X oras.land/oras/internal/version.GitTreeState=clean"
+)
+PROMETHEUS_METADATA = (
+    "-X github.com/prometheus/common/version.Version=3.15.0 "
+    "-X github.com/prometheus/common/version.Revision=" + REVISION + " "
+    "-X github.com/prometheus/common/version.Branch=HEAD "
+    "-X github.com/prometheus/common/version.BuildUser=pulseplate "
+    "-X github.com/prometheus/common/version.BuildDate=20260925-07:25:38"
+)
+BASE_LAYER_CONTRACTS: list[dict[str, Any]] = [
+    {
+        "descriptor": {
+            "size": 124525,
+            "digest": "sha256:2cc7ee286bf3a9e6af5f71756d7fc8e22e23ce65fec9047d774511ffcef79fa8",
+            "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+        },
+        "diff_id": "sha256:9486261b5a13f63ca6904b36721527ac8f19df53d300560138d69ae9b4c203de",
+        "expanded": 491520,
+        "members": 102,
+        "inventory_sha256": "5354f3b705a681bdbdd9c2b69a894e0f56954ab3f420a50bfbd6aa4fb18fbf9e",
+    },
+    {
+        "descriptor": {
+            "size": 12675,
+            "digest": "sha256:c172f21841dff4c8cf45cde46589c1c2616cefe7e819965e92e6d3475c428aa0",
+            "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+        },
+        "diff_id": "sha256:621c35e751a51a9a9dc3e80aa0b7fe8be2a93402ea6ccd307d30852cd7776cda",
+        "expanded": 40960,
+        "members": 17,
+        "inventory_sha256": "6f3a3c9fc89cc96f1c51a98e5f0925c523f4bb6057fec51f39d59451f3bb63c3",
+    },
+    {
+        "descriptor": {
+            "size": 289427,
+            "digest": "sha256:617b009a71d625ef77982b400cb9939dd5ed9809ebf50681a0520b7c08c0ca89",
+            "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+        },
+        "diff_id": "sha256:92a3b02188b326c1b10a0a375d3c0019dff4ee8ff02a4b51a7e640bb9400932f",
+        "expanded": 1157120,
+        "members": 528,
+        "inventory_sha256": "4674ac8595945da188452f079f16d04cff1ab4d2f0640fed482fad4fdaa83784",
+    },
+    {
+        "descriptor": {
+            "size": 256689,
+            "digest": "sha256:a99dd1dd5eaf3e2099256f1a75c8e4c02a1d3a81b8e2bfd1735b1dd166b68a12",
+            "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+        },
+        "diff_id": "sha256:ef430e4865b6130e131d5777c1d072fdcc89478668d10ab41a18549e0fdc88b5",
+        "expanded": 1331200,
+        "members": 761,
+        "inventory_sha256": "642be489a59309de1b5575072f4b859d3bc822e6c8443e51bfa53088f35f2dd6",
+    },
+    {
+        "descriptor": {
+            "size": 32093,
+            "digest": "sha256:d6b1b89eccacc15c2420b2776d72c1dae334a00805ed9af54bf2f71e4d536f28",
+            "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+        },
+        "diff_id": "sha256:275a30dd8ce958b21daa9ad962c6fbc09f98306ee2f486b65c9075dc257b1412",
+        "expanded": 102400,
+        "members": 17,
+        "inventory_sha256": "19cce3cc56c3a63abfe14f9a31a51c2f5b9a5c52b38a7c8234c4d3e62c0a0701",
+    },
+    {
+        "descriptor": {
+            "size": 67,
+            "digest": "sha256:2780920e5dbfbe103d03a583ed75345306e572ec5a48cb10361f046767d9f29a",
+            "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+        },
+        "diff_id": "sha256:4d049f83d9cf21d1f5cc0e11deaf36df02790d0e60c1a3829538fb4b61685368",
+        "expanded": 1536,
+        "members": 1,
+        "inventory_sha256": "b405415ec34e6efa906c1c4e58460fc1aee3ed44c30c2fe4690a847ccedb8df8",
+    },
+    {
+        "descriptor": {
+            "size": 188,
+            "digest": "sha256:7c12895b777bcaa8ccae0605b4de635b68fc32d60fa08f421dc3818bf55ee212",
+            "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+        },
+        "diff_id": "sha256:af5aa97ebe6ce1604747ec1e21af7136ded391bcabe4acef882e718a87c86bcc",
+        "expanded": 2560,
+        "members": 2,
+        "inventory_sha256": "84b6b049b5ebabbfc9550909a1cb652795bbe444725387ff47ab1ba26590b5ab",
+    },
+    {
+        "descriptor": {
+            "size": 123,
+            "digest": "sha256:3214acf345c0cc6bbdb56b698a41ccdefc624a09d6beb0d38b5de0b2303ecaf4",
+            "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+        },
+        "diff_id": "sha256:6f1cdceb6a3146f0ccb986521156bef8a422cdbb0863396f7f751f575ba308f4",
+        "expanded": 2560,
+        "members": 3,
+        "inventory_sha256": "d814686c93c24fd85eec8c12aa3aedb03f5eca52f8936a9f8e2dfe815c8a893f",
+    },
+    {
+        "descriptor": {
+            "size": 162,
+            "digest": "sha256:52630fc75a18675c530ed9eba5f55eca09b03e91bd5bc15307918bbc1a7e7296",
+            "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+        },
+        "diff_id": "sha256:bd3cdfae1d3fdd83a2231d608969b38b82349777c2fff9a7c12d54f8ac5c9b38",
+        "expanded": 2560,
+        "members": 2,
+        "inventory_sha256": "b56bbd4d385ce7a38ae96b3ac9d5c894b9b2d1a7e81cb751c318d127fd26c809",
+    },
+    {
+        "descriptor": {
+            "size": 80,
+            "digest": "sha256:dd64bf2dd177757451a98fcdc999a339c35dee5d9872d8f4dc69c8f3c4dd0112",
+            "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+        },
+        "diff_id": "sha256:4cde6b0bb6f50a5f255eef7b2a42162c661cf776b803225dcac9a659e396bb6b",
+        "expanded": 1536,
+        "members": 1,
+        "inventory_sha256": "52718246e6fcb9b4e631cfd4b581bc299afb4ae98589b6a6d1f932c7c1c2d9f6",
+    },
+    {
+        "descriptor": {
+            "size": 351,
+            "digest": "sha256:b839dfae01f66e15c6a8b63520557ed315bdfe036342fa7a0c537259f10d7a9a",
+            "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+        },
+        "diff_id": "sha256:ad51d0769d16ba578106a177987dfe3d2e02c1668c852b795b2f6b024068242a",
+        "expanded": 2048,
+        "members": 1,
+        "inventory_sha256": "8a452647660cfe3e5a620f3fdb7ee33334bbe8a0aa5f04a2f54cc2cbcd583b93",
+    },
+    {
+        "descriptor": {
+            "size": 311,
+            "digest": "sha256:ebddc55facdc6b1f7e0f30816a5fc7cc62f38abdf76c0a8b0a0ce52085754795",
+            "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+        },
+        "diff_id": "sha256:187cfc6d1e3e8a40a5e64653bcd3239c140807dcf1c09e48021178705a5a6139",
+        "expanded": 3072,
+        "members": 3,
+        "inventory_sha256": "6869ca4e9b4c88ef56f14fcd7afc596d2a6550da6577b580fc4a0f3b0f100cbc",
+    },
+    {
+        "descriptor": {
+            "size": 142002,
+            "digest": "sha256:ec1b04bf2eb2122e86781f791b03ea0cf6588694e0f4a88245250224c186cdf0",
+            "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+        },
+        "diff_id": "sha256:0762a1f6557d1e88a761ab05aa7f65a10dc0e559913ea13befb873d907e1a396",
+        "expanded": 276480,
+        "members": 15,
+        "inventory_sha256": "4ac12edab9f446541289a85b1d0688b05a5e72a77dc88420a7006bd4c21a8ce9",
+    },
+]
+ROOT_MODULE = "github.com/prometheus/prometheus"
+LOCKS = {
+    "go.mod": "94e39d68d3abd10168c4b1944a63356a1d9a467ddeceee46aea75fc14e4381d1",
+    "go.sum": "2b0f11cdccdc6605922c8f48d7afc68ae44fdc90df6b5d2f6f677b447b07d99e",
+}
+SOURCE_INVENTORY = "5ccb3d899fc89ba6f918d71a2923742172baa2f9a073789f70529e088c5a3a8b"
+EMBED_TEMPLATE = "ccdee3172876fa092175431df6986274737d06f0b6409cb280ad91833c2f1755"
+GO_LICENSE = "911f8f5782931320f5b8d1160a76365b83aea6447ee6c04fa6d5591467db9dad"
+SOURCE_LICENSES = {
+    "LICENSE": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+    "NOTICE": "ac9e304462a58a4d71b6488423d4447e614c8b31d517fe24345016522c102a78",
+}
+UI_FILES = {
+    "static/react-app/manifest.json": {
+        "size": 318,
+        "sha256": "976d3997489cdc4998a52e6e6245cdd9487a1af915d5c068fd790c5dc4a5df7a",
+    },
+    "static/react-app/static/js/main.5b2d3908.js.LICENSE.txt": {
+        "size": 3152,
+        "sha256": "c6472c3954f3ac3117d32db6b0f026236708b835ad52ee1acbc3f378cbd17a66",
+    },
+    "static/react-app/static/js/main.5b2d3908.js.map": {
+        "size": 7267253,
+        "sha256": "9dd0a666b35cdfd61eb2719615add94d64cbe476c00b8838ce6d0c6a626b4903",
+    },
+    "static/react-app/static/js/main.5b2d3908.js": {
+        "size": 2195301,
+        "sha256": "b4fe2ab290b349c142a755d217591a44a44bda65e625d17257ac22bfe09ba558",
+    },
+    "static/react-app/static/css/main.3a01f811.css.map": {
+        "size": 340286,
+        "sha256": "8cad096102e1780946316d1eb69bc2e9ec437faae425d383b4bab17a3defb73e",
+    },
+    "static/react-app/static/css/main.3a01f811.css": {
+        "size": 414406,
+        "sha256": "5352633a20e078eafc288d4aa7e7593918c2e8803bdff80be10e29c2d98ab966",
+    },
+    "static/react-app/static/media/index.f6d03137e8c9dd0de04c.cjs": {
+        "size": 329,
+        "sha256": "1dd6e0edcfd633f8b90187b580982bc3ba7308d3050da2988ba2271368f5569a",
+    },
+    "static/react-app/static/media/prometheus_logo_grey.3cf697e5443028ca5e5255b93c7906c5.svg": {
+        "size": 1533,
+        "sha256": "584958f7b25abe6db5f9dff2b6743c60311571feaa2c3f5047d831ae92e74489",
+    },
+    "static/react-app/static/media/codicon.b3726f0165bf67ac6849.ttf": {
+        "size": 61024,
+        "sha256": "1b55f12eca93ba6743e7a196adb0fd4828a4f85311d17f21d03a65a6fe763b6e",
+    },
+    "static/react-app/index.html": {
+        "size": 751,
+        "sha256": "80358a376abe4495010d10c5f03aec56dd0bb5baaf25eb0e5f0e186ee8a550b5",
+    },
+    "static/react-app/favicon.ico": {
+        "size": 15086,
+        "sha256": "d72fc7b0bd1a4c1c4a016dfa4bfd594b2fb65a409575ec8f857864d4bdc658be",
+    },
+    "static/react-app/asset-manifest.json": {
+        "size": 657,
+        "sha256": "bf3d5f3fb1c3dc7eada20b561603a754288190c68e0f35f68bf1bc69a86d4122",
+    },
+    "static/mantine-ui/favicon.svg": {
+        "size": 2777,
+        "sha256": "cb3a90f7f2449b1696f6e253c03ba3eecefe174fca96b67a7f238e3b0345cea5",
+    },
+    "static/mantine-ui/assets/codicon-B_nZgZYP.ttf": {
+        "size": 61024,
+        "sha256": "1b55f12eca93ba6743e7a196adb0fd4828a4f85311d17f21d03a65a6fe763b6e",
+    },
+    "static/mantine-ui/assets/third-party-licenses.txt": {
+        "size": 100441,
+        "sha256": "5f9909113990a31a464a36362831b9eca44ce48084edb51484a8d58ef4850871",
+    },
+    "static/mantine-ui/assets/index-MKGKlG4_.js": {
+        "size": 1931373,
+        "sha256": "a931767fe023a9076a56663d43cc453f1a2e020037ebbdb3e5231072e3c05d06",
+    },
+    "static/mantine-ui/assets/index-BV7pz6k1.css": {
+        "size": 286212,
+        "sha256": "a70076684eaf0dff3e809211397bad284a2fafaa5f6605c902afdf5620bc8fd8",
+    },
+    "static/mantine-ui/index.html": {
+        "size": 1832,
+        "sha256": "266f63a42dcaf55fe74c264aaa037b17d74adc7c501da6a9fcc3218714cedb48",
+    },
+}
+# References retain every primary record; observations below never disposition it.
+ADVISORIES = {
+    "GO-2026-6603": "76a1945737d8c2ea4a34d18fd44230946b1185894ea155f9812d1149b2838d3c",
+    "GO-2026-6610": "2c7881c7945c7c5eadefd3d0caceb1a23b14467373fb28c601141545ff21f190",
+    "GO-2026-6611": "5e89ac4314a24eac41111b71ef4544f22836c7b1baf48747e31c5c1d8282c3de",
+    "GO-2026-6612": "76c44a4cbdbc463286fb968abd288a26025b8576fe2aed3dcda542fde9518452",
+    "GO-2026-6617": "197efc1b2f05e891ab3dad2127b7ea3997dc80dc39b21294ab93e11333c4c08b",
+    "GO-2026-5932": "f277b0400996200a7d5034c676661cd8cf18adeab1fdc5d0dc369e456ddf1fad",
+}
+AFFECTED_PATHS = (
+    "golang.org/x/net/http2",
+    "golang.org/x/crypto/openpgp",
+    "golang.org/x/crypto/openpgp/packet",
+    "golang.org/x/crypto/openpgp/armor",
+    "golang.org/x/crypto/openpgp/clearsign",
+    "golang.org/x/crypto/openpgp/errors",
+    "golang.org/x/crypto/openpgp/elgamal",
+    "golang.org/x/crypto/openpgp/s2k",
+)
+MAX_NATIVE_OUTPUT = 64 * 1024**2
+MAX_CACHE_BYTES = 2 * 1024**3
+MAX_COMPILE_OUTPUT_BYTES = 4 * 1024**3
+LABEL = "io.pulseplate.prometheus-source-qualification"
+GUEST_TMP = Path("/qualification")
+GUEST_TMPFS = "rw,nosuid,nodev,noexec,size=1g,mode=1777"
+CLEANING = False
+INTERRUPTIONS: list[int] = []
+
+
+class QualificationError(RuntimeError):
+    """Constant diagnostics only: signed release URLs must never be logged."""
+
+
+def require(condition: bool, code: str) -> None:
+    if not condition:
+        raise QualificationError(code)
+
+
+def sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def check_deadline(deadline: float | None) -> None:
+    require(deadline is None or time.monotonic() < deadline, "qualification_deadline")
+
+
+def interrupt(signum: int, frame: Any) -> None:
+    INTERRUPTIONS.append(signum)
+    if not CLEANING:
+        raise KeyboardInterrupt("owned_qualification_interrupted")
+
+
+def file_hash(
+    path: Path, deadline: float | None = None, *, maximum_bytes: int | None = None
+) -> str:
+    """Read one bounded single-link regular leaf in cooperative private directories."""
+    maximum = MAX_CACHE_BYTES if maximum_bytes is None else maximum_bytes
+    require(type(maximum) is int and 0 < maximum <= MAX_COMPILE_OUTPUT_BYTES, "file_maximum_bound")
+    real_directory(path.parent)
+    leaf = path.lstat()
+    require(stat.S_ISREG(leaf.st_mode) and leaf.st_nlink == 1, "nonregular_or_multilink_file")
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    descriptor = os.open(path, flags)
+    digest, total = hashlib.sha256(), 0
+    try:
+        before = os.fstat(descriptor)
+        require(
+            stat.S_ISREG(before.st_mode)
+            and before.st_nlink == 1
+            and (before.st_dev, before.st_ino) == (leaf.st_dev, leaf.st_ino),
+            "file_leaf_identity",
+        )
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            for chunk in iter(lambda: stream.read(1024**2), b""):
+                check_deadline(deadline)
+                total += len(chunk)
+                require(total <= maximum, "file_byte_bound")
+                digest.update(chunk)
+        after = os.fstat(descriptor)
+        current = path.lstat()
+        fields = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_nlink",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        require(
+            all(
+                getattr(before, field) == getattr(after, field) == getattr(current, field)
+                for field in fields
+            )
+            and total == before.st_size,
+            "file_changed",
+        )
+    finally:
+        os.close(descriptor)
+    return digest.hexdigest()
+
+
+def producer_paths() -> tuple[Path, Path]:
+    helper = Path(__file__).absolute()
+    return helper, helper.parents[2] / ".github/workflows/build.yml"
+
+
+def real_directory(path: Path) -> None:
+    require(path.is_absolute() and ".." not in path.parts, "unsafe_directory")
+    for parent in (path, *path.parents):
+        info = parent.lstat()
+        require(
+            stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode), "nonreal_directory_chain"
+        )
+
+
+def fresh_directory(path: Path, mode: int = 0o700) -> None:
+    real_directory(path.parent)
+    require(not path.exists() and not path.is_symlink(), "output_not_fresh")
+    path.mkdir(mode=mode)
+    real_directory(path)
+
+
+@dataclass(frozen=True)
+class Artifact:
+    name: str
+    url: str
+    size: int
+    digest: str
+    root: str
+    members: int
+    files: int
+    expanded: int
+    release: bool = False
+
+    @staticmethod
+    def canonical(value: object) -> Artifact:
+        """Reify exact existing Artifact field data in this owner, never Python identity."""
+        data = value if type(value) is dict else getattr(value, "__dict__", None)
+        require(
+            type(data) is dict
+            and type(data.get("digest")) is str
+            and type(data.get("size")) is int,
+            "artifact_digest_size_types",
+        )
+        data = cast(dict[str, Any], data)
+        matches = [
+            item
+            for item in (SOURCE, GO, RETAINED_GO, CURRENT_GO, UI, CHECKSUMS, ORAS_SOURCE)
+            if item.digest == data["digest"] and item.size == data["size"]
+        ]
+        require(len(matches) == 1, "artifact_exact_named_tuple")
+        exact_data(data, vars(matches[0]))
+        return matches[0]
+
+    @property
+    def go_version(self) -> str:
+        artifact = Artifact.canonical(self)
+        require(artifact.name == "go", "artifact_compiler_role")
+        if artifact.digest == GO.digest:
+            return GO_VERSION
+        if artifact.digest == RETAINED_GO.digest:
+            return RETAINED_GO_VERSION
+        return CURRENT_GO_VERSION
+
+    @property
+    def go_version_file(self) -> bytes:
+        artifact = Artifact.canonical(self)
+        require(artifact.name == "go" and artifact.digest != GO.digest, "artifact_VERSION_observed")
+        return (
+            RETAINED_GO_VERSION_FILE
+            if artifact.digest == RETAINED_GO.digest
+            else CURRENT_GO_VERSION_FILE
+        )
+
+
+SOURCE = Artifact(
+    "source",
+    "https://codeload.github.com/prometheus/prometheus/tar.gz/" + REVISION,
+    6163228,
+    "eee7ec029ffdba7d9ee59171cad5ddaff10e71514b0bae1a6fde6dc1ae99e181",
+    "prometheus-" + REVISION,
+    1951,
+    1686,
+    32 * 1024**2,
+)
+GO = Artifact(
+    "go",
+    "https://dl.google.com/go/go1.27.2.linux-amd64.tar.gz",
+    70590635,
+    "ecbadb99091a3f46e31f5f934b068b1864eafa7995211b39eaddf76996045fe5",
+    "go",
+    17373,
+    15657,
+    300 * 1024**2,
+)
+RETAINED_GO = Artifact(
+    "go",
+    "https://dl.google.com/go/go1.27.3.linux-amd64.tar.gz",
+    70588678,
+    "65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40",
+    "go",
+    17373,
+    15657,
+    300 * 1024**2,
+)
+CURRENT_GO = Artifact(
+    "go",
+    "https://dl.google.com/go/go1.27.4.linux-amd64.tar.gz",
+    70680823,
+    "7226736c2339719cda28fbf3a54d71aa63bcefe376e98cef00034268dab24840",
+    "go",
+    17375,
+    15659,
+    300 * 1024**2,
+)
+UI = Artifact(
+    "ui",
+    "https://github.com/prometheus/prometheus/releases/download/v3.15.0/prometheus-web-ui-3.15.0.tar.gz",
+    3343738,
+    "fa8c918ed05e3f89e232e9b69eccd6ed074602cd9e8a2cab7a92bec9651974ae",
+    "",
+    18,
+    18,
+    16 * 1024**2,
+    True,
+)
+CHECKSUMS = Artifact(
+    "checksums",
+    "https://github.com/prometheus/prometheus/releases/download/v3.15.0/sha256sums.txt",
+    3725,
+    "023cab1e6b275ee1b8f5f64215a01d74bbb1b19c45183b7296ced4aa4532707b",
+    "",
+    0,
+    0,
+    0,
+    True,
+)
+
+ORAS_SOURCE = Artifact(
+    "oras-source",
+    "https://codeload.github.com/oras-project/oras/tar.gz/" + ORAS_REVISION,
+    406029,
+    "df21c91ff25c13b9c5c5d26b43dd3830fb978c9a93605f641d1e4d25a871b1ee",
+    "oras-" + ORAS_REVISION,
+    507,
+    411,
+    4 * 1024**2,
+)
+
+
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(
+        self, req: Request, fp: Any, code: int, msg: str, headers: Any, newurl: str
+    ) -> None:
+        return None
+
+
+def opener() -> Any:
+    return build_opener(
+        ProxyHandler({}), HTTPSHandler(context=ssl.create_default_context()), NoRedirect()
+    )
+
+
+def validate_release_handoff(url: str, artifact_name: str) -> None:
+    value = urlsplit(url)
+    require(
+        value.scheme == "https"
+        and value.netloc == "release-assets.githubusercontent.com"
+        and not value.fragment
+        and len(url) <= 8192
+        and all(32 < ord(c) < 127 for c in url),
+        "release_handoff_authority",
+    )
+    paths = {
+        "ui": "/github-production-release-asset/6838921/45b9efd2-fa57-4f55-951b-67f2ea9abb5d",
+        "checksums": "/github-production-release-asset/6838921/db11dc7b-ce43-4aba-ba65-516523e5be1a",
+    }
+    require(
+        artifact_name in paths and value.path == paths[artifact_name] and bool(value.query),
+        "release_handoff_path",
+    )
+
+
+def acquire(artifact: Artifact, path: Path, deadline: float | None = None) -> dict[str, Any]:
+    artifact = Artifact.canonical(artifact)
+    real_directory(path.parent)
+    require(not path.exists() and not path.is_symlink(), "download_cache_collision")
+    expected = {
+        "source": SOURCE.url,
+        "go": GO.url,
+        "ui": UI.url,
+        "checksums": CHECKSUMS.url,
+        "oras-source": ORAS_SOURCE.url,
+    }
+    if artifact.name == "go":
+        expected["go"] = artifact.url
+    value = urlsplit(artifact.url)
+    require(
+        artifact.name in expected
+        and artifact.url == expected[artifact.name]
+        and value.scheme == "https"
+        and value.username is None
+        and value.password is None
+        and value.port is None
+        and not value.query
+        and not value.fragment
+        and artifact.release == (artifact.name in ("ui", "checksums")),
+        "source_authority",
+    )
+    transport = opener()
+    check_deadline(deadline)
+    target = artifact.url
+    handoff = False
+    try:
+        if artifact.release:
+            try:
+                initial = transport.open(
+                    Request(target, headers={"User-Agent": "PulsePlate-source-qualification"}),
+                    timeout=60,
+                )
+            except HTTPError as error:
+                try:
+                    require(
+                        error.code == 302 and error.geturl() == artifact.url,
+                        "release_initial_status",
+                    )
+                    locations = error.headers.get_all("Location", [])
+                    require(len(locations) == 1, "release_location_count")
+                    target = locations[0]
+                    validate_release_handoff(target, artifact.name)
+                    handoff = True
+                finally:
+                    error.close()
+            else:
+                initial.close()
+                raise QualificationError("release_handoff_missing")
+        with transport.open(
+            Request(target, headers={"User-Agent": "PulsePlate-source-qualification"}), timeout=60
+        ) as response:
+            require(
+                type(response.status) is int
+                and response.status == 200
+                and response.geturl() == target,
+                "download_response",
+            )
+            length = response.headers.get("Content-Length")
+            require(length is None or length == str(artifact.size), "download_content_length")
+            digest, count = hashlib.sha256(), 0
+            with path.open("xb") as output:
+                while chunk := response.read(1024**2):
+                    check_deadline(deadline)
+                    count += len(chunk)
+                    require(count <= artifact.size, "download_size")
+                    digest.update(chunk)
+                    output.write(chunk)
+            require(
+                count == artifact.size and digest.hexdigest() == artifact.digest,
+                "download_integrity",
+            )
+    except QualificationError:
+        raise
+    except (HTTPError, URLError, TimeoutError, ssl.SSLError):
+        raise QualificationError("source_transport_failed") from None
+    return {
+        "artifact": artifact.name,
+        "public_source": artifact.url,
+        "bytes": count,
+        "sha256": digest.hexdigest(),
+        "explicit_release_handoff": handoff,
+        "final_redirects": 0,
+    }
+
+
+def extract(
+    artifact: Artifact, archive: Path, destination: Path, deadline: float | None = None
+) -> list[dict[str, Any]]:
+    artifact = Artifact.canonical(artifact)
+    require(
+        file_hash(archive) == artifact.digest and archive.stat().st_size == artifact.size,
+        "archive_bytes",
+    )
+    require(
+        not destination.exists() and not destination.is_symlink(), "extract_destination_collision"
+    )
+    rows: list[dict[str, Any]] = []
+    with tarfile.open(archive, "r:gz") as source:
+        members = source.getmembers()
+        require(len(members) == artifact.members, "archive_member_count")
+        seen: set[str] = set()
+        files: set[str] = set()
+        parents: set[str] = set()
+        total = 0
+        for member in members:
+            check_deadline(deadline)
+            name = member.name
+            require(
+                bool(name)
+                and "\x00" not in name
+                and "\\" not in name
+                and not name.startswith("/")
+                and all(part not in ("", ".", "..") for part in name.rstrip("/").split("/")),
+                "archive_path",
+            )
+            require(member.isreg() or member.isdir(), "archive_member_type")
+            require(member.mode in (0o644, 0o664, 0o755, 0o775), "archive_mode")
+            parts = PurePosixPath(name.rstrip("/")).parts
+            require(not artifact.root or parts[0] == artifact.root, "archive_root")
+            relative = "/".join(parts[1:]) if artifact.root else "/".join(parts)
+            require(relative not in seen, "archive_duplicate")
+            seen.add(relative)
+            require(bool(relative) or member.isdir(), "archive_root_type")
+            if member.isreg():
+                files.add(relative)
+                total += member.size
+                require(
+                    0 <= member.size <= 64 * 1024**2 and total <= artifact.expanded,
+                    "archive_expanded_size",
+                )
+                stream = source.extractfile(member)
+                if stream is None:
+                    raise QualificationError("archive_member_missing")
+                data = stream.read(member.size + 1)
+                require(len(data) == member.size, "archive_member_short")
+                if artifact.name == "go" and artifact.digest != GO.digest and relative == "VERSION":
+                    require(data == artifact.go_version_file, "go_archive_VERSION_file")
+                rows.append(
+                    {
+                        "path": relative,
+                        "sha256": sha(data),
+                        "size": member.size,
+                        "git_mode": "100755" if member.mode & 0o111 else "100644",
+                    }
+                )
+            if relative:
+                parents.update(str(p) for p in PurePosixPath(relative).parents if str(p) != ".")
+        require(
+            len(rows) == artifact.files and not files.intersection(parents),
+            "archive_file_directory_collision",
+        )
+        if artifact.name == "source":
+            require(
+                sha(
+                    json.dumps(
+                        sorted(rows, key=lambda r: r["path"]), sort_keys=True, separators=(",", ":")
+                    ).encode()
+                )
+                == SOURCE_INVENTORY,
+                "source_complete_git_inventory",
+            )
+        if artifact.name == "oras-source":
+            require(
+                sha(canonical_data(sorted(rows, key=lambda row: row["path"])))
+                == ORAS_SOURCE_INVENTORY,
+                "oras_complete_git_inventory",
+            )
+            headers = [
+                {
+                    "path": member.name,
+                    "type": member.type.decode("ascii"),
+                    "mode": member.mode,
+                    "size": member.size,
+                    "linkname": member.linkname,
+                }
+                for member in members
+            ]
+            require(
+                sha(canonical_data(headers)) == ORAS_RAW_HEADERS, "oras_raw_archive_modes_inventory"
+            )
+        if artifact.name == "ui":
+            require(
+                {r["path"]: {"size": r["size"], "sha256": r["sha256"]} for r in rows} == UI_FILES,
+                "UI_complete_inventory",
+            )
+        if artifact.name == "go" and artifact.digest != GO.digest:
+            require("VERSION" in files, "go_archive_VERSION_missing")
+        fresh_directory(destination, 0o755)
+        for member in members:
+            check_deadline(deadline)
+            parts = PurePosixPath(member.name.rstrip("/")).parts
+            relative = "/".join(parts[1:]) if artifact.root else "/".join(parts)
+            if not relative:
+                continue
+            target = destination / relative
+            target.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+            real_directory(target.parent)
+            if member.isdir():
+                target.mkdir(exist_ok=True, mode=0o755)
+            else:
+                require(not target.exists() and not target.is_symlink(), "extract_output_collision")
+                stream = source.extractfile(member)
+                if stream is None:
+                    raise QualificationError("extract_member_missing")
+                with target.open("xb") as output:
+                    shutil.copyfileobj(stream, output, 1024**2)
+                target.chmod(0o755 if member.mode & 0o111 else 0o644)
+    return sorted(rows, key=lambda row: row["path"])
+
+
+def tree_inventory(
+    root: Path, *, maximum: int = MAX_CACHE_BYTES, deadline: float | None = None
+) -> list[dict[str, Any]]:
+    real_directory(root)
+    rows: list[dict[str, Any]] = []
+    total = 0
+    for path in sorted(root.rglob("*")):
+        check_deadline(deadline)
+        info = path.lstat()
+        require(
+            not stat.S_ISLNK(info.st_mode)
+            and (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)),
+            "unsafe_tree_member",
+        )
+        if stat.S_ISREG(info.st_mode):
+            total += info.st_size
+            require(total <= maximum and len(rows) < 250000, "tree_size_bound")
+            rows.append(
+                {
+                    "path": path.relative_to(root).as_posix(),
+                    "size": info.st_size,
+                    "mode": stat.S_IMODE(info.st_mode),
+                    "sha256": file_hash(path, deadline),
+                }
+            )
+    return rows
+
+
+def stage_ui(source: Path, ui: Path, deadline: float | None = None) -> dict[str, Any]:
+    template = source / "web/ui/embed.go.tmpl"
+    require(file_hash(template) == EMBED_TEMPLATE, "embed_template")
+    target_root = source / "web/ui/static"
+    target_root.mkdir(exist_ok=True, mode=0o755)
+    generated = []
+    for relative, expected in sorted(UI_FILES.items()):
+        check_deadline(deadline)
+        raw = (ui / relative).read_bytes()
+        require(
+            sha(raw) == expected["sha256"] and len(raw) == expected["size"], "UI_asset_identity"
+        )
+        target = source / "web/ui" / (relative + ".gz")
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+        real_directory(target.parent)
+        with (
+            target.open("xb") as stream,
+            gzip.GzipFile(
+                filename="", mode="wb", fileobj=stream, compresslevel=6, mtime=0
+            ) as compressed,
+        ):
+            compressed.write(raw)
+        target.chmod(0o644)
+        data = target.read_bytes()
+        require(
+            data[3] == 0 and data[9] == 255 and gzip.decompress(data) == raw, "UI_gzip_roundtrip"
+        )
+        generated.append(relative + ".gz")
+    embed = source / "web/ui/embed.go"
+    with embed.open("xb") as stream:
+        stream.write(
+            template.read_bytes()
+            + ("//go:embed " + " ".join(generated) + "\nvar EmbedFS embed.FS\n").encode()
+        )
+    embed.chmod(0o644)
+    return {
+        "generated_paths": generated,
+        "embed_sha256": file_hash(embed),
+        "python": sys.version,
+        "gzip_source_sha256": file_hash(Path(gzip.__file__)),
+        "zlib_build": zlib.ZLIB_VERSION,
+        "zlib_runtime": zlib.ZLIB_RUNTIME_VERSION,
+        "algorithm": "Python GzipFile filename-empty mtime0 level6 OS255; not GNU gzip byte equality",
+    }
+
+
+def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        require(key not in result, "duplicate_JSON_key")
+        result[key] = value
+    return result
+
+
+def reject_constant(value: str) -> None:
+    raise QualificationError("nonfinite_JSON")
+
+
+def decode_objects(raw: bytes) -> list[dict[str, Any]]:
+    require(0 < len(raw) <= MAX_NATIVE_OUTPUT, "native_JSON_size")
+    text = raw.decode("utf-8", errors="strict")
+    decoder = json.JSONDecoder(object_pairs_hook=unique_object, parse_constant=reject_constant)
+    offset, objects = 0, []
+    while offset < len(text):
+        while offset < len(text) and text[offset] in " \r\n\t":
+            offset += 1
+        if offset == len(text):
+            break
+        value, offset = decoder.raw_decode(text, offset)
+        require(isinstance(value, dict), "native_JSON_not_object")
+        objects.append(value)
+    require(bool(objects), "native_JSON_empty")
+    return objects
+
+
+def decode_modules(raw: bytes) -> list[dict[str, Any]]:
+    objects = decode_objects(raw)
+    seen = set()
+    for value in objects:
+        require(
+            "Error" not in value
+            and type(value.get("Path")) is str
+            and bool(value["Path"])
+            and type(value.get("Version")) is str
+            and bool(value["Version"]),
+            "native_module_error_or_identity",
+        )
+        identity = (value["Path"], value["Version"])
+        require(identity not in seen, "duplicate_native_module")
+        seen.add(identity)
+    return objects
+
+
+def decode_packages(raw: bytes, command: str) -> dict[str, Any]:
+    require(command in ("prometheus", "promtool"), "package_command")
+    packages: dict[str, dict[str, Any]] = {}
+    for value in decode_objects(raw):
+        require(isinstance(value, dict), "package_not_object")
+        path = value.get("ImportPath")
+        if type(path) is not str or not path or path in packages:
+            raise QualificationError("package_identity")
+        require(
+            "Error" not in value
+            and value.get("DepsErrors", []) == []
+            and type(value.get("Incomplete", False)) is bool
+            and not value.get("Incomplete", False),
+            "package_error_or_incomplete",
+        )
+        imports = value.get("Imports", [])
+        mapping = value.get("ImportMap", {})
+        require(
+            type(imports) is list
+            and all(type(v) is str and bool(v) for v in imports)
+            and isinstance(mapping, dict)
+            and all(type(k) is str and type(v) is str for k, v in mapping.items()),
+            "package_import_shape",
+        )
+        packages[path] = value
+    root = ROOT_MODULE + "/cmd/" + command
+    require(root in packages and packages[root].get("Name") == "main", "missing_root_command")
+    for value in packages.values():
+        mapping = value.get("ImportMap", {})
+        require(
+            all(mapping.get(path, path) in packages for path in value.get("Imports", [])),
+            "missing_dependency_object",
+        )
+    ui = packages.get(ROOT_MODULE + "/web/ui")
+    require(
+        (command != "prometheus" and ui is None)
+        or (
+            ui is not None
+            and sorted(ui.get("EmbedFiles", [])) == sorted(path + ".gz" for path in UI_FILES)
+        ),
+        "missing_matching_UI_embed_metadata",
+    )
+    return {
+        "command": command,
+        "package_count": len(packages),
+        "package_paths": sorted(packages),
+        "affected_package_path_observations": {path: path in packages for path in AFFECTED_PATHS},
+        "module_objects": {
+            path: value["Module"] for path, value in packages.items() if "Module" in value
+        },
+        "advisory_disposition": "pending independent source/call/config review and later actual binary cross-check",
+    }
+
+
+def clean_environment(
+    home: Path, tmp: Path, cache: Path, modules: Path, *, offline: bool
+) -> dict[str, str]:
+    return {
+        "PATH": "/usr/bin:/bin",
+        "HOME": str(home),
+        "TMPDIR": str(tmp),
+        "GOCACHE": str(cache),
+        "GOMODCACHE": str(modules),
+        "GOPATH": str(home / "gopath"),
+        "GOOS": "linux",
+        "GOARCH": "amd64",
+        "CGO_ENABLED": "0",
+        "GOTOOLCHAIN": "local",
+        "GOWORK": "off",
+        "GOENV": "off",
+        "GOFLAGS": "-mod=readonly",
+        "GOPROXY": "off" if offline else "https://proxy.golang.org",
+        "GOSUMDB": "off" if offline else "sum.golang.org",
+        "GOMAXPROCS": "2",
+        "LANG": "C.UTF-8",
+    }
+
+
+def sandbox_arguments(
+    docker: str,
+    config: Path,
+    image_id: str,
+    name: str,
+    owner: str,
+    source: Path,
+    go: Path,
+    modules: Path,
+    output: Path | None = None,
+) -> list[str]:
+    for host in (source, go, modules):
+        real_directory(host)
+    if output is not None:
+        real_directory(output)
+    return _expected_sandbox_arguments(
+        docker, config, image_id, name, owner, source, go, modules, output
+    )
+
+
+def _expected_sandbox_arguments(
+    docker: str,
+    config: Path,
+    image_id: str,
+    name: str,
+    owner: str,
+    source: Path,
+    go: Path,
+    modules: Path,
+    output: Path | None = None,
+) -> list[str]:
+    """Render the exact command for fixed mount coordinates without opening their paths."""
+    environment = clean_environment(
+        GUEST_TMP, GUEST_TMP, GUEST_TMP / "gocache", Path("/modules"), offline=True
+    )
+    if output is not None:
+        environment.update(TMPDIR="/output/tmp", GOCACHE="/output/cache")
+    argv = [
+        docker,
+        "--config",
+        str(config),
+        "create",
+        "--pull",
+        "never",
+        "--name",
+        name,
+        "--label",
+        LABEL + "=" + owner,
+        "--platform",
+        "linux/amd64",
+        "--user",
+        "65532:65532",
+        "--workdir",
+        "/src",
+        "--network",
+        "none",
+        "--read-only",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges",
+        "--cpus",
+        "2",
+        "--memory",
+        "4g",
+        "--pids-limit",
+        "128",
+        "--tmpfs",
+        str(GUEST_TMP) + ":" + GUEST_TMPFS,
+        "--entrypoint",
+        "/usr/local/go/bin/go",
+    ]
+    mounts = [
+        (source, "/src", ",readonly"),
+        (go, "/usr/local/go", ",readonly"),
+        (modules, "/modules", ",readonly"),
+    ]
+    if output is not None:
+        mounts.append((output, "/output", ""))
+    for host, guest, mode in mounts:
+        require(host.is_absolute() and ".." not in host.parts, "unsafe_directory")
+        argv += ["--mount", f"type=bind,source={host},target={guest}{mode}"]
+    for key, value in environment.items():
+        argv += ["--env", key + "=" + value]
+    return argv + [image_id]
+
+
+class Native:
+    def __init__(self, evidence: Path, deadline: float, cleanup: int) -> None:
+        self.evidence, self.deadline, self.cleanup = evidence, deadline, cleanup
+        self.cleanup_deadline: float | None = None
+        self.records: list[dict[str, Any]] = []
+
+    def begin_cleanup(self) -> None:
+        require(self.cleanup_deadline is None, "cleanup_deadline_already_started")
+        self.cleanup_deadline = min(self.deadline + self.cleanup, time.monotonic() + self.cleanup)
+
+    def run(
+        self,
+        argv: list[str],
+        name: str,
+        env: dict[str, str],
+        *,
+        cwd: Path,
+        cleaning: bool = False,
+        maximum_seconds: int | None = None,
+        output_bound: int = MAX_NATIVE_OUTPUT,
+        watched_output: Path | None = None,
+    ) -> bytes:
+        require(Path(argv[0]).is_absolute(), "native_absolute_binary")
+        stdout, stderr = self.evidence / (name + ".stdout"), self.evidence / (name + ".stderr")
+        if cleaning:
+            if self.cleanup_deadline is None:
+                raise QualificationError("cleanup_deadline_not_started")
+            cap = self.cleanup_deadline
+        else:
+            cap = self.deadline
+        if maximum_seconds is not None:
+            require(type(maximum_seconds) is int and maximum_seconds > 0, "native_subdeadline")
+            cap = min(cap, time.monotonic() + maximum_seconds)
+        check_deadline(cap)
+        require(
+            type(output_bound) is int and 0 < output_bound <= 512 * 1024**2, "native_output_limit"
+        )
+        code = None
+        failure = None
+        with stdout.open("xb") as output, stderr.open("xb") as error:
+            process = subprocess.Popen(
+                argv, cwd=cwd, env=env, stdout=output, stderr=error, start_new_session=True
+            )  # nosec B603 # B603: absolute owner-selected native argv, nonsecret recorded environment and bounded process group (remove-by: 2026-11-11, ref: PR-2494)
+            try:
+                next_inventory = 0.0
+                while process.poll() is None:
+                    require(
+                        time.monotonic() < cap
+                        and stdout.stat().st_size + stderr.stat().st_size <= output_bound,
+                        "native_time_or_output_bound",
+                    )
+                    if watched_output is not None and time.monotonic() >= next_inventory:
+                        total, count = 0, 0
+                        for path in watched_output.rglob("*"):
+                            try:
+                                info = path.lstat()
+                            except FileNotFoundError:
+                                # This one owned Go output tree is changing while observed.
+                                continue
+                            require(
+                                stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode),
+                                "compiler_output_member",
+                            )
+                            total += info.st_size if stat.S_ISREG(info.st_mode) else 0
+                            count += 1
+                            require(
+                                total <= MAX_COMPILE_OUTPUT_BYTES and count <= 250000,
+                                "compiler_output_byte_or_member_bound",
+                            )
+                        require(
+                            shutil.disk_usage(watched_output).free >= 512 * 1024**2,
+                            "compiler_filesystem_free_reserve_HOLD",
+                        )
+                        next_inventory = time.monotonic() + 5
+                    time.sleep(0.05)
+                code = process.returncode
+            except BaseException as caught:
+                failure = type(caught).__name__
+                if process.poll() is None:
+                    require(os.getpgid(process.pid) == process.pid, "owned_native_group")
+                    os.killpg(process.pid, signal.SIGTERM)
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(process.pid, signal.SIGKILL)
+                        process.wait(timeout=5)
+                raise
+            finally:
+                self.records.append(
+                    {
+                        "argv": argv,
+                        "environment": env,
+                        "cwd": str(cwd),
+                        "exit": code if code is not None else process.poll(),
+                        "failure": failure,
+                        "stdout": str(stdout),
+                        "stderr": str(stderr),
+                        "stdout_sha256": file_hash(stdout),
+                        "stderr_sha256": file_hash(stderr),
+                    }
+                )
+        require(
+            stdout.stat().st_size + stderr.stat().st_size <= output_bound and code == 0,
+            "native_failed",
+        )
+        return stdout.read_bytes()
+
+
+def locks_unchanged(source: Path) -> None:
+    require(
+        all(file_hash(source / path) == digest for path, digest in LOCKS.items()),
+        "source_lock_changed",
+    )
+
+
+def diagnostic_code(error: BaseException) -> str | None:
+    if isinstance(error, QualificationError):
+        value = str(error)
+        if re.fullmatch(r"[A-Za-z0-9_]{1,96}", value):
+            return value
+    return None
+
+
+def create_owned(
+    native: Native,
+    argv: list[str],
+    name: str,
+    expected: dict[str, Any],
+    owned: dict[str, dict[str, Any]],
+    label: str,
+    env: dict[str, str],
+    work: Path,
+) -> None:
+    require(name not in owned, "owned_create_name_reused")
+    owned[name] = expected
+    raw = native.run(argv, label + "-create", env, cwd=work)
+    identifier = raw.decode("ascii").strip()
+    require(re.fullmatch(r"[0-9a-f]{64}", identifier) is not None, "owned_create_full_ID")
+    expected["container_id"] = identifier
+
+
+def start_owned(
+    native: Native,
+    docker: str,
+    config: Path,
+    name: str,
+    expected: dict[str, Any],
+    label: str,
+    env: dict[str, str],
+    work: Path,
+) -> tuple[bytes, dict[str, Any]]:
+    raw = native.run(
+        [docker, "--config", str(config), "start", "--attach", expected["container_id"]],
+        label + "-native",
+        env,
+        cwd=work,
+    )
+    actual = native_one_image(
+        native.run(
+            [docker, "--config", str(config), "inspect", expected["container_id"]],
+            label + "-completed-inspect",
+            env,
+            cwd=work,
+        )
+    )
+    validate_container(actual, name, expected)
+    state = actual["State"]
+    require(
+        state.get("Running") is False
+        and type(state.get("ExitCode")) is int
+        and state["ExitCode"] == 0
+        and state.get("OOMKilled") is False,
+        "container_native_completion",
+    )
+    return raw, state
+
+
+def cleanup_owned(
+    native: Native,
+    docker: str,
+    config: Path,
+    owned: dict[str, dict[str, Any]],
+    env: dict[str, str],
+    work: Path,
+    *,
+    cleaning: bool = True,
+) -> list[dict[str, Any]]:
+    removals = []
+    for name, expected in owned.items():
+        try:
+            inventory = (
+                native.run(
+                    [docker, "--config", str(config), "ps", "--all", "--format", "{{.Names}}"],
+                    name + "-cleanup-inventory",
+                    env,
+                    cwd=work,
+                    cleaning=cleaning,
+                )
+                .decode()
+                .splitlines()
+            )
+            if name not in inventory:
+                removals.append(
+                    {"name": name, "native_absent": True, "already_or_never_created": True}
+                )
+                continue
+            actual = native_one_image(
+                native.run(
+                    [docker, "--config", str(config), "inspect", name],
+                    name + "-cleanup-inspect",
+                    env,
+                    cwd=work,
+                    cleaning=cleaning,
+                )
+            )
+            validate_container(actual, name, expected)
+            native.run(
+                [docker, "--config", str(config), "rm", "--force", expected["container_id"]],
+                name + "-cleanup-remove",
+                env,
+                cwd=work,
+                cleaning=cleaning,
+            )
+            inventory = (
+                native.run(
+                    [docker, "--config", str(config), "ps", "--all", "--format", "{{.Names}}"],
+                    name + "-cleanup-absence",
+                    env,
+                    cwd=work,
+                    cleaning=cleaning,
+                )
+                .decode()
+                .splitlines()
+            )
+            require(name not in inventory, "owned_container_survives")
+            removals.append({"name": name, "native_absent": True})
+        except BaseException as error:
+            removals.append(
+                {"name": name, "failure": type(error).__name__, "code": diagnostic_code(error)}
+            )
+    return removals
+
+
+def decode_selected_modules(
+    raw: bytes, *, root_module: str = ROOT_MODULE
+) -> dict[str, dict[str, Any]]:
+    """Full native list objects; Main has different identity from download rows."""
+    result: dict[str, dict[str, Any]] = {}
+    require(
+        root_module in (ROOT_MODULE, "oras.land/oras", "pulseplate.local/caddy-build"),
+        "finite_selected_module_root",
+    )
+    roots = 0
+    for value in decode_objects(raw):
+        path = value.get("Path")
+        if type(path) is not str or not path or path in result or "Error" in value:
+            raise QualificationError("selected_module_identity_or_error")
+        require("Main" not in value or type(value["Main"]) is bool, "selected_module_Main_type")
+        if value.get("Main") is True:
+            roots += 1
+            require(path == root_module, "selected_module_root")
+            require(
+                "Version" not in value or type(value["Version"]) is str,
+                "selected_root_version_type",
+            )
+        else:
+            require(
+                type(value.get("Version")) is str and bool(value["Version"]),
+                "selected_module_version",
+            )
+        if "Replace" in value:
+            replacement = value["Replace"]
+            require(
+                type(replacement) is dict
+                and "Error" not in replacement
+                and type(replacement.get("Path")) is str
+                and bool(replacement["Path"]),
+                "selected_replacement_identity_or_error",
+            )
+            require(
+                "Version" not in replacement
+                or (type(replacement["Version"]) is str and bool(replacement["Version"])),
+                "selected_replacement_version_type",
+            )
+        result[path] = value
+    require(roots == 1, "exact_one_selected_Main")
+    return result
+
+
+def replay_coordinates(
+    value: dict[str, Any], source: Path, modules: Path, *, download: bool
+) -> dict[str, Any]:
+    """Only named native coordinate fields; retain all raw objects separately."""
+    from copy import deepcopy
+
+    result = deepcopy(value)
+    roots = ((str(source), "source"), (str(modules), "modules"))
+
+    def coordinates(obj: dict[str, Any], fields: tuple[str, ...]) -> None:
+        for field in fields:
+            if field not in obj:
+                continue
+            raw = obj[field]
+            require(
+                type(raw) is str
+                and bool(raw)
+                and raw.startswith("/")
+                and str(PurePosixPath(raw)) == raw
+                and ".." not in PurePosixPath(raw).parts,
+                "unsupported_native_coordinate",
+            )
+            matches = [
+                (root, role) for root, role in roots if raw == root or raw.startswith(root + "/")
+            ]
+            require(len(matches) == 1, "unbound_native_coordinate")
+            root, role = matches[0]
+            obj[field] = {"owned_root_role": role, "relative_suffix": raw[len(root) :]}
+
+    coordinates(result, ("Dir", "Info", "GoMod", "Zip") if download else ("Dir", "GoMod"))
+    if "Replace" in result:
+        require(type(result["Replace"]) is dict, "native_Replace_shape")
+        coordinates(result["Replace"], ("Dir", "GoMod"))
+    return result
+
+
+def _derivation_locks(source: Path) -> dict[str, bytes]:
+    result = {}
+    for name in LOCKS:
+        digest = file_hash(source / name)
+        raw = (source / name).read_bytes()
+        require(sha(raw) == digest, "derivation_lock_read_changed")
+        result[name] = raw
+    return result
+
+
+def _derivation_nonlocks(source: Path, deadline: float) -> list[dict[str, Any]]:
+    return [row for row in tree_inventory(source, deadline=deadline) if row["path"] not in LOCKS]
+
+
+def _derivation_guard(
+    source: Path,
+    expected: dict[str, bytes],
+    remainder: list[dict[str, Any]],
+    go: Path,
+    go_hash: str,
+    deadline: float,
+) -> None:
+    require(_derivation_locks(source) == expected, "frozen_derivation_locks_changed")
+    require(
+        _derivation_nonlocks(source, deadline) == remainder, "derivation_nonlock_source_changed"
+    )
+    require(file_hash(go / "bin/go", deadline) == go_hash, "derivation_Go_binary_changed")
+
+
+def _derivation_phase(
+    native: Native,
+    source: Path,
+    go: Path,
+    modules: Path,
+    environment: dict[str, str],
+    label: str,
+    expected: dict[str, bytes],
+    remainder: list[dict[str, Any]],
+    go_hash: str,
+    *,
+    compiler_artifact: Artifact | None = None,
+) -> dict[str, Any]:
+    compiler_artifact = Artifact.canonical(
+        CURRENT_GO if compiler_artifact is None else compiler_artifact
+    )
+    require(compiler_artifact.name == "go", "compiler_artifact_role")
+    exact_data(vars(compiler_artifact), vars(CURRENT_GO))
+    result: dict[str, Any] = {}
+    commands = (
+        ("version", ["version"]),
+        ("edit", ["mod", "edit", "-json"]),
+        ("download", ["mod", "download", "-json"]),
+        ("verify", ["mod", "verify"]),
+        ("selected", ["list", "-m", "-json", "all"]),
+        ("graph", ["mod", "graph"]),
+    )
+    # Observe full selected objects after readonly acquisition so pre-get cache
+    # hydration cannot masquerade as get-produced module metadata transitions.
+    for key, command in commands:
+        _derivation_guard(source, expected, remainder, go, go_hash, native.deadline)
+        raw = native.run([str(go / "bin/go"), *command], label + "-" + key, environment, cwd=source)
+        _derivation_guard(source, expected, remainder, go, go_hash, native.deadline)
+        if key == "version":
+            require(raw.decode() == compiler_artifact.go_version, "derivation_native_Go_version")
+        elif key == "edit":
+            objects = decode_objects(raw)
+            require(
+                len(objects) == 1
+                and "Error" not in objects[0]
+                and type(objects[0].get("Module")) is dict
+                and objects[0]["Module"].get("Path") == ROOT_MODULE,
+                "native_mod_edit_identity",
+            )
+            result[key] = objects[0]
+        elif key == "selected":
+            result[key] = decode_selected_modules(raw)
+        elif key == "download":
+            result[key] = decode_modules(raw)
+        else:
+            result[key] = raw.decode("utf-8", errors="strict")
+    require(bool(result["graph"]), "empty_native_module_graph")
+    return result
+
+
+def _derivation_comparison(phase: dict[str, Any], source: Path, modules: Path) -> dict[str, Any]:
+    return {
+        "edit": phase["edit"],
+        "selected": {
+            key: replay_coordinates(value, source, modules, download=False)
+            for key, value in phase["selected"].items()
+        },
+        "download": sorted(
+            (
+                replay_coordinates(value, source, modules, download=True)
+                for value in phase["download"]
+            ),
+            key=lambda value: (value["Path"], value["Version"]),
+        ),
+        "graph_complete_line_multiset": sorted(phase["graph"].splitlines(keepends=True)),
+        "verify": phase["verify"],
+    }
+
+
+def _derivation_offline(
+    native: Native,
+    source: Path,
+    go: Path,
+    modules: Path,
+    expected_locks: dict[str, bytes],
+    remainder: list[dict[str, Any]],
+    go_hash: str,
+    label: str,
+    docker: str,
+    config: Path,
+    image: dict[str, Any],
+    owner: str,
+    before_names: list[str],
+    owned: dict[str, dict[str, Any]],
+    docker_env: dict[str, str],
+    work: Path,
+    *,
+    restore_cache_modes: bool = False,
+    compiler_artifact: Artifact | None = None,
+) -> dict[str, Any]:
+    # An incumbent observation precedes the newly authored get. Retain the
+    # complete owned member identities before temporarily freezing its cache.
+    compiler_artifact = Artifact.canonical(
+        CURRENT_GO if compiler_artifact is None else compiler_artifact
+    )
+    require(compiler_artifact.name == "go", "compiler_artifact_role")
+    exact_data(vars(compiler_artifact), vars(CURRENT_GO))
+    members: dict[Path, os.stat_result] = {}
+    original_cache: list[dict[str, Any]] = []
+    if restore_cache_modes:
+        original_cache = tree_inventory(modules, deadline=native.deadline)
+        for path in (modules, *sorted(modules.rglob("*"))):
+            check_deadline(native.deadline)
+            info = path.lstat()
+            require(
+                len(members) < 250000
+                and info.st_uid == os.getuid()
+                and (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)),
+                "incumbent_cache_owned_member",
+            )
+            members[path] = info
+    for path in modules.rglob("*"):
+        check_deadline(native.deadline)
+        info = path.lstat()
+        require(stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode), "module_cache_member")
+        path.chmod(0o555 if stat.S_ISDIR(info.st_mode) else 0o444)
+    modules.chmod(0o555)
+    cache = tree_inventory(modules, deadline=native.deadline)
+    require(bool(cache), "empty_module_cache")
+    (native.evidence / (label + "-module-cache-members.json")).write_text(
+        json.dumps(cache, sort_keys=True) + "\n"
+    )
+    observations: dict[str, Any] = {}
+    full_packages: dict[str, Any] = {}
+    completions: dict[str, Any] = {}
+    for command_name, command in (
+        ("version", ["version"]),
+        ("verify", ["mod", "verify"]),
+        ("prometheus", ["list", "-deps", "-json", "-tags=netgo,builtinassets", "./cmd/prometheus"]),
+        ("promtool", ["list", "-deps", "-json", "-tags=netgo,builtinassets", "./cmd/promtool"]),
+    ):
+        _derivation_guard(source, expected_locks, remainder, go, go_hash, native.deadline)
+        require(
+            tree_inventory(modules, deadline=native.deadline) == cache,
+            "readonly_derivation_cache_changed",
+        )
+        stage = label + "-offline-" + command_name
+        name = "pp-prom-derive-" + owner[:12] + "-" + label + "-" + command_name
+        argv = (
+            sandbox_arguments(docker, config, image["Id"], name, owner, source, go, modules)
+            + command
+        )
+        require(name not in before_names, "owned_container_collision")
+        environment = dict(value.split("=", 1) for value in image["Config"].get("Env", []))
+        environment.update(
+            clean_environment(
+                GUEST_TMP, GUEST_TMP, GUEST_TMP / "gocache", Path("/modules"), offline=True
+            )
+        )
+        expected = {
+            "image": image["Id"],
+            "image_relation": native_base_identity(image),
+            "owner": owner,
+            "command": command,
+            "create_argv": list(argv),
+            "environment": environment,
+            "mounts": {"/src": str(source), "/usr/local/go": str(go), "/modules": str(modules)},
+        }
+        create_owned(native, argv, name, expected, owned, stage, docker_env, work)
+        actual = native_one_image(
+            native.run(
+                [docker, "--config", str(config), "inspect", name],
+                stage + "-inspect",
+                docker_env,
+                cwd=work,
+            )
+        )
+        validate_container(actual, name, expected)
+        raw, completed = start_owned(
+            native, docker, config, name, expected, stage, docker_env, work
+        )
+        completions[command_name] = completed
+        _derivation_guard(source, expected_locks, remainder, go, go_hash, native.deadline)
+        require(
+            tree_inventory(modules, deadline=native.deadline) == cache,
+            "readonly_derivation_cache_changed",
+        )
+        if command_name == "version":
+            require(raw.decode() == compiler_artifact.go_version, "sandbox_Go_version")
+        elif command_name in ("prometheus", "promtool"):
+            observations[command_name] = decode_packages(raw, command_name)
+            full_packages[command_name] = {
+                value["ImportPath"]: value for value in decode_objects(raw)
+            }
+    require(set(observations) == {"prometheus", "promtool"}, "both_command_graphs_required")
+    if restore_cache_modes:
+        require(
+            set((modules, *modules.rglob("*"))) == set(members)
+            and tree_inventory(modules, deadline=native.deadline) == cache,
+            "incumbent_cache_members_changed",
+        )
+        identity_fields = (
+            "st_dev",
+            "st_ino",
+            "st_uid",
+            "st_gid",
+            "st_nlink",
+            "st_size",
+            "st_mtime_ns",
+        )
+        for path, before in members.items():
+            check_deadline(native.deadline)
+            current = path.lstat()
+            require(
+                all(getattr(current, field) == getattr(before, field) for field in identity_fields)
+                and stat.S_IFMT(current.st_mode) == stat.S_IFMT(before.st_mode)
+                and stat.S_IMODE(current.st_mode)
+                == (0o555 if stat.S_ISDIR(before.st_mode) else 0o444),
+                "incumbent_cache_identity_changed",
+            )
+        # No finally-based thaw: observation or identity failure stops the next get.
+        for path, before in members.items():
+            check_deadline(native.deadline)
+            path.chmod(stat.S_IMODE(before.st_mode), follow_symlinks=False)
+        require(
+            tree_inventory(modules, deadline=native.deadline) == original_cache,
+            "incumbent_cache_restore_changed_bytes",
+        )
+        for path, before in members.items():
+            current = path.lstat()
+            require(
+                all(getattr(current, field) == getattr(before, field) for field in identity_fields)
+                and current.st_mode == before.st_mode,
+                "incumbent_cache_restore_identity",
+            )
+    result: dict[str, Any] = {
+        "command_observations": observations,
+        "full_native_package_objects": full_packages,
+        "container_completion": completions,
+        "module_inventory_sha256": sha(json.dumps(cache, sort_keys=True).encode()),
+    }
+    if restore_cache_modes:
+        result["cache_mode_restoration"] = {
+            "files_before": original_cache,
+            "files_frozen": cache,
+            "files_restored": tree_inventory(modules, deadline=native.deadline),
+            "members": [
+                {
+                    "path": path.relative_to(modules).as_posix(),
+                    "mode_before": stat.S_IMODE(before.st_mode),
+                    "mode_restored": stat.S_IMODE(path.lstat().st_mode),
+                    "identity": {field: getattr(before, field) for field in identity_fields},
+                }
+                for path, before in members.items()
+            ],
+            "scope": "Observed incumbent phase only; the following authored get may hydrate cache",
+        }
+    return result
+
+
+def derive_xnet_observe(
+    native: Native,
+    work: Path,
+    downloads: Path,
+    source_a: Path,
+    go: Path,
+    ui: Path,
+    owned: dict[str, dict[str, Any]],
+    docker: str,
+    config: Path,
+    docker_env: dict[str, str],
+    report: dict[str, Any],
+    *,
+    target_version: str = "v0.60.0",
+    compiler_artifact: Artifact | None = None,
+) -> None:
+    """Exactly two original-source fixed-get replays inside this existing Native lease."""
+    compiler_artifact = Artifact.canonical(
+        CURRENT_GO if compiler_artifact is None else compiler_artifact
+    )
+    require(compiler_artifact.name == "go", "compiler_artifact_role")
+    exact_data(vars(compiler_artifact), vars(CURRENT_GO))
+    import difflib
+
+    require(target_version in ("v0.60.0", "v0.62.0"), "unsupported_xnet_derivation_target")
+    owner = uuid.uuid4().hex
+    before_names = (
+        native.run(
+            [docker, "--config", str(config), "ps", "--all", "--format", "{{.Names}}"],
+            "derive-containers-before",
+            docker_env,
+            cwd=work,
+        )
+        .decode()
+        .splitlines()
+    )
+    native.run(
+        [docker, "--config", str(config), "pull", "--platform", "linux/amd64", BASE],
+        "derive-base-pull",
+        docker_env,
+        cwd=work,
+    )
+    image = native_one_image(
+        native.run(
+            [docker, "--config", str(config), "image", "inspect", BASE],
+            "derive-base-inspect",
+            docker_env,
+            cwd=work,
+        )
+    )
+    native_base_identity(image)
+    report["runtime_base_native"] = image
+    report["module_action"] = "xnet060-replay" if target_version == "v0.60.0" else "xnet062-replay"
+    authored_action = "golang.org/x/net@" + target_version
+    report["module_derivation"] = {"authored_action": authored_action, "replays": []}
+    go_hash = file_hash(go / "bin/go", native.deadline)
+    original_remainder = _derivation_nonlocks(source_a, native.deadline)
+    prior: dict[str, Any] | None = None
+    for label in ("a", "b"):
+        report["derivation_stage"] = label + "-original-source"
+        source = source_a if label == "a" else work / "source-b"
+        if label == "b":
+            rows = extract(SOURCE, downloads / SOURCE.name, source, native.deadline)
+            (native.evidence / "source-b-members.json").write_text(
+                json.dumps(rows, sort_keys=True) + "\n"
+            )
+            require(
+                stage_ui(source, ui, native.deadline) == report["UI_transform"],
+                "matching_replay_UI",
+            )
+        locks_unchanged(source)
+        require(
+            _derivation_nonlocks(source, native.deadline) == original_remainder,
+            "replay_original_nonlocks",
+        )
+        area = work / ("replay-" + label)
+        fresh_directory(area)
+        home, tmp, cache, modules = (area / name for name in ("home", "tmp", "gocache", "modules"))
+        for target in (home, tmp, cache, modules):
+            fresh_directory(target, 0o755 if target == modules else 0o700)
+        online = clean_environment(home, tmp, cache, modules, offline=False)
+        original = _derivation_locks(source)
+        for name, raw in original.items():
+            (native.evidence / (label + "-original-" + name)).write_bytes(raw)
+        report["derivation_stage"] = label + "-base-readonly"
+        before = _derivation_phase(
+            native,
+            source,
+            go,
+            modules,
+            online,
+            label + "-base",
+            original,
+            original_remainder,
+            go_hash,
+            compiler_artifact=compiler_artifact,
+        )
+        old = before["selected"].get("golang.org/x/net")
+        require(
+            old is not None and old["Version"] == "v0.58.0" and "Replace" not in old,
+            "original_xnet_identity",
+        )
+        writable = dict(online, GOFLAGS="")
+        incumbent: dict[str, Any] | None = None
+        if target_version == "v0.62.0":
+            original_before = before
+            report["derivation_stage"] = label + "-incumbent-reconstruction"
+            try:
+                native.run(
+                    [str(go / "bin/go"), "get", "golang.org/x/net@v0.60.0"],
+                    label + "-incumbent-get",
+                    writable,
+                    cwd=source,
+                )
+            except BaseException:
+                for name, raw in _derivation_locks(source).items():
+                    (native.evidence / (label + "-failed-incumbent-" + name)).write_bytes(raw)
+                raise
+            incumbent_locks = _derivation_locks(source)
+            require(
+                {name: sha(raw) for name, raw in incumbent_locks.items()}
+                == XNET060_INCUMBENT_LOCKS,
+                "incumbent_selected_lock_identity",
+            )
+            for name, raw in incumbent_locks.items():
+                (native.evidence / (label + "-incumbent-" + name)).write_bytes(raw)
+            before = _derivation_phase(
+                native,
+                source,
+                go,
+                modules,
+                online,
+                label + "-incumbent",
+                incumbent_locks,
+                original_remainder,
+                go_hash,
+                compiler_artifact=compiler_artifact,
+            )
+            selected_incumbent = before["selected"].get("golang.org/x/net")
+            require(
+                selected_incumbent is not None
+                and selected_incumbent["Version"] == "v0.60.0"
+                and "Replace" not in selected_incumbent,
+                "incumbent_selected_xnet_identity",
+            )
+            incumbent_offline = _derivation_offline(
+                native,
+                source,
+                go,
+                modules,
+                incumbent_locks,
+                original_remainder,
+                go_hash,
+                label + "-incumbent",
+                docker,
+                config,
+                image,
+                owner,
+                before_names,
+                owned,
+                docker_env,
+                work,
+                restore_cache_modes=True,
+                compiler_artifact=compiler_artifact,
+            )
+            _retain_xnet062_arrays(native, label, incumbent_offline)
+            incumbent = {
+                "role": "historical selected-base reconstruction; not new authored intent",
+                "action": "golang.org/x/net@v0.60.0",
+                "original_before": original_before,
+                "locks": {name: sha(raw) for name, raw in incumbent_locks.items()},
+                "offline": incumbent_offline,
+            }
+        report["derivation_stage"] = label + "-sole-fixed-get"
+        try:
+            native.run(
+                [str(go / "bin/go"), "get", authored_action],
+                label + "-sole-get",
+                writable,
+                cwd=source,
+            )
+        except BaseException:
+            for name, raw in _derivation_locks(source).items():
+                (native.evidence / (label + "-failed-get-" + name)).write_bytes(raw)
+            raise
+        # Freeze exactly ONCE, immediately after successful get. Never after download.
+        derived = _derivation_locks(source)
+        require(derived != original, "empty_authored_module_delta")
+        if incumbent is not None:
+            require(derived != incumbent_locks, "empty_incumbent_to_final_delta")
+        for name, raw in derived.items():
+            (native.evidence / (label + "-derived-" + name)).write_bytes(raw)
+        (native.evidence / (label + "-postget-source-members.json")).write_text(
+            json.dumps(tree_inventory(source, deadline=native.deadline), sort_keys=True) + "\n"
+        )
+        _derivation_guard(source, derived, original_remainder, go, go_hash, native.deadline)
+        patch = b"".join(
+            b"".join(
+                difflib.diff_bytes(
+                    difflib.unified_diff,
+                    original[name].splitlines(keepends=True),
+                    derived[name].splitlines(keepends=True),
+                    fromfile=("a/" + name).encode(),
+                    tofile=("b/" + name).encode(),
+                )
+            )
+            for name in LOCKS
+        )
+        (native.evidence / (label + "-module-derivation.patch")).write_bytes(patch)
+        report["derivation_stage"] = label + "-derived-readonly"
+        after = _derivation_phase(
+            native,
+            source,
+            go,
+            modules,
+            online,
+            label + "-derived",
+            derived,
+            original_remainder,
+            go_hash,
+            compiler_artifact=compiler_artifact,
+        )
+        selected = after["selected"].get("golang.org/x/net")
+        require(
+            selected is not None
+            and selected["Version"] == target_version
+            and "Replace" not in selected,
+            "derived_xnet_identity",
+        )
+        transitions = [
+            {
+                "Path": path,
+                "before": before["selected"].get(path),
+                "after": after["selected"].get(path),
+                "class": (
+                    "I_R"
+                    if path == "golang.org/x/net"
+                    else "C_R_candidate_pending_independent_review"
+                ),
+            }
+            for path in sorted(set(before["selected"]) | set(after["selected"]))
+            if before["selected"].get(path) != after["selected"].get(path)
+        ]
+        report["derivation_stage"] = label + "-offline-both-commands"
+        offline = _derivation_offline(
+            native,
+            source,
+            go,
+            modules,
+            derived,
+            original_remainder,
+            go_hash,
+            label,
+            docker,
+            config,
+            image,
+            owner,
+            before_names,
+            owned,
+            docker_env,
+            work,
+            compiler_artifact=compiler_artifact,
+        )
+        record = {
+            "replay": label,
+            "original_locks": {name: sha(raw) for name, raw in original.items()},
+            "derived_locks": {name: sha(raw) for name, raw in derived.items()},
+            "patch_sha256": sha(patch),
+            "before": before,
+            "after": after,
+            "complete_module_transitions": transitions,
+            "native_directives_before": before["edit"],
+            "native_directives_after": after["edit"],
+            "offline": offline,
+            "nonlock_source_inventory_sha256": sha(
+                json.dumps(original_remainder, sort_keys=True).encode()
+            ),
+        }
+        report["module_derivation"]["replays"].append(record)
+        if incumbent is not None:
+            record["incumbent_reconstruction"] = incumbent
+            record["lock_patch_scope"] = "original-to-final materialization; not new closure base"
+        comparison = {
+            "original": original,
+            "derived": derived,
+            "patch": patch,
+            "before": _derivation_comparison(before, source, modules),
+            "after": _derivation_comparison(after, source, modules),
+            "full_native_package_objects": offline["full_native_package_objects"],
+            "nonlock_source": original_remainder,
+        }
+        if incumbent is not None:
+            comparison["incumbent_locks"] = incumbent_locks
+            comparison["original_before"] = _derivation_comparison(original_before, source, modules)
+            comparison["incumbent_packages"] = incumbent_offline["full_native_package_objects"]
+        if prior is not None:
+            require(comparison == prior, "independent_derivation_replay_mismatch")
+        prior = comparison
+    require(
+        len(report["module_derivation"]["replays"]) == 2, "two_complete_derivation_replays_required"
+    )
+    report["module_derivation"][
+        "replay_equality"
+    ] = "observed_under_explicit_coordinate_correspondence_only"
+    report["module_derivation"][
+        "closure_disposition"
+    ] = "pending independent complete delta/fullF review; metadata only"
+
+
+def _xnet062_json_bytes(value: Any, deadline: float | None) -> bytes:
+    """Bound this producer's new JSON before writing; never encode the full report."""
+    result = bytearray()
+    encoder = json.JSONEncoder(sort_keys=True, separators=(",", ":"), allow_nan=False)
+    for part in encoder.iterencode(value):
+        check_deadline(deadline)
+        raw = part.encode("utf-8")
+        require(len(result) + len(raw) + 1 <= MAX_NATIVE_OUTPUT, "xnet062_report_size")
+        result.extend(raw)
+    result.extend(b"\n")
+    return bytes(result)
+
+
+def _xnet062_member(evidence: Path, name: str, deadline: float | None) -> bytes:
+    """Read only a producer-enumerated leaf, not a descriptor-selected path."""
+    require(name not in ("", ".", "..") and Path(name).name == name, "xnet062_member_name")
+    real_directory(evidence)
+    path = evidence / name
+    leaf = path.lstat()
+    require(
+        stat.S_ISREG(leaf.st_mode) and leaf.st_nlink == 1,
+        "xnet062_member_type",
+    )
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        before = os.fstat(descriptor)
+        require(
+            stat.S_ISREG(before.st_mode)
+            and before.st_nlink == 1
+            and (before.st_dev, before.st_ino) == (leaf.st_dev, leaf.st_ino)
+            and 0 <= before.st_size <= MAX_NATIVE_OUTPUT,
+            "xnet062_member_identity_or_size",
+        )
+        result = bytearray()
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            while True:
+                check_deadline(deadline)
+                chunk = stream.read(min(1024**2, MAX_NATIVE_OUTPUT + 1 - len(result)))
+                if not chunk:
+                    break
+                result.extend(chunk)
+                require(len(result) <= MAX_NATIVE_OUTPUT, "xnet062_member_size")
+        after, current = os.fstat(descriptor), path.lstat()
+        fields = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_nlink",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        require(
+            all(
+                getattr(before, field) == getattr(after, field) == getattr(current, field)
+                for field in fields
+            )
+            and len(result) == before.st_size,
+            "xnet062_member_changed",
+        )
+        return bytes(result)
+    finally:
+        os.close(descriptor)
+
+
+def _xnet062_write(evidence: Path, name: str, raw: bytes, deadline: float | None) -> None:
+    real_directory(evidence)
+    require(Path(name).name == name and 0 < len(raw) <= MAX_NATIVE_OUTPUT, "xnet062_write_bound")
+    check_deadline(deadline)
+    descriptor = os.open(
+        evidence / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600
+    )
+    with os.fdopen(descriptor, "wb") as stream:
+        stream.write(raw)
+        stream.flush()
+        check_deadline(deadline)
+    require(_xnet062_member(evidence, name, deadline) == raw, "xnet062_written_bytes")
+
+
+def _retain_xnet062_arrays(native: Native, lane: str, offline: dict[str, Any]) -> None:
+    require(lane in ("a", "b"), "xnet062_lane")
+    restoration = offline["cache_mode_restoration"]
+    for key, suffix in (
+        ("files_before", "before"),
+        ("files_restored", "restored"),
+        ("members", "physical-members"),
+    ):
+        _xnet062_write(
+            native.evidence,
+            lane + "-incumbent-cache-" + suffix + ".json",
+            _xnet062_json_bytes(restoration[key], native.deadline),
+            native.deadline,
+        )
+
+
+def _check_xnet062_report(
+    original: dict[str, Any],
+    view: dict[str, Any],
+    native: Native,
+    owned: dict[str, dict[str, Any]],
+    docker: str,
+    config: Path,
+    *,
+    complete: bool,
+    files: dict[str, bytes] | None = None,
+) -> None:
+    """Check finite serialization preservation, never admit locks or alleged originals.
+
+    Original/owned values come directly from this operation's existing runtime
+    checks. The optional mapping is the existing validated archive transport.
+    """
+
+    def raw_member(name: str) -> bytes:
+        check_deadline(native.cleanup_deadline)
+        raw = (
+            _xnet062_member(native.evidence, name, native.cleanup_deadline)
+            if files is None
+            else files[name]
+        )
+        require(type(raw) is bytes and len(raw) <= MAX_NATIVE_OUTPUT, "xnet062_member_size")
+        return raw
+
+    def bound(binding: Any, name: str) -> bytes:
+        raw = raw_member(name)
+        require(bool(raw), "xnet062_empty_member")
+        exact_data(binding, {"member": name, "bytes": len(raw), "sha256": sha(raw)})
+        return raw
+
+    def array(binding: Any, name: str, *, compact: bool) -> list[Any]:
+        raw = bound(binding, name)
+        value = json.loads(
+            raw.decode("utf-8", errors="strict"),
+            object_pairs_hook=unique_object,
+            parse_constant=reject_constant,
+        )
+        require(type(value) is list, "xnet062_array_root")
+        expected = (
+            _xnet062_json_bytes(value, native.cleanup_deadline)
+            if compact
+            else (json.dumps(value, sort_keys=True, allow_nan=False) + "\n").encode()
+        )
+        require(raw == expected, "xnet062_array_encoding")
+        return cast(list[Any], value)
+
+    def native_record(stage: str) -> tuple[dict[str, Any], bytes]:
+        matches = [
+            row
+            for row in original["native_operations"]
+            if row.get("stdout") == str(native.evidence / (stage + ".stdout"))
+        ]
+        require(len(matches) == 1, "xnet062_native_record_cardinality")
+        row = matches[0]
+        require(
+            type(row.get("exit")) is int and row["exit"] == 0 and row.get("failure") is None,
+            "xnet062_native_terminal",
+        )
+        stdout = raw_member(stage + ".stdout")
+        stderr = raw_member(stage + ".stderr")
+        require(
+            row.get("stderr") == str(native.evidence / (stage + ".stderr"))
+            and row.get("stdout_sha256") == sha(stdout)
+            and row.get("stderr_sha256") == sha(stderr),
+            "xnet062_native_raw_binding",
+        )
+        return row, stdout
+
+    def offline(before: dict[str, Any], after: dict[str, Any], label: str) -> None:
+        reconstructed = dict(after)
+        bindings = reconstructed.pop("full_native_package_members")
+        require(
+            type(bindings) is dict and set(bindings) == {"prometheus", "promtool"},
+            "xnet062_package_slots",
+        )
+        packages = {}
+        for command in ("prometheus", "promtool"):
+            raw = bound(bindings[command], label + "-offline-" + command + "-native.stdout")
+            exact_data(decode_packages(raw, command), before["command_observations"][command])
+            packages[command] = {value["ImportPath"]: value for value in decode_objects(raw)}
+        reconstructed["full_native_package_objects"] = packages
+        frozen = array(
+            reconstructed.pop("module_inventory_member"),
+            label + "-module-cache-members.json",
+            compact=False,
+        )
+        require(
+            sha(json.dumps(frozen, sort_keys=True).encode()) == before["module_inventory_sha256"],
+            "xnet062_frozen_semantic_hash",
+        )
+        if label.endswith("-incumbent"):
+            restoration = dict(reconstructed["cache_mode_restoration"])
+            for key, replacement, suffix in (
+                ("files_before", "files_before_member", "before"),
+                ("files_restored", "files_restored_member", "restored"),
+                ("members", "physical_members_member", "physical-members"),
+            ):
+                restoration[key] = array(
+                    restoration.pop(replacement), label + "-cache-" + suffix + ".json", compact=True
+                )
+            restoration["files_frozen"] = frozen
+            reconstructed["cache_mode_restoration"] = restoration
+        exact_data(reconstructed, before)
+        if not complete:
+            return
+        # Reuse the actual construction's expected values, never inspect paths
+        # that the subsequent get may already have changed.
+        for command, argv in (
+            ("version", ["version"]),
+            ("verify", ["mod", "verify"]),
+            (
+                "prometheus",
+                ["list", "-deps", "-json", "-tags=netgo,builtinassets", "./cmd/prometheus"],
+            ),
+            ("promtool", ["list", "-deps", "-json", "-tags=netgo,builtinassets", "./cmd/promtool"]),
+        ):
+            matches = [
+                (name, expected)
+                for name, expected in owned.items()
+                if name == "pp-prom-derive-" + expected["owner"][:12] + "-" + label + "-" + command
+            ]
+            require(len(matches) == 1, "xnet062_owned_command")
+            name, expected = matches[0]
+            exact_data(expected["command"], argv)
+            stage = label + "-offline-" + command
+            created, identifier_raw = native_record(stage + "-create")
+            exact_data(created["argv"], expected["create_argv"])
+            require(
+                identifier_raw.decode("ascii").strip() == expected["container_id"],
+                "xnet062_create_ID",
+            )
+            started, _ = native_record(stage + "-native")
+            exact_data(
+                started["argv"],
+                [docker, "--config", str(config), "start", "--attach", expected["container_id"]],
+            )
+            prestart, prestart_raw = native_record(stage + "-inspect")
+            exact_data(prestart["argv"], [docker, "--config", str(config), "inspect", name])
+            validate_container(native_one_image(prestart_raw), name, expected)
+            terminal, terminal_raw = native_record(stage + "-completed-inspect")
+            exact_data(
+                terminal["argv"],
+                [docker, "--config", str(config), "inspect", expected["container_id"]],
+            )
+            actual = native_one_image(terminal_raw)
+            validate_container(actual, name, expected)
+            exact_data(actual["State"], before["container_completion"][command])
+            state = actual["State"]
+            require(
+                state.get("Running") is False
+                and type(state.get("ExitCode")) is int
+                and state["ExitCode"] == 0
+                and state.get("OOMKilled") is False,
+                "xnet062_container_terminal",
+            )
+
+    if "module_derivation" not in original:
+        require(not complete, "xnet062_incomplete")
+        exact_data(view, original)
+        return
+    before_replays = original["module_derivation"]["replays"]
+    lanes = [record["replay"] for record in before_replays]
+    require(lanes == (["a", "b"] if complete else ["a", "b"][: len(lanes)]), "xnet062_replay_slots")
+    require(
+        original.get("module_action") == "xnet062-replay"
+        and original["module_derivation"].get("authored_action") == "golang.org/x/net@v0.62.0",
+        "xnet062_report_action",
+    )
+    reconstructed = dict(view)
+    derivation = dict(reconstructed["module_derivation"])
+    replays = derivation["replays"]
+    require(type(replays) is list and len(replays) == len(before_replays), "xnet062_replay_slots")
+    restored = []
+    for before, after in zip(before_replays, replays, strict=True):
+        lane = before["replay"]
+        offline(before["offline"], after["offline"], lane)
+        offline(
+            before["incumbent_reconstruction"]["offline"],
+            after["incumbent_reconstruction"]["offline"],
+            lane + "-incumbent",
+        )
+        record = dict(after)
+        record["offline"] = before["offline"]
+        incumbent = dict(record["incumbent_reconstruction"])
+        incumbent["offline"] = before["incumbent_reconstruction"]["offline"]
+        record["incumbent_reconstruction"] = incumbent
+        restored.append(record)
+    derivation["replays"] = restored
+    reconstructed["module_derivation"] = derivation
+    exact_data(reconstructed, original)
+
+
+def _xnet062_report_view(
+    report: dict[str, Any],
+    native: Native,
+    owned: dict[str, dict[str, Any]],
+    docker: str,
+    config: Path,
+    *,
+    complete: bool,
+) -> dict[str, Any]:
+    def binding(name: str) -> dict[str, Any]:
+        raw = _xnet062_member(native.evidence, name, native.cleanup_deadline)
+        return {"member": name, "bytes": len(raw), "sha256": sha(raw)}
+
+    def offline(value: dict[str, Any], label: str) -> dict[str, Any]:
+        result = dict(value)
+        del result["full_native_package_objects"]
+        result["full_native_package_members"] = {
+            command: binding(label + "-offline-" + command + "-native.stdout")
+            for command in ("prometheus", "promtool")
+        }
+        result["module_inventory_member"] = binding(label + "-module-cache-members.json")
+        if label.endswith("-incumbent"):
+            restoration = dict(result["cache_mode_restoration"])
+            for key, replacement, suffix in (
+                ("files_before", "files_before_member", "before"),
+                ("files_restored", "files_restored_member", "restored"),
+                ("members", "physical_members_member", "physical-members"),
+            ):
+                del restoration[key]
+                restoration[replacement] = binding(label + "-cache-" + suffix + ".json")
+            del restoration["files_frozen"]
+            result["cache_mode_restoration"] = restoration
+        return result
+
+    view = dict(report)
+    if "module_derivation" in report:
+        derivation = dict(report["module_derivation"])
+        replays = []
+        for record in derivation["replays"]:
+            lane = record["replay"]
+            require(lane in ("a", "b"), "xnet062_lane")
+            replay = dict(record)
+            replay["offline"] = offline(record["offline"], lane)
+            incumbent = dict(record["incumbent_reconstruction"])
+            incumbent["offline"] = offline(incumbent["offline"], lane + "-incumbent")
+            replay["incumbent_reconstruction"] = incumbent
+            replays.append(replay)
+        derivation["replays"] = replays
+        view["module_derivation"] = derivation
+    _check_xnet062_report(report, view, native, owned, docker, config, complete=complete)
+    return view
+
+
+def _finalize_xnet062_report(
+    report: dict[str, Any],
+    native: Native,
+    owned: dict[str, dict[str, Any]],
+    docker: str,
+    config: Path,
+    *,
+    derive_completed: bool,
+) -> dict[str, Any]:
+    """Finalize within the one cleanup allowance; the caller preserves primary errors."""
+    require(native.cleanup_deadline is not None, "cleanup_deadline_not_started")
+    success = (
+        derive_completed
+        and report["failure"] is None
+        and not report["interruptions"]
+        and all(
+            row.get("native_absent") is True and "failure" not in row for row in report["cleanup"]
+        )
+    )
+    report["status"] = "failed_or_unknown"
+    view = _xnet062_report_view(report, native, owned, docker, config, complete=success)
+    if success:
+        require(
+            all(
+                type(row.get("exit")) is int and row["exit"] == 0 and row.get("failure") is None
+                for row in report["native_operations"]
+            ),
+            "xnet062_native_terminal",
+        )
+        view["status"] = "observed_package_metadata_only"
+    else:
+        # An incumbent may have completed before the final get failed, without
+        # ever entering the completed replay list. Keep its finite raw homes
+        # visible as diagnostics, not as another successful replay.
+        completed_lanes = {
+            row["replay"] for row in report.get("module_derivation", {}).get("replays", [])
+        }
+        partial = {}
+        for lane in ("a", "b"):
+            if lane in completed_lanes:
+                continue
+            for suffix in ("before", "restored", "physical-members"):
+                name = lane + "-incumbent-cache-" + suffix + ".json"
+                path = native.evidence / name
+                if not path.exists() and not path.is_symlink():
+                    continue
+                try:
+                    raw = _xnet062_member(native.evidence, name, native.cleanup_deadline)
+                    partial[name] = {"member": name, "bytes": len(raw), "sha256": sha(raw)}
+                except (OSError, QualificationError) as error:
+                    partial[name] = {
+                        "failure": type(error).__name__,
+                        "code": diagnostic_code(error),
+                    }
+        if partial:
+            view["partial_incumbent_members"] = partial
+    encoded = _xnet062_json_bytes(view, native.cleanup_deadline)
+    exact_data(one_object(encoded), view)
+    # Publish only complete, read-back bytes. A failed staging write stays raw
+    # diagnostic evidence and cannot occupy the successful report's name.
+    _xnet062_write(native.evidence, ".qualification.json.pending", encoded, native.cleanup_deadline)
+    destination = native.evidence / "qualification.json"
+    require(not destination.exists() and not destination.is_symlink(), "xnet062_report_collision")
+    check_deadline(native.cleanup_deadline)
+    (native.evidence / ".qualification.json.pending").rename(destination)
+    return view
+
+
+def qualify(
+    work: Path,
+    seconds: int,
+    cleanup: int,
+    *,
+    derive_xnet060: bool = False,
+    derive_xnet062: bool = False,
+    compiler_artifact: Artifact | None = None,
+) -> dict[str, Any]:
+    compiler_artifact = Artifact.canonical(
+        CURRENT_GO if compiler_artifact is None else compiler_artifact
+    )
+    require(compiler_artifact.name == "go", "compiler_artifact_role")
+    exact_data(vars(compiler_artifact), vars(CURRENT_GO))
+    require(
+        type(derive_xnet060) is bool and type(derive_xnet062) is bool,
+        "xnet_derivation_selector_type",
+    )
+    require(not (derive_xnet060 and derive_xnet062), "conflicting_xnet_derivation_targets")
+    require(
+        platform.system() == "Linux"
+        and platform.machine() in ("x86_64", "amd64")
+        and os.environ.get("GITHUB_ACTIONS") == "true"
+        and os.environ.get("RUNNER_OS") == "Linux",
+        "hosted_linux_only",
+    )
+    require(
+        type(seconds) is int
+        and 0 < seconds <= (1800 if derive_xnet062 else 900)
+        and type(cleanup) is int
+        and 0 < cleanup <= 120,
+        "qualification_budget",
+    )
+    global CLEANING
+    fresh_directory(work)
+    evidence = work / "evidence"
+    fresh_directory(evidence)
+    deadline = time.monotonic() + seconds
+    native = Native(evidence, deadline, cleanup)
+    report: dict[str, Any] = {
+        "purpose": "Complete native package metadata only; no binary/source-build, selection, remediation, readiness or publication claim",
+        "source_revision": REVISION,
+        "source_tree": TREE,
+        "heavy_build_invocations": 0,
+        "publication_commands": 0,
+        "automatic_retries": 0,
+        "primary_advisory_references": [
+            {"id": k, "raw_sha256": v, "review": "pending"} for k, v in ADVISORIES.items()
+        ],
+        "failure": None,
+    }
+    owned: dict[str, dict[str, Any]] = {}
+    docker_path = shutil.which("docker")
+    if docker_path is None:
+        raise QualificationError("native_Docker_missing")
+    docker = str(Path(docker_path).resolve())
+    config = work / "docker-config"
+    fresh_directory(config)
+    docker_env = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": str(work),
+        "DOCKER_CONFIG": str(config),
+        "LANG": "C.UTF-8",
+    }
+    stage = "source_acquisition"
+    derive_completed = False
+    primary_error: BaseException | None = None
+    compact_report: dict[str, Any] | None = None
+    try:
+        if os.environ.get("GITHUB_REF") == P062_REF:
+            require(derive_xnet062, "p062_Q_exact_selector")
+            stage = "authenticated_P1_and_retained_T"
+            root = producer_paths()[0].parents[2]
+            api = GitHubRead(work / "GitHub-private", evidence, deadline, cleanup)
+            authentication_error: BaseException | None = None
+            try:
+                report["admission"] = manual_hosted_admission(
+                    api, "qualification", producer_root=root
+                )
+                _tool, retained = retained_tool(
+                    api, root, work, compiler_artifact=compiler_artifact
+                )
+                report["retained_tool"] = retained["coordinates"]
+            except BaseException as error:
+                authentication_error = error
+                raise
+            finally:
+                try:
+                    api.close()
+                except BaseException as cleanup_error:
+                    report["authentication_cleanup_failure"] = {
+                        "class": type(cleanup_error).__name__,
+                        "code": diagnostic_code(cleanup_error),
+                    }
+                    if authentication_error is None:
+                        raise
+        downloads = work / "downloads"
+        fresh_directory(downloads)
+        report["acquisition"] = []
+        for artifact in (SOURCE, compiler_artifact, UI, CHECKSUMS):
+            require(time.monotonic() < deadline, "qualification_deadline")
+            stage = "acquire_" + artifact.name
+            report["acquisition"].append(acquire(artifact, downloads / artifact.name, deadline))
+        expected_row = UI.digest + "  prometheus-web-ui-3.15.0.tar.gz"
+        require(
+            (downloads / "checksums").read_text().splitlines().count(expected_row) == 1,
+            "UI_checksum_row",
+        )
+        source, go, ui = work / "source", work / "go", work / "ui"
+        for artifact, target in ((SOURCE, source), (compiler_artifact, go), (UI, ui)):
+            stage = "extract_" + artifact.name
+            rows = extract(artifact, downloads / artifact.name, target, deadline)
+            (evidence / (artifact.name + "-members.json")).write_text(
+                json.dumps(rows, sort_keys=True, indent=2) + "\n"
+            )
+        require(
+            (source / "VERSION").read_bytes() == b"3.15.0\n"
+            and (go / "VERSION").read_bytes() == compiler_artifact.go_version_file,
+            "source_VERSION",
+        )
+        require(
+            file_hash(go / "LICENSE") == GO_LICENSE
+            and all(file_hash(source / p) == v for p, v in SOURCE_LICENSES.items()),
+            "source_licenses",
+        )
+        stage = "matching_UI_staging"
+        report["UI_transform"] = stage_ui(source, ui, deadline)
+        locks_unchanged(source)
+        initial_source = tree_inventory(source, deadline=deadline)
+        if derive_xnet060 or derive_xnet062:
+            stage = "xnet062_replay" if derive_xnet062 else "xnet060_replay"
+            derive_xnet_observe(
+                native,
+                work,
+                downloads,
+                source,
+                go,
+                ui,
+                owned,
+                docker,
+                config,
+                docker_env,
+                report,
+                target_version="v0.62.0" if derive_xnet062 else "v0.60.0",
+                compiler_artifact=compiler_artifact,
+            )
+            if report.get("admission", {}).get("producer_epoch") == "xnet062":
+                for replay in report["module_derivation"]["replays"]:
+                    exact_data(replay["derived_locks"], DERIVED_LOCKS)
+            derive_completed = True
+        else:
+            modules = work / "modules"
+            fresh_directory(modules, 0o755)
+            home, tmp, cache = work / "online-home", work / "online-tmp", work / "online-cache"
+            for target in (home, tmp, cache):
+                fresh_directory(target)
+            online = clean_environment(home, tmp, cache, modules, offline=False)
+            stage = "public_native_Go_prefetch"
+            go_binary = str(go / "bin/go")
+            require(
+                native.run([go_binary, "version"], "online-go-version", online, cwd=source).decode()
+                == compiler_artifact.go_version,
+                "native_Go_version",
+            )
+            module_raw = native.run(
+                [go_binary, "mod", "download", "-json"],
+                "public-module-download",
+                online,
+                cwd=source,
+            )
+            report["native_module_objects"] = decode_modules(module_raw)
+            locks_unchanged(source)
+            native.run([go_binary, "mod", "verify"], "online-module-verify", online, cwd=source)
+            locks_unchanged(source)
+            for target in modules.rglob("*"):
+                info = target.lstat()
+                require(
+                    stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode), "module_cache_member"
+                )
+                target.chmod(0o555 if stat.S_ISDIR(info.st_mode) else 0o444)
+            modules.chmod(0o555)
+            module_inventory = tree_inventory(modules, deadline=deadline)
+            require(bool(module_inventory), "empty_module_cache")
+            (evidence / "module-cache-members.json").write_text(
+                json.dumps(module_inventory, sort_keys=True, indent=2) + "\n"
+            )
+            before_names = (
+                native.run(
+                    [docker, "--config", str(config), "ps", "--all", "--format", "{{.Names}}"],
+                    "containers-before",
+                    docker_env,
+                    cwd=work,
+                )
+                .decode()
+                .splitlines()
+            )
+            native.run(
+                [docker, "--config", str(config), "pull", "--platform", "linux/amd64", BASE],
+                "public-base-pull",
+                docker_env,
+                cwd=work,
+            )
+            image = native_one_image(
+                native.run(
+                    [docker, "--config", str(config), "image", "inspect", BASE],
+                    "base-native-inspect",
+                    docker_env,
+                    cwd=work,
+                )
+            )
+            native_base_identity(image)
+            report["runtime_base_native"] = image
+            owner = uuid.uuid4().hex
+            captures = [
+                ("go-version", ["version"]),
+                ("module-verify", ["mod", "verify"]),
+                (
+                    "prometheus",
+                    ["list", "-deps", "-json", "-tags=netgo,builtinassets", "./cmd/prometheus"],
+                ),
+                (
+                    "promtool",
+                    ["list", "-deps", "-json", "-tags=netgo,builtinassets", "./cmd/promtool"],
+                ),
+            ]
+            observations = {}
+            report["container_completion"] = {}
+            for label, command in captures:
+                name = "pp-prom-source-" + owner[:12] + "-" + label
+                argv = (
+                    sandbox_arguments(docker, config, image["Id"], name, owner, source, go, modules)
+                    + command
+                )
+                require(name not in before_names, "owned_container_collision")
+                expected_env = dict(v.split("=", 1) for v in image["Config"].get("Env", []))
+                expected_env.update(
+                    clean_environment(
+                        GUEST_TMP, GUEST_TMP, GUEST_TMP / "gocache", Path("/modules"), offline=True
+                    )
+                )
+                expected = {
+                    "image": image["Id"],
+                    "image_relation": native_base_identity(image),
+                    "owner": owner,
+                    "command": command,
+                    "environment": expected_env,
+                    "mounts": {
+                        "/src": str(source),
+                        "/usr/local/go": str(go),
+                        "/modules": str(modules),
+                    },
+                }
+                stage = "offline_" + label
+                create_owned(native, argv, name, expected, owned, label, docker_env, work)
+                actual = native_one_image(
+                    native.run(
+                        [docker, "--config", str(config), "inspect", name],
+                        label + "-inspect",
+                        docker_env,
+                        cwd=work,
+                    )
+                )
+                validate_container(actual, name, expected)
+                raw, completion = start_owned(
+                    native, docker, config, name, expected, label, docker_env, work
+                )
+                report["container_completion"][label] = completion
+                if label == "go-version":
+                    require(raw.decode() == compiler_artifact.go_version, "sandbox_Go_version")
+                elif label in ("prometheus", "promtool"):
+                    observations[label] = decode_packages(raw, label)
+            require(set(observations) == {"prometheus", "promtool"}, "both_command_graphs_required")
+            locks_unchanged(source)
+            require(
+                tree_inventory(source, deadline=deadline) == initial_source
+                and tree_inventory(modules, deadline=deadline) == module_inventory,
+                "readonly_inputs_changed",
+            )
+            report["command_observations"] = observations
+            report["source_inventory_sha256"] = sha(
+                json.dumps(initial_source, sort_keys=True).encode()
+            )
+            report["module_inventory_sha256"] = sha(
+                json.dumps(module_inventory, sort_keys=True).encode()
+            )
+        report["producer"] = {str(p): file_hash(p) for p in producer_paths()}
+    except BaseException as error:
+        primary_error = error
+        report["failure"] = {
+            "class": type(error).__name__,
+            "code": diagnostic_code(error),
+            "stage": stage,
+        }
+        raise
+    finally:
+        CLEANING = True
+        try:
+            native.begin_cleanup()
+            removals = cleanup_owned(native, docker, config, owned, docker_env, work)
+            report["cleanup"] = removals
+            report["native_operations"] = native.records
+            report["interruptions"] = list(INTERRUPTIONS)
+            if derive_xnet062:
+                compact_report = _finalize_xnet062_report(
+                    report, native, owned, docker, config, derive_completed=derive_completed
+                )
+            else:
+                report["status"] = (
+                    "observed_package_metadata_only"
+                    if report["failure"] is None
+                    and not INTERRUPTIONS
+                    and not any("failure" in v for v in removals)
+                    else "failed_or_unknown"
+                )
+                (evidence / "qualification.json").write_text(
+                    json.dumps(report, indent=2, sort_keys=True) + "\n"
+                )
+        except BaseException as reporting_error:
+            if not derive_xnet062:
+                raise
+            # A partially written file is retained, never overwritten as success.
+            # If no output was created, retain a bounded diagnostic without
+            # attempting to encode the original oversized derivation again.
+            diagnostic = {key: value for key, value in report.items() if key != "module_derivation"}
+            diagnostic.update(
+                status="failed_or_unknown",
+                native_operations=native.records,
+                interruptions=list(INTERRUPTIONS),
+                report_failure={
+                    "class": type(reporting_error).__name__,
+                    "code": diagnostic_code(reporting_error),
+                },
+                incomplete_diagnostic=True,
+            )
+            try:
+                require(native.cleanup_deadline is not None, "cleanup_deadline_not_started")
+                if not (evidence / "qualification.json").exists():
+                    _xnet062_write(
+                        evidence,
+                        "qualification.json",
+                        _xnet062_json_bytes(diagnostic, native.cleanup_deadline),
+                        native.cleanup_deadline,
+                    )
+            except BaseException:
+                # The actual primary exception/raw native streams remain the
+                # failure evidence when diagnostic storage is also unavailable.
+                if primary_error is None:
+                    raise reporting_error
+            if primary_error is None:
+                raise
+        finally:
+            CLEANING = False
+    if derive_xnet062:
+        if compact_report is None:
+            raise QualificationError("qualification_or_cleanup_failed")
+        require(
+            compact_report["status"] == "observed_package_metadata_only",
+            "qualification_or_cleanup_failed",
+        )
+        return compact_report
+    require(report["status"] == "observed_package_metadata_only", "qualification_or_cleanup_failed")
+    return report
+
+
+def validate_container(actual: dict[str, Any], name: str, expected: dict[str, Any]) -> None:
+    config, host = actual["Config"], actual["HostConfig"]
+    require(
+        actual.get("Id") == expected.get("container_id")
+        and type(expected.get("container_id")) is str
+        and re.fullmatch(r"[0-9a-f]{64}", expected["container_id"]) is not None,
+        "container_full_identity",
+    )
+    native_container_image_identity(actual, expected["image_relation"])
+    require(
+        actual["Name"] == "/" + name
+        and actual["Image"] == expected["image"]
+        and config["Labels"].get(LABEL) == expected["owner"],
+        "container_identity",
+    )
+    require(
+        config["User"] == "65532:65532"
+        and config["WorkingDir"] == "/src"
+        and config["Entrypoint"] == ["/usr/local/go/bin/go"]
+        and config["Cmd"] == expected["command"],
+        "container_command",
+    )
+    require(
+        host["NetworkMode"] == "none"
+        and host["ReadonlyRootfs"] is True
+        and host["Privileged"] is False
+        and host["NanoCpus"] == 2000000000
+        and host["Memory"] == 4294967296
+        and host["PidsLimit"] == 128,
+        "container_isolation",
+    )
+    require(
+        host["CapDrop"] == ["ALL"]
+        and host.get("CapAdd") in (None, [])
+        and host["SecurityOpt"] in (["no-new-privileges"], ["no-new-privileges:true"]),
+        "container_capabilities",
+    )
+    mounts = {
+        v["Destination"]: v["Source"]
+        for v in actual["Mounts"]
+        if v["Type"] == "bind" and v["RW"] is False
+    }
+    require(
+        mounts == expected["mounts"]
+        and len(actual["Mounts"]) == (4 if "output" in expected else 3)
+        and host.get("Binds") in (None, []),
+        "container_mounts",
+    )
+    if "output" in expected:
+        writable = [v for v in actual["Mounts"] if v["Type"] == "bind" and v["RW"] is True]
+        require(
+            len(writable) == 1
+            and writable[0]["Destination"] == "/output"
+            and writable[0]["Source"] == expected["output"],
+            "container_finite_output_mount",
+        )
+    require(host.get("Tmpfs") == {str(GUEST_TMP): GUEST_TMPFS}, "container_tmpfs")
+    environment = dict(value.split("=", 1) for value in config["Env"])
+    required_env = clean_environment(
+        GUEST_TMP, GUEST_TMP, GUEST_TMP / "gocache", Path("/modules"), offline=True
+    )
+    if "output" in expected:
+        required_env.update(TMPDIR="/output/tmp", GOCACHE="/output/cache")
+    require(
+        all(environment.get(k) == v for k, v in required_env.items())
+        and environment == expected["environment"],
+        "container_environment",
+    )
+
+
+# Preparation only. No authenticated invocation or native-format parity claim.
+GHCR_REPOSITORY = "Katsiarynakavaleuskaya/PulsePlate"
+GHCR_OWNER = "Katsiarynakavaleuskaya"
+GHCR_PACKAGE = "pulseplate"
+GHCR_REQUESTS = (
+    "/repos/Katsiarynakavaleuskaya/PulsePlate",
+    "/users/Katsiarynakavaleuskaya/packages/container/pulseplate",
+)
+GHCR_OUTPUT_LIMIT = 1024**2
+
+
+def ghcr_response(raw: bytes) -> tuple[int, dict[str, Any]]:
+    """Consume one bounded native --include response; never publish its fields wholesale."""
+    require(0 < len(raw) <= GHCR_OUTPUT_LIMIT, "GHCR_response_size")
+    header, separator, body = raw.partition(b"\r\n\r\n")
+    require(bool(separator) and len(header) <= 32768, "GHCR_HTTP_header")
+    status_line, status_lf, fields = header.partition(b"\n")
+    require(status_lf == b"\n" and b"\r" not in status_line, "GHCR_HTTP_status")
+    require(bool(fields), "GHCR_HTTP_header")
+    lines = fields.split(b"\r\n")
+    match = re.fullmatch(rb"HTTP/(?:1\.1|2(?:\.0)?) ([1-5][0-9]{2})(?: [\x20-\x7e]+)?", status_line)
+    if match is None:
+        raise QualificationError("GHCR_HTTP_status")
+    status_code = int(match.group(1))
+    require(
+        all(re.fullmatch(rb"[A-Za-z0-9!#$%&'*+.^_`|~-]+: [\x20-\x7e]*", line) for line in lines),
+        "GHCR_HTTP_header",
+    )
+    require(status_code == 200, "GHCR_HTTP_status_" + str(status_code))
+    value = json.loads(
+        body.decode("utf-8", errors="strict"),
+        object_pairs_hook=unique_object,
+        parse_constant=reject_constant,
+    )
+    require(type(value) is dict, "GHCR_JSON_not_object")
+    return status_code, value
+
+
+def ghcr_identity(repository: dict[str, Any], package: dict[str, Any]) -> dict[str, Any]:
+    def positive(value: Any) -> int:
+        if type(value) is not int or value <= 0:
+            raise QualificationError("GHCR_positive_ID")
+        return value
+
+    def expected(value: Any, literal: str) -> None:
+        require(
+            type(value) is str and value.isascii() and value.lower() == literal.lower(),
+            "GHCR_expected_identity",
+        )
+
+    repo_owner = repository.get("owner")
+    package_owner, linked_repository = package.get("owner"), package.get("repository")
+    if type(repo_owner) is not dict:
+        raise QualificationError("GHCR_identity_objects")
+    if type(package_owner) is not dict:
+        raise QualificationError("GHCR_identity_objects")
+    if type(linked_repository) is not dict:
+        raise QualificationError("GHCR_identity_objects")
+    repo_id, owner_id, package_id = (
+        positive(repository.get("id")),
+        positive(repo_owner.get("id")),
+        positive(package.get("id")),
+    )
+    expected(repository.get("full_name"), GHCR_REPOSITORY)
+    expected(repo_owner.get("login"), GHCR_OWNER)
+    expected(package_owner.get("login"), GHCR_OWNER)
+    expected(linked_repository.get("full_name"), GHCR_REPOSITORY)
+    require(
+        positive(package_owner.get("id")) == owner_id
+        and positive(linked_repository.get("id")) == repo_id,
+        "GHCR_cross_ID",
+    )
+    require(
+        package.get("name") == GHCR_PACKAGE
+        and package.get("package_type") == "container"
+        and package.get("visibility") == "public",
+        "GHCR_package_properties",
+    )
+    return {
+        "repository": {"id": repo_id, "full_name": GHCR_REPOSITORY},
+        "owner": {"id": owner_id, "login": GHCR_OWNER},
+        "package": {
+            "id": package_id,
+            "name": GHCR_PACKAGE,
+            "package_type": "container",
+            "visibility": "public",
+            "source_repository_id": repo_id,
+        },
+    }
+
+
+def process_census(cap: float, known: tuple[bytes, ...]) -> dict[int, dict[str, Any]]:
+    check_deadline(cap)
+    observed = subprocess.run(
+        ["/bin/ps", "-axo", "pid,ppid,pgid,uid,lstart,state,comm"],
+        capture_output=True,
+        env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+        timeout=min(1, max(0.001, cap - time.monotonic())),
+        check=False,
+    )  # nosec B603 # B603: fixed /bin/ps ownership census with closed argv, minimal environment and bounded timeout (remove-by: 2026-11-11, ref: PR-2494)
+    require(
+        observed.returncode == 0
+        and len(observed.stdout) + len(observed.stderr) <= GHCR_OUTPUT_LIMIT,
+        "GHCR_process_census",
+    )
+    require(
+        all(value not in observed.stdout and value not in observed.stderr for value in known),
+        "GHCR_credential_reflection_HOLD",
+    )
+    rows: dict[int, dict[str, Any]] = {}
+    for line in observed.stdout.decode("utf-8", errors="strict").splitlines()[1:]:
+        fields = line.split(None, 10)
+        require(len(fields) == 11, "GHCR_process_census_row")
+        pid, ppid, pgid, uid = (int(value) for value in fields[:4])
+        require(pid > 0 and pid not in rows, "GHCR_process_census_identity")
+        rows[pid] = {
+            "pid": pid,
+            "ppid": ppid,
+            "pgid": pgid,
+            "uid": uid,
+            "start": " ".join(fields[4:9]),
+            "state": fields[9],
+            "comm": fields[10],
+        }
+    return rows
+
+
+def process_identity(row: dict[str, Any]) -> tuple[Any, ...]:
+    return (row["pid"], row["pgid"], row["uid"], row["start"], row["comm"])
+
+
+def owned_members(
+    process: subprocess.Popen[bytes],
+    seen: dict[int, tuple[Any, ...]],
+    cap: float,
+    known: tuple[bytes, ...],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if not seen:
+        rows = process_census(cap, known)
+        require(
+            not any(row["pgid"] == process.pid for row in rows.values())
+            and process.poll() is not None,
+            "GHCR_owned_group_unverified",
+        )
+        return [], []
+    process.poll()
+    rows = process_census(cap, known)
+    leader = rows.get(process.pid)
+    if leader is not None and process_identity(leader) != seen.get(process.pid):
+        # An exited direct child can have a transient kernel comm before reap.
+        # Native wait/absence resolves it; a live changed identity still rejects.
+        try:
+            process.wait(timeout=min(0.05, max(0.001, cap - time.monotonic())))
+        except subprocess.TimeoutExpired:
+            pass
+        if process.returncode is not None:
+            rows = process_census(cap, known)
+    live = {
+        pid
+        for pid, identity in seen.items()
+        if pid in rows and process_identity(rows[pid]) == identity
+    }
+    while True:
+        children = {
+            pid for pid, row in rows.items() if row["ppid"] in live and row["uid"] == os.getuid()
+        } - live
+        if not children:
+            break
+        for pid in children:
+            seen[pid] = process_identity(rows[pid])
+        live |= children
+    group = [row for row in rows.values() if row["pgid"] == process.pid]
+    active = [row for row in group if not row["state"].startswith("Z")]
+    require(
+        all(row["pid"] in live and row["uid"] == os.getuid() for row in active),
+        "GHCR_unknown_or_reused_group_member",
+    )
+    return group, active
+
+
+def cleanup_process(
+    process: subprocess.Popen[bytes] | None,
+    seen: dict[int, tuple[Any, ...]],
+    cap: float,
+    known: tuple[bytes, ...],
+) -> None:
+    if process is None:
+        return
+    process.poll()
+    for signum in (signal.SIGTERM, signal.SIGKILL):
+        _group, active = owned_members(process, seen, cap, known)
+        if not active:
+            break
+        os.killpg(process.pid, signum)
+        wait_until = min(cap, time.monotonic() + 5)
+        while time.monotonic() < wait_until:
+            process.poll()
+            # Reuse the canonical live-identity predicate, including during drain.
+            if not owned_members(process, seen, cap, known)[1]:
+                break
+            time.sleep(0.05)
+    while time.monotonic() < cap:
+        if not owned_members(process, seen, cap, known)[1]:
+            break
+        time.sleep(0.05)
+    require(
+        not owned_members(process, seen, cap, known)[1],
+        "GHCR_owned_group_cleanup_absence",
+    )
+    for stream in (process.stdin, process.stdout, process.stderr):
+        if stream is not None:
+            stream.close()
+
+
+def witness_owned_process(
+    process: subprocess.Popen[bytes],
+    seen: dict[int, tuple[Any, ...]],
+    cap: float,
+    known: tuple[bytes, ...],
+) -> None:
+    # Capture the actual own-child identity before poll/wait can reap its leader.
+    seen.clear()
+    rows = process_census(cap, known)
+    row = rows.get(process.pid)
+    if row is None:
+        require(
+            not any(value["pgid"] == process.pid for value in rows.values())
+            and process.poll() is not None,
+            "GHCR_owned_group_unverified",
+        )
+        return
+    require(
+        row["ppid"] == os.getpid() and row["pgid"] == process.pid and row["uid"] == os.getuid(),
+        "GHCR_owned_group_unverified",
+    )
+    seen[process.pid] = process_identity(row)
+    owned_members(process, seen, cap, known)
+
+
+def qualify_existing_ghcr_package(
+    work: Path, public: Path, seconds: int, cleanup: int
+) -> dict[str, Any]:
+    """Exactly one auth status and two fixed API commands, with memory-first output capture."""
+    global CLEANING
+    require(not INTERRUPTIONS, "GHCR_interrupted")
+    require(
+        type(seconds) is int and 0 < seconds <= 90 and type(cleanup) is int and 0 < cleanup <= 30,
+        "GHCR_budget",
+    )
+    require(
+        os.environ.get("GITHUB_ACTIONS") == "true" and os.environ.get("RUNNER_OS") == "Linux",
+        "GHCR_hosted_only",
+    )
+    require(
+        os.environ.get("GITHUB_REPOSITORY") == GHCR_REPOSITORY
+        and os.environ.get("GITHUB_JOB") == "prometheus-ghcr-package-qualification",
+        "GHCR_job_context",
+    )
+    run, attempt, head = (
+        os.environ.get(key, "") for key in ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_SHA")
+    )
+    require(
+        re.fullmatch(r"[1-9][0-9]{0,19}", run) is not None
+        and attempt == "1"
+        and re.fullmatch(r"[0-9a-f]{40}", head) is not None,
+        "GHCR_run_context",
+    )
+    runner = Path(os.environ.get("RUNNER_TEMP", ""))
+    real_directory(runner)
+    require(
+        work == runner / ("ghcr-private-" + run + "-" + attempt)
+        and public == runner / ("ghcr-public-" + run + "-" + attempt) / "qualification.json",
+        "GHCR_output_coordinates",
+    )
+    require(not public.parent.exists() and not public.parent.is_symlink(), "GHCR_public_not_fresh")
+    credential = os.environ.get("GH_TOKEN")
+    if type(credential) is not str or not credential:
+        raise QualificationError("GHCR_step_credential_missing")
+    known = credential.encode("utf-8", errors="strict")
+    gh = shutil.which("gh")
+    if gh is None or not Path(gh).is_absolute():
+        raise QualificationError("GHCR_native_missing")
+    private = [work / name for name in ("home", "config", "cache", "tmp")]
+    identities: dict[Path, tuple[int, int]] = {}
+    environment = {
+        "PATH": "/usr/bin:/bin",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "GH_HOST": "github.com",
+        "GH_TOKEN": credential,
+        "GH_PROMPT_DISABLED": "1",
+        "GH_PAGER": "cat",
+        "PAGER": "cat",
+        "GH_NO_UPDATE_NOTIFIER": "1",
+        "GH_NO_EXTENSION_UPDATE_NOTIFIER": "1",
+        "GH_TELEMETRY": "0",
+        "DO_NOT_TRACK": "1",
+        "HOME": str(private[0]),
+        "GH_CONFIG_DIR": str(private[1]),
+        "XDG_CONFIG_HOME": str(private[1]),
+        "XDG_CACHE_HOME": str(private[2]),
+        "TMPDIR": str(private[3]),
+    }
+    deadline = time.monotonic() + seconds
+    cleanup_deadline: float | None = None
+    process: subprocess.Popen[bytes] | None = None
+
+    def begin_cleanup() -> float:
+        nonlocal cleanup_deadline
+        if cleanup_deadline is None:
+            cleanup_deadline = min(deadline + cleanup, time.monotonic() + cleanup)
+        return cleanup_deadline
+
+    seen: dict[int, tuple[Any, ...]] = {}
+
+    def capture(argv: list[str]) -> bytes:
+        nonlocal process
+        check_deadline(deadline)
+        streams = [bytearray(), bytearray()]
+        # This fixed seam deliberately does not call Native.run or serialize environment/raw output.
+        process = subprocess.Popen(
+            argv,
+            cwd=work,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )  # nosec B603 # B603: dedicated absolute gh qualification with fixed requests, private credentials and bounded capture (remove-by: 2026-11-11, ref: PR-2494)
+        if process.stdout is None or process.stderr is None:
+            raise QualificationError("GHCR_capture_streams_missing")
+        witness_owned_process(process, seen, deadline, (known,))
+        try:
+            with selectors.DefaultSelector() as selector:
+                for index, stream in enumerate((process.stdout, process.stderr)):
+                    os.set_blocking(stream.fileno(), False)
+                    selector.register(stream, selectors.EVENT_READ, index)
+                while selector.get_map():
+                    check_deadline(deadline)
+                    owned_members(process, seen, deadline, (known,))
+                    for key, _ in selector.select(min(0.1, max(0, deadline - time.monotonic()))):
+                        block = os.read(key.fd, 65536)
+                        if not block:
+                            selector.unregister(key.fileobj)
+                        else:
+                            require(
+                                sum(map(len, streams)) + len(block) <= GHCR_OUTPUT_LIMIT,
+                                "GHCR_native_output_bound",
+                            )
+                            streams[key.data].extend(block)
+        except BaseException:
+            require(
+                all(known not in bytes(stream) for stream in streams),
+                "GHCR_credential_reflection_HOLD",
+            )
+            raise
+        code = process.wait(timeout=max(0.001, deadline - time.monotonic()))
+        process.stdout.close()
+        process.stderr.close()
+        require(
+            all(known not in bytes(stream) for stream in streams), "GHCR_credential_reflection_HOLD"
+        )
+        require(
+            not owned_members(process, seen, deadline, (known,))[1], "GHCR_owned_group_survived"
+        )
+        exit_code = "GHCR_native_exit_" + ("signal_" + str(-code) if code < 0 else str(code))
+        if code != 0 and argv[1] == "api":
+            try:
+                ghcr_response(bytes(streams[0]))
+            except (QualificationError, ValueError, UnicodeError) as error:
+                raise QualificationError(
+                    exit_code + "_" + (diagnostic_code(error) or type(error).__name__)
+                ) from None
+        require(code == 0, exit_code)
+        process = None
+        return bytes(streams[0])
+
+    primary: BaseException | None = None
+    cleanup_error: BaseException | None = None
+    result: dict[str, Any] | None = None
+    try:
+        for directory in [work, *private]:
+            fresh_directory(directory)
+            info = directory.lstat()
+            identities[directory] = (info.st_dev, info.st_ino)
+        capture([gh, "auth", "status", "--hostname", "github.com"])
+        responses = [
+            ghcr_response(
+                capture(
+                    [
+                        gh,
+                        "api",
+                        "--hostname",
+                        "github.com",
+                        "--method",
+                        "GET",
+                        "--include",
+                        "-H",
+                        "Accept:application/vnd.github+json",
+                        endpoint,
+                    ]
+                )
+            )
+            for endpoint in GHCR_REQUESTS
+        ]
+        identity = ghcr_identity(responses[0][1], responses[1][1])
+        result = {
+            "purpose": "One existing GHCR package identity observation only",
+            "qualified": True,
+            "observed_utc": datetime.now(timezone.utc).isoformat(),
+            "source_head": head,
+            "run_id": int(run),
+            "run_attempt": 1,
+            "job": "prometheus-ghcr-package-qualification",
+            "native_auth_exit": 0,
+            "requests": [
+                {"path": endpoint, "native_exit": 0, "HTTP_status": response[0]}
+                for endpoint, response in zip(GHCR_REQUESTS, responses, strict=True)
+            ],
+            "repository": identity["repository"],
+            "owner": identity["owner"],
+            "package": identity["package"],
+        }
+    except BaseException as error:
+        primary = error
+    finally:
+        cap = begin_cleanup()
+        CLEANING = True
+        try:
+            cleanup_process(process, seen, cap, (known,))
+            if work in identities:
+                require(
+                    set(work.iterdir()) == set(identities) - {work}, "GHCR_private_members_changed"
+                )
+            for directory in reversed(identities):
+                check_deadline(cap)
+                info = directory.lstat()
+                require(
+                    stat.S_ISDIR(info.st_mode)
+                    and info.st_uid == os.getuid()
+                    and stat.S_IMODE(info.st_mode) == 0o700
+                    and (info.st_dev, info.st_ino) == identities[directory],
+                    "GHCR_private_directory_identity",
+                )
+                directory.rmdir()
+            require(not work.exists() and not work.is_symlink(), "GHCR_private_cleanup_absence")
+        except BaseException as error:
+            cleanup_error = error
+        finally:
+            CLEANING = False
+    if primary is not None:
+        if cleanup_error is not None:
+            print(
+                "GHCR cleanup also failed:"
+                + (diagnostic_code(cleanup_error) or type(cleanup_error).__name__),
+                file=sys.stderr,
+            )
+        raise primary
+    require(cleanup_error is None, "GHCR_cleanup_failed")
+    require(not INTERRUPTIONS, "GHCR_interrupted")
+    if result is None:
+        raise QualificationError("GHCR_result_missing")
+    encoded = (json.dumps(result, sort_keys=True, indent=2) + "\n").encode()
+    require(known not in encoded and len(encoded) <= 16384, "GHCR_public_projection_HOLD")
+    check_deadline(cap)
+    fresh_directory(public.parent)
+    descriptor = os.open(public, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "wb") as stream:
+        stream.write(encoded)
+    return result
+
+
+def canonical_data(value: Any) -> bytes:
+    """Canonicalize declared data only; executable producer bytes stay raw."""
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+
+
+def one_object(raw: bytes) -> dict[str, Any]:
+    objects = decode_objects(raw)
+    require(len(objects) == 1, "exact_one_JSON_object")
+    return objects[0]
+
+
+def exact_data(actual: Any, expected: Any) -> None:
+    require(type(actual) is type(expected), "declared_data_type")
+    if type(expected) is dict:
+        require(set(actual) == set(expected), "declared_data_keys")
+        for key, value in expected.items():
+            exact_data(actual[key], value)
+    elif type(expected) is list:
+        require(len(actual) == len(expected), "declared_data_length")
+        for left, right in zip(actual, expected, strict=True):
+            exact_data(left, right)
+    else:
+        require(actual == expected, "declared_data_value")
+
+
+# Content identities are distinct from the daemon's image and container operands.
+_NATIVE_BASE_MANIFEST_SIZE = 2864
+_NATIVE_HISTORICAL_BASE_DIFF_IDS = [
+    "sha256:9486261b5a13f63ca6904b36721527ac8f19df53d300560138d69ae9b4c203de",
+    "sha256:621c35e751a51a9a9dc3e80aa0b7fe8be2a93402ea6ccd307d30852cd7776cda",
+    "sha256:763a77745f27b86cf26b97887b6842d83720e63b1c48848c0ba9ee54e351d63a",
+    "sha256:f0d0eff4c2312a7bd6e21797bdfea5eb35f60e76b555ce2b22794424af2cad36",
+    "sha256:275a30dd8ce958b21daa9ad962c6fbc09f98306ee2f486b65c9075dc257b1412",
+    "sha256:4d049f83d9cf21d1f5cc0e11deaf36df02790d0e60c1a3829538fb4b61685368",
+    "sha256:af5aa97ebe6ce1604747ec1e21af7136ded391bcabe4acef882e718a87c86bcc",
+    "sha256:6f1cdceb6a3146f0ccb986521156bef8a422cdbb0863396f7f751f575ba308f4",
+    "sha256:bd3cdfae1d3fdd83a2231d608969b38b82349777c2fff9a7c12d54f8ac5c9b38",
+    "sha256:4cde6b0bb6f50a5f255eef7b2a42162c661cf776b803225dcac9a659e396bb6b",
+    "sha256:ad51d0769d16ba578106a177987dfe3d2e02c1668c852b795b2f6b024068242a",
+    "sha256:187cfc6d1e3e8a40a5e64653bcd3239c140807dcf1c09e48021178705a5a6139",
+    "sha256:f2392a9484bf6b18f06beaf705b994e31dbb2716c99cf7d03c9c495cd107f364",
+]
+_NATIVE_GO_INDEX = "sha256:0525c952defebc693cdaf62cdf43afa32be5a7f377e99260642ea19c240c708e"
+_NATIVE_GO_MANIFEST = "sha256:9d1e2c4fda593efb2c405e1c855c75ec17fe42dc02f6b7142a5ea7af7f386bf4"
+_NATIVE_GO_CONFIG = "sha256:c3b115201bc73f32bec28694395c415387ba16e1068e9f1c1ac4971db9ba20df"
+_NATIVE_GO_DIFF_IDS = [
+    "sha256:54ea9baa1bbd7651dbda5c61569dad60fa601c73e5b784e154e8ba0f314e84fd",
+    "sha256:93b494d131b8f63f5b27e2dc65f28c90a5af5a99a60c2fa63d6f5548fe582e9d",
+    "sha256:a3d0eb5960971c8a8822f904fcb5d504055279767de489edaec0a50ab9c0f2d7",
+    "sha256:9ddd0f534847de5d0718677fa9f94ba7106c45594305edc5e1f612fc87397d71",
+    "sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef",
+]
+_NATIVE_GO_ANNOTATIONS = {
+    "com.docker.official-images.bashbrew.arch": "amd64",
+    "org.opencontainers.image.base.digest": "sha256:3d67941fed5ae436b2bb9791cb3f50a252441c7706bbc5b4e738936df8ff8306",
+    "org.opencontainers.image.base.name": "alpine:3.23",
+    "org.opencontainers.image.created": "2026-10-21T21:25:10Z",
+    "org.opencontainers.image.revision": "650cf2f338d22da87df8c773cfc88afa26699502",
+    "org.opencontainers.image.source": "https://github.com/docker-library/golang.git#650cf2f338d22da87df8c773cfc88afa26699502:1.26/alpine3.23",
+    "org.opencontainers.image.url": "https://hub.docker.com/_/golang",
+    "org.opencontainers.image.version": "1.26.10-alpine3.23",
+}
+
+
+# Exact supplier12611 DATA; Native Docker owns the content/native correspondence.
+_CURRENT_NATIVE_GO_SOURCE = "golang:1.26.11-alpine3.23@sha256:db99415e2625ce0ee03eed09edf7f32ae8c58dc399f28cc602a87fe7238119e4"
+_CURRENT_NATIVE_GO_INDEX = "sha256:db99415e2625ce0ee03eed09edf7f32ae8c58dc399f28cc602a87fe7238119e4"
+_CURRENT_NATIVE_GO_MANIFEST = (
+    "sha256:6fa4e6dc2fc42920e53eb6b6a7e928155dc68282060f0901ec3cdd134c3a0eb5"
+)
+_CURRENT_NATIVE_GO_CONFIG = {
+    "mediaType": "application/vnd.oci.image.config.v1+json",
+    "digest": "sha256:7112a03fdc0b65a29119dce314aea166996eda5719399bf90b9cab54f369e8a6",
+    "size": 2195,
+}
+_CURRENT_NATIVE_GO_LAYERS = [
+    {
+        "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+        "digest": "sha256:74c614fb2c68574f50c582dcc9c18c46618bd6ff2019768190aacfb861ce51d2",
+        "size": 3852589,
+    },
+    {
+        "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+        "digest": "sha256:381c5390af1396a766b47955369d41eb08f5e8287bfa1fa6d7a14f5e62f0395e",
+        "size": 244455,
+    },
+    {
+        "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+        "digest": "sha256:6dbc954da649613d4c282586205a0e44ab2d9d17be5dfde8d18d13f7461fad21",
+        "size": 67419428,
+    },
+    {
+        "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+        "digest": "sha256:740ff3bddbeff762232a2e9e7c72e7f7ab3de22d471c5108d3025ab27b1efcb5",
+        "size": 125,
+    },
+    {
+        "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+        "digest": "sha256:4f4fb700ef54461cfa02571ae0db9a0dc1e0cdb5577484a6d75e68dc38e8acc1",
+        "size": 32,
+    },
+]
+_CURRENT_NATIVE_GO_ANNOTATIONS = {
+    "com.docker.official-images.bashbrew.arch": "amd64",
+    "org.opencontainers.image.base.digest": "sha256:644c1ad8fc45cc581ab1b5ea7ec1bebc9b037fd4801ad697ca124deb3f9c9332",
+    "org.opencontainers.image.base.name": "alpine:3.23",
+    "org.opencontainers.image.created": "2026-11-10T18:21:13Z",
+    "org.opencontainers.image.revision": "f66ba4e64dfbab452b77f8ae045428aacadc24a2",
+    "org.opencontainers.image.source": "https://github.com/docker-library/golang.git#f66ba4e64dfbab452b77f8ae045428aacadc24a2:1.26/alpine3.23",
+    "org.opencontainers.image.url": "https://hub.docker.com/_/golang",
+    "org.opencontainers.image.version": "1.26.11-alpine3.23",
+}
+_CURRENT_NATIVE_GO_DIFF_IDS = [
+    "sha256:7900194cf2429d4e860306cd85f7b1d04154ef522ab603ff058bd8221b0cee62",
+    "sha256:b0abdc08268cedb7846fbe64793ae2f6e743d45275bf933b7afcd67864cb6ff5",
+    "sha256:b9757dc9f68b118b80b08e11b4b5b47178d7ba07e555dc4b78ea39dd433a2a3d",
+    "sha256:9ae87daf88b9eae5f5fe52dde4181d6d57db951194b7daead8f7389a8c8f883c",
+    "sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef",
+]
+_CURRENT_NATIVE_GO_CONFIG_FIELDS = {
+    "Env": [
+        "PATH=/go/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "GOLANG_VERSION=1.26.11",
+        "GOTOOLCHAIN=local",
+        "GOPATH=/go",
+    ],
+    "Cmd": ["/bin/sh"],
+    "WorkingDir": "/go",
+}
+
+
+# Exact native defaults observed for the current supplier tuple in classic Docker storage.
+_CURRENT_NATIVE_GO_CLASSIC_DEFAULTS = {
+    "AttachStderr": False,
+    "AttachStdin": False,
+    "AttachStdout": False,
+    "Domainname": "",
+    "Entrypoint": None,
+    "Hostname": "",
+    "Image": "",
+    "Labels": None,
+    "OnBuild": None,
+    "OpenStdin": False,
+    "StdinOnce": False,
+    "Tty": False,
+    "User": "",
+    "Volumes": None,
+}
+
+
+def native_one_image(raw: bytes) -> dict[str, Any]:
+    """One complete Docker inspect array; Go's JSON object stream is not this carrier."""
+    require(0 < len(raw) <= MAX_NATIVE_OUTPUT, "native_image_JSON_size")
+    value = json.loads(
+        raw.decode("utf-8"), object_pairs_hook=unique_object, parse_constant=reject_constant
+    )
+    require(
+        type(value) is list and len(value) == 1 and type(value[0]) is dict, "native_image_exact_one"
+    )
+    return cast(dict[str, Any], value[0])
+
+
+def _native_descriptor(
+    value: Any, core: dict[str, Any], *, platform: bool, annotations: bool = False
+) -> None:
+    required = {"mediaType", "digest", "size"} | ({"platform"} if platform else set())
+    require(
+        type(value) is dict
+        and set(value) in (required, required | {"annotations"} if annotations else required),
+        "native_descriptor_role_keys",
+    )
+    exact_data({key: value[key] for key in core}, core)
+    if platform:
+        exact_data(value["platform"], {"architecture": "amd64", "os": "linux"})
+    if "annotations" in value:
+        exact_data(value["annotations"], _NATIVE_GO_ANNOTATIONS)
+
+
+def native_base_identity(image: dict[str, Any], *, current: bool = True) -> dict[str, Any]:
+    """Only the independently pinned current/historical distroless base content."""
+    require(type(current) is bool and type(image) is dict, "native_base_epoch")
+    manifest = BASE.split("@", 1)[1] if current else HISTORICAL_BASE.split("@", 1)[1]
+    config = BASE_CONFIG if current else HISTORICAL_BASE_CONFIG
+    reference = BASE if current else HISTORICAL_BASE
+    diff_ids = (
+        [row["diff_id"] for row in BASE_LAYER_CONTRACTS]
+        if current
+        else _NATIVE_HISTORICAL_BASE_DIFF_IDS
+    )
+    require(
+        (image.get("Os"), image.get("Architecture")) == ("linux", "amd64"), "native_base_platform"
+    )
+    exact_data(image.get("RootFS"), {"Type": "layers", "Layers": diff_ids})
+    digests = image.get("RepoDigests")
+    require(
+        type(digests) is list
+        and all(type(v) is str for v in digests)
+        and digests.count(reference) == 1,
+        "native_base_repository",
+    )
+    cfg = image.get("Config")
+    require(
+        type(cfg) is dict and cfg.get("Volumes") in (None, {}) and cfg.get("OnBuild") in (None, []),
+        "native_base_config",
+    )
+    cfg = cast(dict[str, Any], cfg)
+    require(
+        cfg.get("User") == "65532"
+        and cfg.get("WorkingDir") == "/home/nonroot"
+        and cfg.get("Cmd") in (None, [])
+        and cfg.get("Entrypoint") in (None, []),
+        "native_base_runtime_config",
+    )
+    exact_data(
+        cfg.get("Env"),
+        [
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt",
+        ],
+    )
+    core = {"mediaType": OCI_MANIFEST, "digest": manifest, "size": _NATIVE_BASE_MANIFEST_SIZE}
+    engine = image.get("Id")
+    if engine == config:
+        if "Descriptor" in image:
+            require(current, "historical_descriptor_unqualified")
+            _native_descriptor(image["Descriptor"], core, platform=False)
+        representation = "config"
+    else:
+        require(current and engine == manifest, "native_base_engine_relation")
+        _native_descriptor(image.get("Descriptor"), core, platform=False)
+        representation = "manifest"
+    return {
+        "profile": "base-current" if current else "base-historical",
+        "representation": representation,
+        "engine_id": engine,
+        "operand": engine,
+        "config_digest": config,
+        "requested_root": reference,
+        "manifest": core if current else None,
+    }
+
+
+def native_go_identity(
+    image: dict[str, Any],
+    index_raw: bytes,
+    manifest_raw: bytes,
+    *,
+    indexed: bool = False,
+    expected_source: str | None = None,
+) -> dict[str, Any]:
+    """Exact qualified Go0525 platform-pull/M-create profile, never arbitrary compiler input."""
+    require(
+        expected_source is None or type(expected_source) is str, "native_Go_expected_source_type"
+    )
+    if expected_source == _CURRENT_NATIVE_GO_SOURCE:
+        require(type(indexed) is bool and not indexed, "native_Go_current_operand_role")
+        require(
+            type(index_raw) is bytes
+            and len(index_raw) == 9026
+            and "sha256:" + sha(index_raw) == _CURRENT_NATIVE_GO_INDEX
+            and type(manifest_raw) is bytes
+            and len(manifest_raw) == 1922
+            and "sha256:" + sha(manifest_raw) == _CURRENT_NATIVE_GO_MANIFEST,
+            "native_Go_current_content_roots",
+        )
+        index, manifest = one_object(index_raw), one_object(manifest_raw)
+        require(
+            set(index) == {"schemaVersion", "mediaType", "manifests"},
+            "native_Go_current_index_shape",
+        )
+        exact_data(index["schemaVersion"], 2)
+        exact_data(index["mediaType"], "application/vnd.oci.image.index.v1+json")
+        require(type(index["manifests"]) is list, "native_Go_current_index_members")
+        platform = {"architecture": "amd64", "os": "linux"}
+        selected = [
+            row
+            for row in index["manifests"]
+            if type(row) is dict and row.get("platform") == platform
+        ]
+        require(len(selected) == 1, "native_Go_current_one_platform")
+        core = {"mediaType": OCI_MANIFEST, "digest": _CURRENT_NATIVE_GO_MANIFEST, "size": 1922}
+        exact_data(
+            selected[0],
+            {**core, "platform": platform, "annotations": _CURRENT_NATIVE_GO_ANNOTATIONS},
+        )
+        require(
+            set(manifest) == {"schemaVersion", "mediaType", "config", "layers", "annotations"},
+            "native_Go_current_manifest_shape",
+        )
+        exact_data(manifest["schemaVersion"], 2)
+        exact_data(manifest["mediaType"], OCI_MANIFEST)
+        exact_data(_descriptor(manifest["config"], OCI_CONFIG), _CURRENT_NATIVE_GO_CONFIG)
+        require(
+            type(manifest["layers"]) is list and len(manifest["layers"]) == 5,
+            "native_Go_current_layers",
+        )
+        for layer in manifest["layers"]:
+            _descriptor(layer, "application/vnd.oci.image.layer.v1.tar+gzip")
+        exact_data(manifest["layers"], _CURRENT_NATIVE_GO_LAYERS)
+        exact_data(manifest["annotations"], _CURRENT_NATIVE_GO_ANNOTATIONS)
+        require(type(image) is dict, "native_Go_current_image")
+        exact_data([image.get("Os"), image.get("Architecture")], ["linux", "amd64"])
+        exact_data(image.get("RootFS"), {"Type": "layers", "Layers": _CURRENT_NATIVE_GO_DIFF_IDS})
+        exact_data(image.get("RepoDigests"), ["golang@" + _CURRENT_NATIVE_GO_MANIFEST])
+        engine = image.get("Id")
+        if engine == _CURRENT_NATIVE_GO_CONFIG["digest"]:
+            exact_data(
+                image.get("Config"),
+                {**_CURRENT_NATIVE_GO_CONFIG_FIELDS, **_CURRENT_NATIVE_GO_CLASSIC_DEFAULTS},
+            )
+            require("Descriptor" not in image, "native_Go_current_classic_descriptor")
+            representation = "config"
+        else:
+            exact_data(engine, _CURRENT_NATIVE_GO_MANIFEST)
+            exact_data(image.get("Config"), _CURRENT_NATIVE_GO_CONFIG_FIELDS)
+            exact_data(image.get("Descriptor"), core)
+            representation = "manifest"
+        return {
+            "profile": "go12611-platform",
+            "representation": representation,
+            "engine_id": engine,
+            "operand": engine,
+            "config_digest": _CURRENT_NATIVE_GO_CONFIG["digest"],
+            "requested_root": "golang@" + _CURRENT_NATIVE_GO_MANIFEST,
+            "manifest": core,
+        }
+    require(
+        expected_source is None
+        or expected_source == "golang:1.26.10-alpine3.23@" + _NATIVE_GO_INDEX,
+        "native_Go_expected_source_join",
+    )
+    require(type(indexed) is bool, "native_Go_operand_role")
+    require(
+        "sha256:" + sha(index_raw) == _NATIVE_GO_INDEX
+        and "sha256:" + sha(manifest_raw) == _NATIVE_GO_MANIFEST,
+        "native_Go_content_roots",
+    )
+    require(len(manifest_raw) == 1922, "native_Go_manifest_size")
+    index, manifest = one_object(index_raw), one_object(manifest_raw)
+    require(set(index) == {"schemaVersion", "mediaType", "manifests"}, "native_Go_index_shape")
+    exact_data(index["mediaType"], "application/vnd.oci.image.index.v1+json")
+    require(type(index.get("manifests")) is list, "native_Go_index_members")
+    exact_data(index.get("schemaVersion"), 2)
+    selected = [
+        row
+        for row in index["manifests"]
+        if type(row) is dict and row.get("platform") == {"architecture": "amd64", "os": "linux"}
+    ]
+    require(len(selected) == 1, "native_Go_one_platform")
+    core = {"mediaType": OCI_MANIFEST, "digest": _NATIVE_GO_MANIFEST, "size": 1922}
+    _native_descriptor(selected[0], core, platform=True, annotations=True)
+    require(
+        selected[0].get("annotations") == _NATIVE_GO_ANNOTATIONS, "native_Go_source_annotations"
+    )
+    exact_data(manifest.get("schemaVersion"), 2)
+    exact_data(manifest.get("mediaType"), OCI_MANIFEST)
+    config = _descriptor(manifest.get("config"), OCI_CONFIG)
+    require(config["digest"] == _NATIVE_GO_CONFIG, "native_Go_config_content")
+    require(
+        type(manifest.get("layers")) is list and len(manifest["layers"]) == 5, "native_Go_layers"
+    )
+    for layer in manifest["layers"]:
+        _descriptor(layer, "application/vnd.oci.image.layer.v1.tar+gzip")
+    require(
+        type(image) is dict and (image.get("Os"), image.get("Architecture")) == ("linux", "amd64"),
+        "native_Go_platform",
+    )
+    exact_data(image.get("RootFS"), {"Type": "layers", "Layers": _NATIVE_GO_DIFF_IDS})
+    digests = image.get("RepoDigests")
+    require(
+        type(digests) is list
+        and all(type(v) is str for v in digests)
+        and digests.count("golang@" + (_NATIVE_GO_INDEX if indexed else _NATIVE_GO_MANIFEST)) == 1,
+        "native_Go_platform_repository",
+    )
+    cfg = image.get("Config")
+    require(
+        type(cfg) is dict and cfg.get("Volumes") in (None, {}) and cfg.get("OnBuild") in (None, []),
+        "native_Go_config",
+    )
+    cfg = cast(dict[str, Any], cfg)
+    require(
+        cfg.get("WorkingDir") == "/go"
+        and cfg.get("Cmd") == ["/bin/sh"]
+        and cfg.get("User") in (None, "")
+        and cfg.get("Entrypoint") in (None, []),
+        "native_Go_runtime_config",
+    )
+    exact_data(
+        cfg.get("Env"),
+        [
+            "PATH=/go/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "GOLANG_VERSION=1.26.10",
+            "GOTOOLCHAIN=local",
+            "GOPATH=/go",
+        ],
+    )
+    engine = image.get("Id")
+    if engine == _NATIVE_GO_CONFIG:
+        require(not indexed, "native_Go_classic_index_operand_unqualified")
+        if "Descriptor" in image:
+            _native_descriptor(image["Descriptor"], core, platform=False)
+        representation = "config"
+    else:
+        require(engine == _NATIVE_GO_MANIFEST, "native_Go_engine_relation")
+        _native_descriptor(image.get("Descriptor"), core, platform=indexed, annotations=indexed)
+        if indexed:
+            exact_data(image["Descriptor"].get("annotations"), _NATIVE_GO_ANNOTATIONS)
+        representation = "manifest"
+    return {
+        "profile": "go0525-index" if indexed else "go0525-platform",
+        "representation": representation,
+        "engine_id": engine,
+        "operand": ("golang:1.26.10-alpine3.23@" + _NATIVE_GO_INDEX) if indexed else engine,
+        "config_digest": _NATIVE_GO_CONFIG,
+        "requested_root": (
+            ("golang:1.26.10-alpine3.23@" + _NATIVE_GO_INDEX)
+            if indexed
+            else "golang@" + _NATIVE_GO_MANIFEST
+        ),
+        "manifest": core,
+    }
+
+
+def native_container_image_identity(
+    actual: dict[str, Any], relation: dict[str, Any], *, expected_source: str | None = None
+) -> None:
+    """Bind one declared create operand; descriptor roles are not whole-object aliases."""
+    require(
+        expected_source is None or type(expected_source) is str, "native_Go_expected_source_type"
+    )
+    if relation.get("profile") == "go12611-platform":
+        require(
+            expected_source == _CURRENT_NATIVE_GO_SOURCE, "native_container_current_source_join"
+        )
+        core = {"mediaType": OCI_MANIFEST, "digest": _CURRENT_NATIVE_GO_MANIFEST, "size": 1922}
+        representation = relation.get("representation")
+        require(representation in ("config", "manifest"), "native_container_current_representation")
+        operand = (
+            _CURRENT_NATIVE_GO_CONFIG["digest"]
+            if representation == "config"
+            else _CURRENT_NATIVE_GO_MANIFEST
+        )
+        exact_data(
+            relation,
+            {
+                "profile": "go12611-platform",
+                "representation": representation,
+                "engine_id": operand,
+                "operand": operand,
+                "config_digest": _CURRENT_NATIVE_GO_CONFIG["digest"],
+                "requested_root": "golang@" + _CURRENT_NATIVE_GO_MANIFEST,
+                "manifest": core,
+            },
+        )
+        require(
+            type(actual) is dict and type(actual.get("Config")) is dict,
+            "native_container_current_objects",
+        )
+        exact_data(actual.get("Image"), operand)
+        exact_data(actual["Config"].get("Image"), operand)
+        if representation == "config":
+            require(
+                "ImageManifestDescriptor" not in actual,
+                "native_container_current_classic_descriptor",
+            )
+        else:
+            exact_data(
+                actual.get("ImageManifestDescriptor"),
+                {**core, "platform": {"architecture": "amd64", "os": "linux"}},
+            )
+        return
+    require(
+        expected_source is None
+        or expected_source == "golang:1.26.10-alpine3.23@" + _NATIVE_GO_INDEX,
+        "native_container_expected_source_join",
+    )
+    profile = relation.get("profile")
+    require(
+        profile in ("base-current", "base-historical", "go0525-platform", "go0525-index"),
+        "native_container_profile",
+    )
+    if profile == "base-historical":
+        require(
+            relation.get("representation") == "config"
+            and relation.get("requested_root") == HISTORICAL_BASE
+            and relation.get("config_digest") == HISTORICAL_BASE_CONFIG
+            and relation.get("manifest") is None
+            and relation.get("engine_id") == relation.get("operand") == HISTORICAL_BASE_CONFIG
+            and actual.get("Image") == HISTORICAL_BASE_CONFIG
+            and actual.get("Config", {}).get("Image") == HISTORICAL_BASE_CONFIG
+            and "ImageManifestDescriptor" not in actual,
+            "historical_native_config_operand",
+        )
+        return
+    expected_root = (
+        BASE
+        if profile == "base-current"
+        else (
+            "golang@" + _NATIVE_GO_MANIFEST
+            if profile == "go0525-platform"
+            else "golang:1.26.10-alpine3.23@" + _NATIVE_GO_INDEX
+        )
+    )
+    require(relation.get("requested_root") == expected_root, "native_container_requested_root")
+    core = relation["manifest"]
+    expected_config = (
+        _NATIVE_GO_CONFIG
+        if profile in ("go0525-platform", "go0525-index")
+        else BASE_CONFIG if profile == "base-current" else HISTORICAL_BASE_CONFIG
+    )
+    expected_manifest = (
+        _NATIVE_GO_MANIFEST
+        if profile in ("go0525-platform", "go0525-index")
+        else (
+            BASE.split("@", 1)[1] if profile == "base-current" else HISTORICAL_BASE.split("@", 1)[1]
+        )
+    )
+    require(
+        relation["config_digest"] == expected_config and core["digest"] == expected_manifest,
+        "native_container_content_epoch",
+    )
+    exact_data(
+        core,
+        {
+            "mediaType": OCI_MANIFEST,
+            "digest": expected_manifest,
+            "size": (
+                1922
+                if profile in ("go0525-platform", "go0525-index")
+                else _NATIVE_BASE_MANIFEST_SIZE
+            ),
+        },
+    )
+    representation = relation.get("representation")
+    require(
+        representation in ("config", "manifest")
+        and not (profile == "base-historical" and representation == "manifest"),
+        "native_container_representation",
+    )
+    if profile == "go0525-index":
+        operand = "golang:1.26.10-alpine3.23@" + _NATIVE_GO_INDEX
+        require(
+            representation == "manifest"
+            and relation["engine_id"] == _NATIVE_GO_MANIFEST
+            and relation["operand"] == operand
+            and actual.get("Image") == _NATIVE_GO_INDEX
+            and actual.get("Config", {}).get("Image") == operand,
+            "native_Go_index_operand",
+        )
+        _native_descriptor(
+            actual.get("ImageManifestDescriptor"), core, platform=True, annotations=True
+        )
+        exact_data(actual["ImageManifestDescriptor"].get("annotations"), _NATIVE_GO_ANNOTATIONS)
+        return
+    operand = expected_config if representation == "config" else expected_manifest
+    require(
+        relation["operand"] == relation["engine_id"] == operand
+        and actual.get("Image") == operand
+        and type(actual.get("Config")) is dict
+        and actual["Config"].get("Image") == operand,
+        "native_container_operand",
+    )
+    if representation == "manifest" or "ImageManifestDescriptor" in actual:
+        require(profile != "base-historical", "historical_container_descriptor_unqualified")
+        _native_descriptor(
+            actual.get("ImageManifestDescriptor"),
+            core,
+            platform=True,
+            annotations=profile == "go0525-platform",
+        )
+
+
+def finite_recipe() -> bytes:
+    return (
+        "# Finite payload declaration; prometheus_source_image.py compares these exact bytes.\n"
+        "# This file is DATA. No Dockerfile frontend or build executor consumes it.\n"
+        f"FROM {BASE}\n"
+        "COPY prometheus /usr/bin/prometheus\nCOPY promtool /usr/bin/promtool\n"
+        "COPY prometheus.yml /etc/prometheus/prometheus.yml\nCOPY LICENSE /LICENSE\n"
+        "COPY NOTICE /NOTICE\nUSER 65532:65532\nWORKDIR /prometheus\n"
+        'ENTRYPOINT ["/bin/prometheus"]\n'
+        'CMD ["--config.file=/etc/prometheus/prometheus.yml","--storage.tsdb.path=/prometheus"]\n'
+    ).encode()
+
+
+def declared_inputs(
+    *,
+    historical_xnet060: bool = False,
+    compiler_artifact: Artifact | None = None,
+) -> dict[str, Any]:
+    compiler_artifact = Artifact.canonical(
+        CURRENT_GO if compiler_artifact is None else compiler_artifact
+    )
+    require(compiler_artifact.name == "go", "compiler_artifact_role")
+    return {
+        "source": {
+            "version": "3.15.0",
+            "revision": REVISION,
+            "tree": TREE,
+            "epoch": SOURCE_DATE_EPOCH,
+            "archive": SOURCE.__dict__,
+            "original_locks": LOCKS,
+            "derived_locks": XNET060_INCUMBENT_LOCKS if historical_xnet060 else DERIVED_LOCKS,
+        },
+        "go": {"archive": vars(compiler_artifact), "version": compiler_artifact.go_version},
+        "ui": {
+            "archive": UI.__dict__,
+            "checksums": CHECKSUMS.__dict__,
+            "files": UI_FILES,
+            "compression": "Python GzipFile filename-empty mtime0 level6 OS255",
+        },
+        "base": {
+            "runtime_ref": BASE,
+            "config_digest": BASE_CONFIG,
+            "root_media_type": OCI_MANIFEST,
+            "layers": BASE_LAYER_CONTRACTS,
+        },
+        "oras": {
+            "identity": "PulsePlate-rebuilt upstream ORAS; not the upstream release binary",
+            "version": "1.3.4",
+            "revision": ORAS_REVISION,
+            "tree": ORAS_TREE,
+            "source": ORAS_SOURCE.__dict__,
+            "canonical_inventory_sha256": ORAS_SOURCE_INVENTORY,
+            "raw_headers_sha256": ORAS_RAW_HEADERS,
+            "original_locks": ORAS_LOCKS,
+            "license_sha256": ORAS_LICENSE,
+            "compiler": compiler_artifact.go_version.split()[2] + " linux/amd64 CGO_ENABLED=0",
+            "command": ORAS_COMMAND,
+            "flags": [
+                "-mod=readonly",
+                "-p=1",
+                "-trimpath",
+                "-buildvcs=false",
+                "-ldflags=" + ORAS_METADATA,
+            ],
+            "retained": None,
+        },
+        "platform": "linux/amd64",
+        "recipe_sha256": sha(finite_recipe()),
+        "compiler": {
+            "user": "65532:65532",
+            "network": "none",
+            "CGO_ENABLED": "0",
+            "commands": ["./cmd/prometheus", "./cmd/promtool"],
+            "flags": ["-p=1", "-trimpath", "-buildvcs=false", "-tags=netgo,builtinassets"],
+            "ldflags": PROMETHEUS_METADATA,
+            "cache": "fresh-per-logical-image-build; shared only by its two named commands",
+            "maximum_seconds_each": 3600,
+            "total_serial_invocations": 2,
+            "automatic_retries": 0,
+        },
+    }
+
+
+def read_image_manifest(
+    path: Path,
+    *,
+    preparation: bool = False,
+    compiler_artifact: Artifact | None = None,
+) -> dict[str, Any]:
+    compiler_artifact = Artifact.canonical(
+        CURRENT_GO if compiler_artifact is None else compiler_artifact
+    )
+    require(compiler_artifact.name == "go", "compiler_artifact_role")
+    real_directory(path.parent)
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        before = os.fstat(descriptor)
+        require(
+            stat.S_ISREG(before.st_mode)
+            and before.st_nlink == 1
+            and 0 < before.st_size <= 64 * 1024,
+            "manifest_bounded_regular_leaf",
+        )
+        raw = os.read(descriptor, before.st_size + 1)
+        after, current = os.fstat(descriptor), path.lstat()
+        require(
+            len(raw) == before.st_size
+            and all(
+                getattr(before, key) == getattr(after, key) == getattr(current, key)
+                for key in (
+                    "st_dev",
+                    "st_ino",
+                    "st_mode",
+                    "st_size",
+                    "st_mtime_ns",
+                    "st_ctime_ns",
+                    "st_nlink",
+                )
+            ),
+            "manifest_read_changed",
+        )
+    finally:
+        os.close(descriptor)
+    value = one_object(raw)
+    require(
+        set(value) == {"schema", "phase", "inputs", "selection", "candidate"}, "image_manifest_keys"
+    )
+    require(value["schema"] == IMAGE_SCHEMA, "image_manifest_schema")
+    require(
+        type(value["inputs"]) is dict and type(value["inputs"].get("oras")) is dict,
+        "image_input_objects",
+    )
+    # Two exact data epochs; recognizing historical data grants no current stage.
+    historical = value["inputs"].get("source", {}).get("derived_locks") == XNET060_INCUMBENT_LOCKS
+    expected = declared_inputs(historical_xnet060=historical, compiler_artifact=compiler_artifact)
+    retained = value["inputs"]["oras"].get("retained")
+    if retained is not None:
+        validate_tool_coordinates(retained)
+        expected["oras"]["retained"] = retained
+    exact_data(value["inputs"], expected)
+    if value["phase"] == "source_prepared":
+        require(
+            preparation and value["selection"] is None and value["candidate"] is None,
+            "source_prepared_not_consumable",
+        )
+    else:
+        require(value["phase"] == "candidate_selected", "image_manifest_phase")
+        require(retained is not None, "candidate_requires_retained_tool")
+        validate_selection(value["selection"])
+        validate_candidate_coordinates(value["candidate"])
+    return value
+
+
+def validate_tool_coordinates(value: Any) -> None:
+    require(
+        type(value) is dict
+        and set(value)
+        == {
+            "source_head",
+            "run_id",
+            "artifact_id",
+            "artifact_name",
+            "artifact_digest",
+            "binary_sha256",
+            "binary_bytes",
+            "input_digest",
+        },
+        "tool_retained_keys",
+    )
+    require(
+        type(value["source_head"]) is str
+        and re.fullmatch(r"[0-9a-f]{40}", value["source_head"]) is not None,
+        "tool_source_head",
+    )
+    for name in ("run_id", "artifact_id", "binary_bytes"):
+        require(type(value[name]) is int and value[name] > 0, "tool_retained_positive_integer")
+    require(value["binary_bytes"] <= 64 * 1024**2, "tool_binary_bound")
+    require(value["artifact_name"] == f'prometheus-oras-{value["run_id"]}-1', "tool_artifact_name")
+    for name in ("artifact_digest", "input_digest"):
+        _digest(value[name])
+    require(
+        type(value["binary_sha256"]) is str
+        and re.fullmatch(r"[0-9a-f]{64}", value["binary_sha256"]) is not None,
+        "tool_binary_digest",
+    )
+
+
+def tool_input_projection(
+    root: Path,
+    *,
+    compiler_artifact: Artifact | None = None,
+) -> dict[str, Any]:
+    """The tool's own output coordinates are never inputs to that tool build."""
+    compiler_artifact = Artifact.canonical(
+        CURRENT_GO if compiler_artifact is None else compiler_artifact
+    )
+    require(compiler_artifact.name == "go", "compiler_artifact_role")
+    value = read_image_manifest(
+        root / "deploy/prometheus/image-manifest.json",
+        preparation=True,
+        compiler_artifact=compiler_artifact,
+    )
+    inputs = copy.deepcopy(value["inputs"])
+    inputs["oras"]["retained"] = None
+    return {
+        "inputs": inputs,
+        "raw_producer": {
+            name: {"bytes": (root / name).stat().st_size, "sha256": file_hash(root / name)}
+            for name in (
+                "scripts/ci/prometheus_source_image.py",
+                ".github/workflows/build.yml",
+                "deploy/prometheus/Containerfile",
+            )
+        },
+    }
+
+
+def producer_projection(
+    root: Path,
+    acquired: object,
+    *,
+    compiler_artifact: Artifact | None = None,
+) -> dict[str, Any]:
+    """No selection, artifact-output ID, wrapper head or timestamp is a build input."""
+    compiler_artifact = Artifact.canonical(
+        CURRENT_GO if compiler_artifact is None else compiler_artifact
+    )
+    require(compiler_artifact.name == "go", "compiler_artifact_role")
+    recipe = root / "deploy/prometheus/Containerfile"
+    require(recipe.read_bytes() == finite_recipe(), "finite_recipe_bytes")
+    paths = (
+        "scripts/ci/prometheus_source_image.py",
+        ".github/workflows/build.yml",
+        "deploy/prometheus/Containerfile",
+    )
+    manifest = read_image_manifest(
+        root / "deploy/prometheus/image-manifest.json",
+        preparation=True,
+        compiler_artifact=compiler_artifact,
+    )
+    require(
+        type(acquired) is dict
+        and set(acquired) == {"source", "go", "modules", "UI_transform", "tool_implementations"},
+        "acquired_input_inventory",
+    )
+    acquired = cast(dict[str, Any], acquired)
+    for name in ("source", "go", "modules"):
+        require(
+            type(acquired[name]) is str
+            and re.fullmatch(r"[0-9a-f]{64}", acquired[name]) is not None,
+            "acquired_digest_type",
+        )
+    require(acquired["go"] == compiler_artifact.digest, "acquired_qualified_Go")
+    transform, implementations = acquired["UI_transform"], acquired["tool_implementations"]
+    require(
+        type(transform) is dict
+        and set(transform)
+        == {
+            "generated_paths",
+            "embed_sha256",
+            "python",
+            "gzip_source_sha256",
+            "zlib_build",
+            "zlib_runtime",
+            "algorithm",
+        },
+        "acquired_UI_transform_fields",
+    )
+    exact_data(transform["generated_paths"], [name + ".gz" for name in sorted(UI_FILES)])
+    exact_data(
+        transform["algorithm"],
+        "Python GzipFile filename-empty mtime0 level6 OS255; not GNU gzip byte equality",
+    )
+    require(
+        type(implementations) is dict
+        and set(implementations)
+        == {"oras_sha256", "python_executable_sha256", "python_version", "zlib"},
+        "acquired_implementation_fields",
+    )
+    for value in (
+        transform["embed_sha256"],
+        transform["gzip_source_sha256"],
+        implementations["oras_sha256"],
+        implementations["python_executable_sha256"],
+    ):
+        require(
+            type(value) is str and re.fullmatch(r"[0-9a-f]{64}", value) is not None,
+            "acquired_implementation_digest_type",
+        )
+    for value in (
+        transform["python"],
+        transform["zlib_build"],
+        transform["zlib_runtime"],
+        implementations["python_version"],
+        implementations["zlib"],
+    ):
+        require(type(value) is str and 0 < len(value) <= 1024, "acquired_implementation_version")
+    require(
+        transform["python"] == implementations["python_version"]
+        and transform["zlib_runtime"] == implementations["zlib"]
+        and manifest["inputs"]["oras"]["retained"] is not None
+        and implementations["oras_sha256"]
+        == manifest["inputs"]["oras"]["retained"]["binary_sha256"],
+        "acquired_retained_implementation_binding",
+    )
+    return {
+        "raw_producer": {
+            name: {"bytes": (root / name).stat().st_size, "sha256": file_hash(root / name)}
+            for name in paths
+        },
+        "inputs": manifest["inputs"],
+        "acquired": acquired,
+    }
+
+
+def _digest(value: Any) -> str:
+    require(
+        type(value) is str and re.fullmatch(r"sha256:[0-9a-f]{64}", value) is not None,
+        "sha256_digest_shape",
+    )
+    return cast(str, value)
+
+
+def _descriptor(value: Any, media: str) -> dict[str, Any]:
+    require(
+        type(value) is dict and set(value) == {"mediaType", "size", "digest"}, "descriptor_keys"
+    )
+    require(
+        value["mediaType"] == media
+        and type(value["size"]) is int
+        and 0 < value["size"] <= MAX_CACHE_BYTES,
+        "descriptor_media_or_size",
+    )
+    _digest(value["digest"])
+    return cast(dict[str, Any], value)
+
+
+def _blob(layout: Path, descriptor: dict[str, Any]) -> bytes:
+    path = layout / "blobs/sha256" / _digest(descriptor["digest"])[7:]
+    require(
+        path.stat().st_size == descriptor["size"] and file_hash(path) == descriptor["digest"][7:],
+        "blob_identity",
+    )
+    raw = path.read_bytes()
+    require(
+        len(raw) == descriptor["size"] and sha(raw) == descriptor["digest"][7:], "blob_read_changed"
+    )
+    return raw
+
+
+def _gunzip(raw: bytes, maximum: int) -> bytes:
+    output = bytearray()
+    with gzip.GzipFile(fileobj=io.BytesIO(raw)) as stream:
+        while chunk := stream.read(1024**2):
+            output.extend(chunk)
+            require(len(output) <= maximum, "layer_expanded_bound")
+    return bytes(output)
+
+
+BASE_CA_SHA256 = "e9c7b63ee2623386e9b0a3ee32f499d01a8ea23dc83b8383ddff9f8e749543b7"
+BASE_CA_BYTES = 222073
+REMOVED_CA_DER_SHA256 = frozenset(
+    {
+        "86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b",
+        "d7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4",
+    }
+)
+
+
+def validate_default_ca(data: bytes) -> None:
+    """Recognize only the admitted default bundle and the two removed DER identities."""
+    import ssl
+
+    require(len(data) == BASE_CA_BYTES and sha(data) == BASE_CA_SHA256, "vendor_default_CA_bytes")
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    try:
+        context.load_verify_locations(cadata=data.decode("ascii"))
+    except (UnicodeDecodeError, ssl.SSLError) as error:
+        raise QualificationError("vendor_default_CA_parse") from error
+    certificates = context.get_ca_certs(binary_form=True)
+    require(
+        len(certificates) == 148
+        and not REMOVED_CA_DER_SHA256.intersection(sha(value) for value in certificates),
+        "vendor_removed_CA_present",
+    )
+
+
+def base_graph(layout: Path) -> dict[str, Any]:
+    """Canonical repo-authored ingress remains distinct from native Docker save."""
+    root_path = layout / "blobs/sha256" / BASE.split("@", 1)[1][7:]
+    exact_data(
+        _layout_root(layout),
+        {
+            "mediaType": OCI_MANIFEST,
+            "size": root_path.stat().st_size,
+            "digest": BASE.split("@", 1)[1],
+        },
+    )
+    content = _base_graph_content(layout)
+    _layout_inventory(
+        layout,
+        {BASE.split("@", 1)[1], BASE_CONFIG}
+        | {row["descriptor"]["digest"] for row in BASE_LAYER_CONTRACTS},
+    )
+    return content
+
+
+def _base_graph_content(layout: Path) -> dict[str, Any]:
+    """Authenticate and inspect the one vendor graph; never extract/apply its layers."""
+    root_path = layout / "blobs/sha256" / BASE.rsplit(":", 1)[1]
+    require(file_hash(root_path) == BASE.rsplit(":", 1)[1], "vendor_root_digest")
+    raw_root = root_path.read_bytes()
+    root = one_object(raw_root)
+    require(
+        set(root) == {"schemaVersion", "mediaType", "config", "layers", "annotations"},
+        "vendor_manifest_keys",
+    )
+    exact_data(root["schemaVersion"], 2)
+    exact_data(root["mediaType"], OCI_MANIFEST)
+    exact_data(root["layers"], [row["descriptor"] for row in BASE_LAYER_CONTRACTS])
+    exact_data(root["config"], {"mediaType": OCI_CONFIG, "size": 2938, "digest": BASE_CONFIG})
+    config_raw = _blob(layout, root["config"])
+    config = one_object(config_raw)
+    exact_data(
+        config["rootfs"],
+        {"type": "layers", "diff_ids": [row["diff_id"] for row in BASE_LAYER_CONTRACTS]},
+    )
+    require(
+        config["architecture"] == "amd64"
+        and config["os"] == "linux"
+        and not config["config"].get("OnBuild")
+        and not config["config"].get("Volumes"),
+        "vendor_config",
+    )
+    layers = []
+    topology = []
+    ca_occurrences = 0
+    for contract in BASE_LAYER_CONTRACTS:
+        compressed = _blob(layout, contract["descriptor"])
+        expanded = _gunzip(compressed, contract["expanded"])
+        require(
+            len(expanded) == contract["expanded"]
+            and "sha256:" + sha(expanded) == contract["diff_id"],
+            "vendor_independent_diffID",
+        )
+        rows = []
+        with tarfile.open(fileobj=io.BytesIO(expanded), mode="r:") as archive:
+            members = archive.getmembers()
+            require(len(members) == contract["members"], "vendor_member_count")
+            for member in members:
+                require(
+                    member.type in (tarfile.REGTYPE, tarfile.DIRTYPE, tarfile.SYMTYPE),
+                    "unsupported_vendor_member_type",
+                )
+                row = {
+                    "name": member.name,
+                    "type": member.type.decode("ascii"),
+                    "size": member.size,
+                    "mode": member.mode,
+                    "linkname": member.linkname,
+                }
+                if member.isreg():
+                    stream = archive.extractfile(member)
+                    require(stream is not None, "vendor_member_stream")
+                    stream = cast(BinaryIO, stream)
+                    data = stream.read(member.size + 1)
+                    require(len(data) == member.size, "vendor_member_size")
+                    row["sha256"] = sha(data)
+                    if member.name == "etc/ssl/certs/ca-certificates.crt":
+                        validate_default_ca(data)
+                        ca_occurrences += 1
+                rows.append(row)
+                if member.name in ("bin", "usr", "usr/bin", "etc", "etc/prometheus", "prometheus"):
+                    topology.append(row)
+        require(
+            sha(canonical_data(rows)) == contract["inventory_sha256"], "vendor_complete_inventory"
+        )
+        layers.append({"compressed": compressed, "uncompressed": expanded})
+    require(
+        [row for row in topology if row["name"] == "bin"]
+        == [{"name": "bin", "type": "2", "size": 0, "mode": 0o777, "linkname": "usr/bin"}],
+        "vendor_known_bin_alias",
+    )
+    require(
+        all(
+            row["type"] == "5" and row["mode"] == 0o755
+            for row in topology
+            if row["name"] in ("usr", "usr/bin", "etc")
+        )
+        and not any(row["name"] in ("etc/prometheus", "prometheus") for row in topology),
+        "vendor_payload_parent_topology",
+    )
+    require(ca_occurrences == 1, "vendor_default_CA_unique")
+    return {
+        "manifest": root,
+        "manifest_raw": raw_root,
+        "config": config,
+        "config_raw": config_raw,
+        "layers": layers,
+    }
+
+
+PAYLOAD_DIRECTORIES = (("etc/prometheus", 0, 0), ("prometheus", 65532, 65532))
+PAYLOAD_FILES = {
+    "LICENSE": ("LICENSE", 0o644),
+    "NOTICE": ("NOTICE", 0o644),
+    "etc/prometheus/prometheus.yml": ("prometheus.yml", 0o644),
+    "usr/bin/prometheus": ("prometheus", 0o755),
+    "usr/bin/promtool": ("promtool", 0o755),
+}
+
+
+def payload_layer(files: dict[str, bytes], *, synthetic: bool = False) -> tuple[bytes, bytes]:
+    require(set(files) == {entry[0] for entry in PAYLOAD_FILES.values()}, "payload_exact_files")
+    for name in ("prometheus", "promtool"):
+        raw = files[name]
+        require(0 < len(raw) <= 256 * 1024**2, "payload_binary_size")
+        if not synthetic:
+            require(
+                raw[:6] == b"\x7fELF\x02\x01" and raw[18:20] == b"\x3e\x00", "payload_amd64_ELF"
+            )
+    require(
+        synthetic
+        or (
+            sha(files["prometheus.yml"]) == DEFAULT_CONFIG_SHA256
+            and all(sha(files[name]) == digest for name, digest in SOURCE_LICENSES.items())
+        ),
+        "payload_source_files",
+    )
+    stream = io.BytesIO()
+    with tarfile.open(fileobj=stream, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+        # Existing vendor usr/usr-bin/etc ownership is retained byte-for-byte.
+        for name, uid, gid in PAYLOAD_DIRECTORIES:
+            member = tarfile.TarInfo(name)
+            member.type, member.mode, member.uid, member.gid, member.mtime = (
+                tarfile.DIRTYPE,
+                0o755,
+                uid,
+                gid,
+                SOURCE_DATE_EPOCH,
+            )
+            archive.addfile(member)
+        for path, (name, mode) in sorted(PAYLOAD_FILES.items()):
+            raw = files[name]
+            member = tarfile.TarInfo(path)
+            member.mode, member.size, member.mtime = mode, len(raw), SOURCE_DATE_EPOCH
+            archive.addfile(member, io.BytesIO(raw))
+    uncompressed = stream.getvalue()
+    compressed = io.BytesIO()
+    with gzip.GzipFile(
+        filename="", mode="wb", fileobj=compressed, compresslevel=6, mtime=0
+    ) as output:
+        output.write(uncompressed)
+    result = compressed.getvalue()
+    require(result[3] == 0 and result[9] == 255, "payload_gzip_header")
+    return uncompressed, result
+
+
+def _write_blob(layout: Path, raw: bytes, media: str) -> dict[str, Any]:
+    digest = sha(raw)
+    path = layout / "blobs/sha256" / digest
+    if path.exists():
+        require(file_hash(path) == digest and path.read_bytes() == raw, "blob_collision")
+    else:
+        with path.open("xb") as output:
+            output.write(raw)
+        path.chmod(0o644)
+    return {"mediaType": media, "size": len(raw), "digest": "sha256:" + digest}
+
+
+def construct_image(
+    base: dict[str, Any],
+    files: dict[str, bytes],
+    layout: Path,
+    docker_archive: Path,
+    *,
+    synthetic: bool = False,
+) -> dict[str, Any]:
+    fresh_directory(layout, 0o755)
+    (layout / "blobs/sha256").mkdir(parents=True, mode=0o755)
+    uncompressed, compressed = payload_layer(files, synthetic=synthetic)
+    diff_id = "sha256:" + sha(uncompressed)
+    layers = []
+    for contract, layer in zip(BASE_LAYER_CONTRACTS, base["layers"], strict=True):
+        layers.append(_write_blob(layout, layer["compressed"], OCI_LAYER))
+        exact_data(layers[-1], contract["descriptor"])
+    layers.append(_write_blob(layout, compressed, OCI_LAYER))
+    config = copy.deepcopy(base["config"])
+    config["created"] = "2026-09-25T07:25:38Z"
+    config["config"].update(
+        {
+            "User": "65532:65532",
+            "WorkingDir": "/prometheus",
+            "Entrypoint": ["/bin/prometheus"],
+            "Cmd": [
+                "--config.file=/etc/prometheus/prometheus.yml",
+                "--storage.tsdb.path=/prometheus",
+            ],
+            "ExposedPorts": {"9090/tcp": {}},
+            "Labels": {
+                "org.opencontainers.image.version": "3.15.0",
+                "org.opencontainers.image.revision": REVISION,
+                "org.opencontainers.image.source": "https://github.com/prometheus/prometheus",
+            },
+        }
+    )
+    config["rootfs"]["diff_ids"].append(diff_id)
+    config["history"].append(
+        {"created": config["created"], "created_by": "PulsePlate finite Prometheus payload"}
+    )
+    config_raw = canonical_data(config)
+    config_descriptor = _write_blob(layout, config_raw, OCI_CONFIG)
+    manifest = {
+        "schemaVersion": 2,
+        "mediaType": OCI_MANIFEST,
+        "config": config_descriptor,
+        "layers": layers,
+    }
+    manifest_descriptor = _write_blob(layout, canonical_data(manifest), OCI_MANIFEST)
+    (layout / "oci-layout").write_bytes(canonical_data({"imageLayoutVersion": "1.0.0"}))
+    (layout / "index.json").write_bytes(
+        canonical_data(
+            {
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.index.v1+json",
+                "manifests": [manifest_descriptor],
+            }
+        )
+    )
+    require(
+        not docker_archive.exists() and not docker_archive.is_symlink(), "docker_archive_not_fresh"
+    )
+    config_name = config_descriptor["digest"][7:] + ".json"
+    layer_names = [value[7:] + "/layer.tar" for value in config["rootfs"]["diff_ids"]]
+    docker_manifest = [
+        {
+            "Config": config_name,
+            "RepoTags": ["pulseplate-prometheus:candidate"],
+            "Layers": layer_names,
+        }
+    ]
+    entries = [("manifest.json", canonical_data(docker_manifest)), (config_name, config_raw)]
+    entries += list(
+        zip(
+            layer_names,
+            [layer["uncompressed"] for layer in base["layers"]] + [uncompressed],
+            strict=True,
+        )
+    )
+    with tarfile.open(docker_archive, "x", format=tarfile.USTAR_FORMAT) as archive:
+        for name, raw in entries:
+            member = tarfile.TarInfo(name)
+            member.size, member.mode, member.mtime = len(raw), 0o644, SOURCE_DATE_EPOCH
+            archive.addfile(member, io.BytesIO(raw))
+    return {
+        "manifest_digest": manifest_descriptor["digest"],
+        "config_digest": config_descriptor["digest"],
+        "layers": layers,
+        "diff_ids": config["rootfs"]["diff_ids"],
+        "binary_sha256": {name: sha(files[name]) for name in ("prometheus", "promtool")},
+        "synthetic_format_only": synthetic,
+        "docker_archive_sha256": file_hash(docker_archive),
+    }
+
+
+def validate_selection(value: Any) -> None:
+    require(
+        type(value) is dict
+        and set(value)
+        == {
+            "repository",
+            "platform",
+            "root_media_type",
+            "manifest_digest",
+            "config_digest",
+            "layers",
+            "diff_ids",
+            "runtime_ref",
+            "binaries",
+            "ui_inventory_sha256",
+            "source_revision",
+            "version",
+        },
+        "selection_keys",
+    )
+    require(
+        value["repository"] == IMAGE_REPOSITORY
+        and value["platform"] == "linux/amd64"
+        and value["root_media_type"] == OCI_MANIFEST
+        and value["source_revision"] == REVISION
+        and value["version"] == "3.15.0",
+        "selection_fixed_identity",
+    )
+    root, config = _digest(value["manifest_digest"]), _digest(value["config_digest"])
+    require(
+        root != config and value["runtime_ref"] == IMAGE_REPOSITORY + "@" + root,
+        "selection_distinct_identity",
+    )
+    require(
+        type(value["layers"]) is list
+        and len(value["layers"]) == 14
+        and type(value["diff_ids"]) is list
+        and len(value["diff_ids"]) == 14,
+        "selection_layer_count",
+    )
+    for descriptor in value["layers"]:
+        _descriptor(descriptor, OCI_LAYER)
+    exact_data(value["layers"][:13], [row["descriptor"] for row in BASE_LAYER_CONTRACTS])
+    exact_data(value["diff_ids"][:13], [row["diff_id"] for row in BASE_LAYER_CONTRACTS])
+    for digest in value["diff_ids"]:
+        _digest(digest)
+    require(len(set(value["diff_ids"])) == 14, "selection_duplicate_diffID")
+    require(
+        type(value["binaries"]) is dict and set(value["binaries"]) == {"prometheus", "promtool"},
+        "selection_both_binaries",
+    )
+    for record in value["binaries"].values():
+        require(
+            type(record) is dict
+            and set(record) == {"sha256", "version"}
+            and record["version"] == "3.15.0"
+            and type(record["sha256"]) is str
+            and re.fullmatch(r"[0-9a-f]{64}", record["sha256"]) is not None,
+            "selection_binary_identity",
+        )
+    exact_data(value["ui_inventory_sha256"], sha(canonical_data(UI_FILES)))
+
+
+def validate_candidate_coordinates(value: Any) -> None:
+    require(
+        type(value) is dict and set(value) == {"repository", "producer", "artifact", "outputs"},
+        "candidate_keys",
+    )
+    exact_data(value["repository"], {"id": 1043311030, "full_name": GHCR_REPOSITORY})
+    producer = value["producer"]
+    require(
+        type(producer) is dict
+        and set(producer)
+        == {
+            "workflow_id",
+            "workflow_path",
+            "source_head",
+            "source_ref",
+            "pr_number",
+            "run_id",
+            "run_attempt",
+            "job_ids",
+            "raw_producer",
+            "input_projection_sha256",
+        },
+        "candidate_producer_keys",
+    )
+    require(
+        producer["workflow_path"] == ".github/workflows/build.yml"
+        and producer["run_attempt"] == 1
+        and type(producer["run_attempt"]) is int,
+        "candidate_producer_workflow_attempt",
+    )
+    for field in ("workflow_id", "pr_number", "run_id"):
+        require(type(producer[field]) is int and producer[field] > 0, "candidate_positive_ID")
+    require(
+        type(producer["source_head"]) is str
+        and re.fullmatch(r"[0-9a-f]{40}", producer["source_head"]) is not None
+        and type(producer["source_ref"]) is str
+        and re.fullmatch(r"refs/heads/[A-Za-z0-9_./-]{1,200}", producer["source_ref"]) is not None
+        and ".." not in producer["source_ref"],
+        "candidate_source_coordinate",
+    )
+    require(
+        type(producer["job_ids"]) is list
+        and bool(producer["job_ids"])
+        and all(type(v) is int and v > 0 for v in producer["job_ids"])
+        and len(set(producer["job_ids"])) == len(producer["job_ids"]),
+        "candidate_job_inventory",
+    )
+    paths = {
+        "scripts/ci/prometheus_source_image.py",
+        ".github/workflows/build.yml",
+        "deploy/prometheus/Containerfile",
+    }
+    require(
+        type(producer["raw_producer"]) is dict and set(producer["raw_producer"]) == paths,
+        "candidate_full_raw_producer",
+    )
+    for record in producer["raw_producer"].values():
+        require(
+            type(record) is dict
+            and set(record) == {"bytes", "sha256"}
+            and type(record["bytes"]) is int
+            and 0 < record["bytes"] <= 1024**2,
+            "candidate_producer_size",
+        )
+        _digest("sha256:" + record["sha256"])
+    _digest("sha256:" + producer["input_projection_sha256"])
+    artifact = value["artifact"]
+    require(
+        type(artifact) is dict
+        and set(artifact) == {"id", "name", "digest", "size", "expires_at", "archive_sha256"},
+        "candidate_artifact_keys",
+    )
+    require(
+        type(artifact["id"]) is int
+        and artifact["id"] > 0
+        and type(artifact["size"]) is int
+        and 0 < artifact["size"] <= MAX_CACHE_BYTES
+        and artifact["name"] == f"prometheus-source-candidate-{producer['run_id']}-1",
+        "candidate_artifact_identity",
+    )
+    require(
+        _digest(artifact["digest"]) == "sha256:" + artifact["archive_sha256"],
+        "candidate_artifact_raw_digest",
+    )
+    require(
+        type(artifact["expires_at"]) is str
+        and re.fullmatch(
+            r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", artifact["expires_at"]
+        )
+        is not None,
+        "candidate_expiry_type",
+    )
+    require(
+        type(value["outputs"]) is dict
+        and set(value["outputs"])
+        == {
+            "oci_archive_sha256",
+            "docker_archive_sha256",
+            "native_report_sha256",
+            "pair_report_sha256",
+            "spdx_sha256",
+            "provenance_bundle_sha256",
+            "sbom_bundle_sha256",
+        },
+        "candidate_output_keys",
+    )
+    for digest in value["outputs"].values():
+        _digest("sha256:" + digest)
+
+
+def _layout_inventory(layout: Path, blobs: set[str]) -> None:
+    real_directory(layout)
+    expected_blobs = {"blobs/sha256/" + digest[7:] for digest in blobs}
+    expected_files = {"oci-layout", "index.json"} | expected_blobs
+    files: set[str] = set()
+    directories: set[str] = set()
+
+    def observe(
+        error: BaseException,
+        path: Path,
+        info: os.stat_result | None,
+        predicate: str,
+        uncertainty: str | None = None,
+    ) -> None:
+        try:
+            relative = json.dumps(path.relative_to(layout).as_posix(), ensure_ascii=True)[1:-1]
+            facts: dict[str, Any] = {
+                "predicate": predicate,
+                "relative": relative[:512],
+                "relative_truncated": len(relative) > 512,
+                "observation_error": uncertainty,
+            }
+            if info is not None:
+                facts.update(
+                    type=(
+                        "directory"
+                        if stat.S_ISDIR(info.st_mode)
+                        else (
+                            "regular"
+                            if stat.S_ISREG(info.st_mode)
+                            else "link" if stat.S_ISLNK(info.st_mode) else "special"
+                        )
+                    ),
+                    mode=oct(stat.S_IMODE(info.st_mode)),
+                    nlink=info.st_nlink,
+                    uid=info.st_uid,
+                )
+            setattr(error, "layout_rejection", facts)
+        except BaseException as diagnostic_error:
+            # Optional diagnostics never replace the actual predicate/read failure.
+            setattr(
+                error,
+                "layout_rejection",
+                {
+                    "predicate": predicate,
+                    "observation_error": type(diagnostic_error).__name__,
+                },
+            )
+
+    def check(condition: bool, predicate: str, path: Path, info: os.stat_result) -> None:
+        if not condition:
+            error = QualificationError(predicate)
+            observe(error, path, info, predicate)
+            raise error
+
+    for path in layout.rglob("*"):
+        try:
+            info = path.lstat()
+        except OSError as error:
+            observe(error, path, None, "layout_regular_leaf", type(error).__name__)
+            raise
+        relative = path.relative_to(layout).as_posix()
+        check(
+            info.st_uid == os.getuid() and len(files) + len(directories) < 64,
+            "layout_owner_count",
+            path,
+            info,
+        )
+        if stat.S_ISDIR(info.st_mode):
+            directories.add(relative)
+            check(
+                relative in {"blobs", "blobs/sha256", "ingest"},
+                "layout_closed_inventory",
+                path,
+                info,
+            )
+            if relative == "ingest":
+                try:
+                    empty = next(path.iterdir(), None) is None
+                except OSError as error:
+                    observe(error, path, info, "layout_closed_inventory", type(error).__name__)
+                    raise
+                check(empty, "layout_closed_inventory", path, info)
+        else:
+            modes = (0o444, 0o600, 0o644) if relative in expected_blobs else (0o600, 0o644)
+            check(
+                stat.S_ISREG(info.st_mode)
+                and info.st_nlink == 1
+                and stat.S_IMODE(info.st_mode) in modes,
+                "layout_regular_leaf",
+                path,
+                info,
+            )
+            check(relative in expected_files, "layout_closed_inventory", path, info)
+            files.add(relative)
+    check(
+        directories in ({"blobs", "blobs/sha256"}, {"blobs", "blobs/sha256", "ingest"})
+        and files == expected_files,
+        "layout_closed_inventory",
+        layout,
+        layout.lstat(),
+    )
+
+
+def _layout_root(layout: Path) -> dict[str, Any]:
+    exact_data(one_object((layout / "oci-layout").read_bytes()), {"imageLayoutVersion": "1.0.0"})
+    index = one_object((layout / "index.json").read_bytes())
+    require(set(index) == {"schemaVersion", "mediaType", "manifests"}, "layout_index_keys")
+    exact_data(index["schemaVersion"], 2)
+    require(
+        index["mediaType"] == "application/vnd.oci.image.index.v1+json"
+        and type(index["manifests"]) is list
+        and len(index["manifests"]) == 1,
+        "layout_one_descriptor",
+    )
+    descriptor = dict(index["manifests"][0])
+    if "annotations" in descriptor:
+        annotations = descriptor.pop("annotations")
+        require(
+            type(annotations) is dict
+            and set(annotations) == {"org.opencontainers.image.ref.name"}
+            and annotations["org.opencontainers.image.ref.name"]
+            in ("base", "candidate", "format-probe", "pullback"),
+            "layout_transport_annotation",
+        )
+    if "platform" in descriptor:
+        exact_data(descriptor.pop("platform"), {"architecture": "amd64", "os": "linux"})
+    return _descriptor(descriptor, OCI_MANIFEST)
+
+
+def native_base_export_graph(layout: Path) -> dict[str, Any]:
+    """Two closed current-BASE native transports; canonical _layout_root is unchanged."""
+    real_directory(layout)
+    members = list(layout.rglob("*"))
+    require(len(members) <= 33, "native_BASE_export_member_bound")
+    total = 0
+    for path in members:
+        info = path.lstat()
+        relative = path.relative_to(layout).as_posix()
+        require(info.st_uid == os.getuid(), "native_BASE_export_owner")
+        if stat.S_ISDIR(info.st_mode):
+            require(relative in ("blobs", "blobs/sha256"), "native_BASE_export_directory")
+        else:
+            require(
+                stat.S_ISREG(info.st_mode)
+                and info.st_nlink == 1
+                and stat.S_IMODE(info.st_mode) in (0o444, 0o600, 0o644)
+                and (
+                    relative in ("index.json", "manifest.json", "oci-layout")
+                    or re.fullmatch(r"blobs/sha256/[0-9a-f]{64}", relative) is not None
+                ),
+                "native_BASE_export_member",
+            )
+            total += info.st_size
+            require(
+                0 <= info.st_size <= 16 * 1024**2 and total <= 16 * 1024**2,
+                "native_BASE_export_byte_bound",
+            )
+    index = one_object((layout / "index.json").read_bytes())
+    expected_core = {
+        "mediaType": OCI_MANIFEST,
+        "digest": BASE.split("@", 1)[1],
+        "size": _NATIVE_BASE_MANIFEST_SIZE,
+    }
+    native_index = {
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [
+            {
+                **expected_core,
+                "annotations": {
+                    "containerd.io/distribution.source.gcr.io": "distroless/static-debian13"
+                },
+            }
+        ],
+    }
+    if index == native_index:
+        exact_data(index, native_index)
+        exact_data(
+            one_object((layout / "oci-layout").read_bytes()), {"imageLayoutVersion": "1.0.0"}
+        )
+        expected_files = {"index.json", "manifest.json", "oci-layout"}
+        expected_files |= {
+            "blobs/sha256/" + digest[7:]
+            for digest in (
+                {BASE.split("@", 1)[1], BASE_CONFIG}
+                | {row["descriptor"]["digest"] for row in BASE_LAYER_CONTRACTS}
+            )
+        }
+        files, directories = set(), set()
+        real_directory(layout)
+        for path in layout.rglob("*"):
+            info = path.lstat()
+            name = path.relative_to(layout).as_posix()
+            require(info.st_uid == os.getuid(), "native_BASE_export_owner")
+            if stat.S_ISDIR(info.st_mode):
+                directories.add(name)
+            else:
+                require(
+                    stat.S_ISREG(info.st_mode)
+                    and info.st_nlink == 1
+                    and stat.S_IMODE(info.st_mode) in (0o444, 0o600, 0o644),
+                    "native_BASE_export_regular",
+                )
+                files.add(name)
+        exact_data(files, expected_files)
+        exact_data(directories, {"blobs", "blobs/sha256"})
+        raw = (layout / "manifest.json").read_bytes()
+        require(0 < len(raw) <= MAX_NATIVE_OUTPUT, "native_BASE_Docker_manifest_bound")
+        docker_manifest = json.loads(
+            raw, object_pairs_hook=unique_object, parse_constant=reject_constant
+        )
+        exact_data(
+            docker_manifest,
+            [
+                {
+                    "Config": "blobs/sha256/" + BASE_CONFIG[7:],
+                    "RepoTags": None,
+                    "Layers": [
+                        "blobs/sha256/" + row["descriptor"]["digest"][7:]
+                        for row in BASE_LAYER_CONTRACTS
+                    ],
+                }
+            ],
+        )
+        _base_graph_content(layout)
+        return expected_core
+    # Original current legacy31 export: canonical wrapper and uncompressed graph.
+    require(
+        len(tree_inventory(layout, maximum=16 * 1024**2)) == 31, "AM_current_Q_export_finite_shape"
+    )
+    descriptor = _layout_root(layout)
+    manifest = one_object(_blob(layout, descriptor))
+    exact_data(set(manifest), {"schemaVersion", "mediaType", "config", "layers"})
+    exact_data(manifest["schemaVersion"], 2)
+    exact_data(manifest["mediaType"], OCI_MANIFEST)
+    exact_data(manifest["config"], {"mediaType": OCI_CONFIG, "size": 2938, "digest": BASE_CONFIG})
+    configuration = one_object(_blob(layout, manifest["config"]))
+    exact_data(
+        configuration["rootfs"],
+        {"type": "layers", "diff_ids": [row["diff_id"] for row in BASE_LAYER_CONTRACTS]},
+    )
+    require(
+        configuration["os"] == "linux" and configuration["architecture"] == "amd64",
+        "AM_current_export_platform",
+    )
+    expected_layers = [
+        {
+            "mediaType": "application/vnd.oci.image.layer.v1.tar",
+            "digest": row["diff_id"],
+            "size": row["expanded"],
+        }
+        for row in BASE_LAYER_CONTRACTS
+    ]
+    exact_data(manifest["layers"], expected_layers)
+    for layer in expected_layers:
+        _blob(layout, layer)
+    return descriptor
+
+
+def _payload_files(expanded: bytes) -> dict[str, bytes]:
+    expected_names = [name for name, _, _ in PAYLOAD_DIRECTORIES] + sorted(PAYLOAD_FILES)
+    values = {}
+    with tarfile.open(fileobj=io.BytesIO(expanded), mode="r:") as archive:
+        members = archive.getmembers()
+        require(
+            [member.name for member in members] == expected_names, "payload_member_inventory_order"
+        )
+        for member in members:
+            require(
+                not member.pax_headers
+                and not member.linkname
+                and not member.uname
+                and not member.gname
+                and member.mtime == SOURCE_DATE_EPOCH,
+                "payload_fixed_header",
+            )
+            if member.name in PAYLOAD_FILES:
+                name, mode = PAYLOAD_FILES[member.name]
+                require(
+                    member.isreg() and member.mode == mode and member.uid == member.gid == 0,
+                    "payload_file_type_owner_mode",
+                )
+                stream = archive.extractfile(member)
+                require(stream is not None, "payload_file_stream")
+                stream = cast(BinaryIO, stream)
+                raw = stream.read(member.size + 1)
+                require(len(raw) == member.size, "payload_file_size")
+                values[name] = raw
+            else:
+                name, uid, gid = next(row for row in PAYLOAD_DIRECTORIES if row[0] == member.name)
+                require(
+                    member.isdir()
+                    and member.mode == 0o755
+                    and member.uid == uid
+                    and member.gid == gid
+                    and member.size == 0,
+                    "payload_directory_type_owner_mode",
+                )
+    return values
+
+
+def validate_oci_graph(
+    layout: Path, base: dict[str, Any], *, synthetic: bool = False
+) -> dict[str, Any]:
+    descriptor = _layout_root(layout)
+    raw = _blob(layout, descriptor)
+    manifest = one_object(raw)
+    require(set(manifest) == {"schemaVersion", "mediaType", "config", "layers"}, "image_root_keys")
+    exact_data(manifest["schemaVersion"], 2)
+    require(
+        manifest["mediaType"] == OCI_MANIFEST and raw == canonical_data(manifest),
+        "image_root_encoding",
+    )
+    require(type(manifest["layers"]) is list and len(manifest["layers"]) == 14, "image_layer_count")
+    config_descriptor = _descriptor(manifest["config"], OCI_CONFIG)
+    exact_data(manifest["layers"][:13], [row["descriptor"] for row in BASE_LAYER_CONTRACTS])
+    expanded_layers = []
+    for contract, layer in zip(BASE_LAYER_CONTRACTS, manifest["layers"][:13], strict=True):
+        compressed = _blob(layout, _descriptor(layer, OCI_LAYER))
+        expanded = _gunzip(compressed, contract["expanded"])
+        require(
+            len(expanded) == contract["expanded"]
+            and "sha256:" + sha(expanded) == contract["diff_id"],
+            "image_base_diffID",
+        )
+        expanded_layers.append(expanded)
+    payload = _blob(layout, _descriptor(manifest["layers"][-1], OCI_LAYER))
+    expanded = _gunzip(payload, 512 * 1024**2)
+    files = _payload_files(expanded)
+    expected_expanded, expected_compressed = payload_layer(files, synthetic=synthetic)
+    require(
+        expanded == expected_expanded and payload == expected_compressed, "payload_exact_encoding"
+    )
+    expanded_layers.append(expanded)
+    diff_ids = [row["diff_id"] for row in BASE_LAYER_CONTRACTS] + ["sha256:" + sha(expanded)]
+    config_raw = _blob(layout, config_descriptor)
+    config = one_object(config_raw)
+    expected_config = copy.deepcopy(base["config"])
+    expected_config["created"] = "2026-09-25T07:25:38Z"
+    expected_config["config"].update(
+        {
+            "User": "65532:65532",
+            "WorkingDir": "/prometheus",
+            "Entrypoint": ["/bin/prometheus"],
+            "Cmd": [
+                "--config.file=/etc/prometheus/prometheus.yml",
+                "--storage.tsdb.path=/prometheus",
+            ],
+            "ExposedPorts": {"9090/tcp": {}},
+            "Labels": {
+                "org.opencontainers.image.version": "3.15.0",
+                "org.opencontainers.image.revision": REVISION,
+                "org.opencontainers.image.source": "https://github.com/prometheus/prometheus",
+            },
+        }
+    )
+    expected_config["rootfs"]["diff_ids"] = diff_ids
+    expected_config["history"].append(
+        {
+            "created": expected_config["created"],
+            "created_by": "PulsePlate finite Prometheus payload",
+        }
+    )
+    exact_data(config, expected_config)
+    require(config_raw == canonical_data(expected_config), "image_config_raw_encoding")
+    blobs = {descriptor["digest"], config_descriptor["digest"]} | {
+        layer["digest"] for layer in manifest["layers"]
+    }
+    require(len(blobs) == 16, "image_duplicate_blob")
+    _layout_inventory(layout, blobs)
+    return {
+        "manifest_digest": descriptor["digest"],
+        "manifest_raw": raw,
+        "config_raw": config_raw,
+        "config_digest": config_descriptor["digest"],
+        "layers": manifest["layers"],
+        "diff_ids": diff_ids,
+        "expanded_layers": expanded_layers,
+        "files": files,
+        "binary_sha256": {name: sha(files[name]) for name in ("prometheus", "promtool")},
+    }
+
+
+def validate_docker_archive(path: Path, graph: dict[str, Any]) -> None:
+    require(path.stat().st_size <= MAX_CACHE_BYTES, "docker_archive_bound")
+    config_name = graph["config_digest"][7:] + ".json"
+    layer_names = [value[7:] + "/layer.tar" for value in graph["diff_ids"]]
+    expected_manifest = [
+        {
+            "Config": config_name,
+            "RepoTags": ["pulseplate-prometheus:candidate"],
+            "Layers": layer_names,
+        }
+    ]
+    expected = {
+        "manifest.json": canonical_data(expected_manifest),
+        config_name: graph["config_raw"],
+    }
+    expected.update(zip(layer_names, graph["expanded_layers"], strict=True))
+    before = file_hash(path)
+    with tarfile.open(path, "r:") as archive:
+        members = archive.getmembers()
+        require(
+            len(members) == len(expected)
+            and len(set(member.name for member in members)) == len(expected)
+            and set(member.name for member in members) == set(expected),
+            "docker_archive_closed_inventory",
+        )
+        for member in members:
+            require(
+                member.isreg()
+                and not member.linkname
+                and not member.pax_headers
+                and member.uid == member.gid == 0
+                and member.mode == 0o644
+                and member.mtime == SOURCE_DATE_EPOCH
+                and member.size == len(expected[member.name]),
+                "docker_archive_regular_header",
+            )
+            stream = archive.extractfile(member)
+            require(
+                stream is not None and stream.read(member.size + 1) == expected[member.name],
+                "docker_archive_raw_config_layer",
+            )
+    require(file_hash(path) == before, "docker_archive_read_changed")
+
+
+def compare_pair(first: dict[str, Any], second: dict[str, Any]) -> None:
+    for field in (
+        "manifest_digest",
+        "manifest_raw",
+        "config_raw",
+        "config_digest",
+        "layers",
+        "diff_ids",
+        "binary_sha256",
+    ):
+        require(first[field] == second[field], "independent_pair_mismatch_" + field)
+    require(first["expanded_layers"] == second["expanded_layers"], "independent_pair_layer_bytes")
+
+
+def consumer_result(mode: str, admission: str, promotion: str) -> str:
+    """Closed event/result table; a generic skipped-or-success bypass is forbidden."""
+    table = {
+        ("changed_pr_candidate", "success", "skipped"): "local",
+        ("new_main_selection", "success", "success"): "published",
+        ("unchanged_published", "skipped", "skipped"): "published",
+        ("historical_pr_candidate", "success", "skipped"): "local",
+        ("historical_main_recovery", "success", "success"): "published",
+    }
+    require((mode, admission, promotion) in table, "consumer_predecessors")
+    return table[(mode, admission, promotion)]
+
+
+class GitHubRead:
+    """Bounded same-repository native API reads; credentials never enter Native records."""
+
+    def __init__(self, private: Path, evidence: Path, deadline: float, cleanup: int) -> None:
+        gh = shutil.which("gh")
+        if gh is None or not Path(gh).is_absolute():
+            raise QualificationError("GitHub_native_missing")
+        token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+        if not isinstance(token, str) or not token:
+            raise QualificationError("GitHub_credential_missing")
+        self.gh, self.private, self.evidence, self.deadline = gh, private, evidence, deadline
+        self.known = token.encode()
+        self.additional_known = tuple(
+            value.encode()
+            for name in ("GITHUB_TOKEN", "GHCR_READ_TOKEN")
+            if (value := os.environ.get(name))
+        )
+        require(type(cleanup) is int and 0 < cleanup <= 120, "GitHub_cleanup_budget")
+        self.cleanup_seconds = cleanup
+        self.cleanup_deadline: float | None = None
+        self.process: subprocess.Popen[bytes] | None = None
+        self.seen: dict[int, tuple[Any, ...]] = {}
+        self.sequence = 0
+        fresh_directory(private)
+        for name in ("home", "config", "cache", "tmp"):
+            fresh_directory(private / name)
+        self.environment = {
+            "PATH": "/usr/bin:/bin",
+            "LANG": "C.UTF-8",
+            "GH_HOST": "github.com",
+            "GH_TOKEN": token,
+            "GITHUB_TOKEN": token,
+            "GH_PROMPT_DISABLED": "1",
+            "GH_PAGER": "cat",
+            "PAGER": "cat",
+            "GH_NO_UPDATE_NOTIFIER": "1",
+            "GH_NO_EXTENSION_UPDATE_NOTIFIER": "1",
+            "GH_TELEMETRY": "0",
+            "DO_NOT_TRACK": "1",
+            "HOME": str(private / "home"),
+            "GH_CONFIG_DIR": str(private / "config"),
+            "XDG_CONFIG_HOME": str(private / "config"),
+            "XDG_CACHE_HOME": str(private / "cache"),
+            "TMPDIR": str(private / "tmp"),
+        }
+        try:
+            self._capture([gh, "auth", "status", "--hostname", "github.com"], 1024**2)
+        except BaseException:
+            self.close()
+            raise
+
+    def begin_cleanup(self) -> float:
+        if self.cleanup_deadline is None:
+            self.cleanup_deadline = min(
+                self.deadline + self.cleanup_seconds, time.monotonic() + self.cleanup_seconds
+            )
+        return self.cleanup_deadline
+
+    def _capture(
+        self,
+        argv: list[str],
+        maximum: int,
+        *,
+        environment: dict[str, str] | None = None,
+        input_data: bytes | None = None,
+    ) -> bytes:
+        global CLEANING
+        check_deadline(self.deadline)
+        require(self.process is None, "GitHub_prior_owned_group_unresolved")
+        require(input_data is None or type(input_data) is bytes, "GitHub_stdin_type")
+        process = subprocess.Popen(
+            argv,
+            cwd=self.private,
+            env=self.environment if environment is None else environment,
+            stdin=subprocess.DEVNULL if input_data is None else subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )  # nosec B603 # B603: owner-bound native argv, private credential environment or stdin, bounded capture and owned cleanup (remove-by: 2026-11-11, ref: PR-2494)
+        self.process = process
+        streams = [bytearray(), bytearray()]
+        primary: BaseException | None = None
+        cleanup_error: BaseException | None = None
+        code: int | None = None
+        tokens = (self.known, *self.additional_known)
+        try:
+            # This witness precedes poll/wait; use the same closed recognizer as GHCR qualification.
+            witness_owned_process(process, self.seen, self.deadline, tokens)
+            require(
+                process.stdout is not None and process.stderr is not None, "GitHub_capture_streams"
+            )
+            with selectors.DefaultSelector() as selector:
+                for index, stream in enumerate(
+                    (cast(BinaryIO, process.stdout), cast(BinaryIO, process.stderr))
+                ):
+                    os.set_blocking(stream.fileno(), False)
+                    selector.register(stream, selectors.EVENT_READ, index)
+                offset = 0
+                if input_data is not None:
+                    require(process.stdin is not None, "GitHub_capture_stdin")
+                    stdin_stream = cast(BinaryIO, process.stdin)
+                    os.set_blocking(stdin_stream.fileno(), False)
+                    if input_data:
+                        selector.register(stdin_stream, selectors.EVENT_WRITE, 2)
+                    else:
+                        stdin_stream.close()
+                while selector.get_map():
+                    check_deadline(self.deadline)
+                    owned_members(process, self.seen, self.deadline, tokens)
+                    for key, _ in selector.select(
+                        min(0.1, max(0, self.deadline - time.monotonic()))
+                    ):
+                        if key.data == 2:
+                            if input_data is None:
+                                raise QualificationError("GitHub_capture_stdin_state")
+                            try:
+                                written = os.write(
+                                    key.fd, memoryview(input_data)[offset : offset + 65536]
+                                )
+                            except BrokenPipeError:
+                                raise QualificationError("GitHub_native_stdin_closed") from None
+                            offset += written
+                            if offset == len(input_data):
+                                selector.unregister(key.fileobj)
+                                cast(BinaryIO, key.fileobj).close()
+                            continue
+                        raw = os.read(key.fd, 65536)
+                        if raw:
+                            require(
+                                sum(map(len, streams)) + len(raw) <= maximum,
+                                "GitHub_native_output_bound",
+                            )
+                            streams[key.data].extend(raw)
+                        else:
+                            selector.unregister(key.fileobj)
+            code = process.wait(timeout=max(0.001, self.deadline - time.monotonic()))
+            require(
+                not owned_members(process, self.seen, self.deadline, tokens)[1],
+                "GHCR_owned_group_survived",
+            )
+            self.process = None
+            self.seen.clear()
+        except BaseException as error:
+            primary = error
+            if any(value in bytes(stream) for value in tokens for stream in streams):
+                primary = QualificationError("GitHub_credential_reflection_HOLD")
+        finally:
+            if self.process is not None:
+                previous_cleaning, CLEANING = CLEANING, True
+                try:
+                    cleanup_process(self.process, self.seen, self.begin_cleanup(), tokens)
+                    self.process = None
+                    self.seen.clear()
+                except BaseException as error:
+                    cleanup_error = error
+                finally:
+                    CLEANING = previous_cleaning
+            for cleanup_stream in (process.stdin, process.stdout, process.stderr):
+                if cleanup_stream is not None and not cleanup_stream.closed:
+                    cleanup_stream.close()
+        if primary is not None:
+            if cleanup_error is not None:
+                print(
+                    "GitHub cleanup also failed:"
+                    + (diagnostic_code(cleanup_error) or type(cleanup_error).__name__),
+                    file=sys.stderr,
+                )
+            raise primary
+        require(cleanup_error is None, "GitHub_cleanup_failed")
+        raw, stderr_raw = bytes(streams[0]), bytes(streams[1])
+        require(
+            all(value not in raw and value not in stderr_raw for value in tokens),
+            "GitHub_credential_reflection_HOLD",
+        )
+        self.sequence += 1
+        stem = "GitHub-" + str(self.sequence)
+        (self.evidence / (stem + ".stderr")).write_bytes(stderr_raw)
+        if len(raw) <= 16 * 1024**2:
+            (self.evidence / (stem + ".stdout")).write_bytes(raw)
+        (self.evidence / (stem + ".json")).write_bytes(
+            canonical_data(
+                {
+                    "argv": argv,
+                    "exit": code,
+                    "stdout_bytes": len(raw),
+                    "stdout_sha256": sha(raw),
+                    "stderr_sha256": sha(stderr_raw),
+                }
+            )
+        )
+        require(code == 0, "GitHub_native_failed")
+        return raw
+
+    def raw(self, endpoint: str, *, maximum: int = 16 * 1024**2) -> bytes:
+        prefix = "/repos/" + GHCR_REPOSITORY
+        require(type(endpoint) is str, "GitHub_same_repository_endpoint")
+        # The comparison namespace is exclusive: encoded/ref/query forms cannot
+        # fall through to the older general endpoint rule.
+        if endpoint.startswith(prefix + "/compare"):
+            accepted = (
+                re.fullmatch(
+                    re.escape(prefix) + r"/compare/[0-9a-f]{40}\.\.\.[0-9a-f]{40}", endpoint
+                )
+                is not None
+            )
+        else:
+            accepted = (
+                (endpoint == prefix or endpoint.startswith(prefix + "/"))
+                and ".." not in endpoint
+                and "#" not in endpoint
+                and all(32 < ord(c) < 127 for c in endpoint)
+            )
+        require(accepted, "GitHub_same_repository_endpoint")
+        return self._capture(
+            [self.gh, "api", "--hostname", "github.com", "--method", "GET", endpoint], maximum
+        )
+
+    def json(self, endpoint: str) -> Any:
+        return json.loads(
+            self.raw(endpoint), object_pairs_hook=unique_object, parse_constant=reject_constant
+        )
+
+    def pages(self, endpoint: str, key: str | None, count: int) -> list[dict[str, Any]]:
+        require(type(count) is int and 0 <= count <= 10000, "GitHub_finite_page_count")
+        values = []
+        for page in range(1, max(1, (count + 99) // 100) + 1):
+            response = self.json(
+                endpoint + ("&" if "?" in endpoint else "?") + f"per_page=100&page={page}"
+            )
+            if key is not None:
+                require(
+                    type(response) is dict
+                    and response.get("total_count") == count
+                    and type(response.get("total_count")) is int,
+                    "GitHub_page_count_drift",
+                )
+                response = response.get(key)
+            require(
+                type(response) is list and all(type(v) is dict for v in response),
+                "GitHub_page_shape",
+            )
+            values.extend(response)
+        require(
+            len(values) == count and len({v.get("id", v.get("sha")) for v in values}) == count,
+            "GitHub_complete_distinct_pages",
+        )
+        return values
+
+    def close(self) -> None:
+        global CLEANING
+        primary = sys.exc_info()[1]
+        previous_cleaning, CLEANING = CLEANING, True
+        try:
+            cap = self.begin_cleanup()
+            if self.process is not None:
+                cleanup_process(self.process, self.seen, cap, (self.known, *self.additional_known))
+                self.process = None
+                self.seen.clear()
+            # Never remove credential/config state unless the owned group is proved absent.
+            check_deadline(cap)
+            require(
+                {p.name for p in self.private.iterdir()} == {"home", "config", "cache", "tmp"},
+                "GitHub_private_directory_inventory",
+            )
+            for path in self.private.rglob("*"):
+                info = path.lstat()
+                require(
+                    info.st_uid == os.getuid()
+                    and not stat.S_ISLNK(info.st_mode)
+                    and (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)),
+                    "GitHub_private_member",
+                )
+            shutil.rmtree(self.private)
+            require(
+                not self.private.exists() and not self.private.is_symlink(),
+                "GitHub_private_cleanup",
+            )
+            self.environment.clear()
+            self.known = b""
+            self.additional_known = ()
+        except BaseException as error:
+            if primary is not None:
+                detail = diagnostic_code(error) or type(error).__name__
+                print("GitHub cleanup also failed:" + detail, file=sys.stderr)
+                primary.add_note("GitHub cleanup also failed:" + detail)
+                raise primary from None
+            raise
+        finally:
+            CLEANING = previous_cleaning
+
+    def source_files(self, head: str, paths: tuple[str, ...]) -> dict[str, bytes]:
+        require(
+            type(head) is str and re.fullmatch(r"[0-9a-f]{40}", head) is not None,
+            "GitHub_source_SHA",
+        )
+        commit = self.json(f"/repos/{GHCR_REPOSITORY}/git/commits/{head}")
+        require(type(commit) is dict and commit.get("sha") == head, "GitHub_commit_binding")
+        tree_sha = commit.get("tree", {}).get("sha")
+        require(
+            type(tree_sha) is str and re.fullmatch(r"[0-9a-f]{40}", tree_sha) is not None,
+            "GitHub_commit_tree",
+        )
+        tree = self.json(f"/repos/{GHCR_REPOSITORY}/git/trees/{tree_sha}?recursive=1")
+        require(
+            type(tree) is dict
+            and tree.get("sha") == tree_sha
+            and tree.get("truncated") is False
+            and type(tree.get("tree")) is list,
+            "GitHub_complete_source_tree",
+        )
+        result = {}
+        for path in paths:
+            require(
+                type(path) is str
+                and path
+                in {
+                    "scripts/ci/prometheus_source_image.py",
+                    ".github/workflows/build.yml",
+                    "deploy/prometheus/Containerfile",
+                    "deploy/prometheus/image-manifest.json",
+                },
+                "GitHub_finite_source_path",
+            )
+            rows = [row for row in tree["tree"] if row.get("path") == path]
+            require(
+                len(rows) == 1
+                and rows[0].get("mode") == "100644"
+                and rows[0].get("type") == "blob",
+                "GitHub_regular_source_blob",
+            )
+            blob = self.json(f'/repos/{GHCR_REPOSITORY}/git/blobs/{rows[0]["sha"]}')
+            require(
+                blob.get("encoding") == "base64" and type(blob.get("content")) is str,
+                "GitHub_blob_encoding",
+            )
+            raw = base64.b64decode(blob["content"].replace("\n", ""), validate=True)
+            require(
+                0 < len(raw) <= 1024**2
+                and blob.get("size") == len(raw)
+                and type(blob.get("size")) is int
+                and blob.get("sha") == rows[0]["sha"]
+                and hashlib.sha1(
+                    b"blob " + str(len(raw)).encode() + b"\0" + raw, usedforsecurity=False
+                ).hexdigest()
+                == rows[0]["sha"],
+                "GitHub_blob_native_identity",
+            )
+            result[path] = raw
+        return result
+
+
+PRODUCER_FILES = (
+    "scripts/ci/prometheus_source_image.py",
+    ".github/workflows/build.yml",
+    "deploy/prometheus/Containerfile",
+)
+MANIFEST_PATH = "deploy/prometheus/image-manifest.json"
+
+
+def authenticate_pr_source(
+    api: GitHubRead, number: object, source: str, final: str, source_ref: str
+) -> dict[str, Any]:
+    require(type(number) is int and number > 0, "candidate_PR_number")
+    pr = api.json(f"/repos/{GHCR_REPOSITORY}/pulls/{number}")
+    require(
+        pr.get("number") == number
+        and pr.get("head", {}).get("repo", {}).get("id") == 1043311030
+        and pr.get("base", {}).get("repo", {}).get("id") == 1043311030
+        and pr["head"].get("sha") == final
+        and "refs/heads/" + pr["head"].get("ref", "") == source_ref
+        and pr["base"].get("ref") == "main",
+        "candidate_same_repository_PR",
+    )
+    count = pr.get("commits")
+    require(type(count) is int and 0 < count <= 250, "candidate_complete_PR_commit_bound")
+    commits = api.pages(f"/repos/{GHCR_REPOSITORY}/pulls/{number}/commits", None, count)
+    graph = {row["sha"]: row for row in commits}
+    require(source in graph and final in graph, "producer_and_final_within_PR")
+    pending, visited = [final], set()
+    while pending:
+        current = pending.pop()
+        if current in visited:
+            continue
+        visited.add(current)
+        row = graph.get(current)
+        if row is not None:
+            require(type(row.get("parents")) is list, "PR_native_parent_inventory")
+            pending.extend(parent["sha"] for parent in row["parents"] if parent["sha"] in graph)
+    require(source in visited, "producer_ancestor_within_PR")
+    return cast(dict[str, Any], pr)
+
+
+def authenticate_producer_inputs(
+    api: GitHubRead,
+    root: Path,
+    source: str,
+    *,
+    tool: bool = False,
+    compiler_artifact: Artifact | None = None,
+) -> dict[str, Any]:
+    compiler_artifact = Artifact.canonical(
+        CURRENT_GO if compiler_artifact is None else compiler_artifact
+    )
+    require(compiler_artifact.name == "go", "compiler_artifact_role")
+    files = api.source_files(source, (*PRODUCER_FILES, MANIFEST_PATH))
+    for name in PRODUCER_FILES:
+        require(files[name] == (root / name).read_bytes(), "full_raw_producer_input_drift")
+    source_manifest = one_object(files[MANIFEST_PATH])
+    current = read_image_manifest(
+        root / MANIFEST_PATH, preparation=True, compiler_artifact=compiler_artifact
+    )
+    source_inputs = copy.deepcopy(source_manifest.get("inputs"))
+    current_inputs = copy.deepcopy(current["inputs"])
+    require(
+        source_manifest.get("schema") == IMAGE_SCHEMA and type(source_inputs) is dict,
+        "producer_source_manifest_inputs",
+    )
+    source_inputs = cast(dict[str, Any], source_inputs)
+    if tool:
+        source_inputs["oras"]["retained"] = None
+        current_inputs["oras"]["retained"] = None
+    exact_data(source_inputs, current_inputs)
+    if not tool and current_inputs.get("source", {}).get("derived_locks") == DERIVED_LOCKS:
+        require(
+            source_manifest.get("phase") == "source_prepared"
+            and source_manifest.get("selection") is None
+            and source_manifest.get("candidate") is None,
+            "p062_P1_prepared_null_outputs",
+        )
+    return {
+        name: {"bytes": len(raw), "sha256": sha(raw)}
+        for name, raw in files.items()
+        if name in PRODUCER_FILES
+    }
+
+
+def classify_source_change(base: dict[str, bytes], head: dict[str, bytes]) -> str:
+    """Select one closed raw-source case; classification grants no image validity."""
+    paths = {*PRODUCER_FILES, MANIFEST_PATH}
+    require(
+        type(base) is dict
+        and type(head) is dict
+        and set(base) == set(head) == paths
+        and all(
+            type(raw) is bytes and 0 < len(raw) <= 1024**2
+            for files in (base, head)
+            for raw in files.values()
+        ),
+        "source_change_inventory",
+    )
+    if base[MANIFEST_PATH] != head[MANIFEST_PATH]:
+        return "manifest_changed"
+    if base[PRODUCER_FILES[0]] == head[PRODUCER_FILES[0]]:
+        return "unchanged_published"
+    require(
+        all(base[name] == head[name] for name in PRODUCER_FILES[1:]),
+        "source_change_recipe_drift",
+    )
+    return "historical_helper_change"
+
+
+def require_native_ancestor(api: GitHubRead, ancestor: str, head: str) -> None:
+    """Delegate one complete bounded SHA relation to the native comparison API."""
+    require(
+        all(
+            type(value) is str and re.fullmatch(r"[0-9a-f]{40}", value) is not None
+            for value in (ancestor, head)
+        ),
+        "native_ancestor_inventory",
+    )
+    prefix = "/repos/" + GHCR_REPOSITORY
+    if ancestor == head:
+        commit = api.json(prefix + "/git/commits/" + head)
+        require(type(commit) is dict and commit.get("sha") == head, "native_ancestor_relation")
+        return
+    value = api.json(prefix + "/compare/" + ancestor + "..." + head)
+    require(
+        type(value) is dict
+        and type(value.get("base_commit")) is dict
+        and value["base_commit"].get("sha") == ancestor
+        and type(value.get("merge_base_commit")) is dict
+        and value["merge_base_commit"].get("sha") == ancestor
+        and value.get("status") == "ahead"
+        and type(value.get("behind_by")) is int
+        and value["behind_by"] == 0,
+        "native_ancestor_relation",
+    )
+    count, ahead, rows = value.get("total_commits"), value.get("ahead_by"), value.get("commits")
+    require(
+        type(count) is int
+        and type(ahead) is int
+        and 0 < count == ahead <= 250
+        and type(rows) is list
+        and len(rows) == count,
+        "native_ancestor_inventory",
+    )
+    identities: list[str] = []
+    for row in rows:
+        require(type(row) is dict, "native_ancestor_inventory")
+        sha_value, parents = row.get("sha"), row.get("parents")
+        require(
+            type(sha_value) is str
+            and re.fullmatch(r"[0-9a-f]{40}", sha_value) is not None
+            and type(parents) is list,
+            "native_ancestor_inventory",
+        )
+        parent_ids: list[str] = []
+        for parent in parents:
+            require(
+                type(parent) is dict
+                and type(parent.get("sha")) is str
+                and re.fullmatch(r"[0-9a-f]{40}", parent["sha"]) is not None,
+                "native_ancestor_inventory",
+            )
+            parent_ids.append(parent["sha"])
+        require(len(set(parent_ids)) == len(parent_ids), "native_ancestor_inventory")
+        identities.append(sha_value)
+    require(
+        len(set(identities)) == count and identities.count(head) == 1,
+        "native_ancestor_inventory",
+    )
+
+
+def authenticate_material_files(root: Path, expected: dict[str, bytes], deadline: float) -> None:
+    """Bind the four lexical local leaves to native H without executing their code."""
+    require(
+        type(expected) is dict and set(expected) == {*PRODUCER_FILES, MANIFEST_PATH},
+        "material_source_binding",
+    )
+    real_directory(root)
+    for name in (*PRODUCER_FILES, MANIFEST_PATH):
+        raw = expected[name]
+        require(type(raw) is bytes and 0 < len(raw) <= 1024**2, "material_source_binding")
+        path = root / name
+        # Keep lexical prefixes: resolve() would conceal a dirty intermediate link.
+        real_directory(path.parent)
+        info = path.lstat()
+        require(
+            stat.S_ISREG(info.st_mode)
+            and info.st_nlink == 1
+            and stat.S_IMODE(info.st_mode) == 0o644
+            and info.st_size == len(raw),
+            "material_source_binding",
+        )
+        require(file_hash(path, deadline) == sha(raw), "material_source_binding")
+
+
+def _historical_selected_files(
+    api: GitHubRead,
+    manifest: dict[str, Any],
+    base: str,
+    head: str,
+    current: dict[str, bytes],
+) -> tuple[str, dict[str, bytes]]:
+    """Authenticate the original merged S independently of receiving main lineage."""
+    producer = manifest["candidate"]["producer"]
+    original = api.json(f'/repos/{GHCR_REPOSITORY}/pulls/{producer["pr_number"]}')
+    require(type(original) is dict, "historical_original_merged_PR")
+    final = original.get("head", {}).get("sha")
+    pr = authenticate_pr_source(
+        api, producer["pr_number"], producer["source_head"], final, producer["source_ref"]
+    )
+    selected = pr.get("merge_commit_sha")
+    require(
+        pr.get("merged") is True
+        and pr.get("state") == "closed"
+        and type(selected) is str
+        and re.fullmatch(r"[0-9a-f]{40}", selected) is not None,
+        "historical_original_merged_PR",
+    )
+    selected = cast(str, selected)
+    require_native_ancestor(api, selected, base)
+    require_native_ancestor(api, base, head)
+    files = api.source_files(selected, (*PRODUCER_FILES, MANIFEST_PATH))
+    require(files[MANIFEST_PATH] == current[MANIFEST_PATH], "historical_selected_manifest")
+    require(
+        all(files[name] == current[name] for name in PRODUCER_FILES[1:]),
+        "historical_recipe_drift",
+    )
+    return selected, files
+
+
+def candidate_source_root(
+    api: GitHubRead, root: Path, work: Path, admission: dict[str, Any]
+) -> Path:
+    """Materialize one authenticated S DATA root for unchanged complete candidate readers."""
+    if admission["mode"] not in ("historical_pr_candidate", "historical_main_recovery"):
+        return root
+    current = api.source_files(admission["head"], (*PRODUCER_FILES, MANIFEST_PATH))
+    authenticate_material_files(root, current, api.deadline)
+    manifest = read_image_manifest(root / MANIFEST_PATH)
+    selected, files = _historical_selected_files(
+        api, manifest, admission["comparison_base"], admission["head"], current
+    )
+    require(selected == admission["historical_source_head"], "historical_selected_manifest")
+    destination = work / "historical-source"
+    fresh_directory(destination)
+    for name, raw in files.items():
+        path = destination / name
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        real_directory(path.parent)
+        with path.open("xb") as output:
+            output.write(raw)
+        path.chmod(0o600)
+    authenticate_producer_inputs(api, destination, manifest["candidate"]["producer"]["source_head"])
+    return destination
+
+
+def event_admission(
+    api: GitHubRead, root: Path, event: dict[str, Any], event_name: str, head: str
+) -> dict[str, Any]:
+    """Authenticate closed original, historical and published event cases."""
+    manifest = read_image_manifest(root / MANIFEST_PATH)
+    candidate = manifest["candidate"]
+    producer = candidate["producer"]
+    if event_name == "pull_request":
+        number = event.get("number")
+        pr = api.json(f"/repos/{GHCR_REPOSITORY}/pulls/{number}")
+        require(
+            pr.get("head", {}).get("sha") == head
+            and pr.get("state") == "open"
+            and pr["head"].get("repo", {}).get("id") == 1043311030
+            and pr.get("base", {}).get("repo", {}).get("id") == 1043311030
+            and pr.get("base", {}).get("ref") == "main"
+            and type(head) is str
+            and re.fullmatch(r"[0-9a-f]{40}", head) is not None,
+            "consumer_actual_open_PR",
+        )
+        base = pr["base"]["sha"]
+        require(
+            type(base) is str
+            and re.fullmatch(r"[0-9a-f]{40}", base) is not None
+            and event.get("pull_request", {}).get("head", {}).get("sha") == head
+            and event["pull_request"].get("base", {}).get("sha") == base,
+            "consumer_actual_open_PR",
+        )
+        base_files = api.source_files(base, (*PRODUCER_FILES, MANIFEST_PATH))
+        current_files = api.source_files(head, (*PRODUCER_FILES, MANIFEST_PATH))
+        authenticate_material_files(root, current_files, api.deadline)
+        manifest = read_image_manifest(root / MANIFEST_PATH)
+        producer = manifest["candidate"]["producer"]
+        change = classify_source_change(base_files, current_files)
+        historical_candidate = change == "historical_helper_change"
+        if change == "unchanged_published" and base_files == current_files:
+            # Only a complete authenticated observation can select another proof class.
+            # API, identity and malformed-state errors propagate without a fallback.
+            _published, diagnostic = observe_publication_predecessor(api, base)
+            historical_candidate = diagnostic is not None
+        if historical_candidate:
+            selected, _files = _historical_selected_files(api, manifest, base, head, current_files)
+            return {
+                "mode": "historical_pr_candidate",
+                "head": head,
+                "publisher_head": None,
+                "historical_source_head": selected,
+                "comparison_base": base,
+            }
+        if change == "unchanged_published":
+            return {
+                "mode": "unchanged_published",
+                "head": head,
+                "publisher_head": pr["base"]["sha"],
+            }
+        require(number == producer["pr_number"], "changed_PR_original_producer")
+        authenticate_pr_source(api, number, producer["source_head"], head, producer["source_ref"])
+        authenticate_producer_inputs(api, root, producer["source_head"])
+        if manifest["inputs"]["source"]["derived_locks"] == DERIVED_LOCKS:
+            require(
+                number == 2494
+                and producer["source_ref"] == P062_REF
+                and head != producer["source_head"],
+                "p062_P2_distinct_actual_output_descendant",
+            )
+            require_native_ancestor(api, producer["source_head"], head)
+        return {"mode": "changed_pr_candidate", "head": head, "publisher_head": None}
+    require(event_name in ("push", "schedule", "workflow_dispatch"), "consumer_event_table")
+    if (
+        event_name == "push"
+        and type(event.get("ref")) is str
+        and event["ref"].startswith("refs/tags/v")
+    ):
+        tag = event["ref"][len("refs/tags/") :]
+        require(re.fullmatch(r"v[A-Za-z0-9_.-]{1,100}", tag) is not None, "published_tag_shape")
+        reference = api.json(f"/repos/{GHCR_REPOSITORY}/git/ref/tags/{tag}")
+        target = reference.get("object", {})
+        if target.get("type") == "tag":
+            annotated = api.json(f'/repos/{GHCR_REPOSITORY}/git/tags/{target["sha"]}')
+            target = annotated.get("object", {})
+        require(
+            target.get("type") == "commit" and target.get("sha") == head,
+            "published_tag_native_commit",
+        )
+        return {"mode": "unchanged_published", "head": head, "publisher_head": head}
+    current = api.json(f"/repos/{GHCR_REPOSITORY}/git/ref/heads/main")
+    require(current.get("object", {}).get("sha") == head, "consumer_current_main")
+    if event_name == "push" and event.get("ref") == "refs/heads/main":
+        before = event.get("before")
+        require(
+            type(before) is str and re.fullmatch(r"[0-9a-f]{40}", before) is not None,
+            "main_before_SHA",
+        )
+        before = cast(str, before)
+        previous = api.source_files(before, (*PRODUCER_FILES, MANIFEST_PATH))
+        current_files = api.source_files(head, (*PRODUCER_FILES, MANIFEST_PATH))
+        authenticate_material_files(root, current_files, api.deadline)
+        manifest = read_image_manifest(root / MANIFEST_PATH)
+        producer = manifest["candidate"]["producer"]
+        change = classify_source_change(previous, current_files)
+        if change == "historical_helper_change":
+            selected, _files = _historical_selected_files(
+                api, manifest, before, head, current_files
+            )
+            return {
+                "mode": "historical_main_recovery",
+                "head": head,
+                "publisher_head": head,
+                "historical_source_head": selected,
+                "comparison_base": before,
+            }
+        if change == "manifest_changed":
+            pr = authenticate_pr_source(
+                api,
+                producer["pr_number"],
+                producer["source_head"],
+                api.json(f'/repos/{GHCR_REPOSITORY}/pulls/{producer["pr_number"]}')["head"]["sha"],
+                producer["source_ref"],
+            )
+            require(
+                pr.get("merged") is True
+                and pr.get("state") == "closed"
+                and pr.get("merge_commit_sha") == head,
+                "new_selection_actual_squash",
+            )
+            authenticate_producer_inputs(api, root, producer["source_head"])
+            return {
+                "mode": "new_main_selection",
+                "head": head,
+                "publisher_head": head,
+                "final_PR_head": pr["head"]["sha"],
+            }
+    return {"mode": "unchanged_published", "head": head, "publisher_head": head}
+
+
+def observe_publication_predecessor(
+    api: GitHubRead, head: str
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Observe once; classified nonpositive states are distinct from evidence errors."""
+    require(
+        type(head) is str and re.fullmatch(r"[0-9a-f]{40}", head) is not None,
+        "publication_predecessor_head",
+    )
+    active = {"queued", "in_progress", "waiting", "pending", "requested"}
+    conclusions = {
+        "success",
+        "failure",
+        "cancelled",
+        "timed_out",
+        "skipped",
+        "neutral",
+        "action_required",
+        "stale",
+        "startup_failure",
+    }
+
+    def run_identity(value: object) -> tuple[object, ...]:
+        require(type(value) is dict, "publication_predecessor_run_identity")
+        row = cast(dict[str, Any], value)
+        require(
+            all(
+                type(row.get(key)) is int and row[key] > 0
+                for key in ("id", "run_attempt", "workflow_id")
+            )
+            and type(row.get("head_sha")) is str
+            and re.fullmatch(r"[0-9a-f]{40}", row["head_sha"]) is not None
+            and type(row.get("head_branch")) is str
+            and bool(row["head_branch"])
+            and type(row.get("event")) is str
+            and bool(row["event"])
+            and type(row.get("path")) is str
+            and bool(row["path"])
+            and all(
+                type(row.get(key)) is dict
+                and type(row[key].get("id")) is int
+                and row[key]["id"] > 0
+                for key in ("repository", "head_repository")
+            ),
+            "publication_predecessor_run_identity",
+        )
+        return (
+            row["id"],
+            row["run_attempt"],
+            row["workflow_id"],
+            row["head_sha"],
+            row["head_branch"],
+            row["event"],
+            row["repository"]["id"],
+            row["head_repository"]["id"],
+            row["path"],
+        )
+
+    def state(row: dict[str, Any]) -> tuple[str, str | None]:
+        status, conclusion = row.get("status"), row.get("conclusion")
+        require(
+            "conclusion" in row
+            and type(status) is str
+            and (
+                (status in active and conclusion is None)
+                or (status == "completed" and type(conclusion) is str and conclusion in conclusions)
+            ),
+            "publication_predecessor_state",
+        )
+        return cast(str, status), cast(str | None, conclusion)
+
+    endpoint = (
+        f"/repos/{GHCR_REPOSITORY}/actions/workflows/build.yml/runs?event=push&head_sha={head}"
+    )
+    first = api.json(endpoint + "&per_page=100&page=1")
+    require(
+        type(first) is dict and "total_count" in first,
+        "publication_predecessor_run_inventory",
+    )
+    runs = api.pages(endpoint, "workflow_runs", first["total_count"])
+    eligible: list[dict[str, Any]] = []
+    observed = []
+    for run in runs:
+        identity = run_identity(run)
+        if (
+            run.get("head_sha") != head
+            or run.get("head_branch") != "main"
+            or run.get("repository", {}).get("id") != 1043311030
+            or run.get("head_repository", {}).get("id") != 1043311030
+            or run.get("event") != "push"
+            or run.get("path") != ".github/workflows/build.yml"
+        ):
+            continue
+        old_status, old_conclusion = state(run)
+        jobs_endpoint = (
+            f'/repos/{GHCR_REPOSITORY}/actions/runs/{run["id"]}/attempts/{run["run_attempt"]}/jobs'
+        )
+        page = api.json(jobs_endpoint + "?per_page=100&page=1")
+        require(
+            type(page) is dict and "total_count" in page,
+            "publication_predecessor_job_inventory",
+        )
+        jobs = api.pages(jobs_endpoint, "jobs", page["total_count"])
+        for job in jobs:
+            require(
+                type(job.get("id")) is int
+                and job["id"] > 0
+                and type(job.get("run_id")) is int
+                and job["run_id"] == run["id"]
+                and type(job.get("run_attempt")) is int
+                and job["run_attempt"] == run["run_attempt"]
+                and job.get("head_sha") == head
+                and type(job.get("name")) is str
+                and bool(job["name"]),
+                "publication_predecessor_job_identity",
+            )
+        publishers = [job for job in jobs if job["name"] == "prometheus-publish"]
+        require(len(publishers) <= 1, "publication_predecessor_publisher_ambiguous")
+        publisher_job = publishers[0] if publishers else None
+        job_state = state(publisher_job) if publisher_job is not None else None
+        # A later allowed poll may discover an operator-created attempt. Within
+        # this observation the run and its jobs must still bind the same attempt.
+        current = api.json(f'/repos/{GHCR_REPOSITORY}/actions/runs/{run["id"]}')
+        require(run_identity(current) == identity, "publication_predecessor_run_drift")
+        current = cast(dict[str, Any], current)
+        run_state = state(current)
+        require(
+            old_status != "completed" or run_state == (old_status, old_conclusion),
+            "publication_predecessor_run_drift",
+        )
+        require(
+            run_state != ("completed", "success") or job_state in (None, ("completed", "success")),
+            "publication_predecessor_run_job_contradiction",
+        )
+        if run_state == job_state == ("completed", "success"):
+            eligible.append({"run": current, "job": publisher_job})
+        observed.append((current, run_state, job_state))
+    if eligible:
+        return max(eligible, key=lambda value: value["run"]["id"]), None
+    if not observed:
+        return None, "positive_publication_predecessor_missing"
+    _run, run_state, job_state = max(observed, key=lambda value: value[0]["id"])
+    terminal = {
+        "failure": "publication_predecessor_failed",
+        "cancelled": "publication_predecessor_cancelled",
+        "timed_out": "publication_predecessor_timed_out",
+    }
+    for conclusion in (run_state[1], job_state[1] if job_state is not None else None):
+        diagnostic = terminal.get(conclusion) if conclusion is not None else None
+        if diagnostic is not None:
+            return None, diagnostic
+    if not (
+        run_state[0] != "completed"
+        and (job_state is None or job_state[0] != "completed" or job_state[1] == "success")
+    ):
+        return None, "publication_predecessor_not_published"
+    return None, "positive_publication_predecessor_active"
+
+
+def require_publication_predecessor(api: GitHubRead, head: str) -> dict[str, Any]:
+    """Require the original positive publisher result and preserve every diagnostic."""
+    predecessor, diagnostic = observe_publication_predecessor(api, head)
+    if diagnostic is not None:
+        raise QualificationError(diagnostic)
+    require(predecessor is not None, "positive_publication_predecessor_missing")
+    return cast(dict[str, Any], predecessor)
+
+
+def authenticated_artifact(
+    api: GitHubRead,
+    artifact_id: int,
+    destination: Path,
+    *,
+    expected_run: int,
+    expected_job: str,
+    expected_head: str,
+    purpose: str = "successful_producer",
+) -> dict[str, Any]:
+    require(
+        purpose == "successful_producer"
+        or (
+            purpose == "tool_prefetch_precompile_failure"
+            and type(expected_run) is int
+            and expected_job == "prometheus-oras-qualification"
+            and (expected_run, expected_head, artifact_id)
+            in (
+                (38170923494, "5de54811121079eadbd3f5d8dbbb8720f712530a", 11713828762),
+                (38192419687, "15097adaa871a900370f6c57a512fe862dddb041", 11722041486),
+            )
+        )
+        or (
+            purpose == "tool_postcompile_layout_failure"
+            and type(expected_run) is int
+            and expected_job == "prometheus-oras-qualification"
+            and (expected_run, expected_head, artifact_id)
+            == (38239428418, "f632572057453d57975a397a5b2db64894204be0", 11742856046)
+        ),
+        "artifact_closed_purpose",
+    )
+    conclusion = "success" if purpose == "successful_producer" else "failure"
+    require(type(artifact_id) is int and artifact_id > 0, "artifact_positive_ID")
+    record = api.json(f"/repos/{GHCR_REPOSITORY}/actions/artifacts/{artifact_id}")
+    require(
+        type(record) is dict
+        and record.get("id") == artifact_id
+        and record.get("expired") is False
+        and type(record.get("size_in_bytes")) is int
+        and 0 < record["size_in_bytes"] <= 1024**3,
+        "artifact_identity_expiry_size",
+    )
+    workflow_run = record.get("workflow_run")
+    require(
+        type(workflow_run) is dict
+        and workflow_run.get("id") == expected_run
+        and workflow_run.get("repository_id") == 1043311030
+        and workflow_run.get("head_repository_id") == 1043311030
+        and workflow_run.get("head_sha") == expected_head,
+        "artifact_run_repository_source",
+    )
+    expiry = record.get("expires_at")
+    require(
+        type(expiry) is str
+        and datetime.fromisoformat(expiry.replace("Z", "+00:00")) > datetime.now(timezone.utc),
+        "artifact_current_expiry",
+    )
+    run = api.json(f"/repos/{GHCR_REPOSITORY}/actions/runs/{expected_run}")
+    workflow = api.json(f"/repos/{GHCR_REPOSITORY}/actions/workflows/build.yml")
+    require(
+        run.get("id") == expected_run
+        and run.get("head_sha") == expected_head
+        and run.get("repository", {}).get("id") == 1043311030
+        and run.get("head_repository", {}).get("id") == 1043311030
+        and run.get("event") == "workflow_dispatch"
+        and run.get("run_attempt") == 1
+        and type(run.get("run_attempt")) is int
+        and run.get("status") == "completed"
+        and run.get("conclusion") == conclusion
+        and run.get("workflow_id") == workflow.get("id")
+        and workflow.get("path") == ".github/workflows/build.yml",
+        "artifact_completed_workflow",
+    )
+    job_page = api.json(
+        f"/repos/{GHCR_REPOSITORY}/actions/runs/{expected_run}/attempts/1/jobs?per_page=100&page=1"
+    )
+    jobs = api.pages(
+        f"/repos/{GHCR_REPOSITORY}/actions/runs/{expected_run}/attempts/1/jobs",
+        "jobs",
+        job_page["total_count"],
+    )
+    matches = [v for v in jobs if v.get("name") == expected_job]
+    require(
+        len(matches) == 1
+        and matches[0].get("status") == "completed"
+        and matches[0].get("conclusion") == conclusion
+        and matches[0].get("run_id") == expected_run
+        and matches[0].get("head_sha") == expected_head,
+        "artifact_successful_producer_job",
+    )
+    raw = api.raw(f"/repos/{GHCR_REPOSITORY}/actions/artifacts/{artifact_id}/zip", maximum=1024**3)
+    require(
+        len(raw) == record["size_in_bytes"]
+        and _digest(record.get("digest")) == "sha256:" + sha(raw),
+        "artifact_native_download_digest",
+    )
+    require(
+        not destination.exists() and not destination.is_symlink(), "artifact_download_not_fresh"
+    )
+    with destination.open("xb") as stream:
+        stream.write(raw)
+    destination.chmod(0o600)
+    return {"artifact": record, "run": run, "workflow": workflow, "job": matches[0]}
+
+
+def _zip_members(path: Path) -> dict[str, bytes]:
+    """Actions transport members are data, never executable inputs by discovery."""
+    before = file_hash(path)
+    result: dict[str, bytes] = {}
+    total = 0
+    with zipfile.ZipFile(path) as archive:
+        require(0 < len(archive.infolist()) <= 4096, "artifact_member_count")
+        for info in archive.infolist():
+            name = info.filename
+            require(
+                type(name) is str
+                and name.isascii()
+                and not name.startswith("/")
+                and "\\" not in name
+                and all(v not in ("", ".", "..") for v in name.split("/"))
+                and name not in result
+                and not info.is_dir()
+                and not info.flag_bits & 1,
+                "artifact_member_path_or_alias",
+            )
+            mode = info.external_attr >> 16
+            require(stat.S_IFMT(mode) in (0, stat.S_IFREG), "artifact_member_type")
+            total += info.file_size
+            require(
+                0 <= info.file_size <= MAX_CACHE_BYTES and total <= MAX_CACHE_BYTES,
+                "artifact_expanded_bound",
+            )
+            raw = archive.read(info)
+            require(len(raw) == info.file_size, "artifact_member_size")
+            result[name] = raw
+    require(file_hash(path) == before, "artifact_transport_changed")
+    return result
+
+
+def _current_qualification_artifact(
+    api: GitHubRead, root: Path, admission: dict[str, Any], destination: Path
+) -> dict[str, Any]:
+    """Resolve one real same-producer qualification; never choose latest success."""
+    head = admission["head"]
+    require(
+        admission.get("ref")
+        == (
+            P062_REF
+            if admission.get("producer_epoch") == "xnet062"
+            else "refs/heads/codex/python-setup-security-stabilization"
+        ),
+        "stabilization_qualification_owner",
+    )
+    endpoint = f"/repos/{GHCR_REPOSITORY}/actions/workflows/build.yml/runs?event=workflow_dispatch"
+    page = api.json(endpoint + "&per_page=100&page=1")
+    runs = api.pages(endpoint, "workflow_runs", page["total_count"])
+    candidates: list[dict[str, Any]] = []
+    for run in runs:
+        if run.get("head_sha") != head or run.get("id") == admission["run_id"]:
+            continue
+        jobs_endpoint = f'/repos/{GHCR_REPOSITORY}/actions/runs/{run["id"]}/jobs?filter=all'
+        jobs_page = api.json(jobs_endpoint + "&per_page=100&page=1")
+        jobs = api.pages(jobs_endpoint, "jobs", jobs_page["total_count"])
+        selected = [
+            row
+            for row in jobs
+            if row.get("name") == "prometheus-source-qualification"
+            and row.get("conclusion") != "skipped"
+        ]
+        if not selected:
+            continue
+        require(
+            len(selected) == 1
+            and run.get("head_branch") == admission["ref"][11:]
+            and type(run.get("run_attempt")) is int
+            and run["run_attempt"] == 1
+            and run.get("status") == "completed"
+            and run.get("conclusion") == "success"
+            and selected[0].get("status") == "completed"
+            and selected[0].get("conclusion") == "success"
+            and selected[0].get("run_id") == run["id"]
+            and selected[0].get("head_sha") == head,
+            "stabilization_qualification_terminal",
+        )
+        artifacts_endpoint = f'/repos/{GHCR_REPOSITORY}/actions/runs/{run["id"]}/artifacts'
+        artifact_page = api.json(artifacts_endpoint + "?per_page=100&page=1")
+        artifacts = api.pages(artifacts_endpoint, "artifacts", artifact_page["total_count"])
+        matching = [
+            row
+            for row in artifacts
+            if row.get("name") == f'prometheus-source-qualification-{run["id"]}-1'
+        ]
+        require(len(matching) == 1, "stabilization_qualification_artifact_unique")
+        candidates.append({"run": run, "artifact": matching[0]})
+    require(len(candidates) == 1, "stabilization_qualification_unique")
+    chosen = candidates[0]
+    result = authenticated_artifact(
+        api,
+        chosen["artifact"]["id"],
+        destination,
+        expected_run=chosen["run"]["id"],
+        expected_job="prometheus-source-qualification",
+        expected_head=head,
+    )
+    authenticate_producer_inputs(api, root, head)
+    return result
+
+
+XNET062_PATCH_SHA256 = "73950dc5f646f76ff0d09885a2fb1ce29f62b29c00dc7ca96d7910ad7ac304bc"
+
+
+def _qualification_xnet062(
+    files: dict[str, bytes],
+    root: Path,
+    qualified: dict[str, Any],
+    work: Path,
+    vendor_base: dict[str, Any],
+    *,
+    compiler_artifact: Artifact | None = None,
+) -> dict[str, bytes]:
+    """Independent retained Q predicates; no runtime-original/Native reconstruction."""
+    compiler_artifact = Artifact.canonical(
+        CURRENT_GO if compiler_artifact is None else compiler_artifact
+    )
+    require(compiler_artifact.name == "go", "compiler_artifact_role")
+    import difflib
+
+    report = one_object(files["qualification.json"])
+    qrun = qualified["run"]
+    require(
+        qrun["head_branch"] == P062_REF[11:]
+        and qrun["run_attempt"] == 1
+        and qrun["conclusion"] == "success"
+        and qrun["status"] == "completed",
+        "p062_Q_authenticated_context",
+    )
+    require(
+        work.is_absolute() and work.name == f'prometheus-source-{qrun["id"]}-1',
+        "p062_Q_trusted_work_root",
+    )
+    manifest = read_image_manifest(
+        root / MANIFEST_PATH, preparation=True, compiler_artifact=compiler_artifact
+    )
+    require(manifest["inputs"]["source"]["derived_locks"] == DERIVED_LOCKS, "p062_Q_current_epoch")
+    for key, expected_scalar in (
+        ("source_revision", REVISION),
+        ("source_tree", TREE),
+        ("module_action", "xnet062-replay"),
+        ("heavy_build_invocations", 0),
+        ("publication_commands", 0),
+        ("automatic_retries", 0),
+        ("interruptions", []),
+        ("failure", None),
+        ("status", "observed_package_metadata_only"),
+    ):
+        exact_data(report.get(key), expected_scalar)
+    expected_admission = {
+        "run_id": qrun["id"],
+        "head": qrun["head_sha"],
+        "ref": P062_REF,
+        "job": P062_JOB_NAMES["qualification"],
+        "workflow_id": 199904435,
+        "job_id": qualified["job"]["id"],
+        "pr_number": 2494,
+        "producer_epoch": "xnet062",
+    }
+    admission = report.get("admission")
+    require(type(admission) is dict, "p062_Q_source_admission")
+    admission = cast(dict[str, Any], admission)
+    exact_data({key: admission.get(key) for key in expected_admission}, expected_admission)
+    exact_data(report.get("retained_tool"), manifest["inputs"]["oras"]["retained"])
+    exact_data(
+        report.get("producer"),
+        {
+            str(root / name): file_hash(root / name)
+            for name in ("scripts/ci/prometheus_source_image.py", ".github/workflows/build.yml")
+        },
+    )
+    exact_data(
+        report.get("acquisition"),
+        [
+            {
+                "artifact": item.name,
+                "public_source": item.url,
+                "bytes": item.size,
+                "sha256": item.digest,
+                "explicit_release_handoff": item.release,
+                "final_redirects": 0,
+            }
+            for item in (SOURCE, compiler_artifact, UI, CHECKSUMS)
+        ],
+    )
+    transform = report.get("UI_transform")
+    require(
+        type(transform) is dict
+        and set(transform)
+        == {
+            "generated_paths",
+            "embed_sha256",
+            "python",
+            "gzip_source_sha256",
+            "zlib_build",
+            "zlib_runtime",
+            "algorithm",
+        },
+        "p062_Q_UI_inventory",
+    )
+    transform = cast(dict[str, Any], transform)
+    exact_data(transform["generated_paths"], [name + ".gz" for name in sorted(UI_FILES)])
+    exact_data(
+        transform["algorithm"],
+        "Python GzipFile filename-empty mtime0 level6 OS255; not GNU gzip byte equality",
+    )
+    for field in ("embed_sha256", "gzip_source_sha256"):
+        _digest("sha256:" + transform[field])
+    require(
+        all(
+            type(transform[field]) is str and bool(transform[field])
+            for field in ("python", "zlib_build", "zlib_runtime")
+        ),
+        "p062_Q_UI_implementation",
+    )
+    records = report.get("native_operations")
+    require(type(records) is list, "p062_Q_native_records")
+    records = cast(list[dict[str, Any]], records)
+    position = 0
+    evidence, go, config = work / "evidence", work / "go", work / "docker-config"
+    docker = "/usr/bin/docker"
+    docker_env = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": str(work),
+        "DOCKER_CONFIG": str(config),
+        "LANG": "C.UTF-8",
+    }
+    bound_slots: set[str] = set()
+
+    def member(name: str) -> bytes:
+        require(
+            name in files and type(files[name]) is bytes and len(files[name]) <= MAX_NATIVE_OUTPUT,
+            "p062_Q_raw_member",
+        )
+        return files[name]
+
+    def bound(value: Any, name: str) -> bytes:
+        require(name not in bound_slots, "p062_Q_duplicate_slot")
+        bound_slots.add(name)
+        raw = member(name)
+        require(bool(raw), "p062_Q_empty_slot")
+        exact_data(value, {"member": name, "bytes": len(raw), "sha256": sha(raw)})
+        return raw
+
+    def array(raw: bytes, *, compact: bool = False) -> list[dict[str, Any]]:
+        value = json.loads(raw, object_pairs_hook=unique_object, parse_constant=reject_constant)
+        require(
+            type(value) is list
+            and 0 < len(value) <= 250000
+            and all(type(row) is dict for row in value),
+            "p062_Q_array",
+        )
+        encoding = (
+            canonical_data(value) + b"\n"
+            if compact
+            else (json.dumps(value, sort_keys=True, allow_nan=False) + "\n").encode()
+        )
+        require(raw == encoding, "p062_Q_array_encoding")
+        return cast(list[dict[str, Any]], value)
+
+    def record(stage: str, argv: list[str], env: dict[str, str], cwd: Path) -> bytes:
+        nonlocal position
+        require(position < len(records), "p062_Q_missing_native_record")
+        row = records[position]
+        position += 1
+        require(type(row) is dict, "p062_Q_native_record_object")
+        stdout, stderr = member(stage + ".stdout"), member(stage + ".stderr")
+        exact_data(
+            row,
+            {
+                "argv": argv,
+                "environment": env,
+                "cwd": str(cwd),
+                "exit": 0,
+                "failure": None,
+                "stdout": str(evidence / (stage + ".stdout")),
+                "stderr": str(evidence / (stage + ".stderr")),
+                "stdout_sha256": sha(stdout),
+                "stderr_sha256": sha(stderr),
+            },
+        )
+        return stdout
+
+    def names(raw: bytes) -> list[str]:
+        require(not raw or raw.endswith(b"\n"), "p062_Q_inventory_terminal")
+        rows = raw.decode("ascii").splitlines()
+        require(
+            len(rows) == len(set(rows))
+            and all(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", n) for n in rows),
+            "p062_Q_inventory_names",
+        )
+        return rows
+
+    before_names = names(
+        record(
+            "derive-containers-before",
+            [docker, "--config", str(config), "ps", "--all", "--format", "{{.Names}}"],
+            docker_env,
+            work,
+        )
+    )
+    record(
+        "derive-base-pull",
+        [docker, "--config", str(config), "pull", "--platform", "linux/amd64", BASE],
+        docker_env,
+        work,
+    )
+    image = native_one_image(
+        record(
+            "derive-base-inspect",
+            [docker, "--config", str(config), "image", "inspect", BASE],
+            docker_env,
+            work,
+        )
+    )
+    relation = native_base_identity(image)
+    exact_data(report.get("runtime_base_native"), image)
+    expected_config = vendor_base["config"]["config"]
+    exact_data({key: image.get("Config", {}).get(key) for key in expected_config}, expected_config)
+    derivation = report.get("module_derivation")
+    require(
+        type(derivation) is dict
+        and type(derivation.get("replays")) is list
+        and len(derivation["replays"]) == 2,
+        "p062_Q_two_replays",
+    )
+    derivation = cast(dict[str, Any], derivation)
+    exact_data(derivation.get("authored_action"), "golang.org/x/net@v0.62.0")
+    exact_data(
+        derivation.get("replay_equality"), "observed_under_explicit_coordinate_correspondence_only"
+    )
+    require(
+        derivation.get("closure_disposition")
+        == "pending independent complete delta/fullF review; metadata only",
+        "p062_Q_no_inferred_closure",
+    )
+    container_records: list[tuple[str, dict[str, Any]]] = []
+    owner: str | None = None
+    ids: set[str] = set()
+    comparisons = []
+    outputs: dict[str, bytes] = {}
+
+    for lane, replay in zip(("a", "b"), derivation["replays"], strict=True):
+        exact_data(replay.get("replay"), lane)
+        source = work / ("source" if lane == "a" else "source-b")
+        area = work / ("replay-" + lane)
+        modules = area / "modules"
+        online = clean_environment(
+            area / "home", area / "tmp", area / "gocache", modules, offline=False
+        )
+        writable = dict(online, GOFLAGS="")
+        lock_epochs = {}
+        for label, expected in (
+            ("original", LOCKS),
+            ("incumbent", XNET060_INCUMBENT_LOCKS),
+            ("derived", DERIVED_LOCKS),
+        ):
+            lock_epochs[label] = {name: member(lane + "-" + label + "-" + name) for name in LOCKS}
+            exact_data({name: sha(raw) for name, raw in lock_epochs[label].items()}, expected)
+        exact_data(replay.get("original_locks"), LOCKS)
+        exact_data(replay.get("derived_locks"), DERIVED_LOCKS)
+        patch = b"".join(
+            b"".join(
+                difflib.diff_bytes(
+                    difflib.unified_diff,
+                    lock_epochs["original"][name].splitlines(keepends=True),
+                    lock_epochs["derived"][name].splitlines(keepends=True),
+                    fromfile=("a/" + name).encode(),
+                    tofile=("b/" + name).encode(),
+                )
+            )
+            for name in LOCKS
+        )
+        require(
+            member(lane + "-module-derivation.patch") == patch
+            and sha(patch) == XNET062_PATCH_SHA256
+            and replay.get("patch_sha256") == sha(patch),
+            "p062_Q_materialization_patch",
+        )
+        postget = array(member(lane + "-postget-source-members.json"))
+        require(len({row.get("path") for row in postget}) == len(postget), "p062_Q_source_paths")
+        nonlocks = [row for row in postget if row.get("path") not in LOCKS]
+        exact_data(
+            replay.get("nonlock_source_inventory_sha256"),
+            sha(json.dumps(nonlocks, sort_keys=True).encode()),
+        )
+
+        def phase(label: str) -> dict[str, Any]:
+            result: dict[str, Any] = {}
+            for key, command in (
+                ("version", ["version"]),
+                ("edit", ["mod", "edit", "-json"]),
+                ("download", ["mod", "download", "-json"]),
+                ("verify", ["mod", "verify"]),
+                ("selected", ["list", "-m", "-json", "all"]),
+                ("graph", ["mod", "graph"]),
+            ):
+                raw = record(label + "-" + key, [str(go / "bin/go"), *command], online, source)
+                if key == "version":
+                    require(raw == compiler_artifact.go_version.encode(), "p062_Q_compiler_version")
+                elif key == "edit":
+                    value = one_object(raw)
+                    require(
+                        "Error" not in value and value.get("Module", {}).get("Path") == ROOT_MODULE,
+                        "p062_Q_directive_root",
+                    )
+                    result[key] = value
+                elif key == "selected":
+                    result[key] = decode_selected_modules(raw)
+                elif key == "download":
+                    result[key] = decode_modules(raw)
+                else:
+                    result[key] = raw.decode("utf-8", errors="strict")
+            require(bool(result["graph"]), "p062_Q_empty_graph")
+            return result
+
+        def offline(label: str, value: dict[str, Any], *, incumbent: bool) -> dict[str, Any]:
+            nonlocal owner
+            bindings = value.get("full_native_package_members")
+            require(
+                type(bindings) is dict and set(bindings) == {"prometheus", "promtool"},
+                "p062_Q_package_slots",
+            )
+            bindings = cast(dict[str, Any], bindings)
+            frozen = array(
+                bound(value.get("module_inventory_member"), label + "-module-cache-members.json")
+            )
+            require(len({v.get("path") for v in frozen}) == len(frozen), "p062_Q_cache_paths")
+            for row in frozen:
+                require(
+                    set(row) == {"path", "size", "mode", "sha256"}
+                    and type(row["size"]) is int
+                    and row["size"] >= 0
+                    and type(row["mode"]) is int
+                    and row["mode"] == 0o444,
+                    "p062_Q_frozen_cache",
+                )
+                _digest("sha256:" + row["sha256"])
+            exact_data(
+                value.get("module_inventory_sha256"),
+                sha(json.dumps(frozen, sort_keys=True).encode()),
+            )
+            full_packages = {}
+            observations = {}
+            completions = {}
+            for command, argv in (
+                ("version", ["version"]),
+                ("verify", ["mod", "verify"]),
+                (
+                    "prometheus",
+                    ["list", "-deps", "-json", "-tags=netgo,builtinassets", "./cmd/prometheus"],
+                ),
+                (
+                    "promtool",
+                    ["list", "-deps", "-json", "-tags=netgo,builtinassets", "./cmd/promtool"],
+                ),
+            ):
+                require(position < len(records), "p062_Q_missing_create")
+                create = records[position].get("argv")
+                require(type(create) is list and create.count("--label") == 1, "p062_Q_owner_label")
+                create = cast(list[str], create)
+                label_value = create[create.index("--label") + 1]
+                require(
+                    type(label_value) is str
+                    and re.fullmatch(re.escape(LABEL) + r"=[0-9a-f]{32}", label_value) is not None,
+                    "p062_Q_owner_label",
+                )
+                observed_owner = label_value.split("=", 1)[1]
+                require(owner is None or owner == observed_owner, "p062_Q_one_owner")
+                owner = observed_owner
+                name = "pp-prom-derive-" + owner[:12] + "-" + label + "-" + command
+                require(name not in before_names, "p062_Q_owned_name_collision")
+                stage = label + "-offline-" + command
+                create_argv = (
+                    _expected_sandbox_arguments(
+                        docker, config, image["Id"], name, owner, source, go, modules
+                    )
+                    + argv
+                )
+                identifier = (
+                    record(stage + "-create", create_argv, docker_env, work).decode("ascii").strip()
+                )
+                require(
+                    re.fullmatch(r"[0-9a-f]{64}", identifier) is not None and identifier not in ids,
+                    "p062_Q_unique_full_created_ID",
+                )
+                ids.add(identifier)
+                environment = dict(v.split("=", 1) for v in expected_config.get("Env", []))
+                environment.update(
+                    clean_environment(
+                        GUEST_TMP, GUEST_TMP, GUEST_TMP / "gocache", Path("/modules"), offline=True
+                    )
+                )
+                expected = {
+                    "image": image["Id"],
+                    "image_relation": relation,
+                    "owner": owner,
+                    "container_id": identifier,
+                    "command": argv,
+                    "environment": environment,
+                    "mounts": {
+                        "/src": str(source),
+                        "/usr/local/go": str(go),
+                        "/modules": str(modules),
+                    },
+                }
+                actual = native_one_image(
+                    record(
+                        stage + "-inspect",
+                        [docker, "--config", str(config), "inspect", name],
+                        docker_env,
+                        work,
+                    )
+                )
+                validate_container(actual, name, expected)
+                require(actual["State"].get("Running") is False, "p062_Q_prestart_state")
+                raw = record(
+                    stage + "-native",
+                    [docker, "--config", str(config), "start", "--attach", identifier],
+                    docker_env,
+                    work,
+                )
+                actual = native_one_image(
+                    record(
+                        stage + "-completed-inspect",
+                        [docker, "--config", str(config), "inspect", identifier],
+                        docker_env,
+                        work,
+                    )
+                )
+                validate_container(actual, name, expected)
+                state = actual["State"]
+                require(
+                    state.get("Running") is False
+                    and type(state.get("ExitCode")) is int
+                    and state["ExitCode"] == 0
+                    and state.get("OOMKilled") is False,
+                    "p062_Q_container_terminal",
+                )
+                completions[command] = state
+                if command == "version":
+                    require(raw == compiler_artifact.go_version.encode(), "p062_Q_compiler_version")
+                elif command in ("prometheus", "promtool"):
+                    require(
+                        bound(bindings[command], stage + "-native.stdout") == raw,
+                        "p062_Q_package_binding",
+                    )
+                    observations[command] = decode_packages(raw, command)
+                    full_packages[command] = {v["ImportPath"]: v for v in decode_objects(raw)}
+                container_records.append((name, expected))
+            exact_data(value.get("command_observations"), observations)
+            exact_data(value.get("container_completion"), completions)
+            if incumbent:
+                restoration = value.get("cache_mode_restoration")
+                require(type(restoration) is dict, "p062_Q_cache_restoration")
+                restoration = cast(dict[str, Any], restoration)
+                before = array(
+                    bound(restoration.get("files_before_member"), label + "-cache-before.json"),
+                    compact=True,
+                )
+                restored = array(
+                    bound(restoration.get("files_restored_member"), label + "-cache-restored.json"),
+                    compact=True,
+                )
+                physical = array(
+                    bound(
+                        restoration.get("physical_members_member"),
+                        label + "-cache-physical-members.json",
+                    ),
+                    compact=True,
+                )
+                exact_data(restored, before)
+                exact_data([{**v, "mode": 0o444} for v in before], frozen)
+                require(
+                    len({v.get("path") for v in physical}) == len(physical),
+                    "p062_Q_physical_cache_paths",
+                )
+                files_before = {v["path"]: v for v in before}
+                for row in physical:
+                    require(
+                        type(row.get("mode_before")) is int
+                        and row.get("mode_restored") == row["mode_before"]
+                        and type(row.get("identity")) is dict,
+                        "p062_Q_cache_mode_identity",
+                    )
+                    identity = row["identity"]
+                    require(
+                        set(identity)
+                        == {
+                            "st_dev",
+                            "st_ino",
+                            "st_uid",
+                            "st_gid",
+                            "st_nlink",
+                            "st_size",
+                            "st_mtime_ns",
+                        }
+                        and all(type(v) is int and v >= 0 for v in identity.values()),
+                        "p062_Q_cache_identity_fields",
+                    )
+                    if row["path"] in files_before:
+                        require(
+                            identity["st_size"] == files_before[row["path"]]["size"]
+                            and row["mode_before"] == files_before[row["path"]]["mode"],
+                            "p062_Q_cache_file_identity",
+                        )
+                require(
+                    set(files_before) <= {v["path"] for v in physical},
+                    "p062_Q_cache_physical_complete",
+                )
+            return {"packages": full_packages, "frozen": frozen}
+
+        original = phase(lane + "-base")
+        require(
+            original["selected"].get("golang.org/x/net", {}).get("Version") == "v0.58.0"
+            and "Replace" not in original["selected"]["golang.org/x/net"],
+            "p062_Q_original_epoch",
+        )
+        record(
+            lane + "-incumbent-get",
+            [str(go / "bin/go"), "get", "golang.org/x/net@v0.60.0"],
+            writable,
+            source,
+        )
+        incumbent_phase = phase(lane + "-incumbent")
+        inc = replay.get("incumbent_reconstruction")
+        require(type(inc) is dict, "p062_Q_incumbent")
+        exact_data(
+            inc.get("role"), "historical selected-base reconstruction; not new authored intent"
+        )
+        exact_data(
+            replay.get("lock_patch_scope"),
+            "original-to-final materialization; not new closure base",
+        )
+        exact_data(inc.get("original_before"), original)
+        exact_data(inc.get("locks"), XNET060_INCUMBENT_LOCKS)
+        exact_data(inc.get("action"), "golang.org/x/net@v0.60.0")
+        require(
+            incumbent_phase["selected"].get("golang.org/x/net", {}).get("Version") == "v0.60.0"
+            and "Replace" not in incumbent_phase["selected"]["golang.org/x/net"],
+            "p062_Q_incumbent_epoch",
+        )
+        incumbent_offline = offline(lane + "-incumbent", inc["offline"], incumbent=True)
+        record(
+            lane + "-sole-get",
+            [str(go / "bin/go"), "get", "golang.org/x/net@v0.62.0"],
+            writable,
+            source,
+        )
+        final = phase(lane + "-derived")
+        require(
+            final["selected"].get("golang.org/x/net", {}).get("Version") == "v0.62.0"
+            and "Replace" not in final["selected"]["golang.org/x/net"],
+            "p062_Q_current_epoch",
+        )
+        exact_data(replay.get("before"), incumbent_phase)
+        exact_data(replay.get("after"), final)
+        exact_data(replay.get("native_directives_before"), incumbent_phase["edit"])
+        exact_data(replay.get("native_directives_after"), final["edit"])
+        transitions = [
+            {
+                "Path": name,
+                "before": incumbent_phase["selected"].get(name),
+                "after": final["selected"].get(name),
+                "class": (
+                    "I_R"
+                    if name == "golang.org/x/net"
+                    else "C_R_candidate_pending_independent_review"
+                ),
+            }
+            for name in sorted(set(incumbent_phase["selected"]) | set(final["selected"]))
+            if incumbent_phase["selected"].get(name) != final["selected"].get(name)
+        ]
+        exact_data(replay.get("complete_module_transitions"), transitions)
+        final_offline = offline(lane, replay["offline"], incumbent=False)
+        comparisons.append(
+            {
+                "original": _derivation_comparison(original, source, modules),
+                "incumbent": _derivation_comparison(incumbent_phase, source, modules),
+                "final": _derivation_comparison(final, source, modules),
+                "nonlocks": nonlocks,
+                "incumbent_packages": incumbent_offline["packages"],
+                "packages": final_offline["packages"],
+                "locks": lock_epochs,
+                "patch": patch,
+            }
+        )
+        outputs = lock_epochs["derived"]
+    exact_data(comparisons[0], comparisons[1])
+    require(len(bound_slots) == 18 and len(container_records) == 16, "p062_Q_complete_slots")
+    for name, expected in container_records:
+        current = names(
+            record(
+                name + "-cleanup-inventory",
+                [docker, "--config", str(config), "ps", "--all", "--format", "{{.Names}}"],
+                docker_env,
+                work,
+            )
+        )
+        require(name in current, "p062_Q_cleanup_owned_presence")
+        actual = native_one_image(
+            record(
+                name + "-cleanup-inspect",
+                [docker, "--config", str(config), "inspect", name],
+                docker_env,
+                work,
+            )
+        )
+        validate_container(actual, name, expected)
+        raw = record(
+            name + "-cleanup-remove",
+            [docker, "--config", str(config), "rm", "--force", expected["container_id"]],
+            docker_env,
+            work,
+        )
+        require(
+            raw.decode("ascii").strip() == expected["container_id"], "p062_Q_cleanup_removed_ID"
+        )
+        require(
+            name
+            not in names(
+                record(
+                    name + "-cleanup-absence",
+                    [docker, "--config", str(config), "ps", "--all", "--format", "{{.Names}}"],
+                    docker_env,
+                    work,
+                )
+            ),
+            "p062_Q_cleanup_absence",
+        )
+    require(position == len(records), "p062_Q_extra_native_record")
+    exact_data(
+        report.get("cleanup"),
+        [{"name": name, "native_absent": True} for name, _ in container_records],
+    )
+    return outputs
+
+
+def qualification_locks(
+    archive: Path,
+    *,
+    producer_root: Path | None = None,
+    artifact_digest: str | None = None,
+    qualified: dict[str, Any] | None = None,
+    qualification_root: Path | None = None,
+    vendor_base: dict[str, Any] | None = None,
+    compiler_artifact: Artifact | None = None,
+) -> dict[str, bytes]:
+    compiler_artifact = Artifact.canonical(
+        CURRENT_GO if compiler_artifact is None else compiler_artifact
+    )
+    require(compiler_artifact.name == "go", "compiler_artifact_role")
+    require(
+        (producer_root is None) == (artifact_digest is None),
+        "qualification_current_binding_pair",
+    )
+    expected_digest = (
+        "1c1f72b037cc8a4446bfae7ff9812ba92fcf8fc10f5f27bd61ee96e889d57762"
+        if artifact_digest is None
+        else _digest(artifact_digest)[7:]
+    )
+    require(
+        file_hash(archive) == expected_digest,
+        "qualification_acquired_input_zip",
+    )
+    files = _zip_members(archive)
+    if qualified is not None:
+        require(
+            producer_root is not None
+            and qualification_root is not None
+            and vendor_base is not None,
+            "p062_Q_independent_caller_context",
+        )
+        return _qualification_xnet062(
+            files,
+            cast(Path, producer_root),
+            qualified,
+            cast(Path, qualification_root),
+            cast(dict[str, Any], vendor_base),
+            compiler_artifact=compiler_artifact,
+        )
+    require(qualification_root is None and vendor_base is None, "p062_Q_context_pair")
+    result = {}
+    for name, digest in XNET060_INCUMBENT_LOCKS.items():
+        a, b = files["a-derived-" + name], files["b-derived-" + name]
+        require(a == b and sha(a) == digest, "qualification_both_native_lock_bytes")
+        result[name] = a
+    require(
+        files["a-module-derivation.patch"] == files["b-module-derivation.patch"]
+        and sha(files["a-module-derivation.patch"])
+        == "c4598c7cf10147c2155b847ca6fa62cf380a2a95df52cb3df22e11a7202fe8ef",
+        "qualification_native_patch",
+    )
+    report = one_object(files["qualification.json"])
+    require(
+        report.get("status") == "observed_package_metadata_only"
+        and report.get("failure") is None
+        and report.get("heavy_build_invocations") == 0
+        and type(report.get("heavy_build_invocations")) is int,
+        "qualification_not_a_build_output",
+    )
+    if producer_root is not None:
+        require(
+            report.get("source_revision") == REVISION
+            and report.get("source_tree") == TREE
+            and type(report.get("publication_commands")) is int
+            and report["publication_commands"] == 0
+            and type(report.get("automatic_retries")) is int
+            and report["automatic_retries"] == 0
+            and report.get("interruptions") == []
+            and report.get("module_action") == "xnet060-replay",
+            "qualification_current_source_outcome",
+        )
+        expected_acquisition = [
+            {
+                "artifact": item.name,
+                "public_source": item.url,
+                "bytes": item.size,
+                "sha256": item.digest,
+                "explicit_release_handoff": item.release,
+                "final_redirects": 0,
+            }
+            for item in (SOURCE, compiler_artifact, UI, CHECKSUMS)
+        ]
+        exact_data(report.get("acquisition"), expected_acquisition)
+        expected_producer = {
+            str(producer_root / path): file_hash(producer_root / path)
+            for path in ("scripts/ci/prometheus_source_image.py", ".github/workflows/build.yml")
+        }
+        exact_data(report.get("producer"), expected_producer)
+        native = report.get("native_operations")
+        cleanup = report.get("cleanup")
+        require(
+            type(native) is list
+            and bool(native)
+            and all(
+                type(row) is dict
+                and type(row.get("exit")) is int
+                and row["exit"] == 0
+                and row.get("failure") is None
+                for row in native
+            )
+            and type(cleanup) is list
+            and all(
+                type(row) is dict
+                and row.get("native_absent") is True
+                and row.get("failure") is None
+                for row in cleanup
+            ),
+            "qualification_current_native_terminal",
+        )
+        for label in ("a", "b"):
+            require(
+                files[label + "-base-version.stdout"] == compiler_artifact.go_version.encode()
+                and files[label + "-derived-version.stdout"]
+                == compiler_artifact.go_version.encode(),
+                "qualification_current_native_Go",
+            )
+    return result
+
+
+def pack_layout(layout: Path, destination: Path) -> None:
+    """Transport this closed layout; never tar a discovered host tree."""
+    descriptor = _layout_root(layout)
+    manifest = one_object(_blob(layout, descriptor))
+    descriptors = [descriptor, manifest["config"], *manifest["layers"]]
+    _layout_inventory(layout, {row["digest"] for row in descriptors})
+    names = [
+        "oci-layout",
+        "index.json",
+        *sorted("blobs/sha256/" + row["digest"][7:] for row in descriptors),
+    ]
+    require(not destination.exists() and not destination.is_symlink(), "layout_transport_fresh")
+    with tarfile.open(destination, "x", format=tarfile.USTAR_FORMAT) as archive:
+        for name in names:
+            raw = (layout / name).read_bytes()
+            member = tarfile.TarInfo(name)
+            member.size, member.mode, member.mtime = len(raw), 0o644, SOURCE_DATE_EPOCH
+            archive.addfile(member, io.BytesIO(raw))
+
+
+def unpack_layout(raw: bytes, destination: Path) -> None:
+    fresh_directory(destination)
+    fresh_directory(destination / "blobs")
+    fresh_directory(destination / "blobs/sha256")
+    names, total = set(), 0
+    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as archive:
+        for member in archive:
+            name = member.name
+            require(
+                name in ("oci-layout", "index.json")
+                or re.fullmatch(r"blobs/sha256/[0-9a-f]{64}", name) is not None,
+                "layout_transport_path",
+            )
+            require(
+                name not in names
+                and member.isreg()
+                and not member.pax_headers
+                and member.mode == 0o644
+                and member.uid == member.gid == 0
+                and member.linkname == ""
+                and member.mtime == SOURCE_DATE_EPOCH,
+                "layout_transport_header",
+            )
+            names.add(name)
+            total += member.size
+            require(
+                len(names) <= 32
+                and 0 < member.size <= MAX_CACHE_BYTES
+                and total <= MAX_CACHE_BYTES,
+                "layout_transport_bound",
+            )
+            source = archive.extractfile(member)
+            require(source is not None, "layout_transport_member")
+            source = cast(BinaryIO, source)
+            with (destination / name).open("xb") as output:
+                shutil.copyfileobj(source, output, 1024**2)
+            (destination / name).chmod(0o600)
+    require({"oci-layout", "index.json"} <= names, "layout_transport_complete")
+
+
+TOOL_PREFETCH_PREDECESSOR = "38170923494:11713828762"
+TOOL_PREFETCH_TWO_PREDECESSORS = "38170923494:11713828762;38192419687:11722041486"
+TOOL_THREE_PREDECESSORS = TOOL_PREFETCH_TWO_PREDECESSORS + ";38239428418:11742856046"
+TOOL_THIRD_ARCHIVE = {
+    "bytes": 13619538,
+    "sha256": "de2cc846beaea8c3dedcc9641d85f882447b9a3ea98651b21170f2887d64bc1e",
+}
+TOOL_THIRD_INPUT_DIGEST = "sha256:28130d8989767ede1a145dd0173a6f0900d3a805a665cf66f69bff6cfdc7c380"
+TOOL_THIRD_NATIVE_DIGEST = "8041bd97ac58a1217aafc8bb9d50878ae1a205bc9c417982d3ae865db89e3441"
+TOOL_THIRD_BINARY_OBSERVATION = {
+    "bytes": 18507104,
+    "sha256": "8c88339f9c1da7826734fa67fff5802ec9be6673a5e7db869758be96412fd9bf",
+}
+
+TOOL_PREFETCH_SECOND_ARCHIVE = {
+    "bytes": 4226255,
+    "sha256": "6f99ee4118b456e387d5732d42c02214b158e86284cfbf4c3d545bd68de49c3d",
+}
+TOOL_PREFETCH_SECOND_INPUT_DIGEST = (
+    "sha256:837381d0c83c90ac6b9b08bfc55d21a5515d77551f6ce7995640081764188c83"
+)
+TOOL_PREFETCH_SECOND_NATIVE_DIGEST = (
+    "cba00916fccb705cf4ff1005b4cb9da331d71dc8e00c0e8315f4754a56b6796e"
+)
+TOOL_PREFETCH_SECOND_STDERR_DIGEST = (
+    "f9da955119c82cf2142aebe17737f7b681ed6833442981554d59a415646d1f42"
+)
+TOOL_PREFETCH_ARCHIVE = {
+    "bytes": 1258104,
+    "sha256": "c147d951cf7a7e268130bd0438ea1a0b9a70502ce47f8283911692af55d87a13",
+}
+TOOL_PREFETCH_INPUT_DIGEST = (
+    "sha256:b9d83366540016516be36c7392e15449fe2bd12ee6b42cdd316cdfe685d2c17c"
+)
+
+
+P062_REF = "refs/heads/codex/dependency-alertmanager-remediation"
+P062_JOB_NAMES = {
+    "tool": "prometheus-oras-qualification",
+    "qualification": "prometheus-source-qualification",
+    "pair": "prometheus-source-build-pair",
+}
+P062_COMPANION = "prometheus-ghcr-package-qualification"
+# Complete relevant first-attempt prefix at the externally admitted 2026-11-07 cutoff.
+# These historical starts remain spent; neither new source nor a new run renews them.
+P062_SPENT_HISTORY = (
+    (
+        37992081779,
+        114028582875,
+        "prometheus-source-qualification",
+        "5082c598007a3da1d86dfe57a37c7713d0e01df3",
+        "codex/dependency-native-runtime-remediation",
+        1,
+        "completed",
+        "failure",
+        "completed",
+        "failure",
+        "2026-10-09T21:13:17Z",
+        "2026-10-09T21:14:14Z",
+    ),
+    (
+        38012637047,
+        114095853422,
+        "prometheus-source-qualification",
+        "e2ab7b64238f93df3012110a6f2a572cb00dd111",
+        "codex/dependency-native-runtime-remediation",
+        1,
+        "completed",
+        "success",
+        "completed",
+        "success",
+        "2026-10-10T01:18:05Z",
+        "2026-10-10T01:19:44Z",
+    ),
+    (
+        38037035815,
+        114169514909,
+        "prometheus-ghcr-package-qualification",
+        "f0442f4fdf5f281730c4584f6352beac09cfd754",
+        "codex/dependency-native-runtime-remediation",
+        1,
+        "completed",
+        "success",
+        "completed",
+        "success",
+        "2026-10-10T08:11:48Z",
+        "2026-10-10T08:12:08Z",
+    ),
+    (
+        38037035815,
+        114169515047,
+        "prometheus-source-qualification",
+        "f0442f4fdf5f281730c4584f6352beac09cfd754",
+        "codex/dependency-native-runtime-remediation",
+        1,
+        "completed",
+        "success",
+        "completed",
+        "success",
+        "2026-10-10T08:11:48Z",
+        "2026-10-10T08:19:24Z",
+    ),
+    (
+        38170923494,
+        114563178711,
+        "prometheus-oras-qualification",
+        "5de54811121079eadbd3f5d8dbbb8720f712530a",
+        "codex/dependency-native-runtime-remediation",
+        1,
+        "completed",
+        "failure",
+        "completed",
+        "failure",
+        "2026-10-11T20:08:13Z",
+        "2026-10-11T20:09:10Z",
+    ),
+    (
+        38192419687,
+        114627819440,
+        "prometheus-oras-qualification",
+        "15097adaa871a900370f6c57a512fe862dddb041",
+        "codex/dependency-native-runtime-remediation",
+        1,
+        "completed",
+        "failure",
+        "completed",
+        "failure",
+        "2026-10-12T01:34:40Z",
+        "2026-10-12T01:35:41Z",
+    ),
+    (
+        38239428418,
+        114778090287,
+        "prometheus-oras-qualification",
+        "f632572057453d57975a397a5b2db64894204be0",
+        "codex/dependency-native-runtime-remediation",
+        1,
+        "completed",
+        "failure",
+        "completed",
+        "failure",
+        "2026-10-12T10:56:20Z",
+        "2026-10-12T10:58:07Z",
+    ),
+    (
+        38269614712,
+        114880342307,
+        "prometheus-oras-qualification",
+        "a18d636138bbab67e96c902b1c61f690263c8b55",
+        "codex/dependency-native-runtime-remediation",
+        1,
+        "completed",
+        "success",
+        "completed",
+        "success",
+        "2026-10-12T15:21:22Z",
+        "2026-10-12T15:23:35Z",
+    ),
+    (
+        38291450453,
+        114952275845,
+        "prometheus-source-build-pair",
+        "b732222719f70fa592218d2255324850843e9eea",
+        "codex/dependency-native-runtime-remediation",
+        1,
+        "completed",
+        "success",
+        "completed",
+        "success",
+        "2026-10-12T18:31:13Z",
+        "2026-10-12T18:48:04Z",
+    ),
+    (
+        39020247533,
+        117360452632,
+        "prometheus-oras-qualification",
+        "9c1b48f8b3a63bf827543cf69090505c1f157fc6",
+        "codex/consolidate-legacy-ownership-guard",
+        1,
+        "completed",
+        "success",
+        "completed",
+        "success",
+        "2026-10-17T09:12:38Z",
+        "2026-10-17T09:14:31Z",
+    ),
+    (
+        39033193167,
+        117397709770,
+        "prometheus-source-build-pair",
+        "e2b86644a9a0264098f57f1bbca5914a3438fbe6",
+        "codex/consolidate-legacy-ownership-guard",
+        1,
+        "completed",
+        "success",
+        "completed",
+        "success",
+        "2026-10-17T12:36:32Z",
+        "2026-10-17T12:53:02Z",
+    ),
+    (
+        40188825249,
+        121155232821,
+        "prometheus-oras-qualification",
+        "c22d641bc0d4dce56925114c827be6d712db7070",
+        "codex/python-setup-security-stabilization",
+        1,
+        "completed",
+        "success",
+        "completed",
+        "success",
+        "2026-10-25T11:25:50Z",
+        "2026-10-25T11:27:41Z",
+    ),
+    (
+        40220581563,
+        121251084855,
+        "prometheus-ghcr-package-qualification",
+        "7e275934593fa83749c5d89054c019fd4f7c6e89",
+        "codex/python-setup-security-stabilization",
+        1,
+        "completed",
+        "success",
+        "completed",
+        "success",
+        "2026-10-25T18:18:06Z",
+        "2026-10-25T18:18:24Z",
+    ),
+    (
+        40220581563,
+        121251085016,
+        "prometheus-source-qualification",
+        "7e275934593fa83749c5d89054c019fd4f7c6e89",
+        "codex/python-setup-security-stabilization",
+        1,
+        "completed",
+        "success",
+        "completed",
+        "success",
+        "2026-10-25T18:18:07Z",
+        "2026-10-25T18:25:55Z",
+    ),
+    (
+        40222244853,
+        121256136190,
+        "prometheus-source-build-pair",
+        "7e275934593fa83749c5d89054c019fd4f7c6e89",
+        "codex/python-setup-security-stabilization",
+        1,
+        "completed",
+        "success",
+        "completed",
+        "success",
+        "2026-10-25T18:39:03Z",
+        "2026-10-25T18:56:16Z",
+    ),
+    (
+        40309564942,
+        121527061782,
+        "prometheus-oras-qualification",
+        "7d2805f8ac60ac17c178c92f24c8f484c89e31f8",
+        "codex/python-setup-security-stabilization",
+        1,
+        "completed",
+        "success",
+        "completed",
+        "success",
+        "2026-10-26T10:43:06Z",
+        "2026-10-26T10:44:57Z",
+    ),
+    (
+        40379959203,
+        121773207468,
+        "prometheus-source-qualification",
+        "a8c9b361dbd57d86e2adf8f01f7880830fc04e53",
+        "codex/python-setup-security-stabilization",
+        1,
+        "completed",
+        "success",
+        "completed",
+        "success",
+        "2026-10-26T18:41:30Z",
+        "2026-10-26T18:46:31Z",
+    ),
+    (
+        40379959203,
+        121773207880,
+        "prometheus-ghcr-package-qualification",
+        "a8c9b361dbd57d86e2adf8f01f7880830fc04e53",
+        "codex/python-setup-security-stabilization",
+        1,
+        "completed",
+        "success",
+        "completed",
+        "success",
+        "2026-10-26T18:41:30Z",
+        "2026-10-26T18:41:49Z",
+    ),
+    (
+        40384356149,
+        121788589461,
+        "prometheus-source-build-pair",
+        "a8c9b361dbd57d86e2adf8f01f7880830fc04e53",
+        "codex/python-setup-security-stabilization",
+        1,
+        "completed",
+        "success",
+        "completed",
+        "success",
+        "2026-10-26T19:10:37Z",
+        "2026-10-26T19:28:29Z",
+    ),
+    (
+        42510229545,
+        128821500270,
+        "prometheus-oras-qualification",
+        "4c4f18692e7b0f5d8e06aac3dd6c85bfe9ee43a9",
+        "codex/dependency-alertmanager-remediation",
+        1,
+        "completed",
+        "success",
+        "completed",
+        "success",
+        "2026-11-08T18:29:12Z",
+        "2026-11-08T18:31:31Z",
+    ),
+    (
+        42619126214,
+        129166421268,
+        "prometheus-ghcr-package-qualification",
+        "3ae68bd04a48a3f2a031b041e3bbf21696ed40b1",
+        "codex/dependency-alertmanager-remediation",
+        1,
+        "completed",
+        "success",
+        "completed",
+        "success",
+        "2026-11-09T12:41:38Z",
+        "2026-11-09T12:41:55Z",
+    ),
+    (
+        42619126214,
+        129166421471,
+        "prometheus-source-qualification",
+        "3ae68bd04a48a3f2a031b041e3bbf21696ed40b1",
+        "codex/dependency-alertmanager-remediation",
+        1,
+        "completed",
+        "success",
+        "completed",
+        "success",
+        "2026-11-09T12:41:38Z",
+        "2026-11-09T12:56:02Z",
+    ),
+    (
+        42701498451,
+        129447127667,
+        "prometheus-oras-qualification",
+        "f098871821badf16556968ab4da6d4f44532c5a3",
+        "codex/dependency-alertmanager-remediation",
+        1,
+        "completed",
+        "success",
+        "completed",
+        "success",
+        "2026-11-09T21:20:08Z",
+        "2026-11-09T21:22:39Z",
+    ),
+    (
+        42732019678,
+        129552125108,
+        "prometheus-ghcr-package-qualification",
+        "af6ef77fd183753751a0043a72c6495ce708515c",
+        "codex/dependency-alertmanager-remediation",
+        1,
+        "completed",
+        "success",
+        "completed",
+        "success",
+        "2026-11-10T00:55:53Z",
+        "2026-11-10T00:56:12Z",
+    ),
+    (
+        42732019678,
+        129552125483,
+        "prometheus-source-qualification",
+        "af6ef77fd183753751a0043a72c6495ce708515c",
+        "codex/dependency-alertmanager-remediation",
+        1,
+        "completed",
+        "success",
+        "completed",
+        "success",
+        "2026-11-10T00:55:53Z",
+        "2026-11-10T01:07:28Z",
+    ),
+    (
+        42734455562,
+        129560137184,
+        "prometheus-source-build-pair",
+        "af6ef77fd183753751a0043a72c6495ce708515c",
+        "codex/dependency-alertmanager-remediation",
+        1,
+        "completed",
+        "success",
+        "completed",
+        "success",
+        "2026-11-10T01:15:21Z",
+        "2026-11-10T01:32:19Z",
+    ),
+)
+
+
+# Failed42673421928/cc25be204a4252409a96208f83c23040e1261714 had zero jobs.
+# It remains charged history, never a fabricated completed job or a stage allowance.
+P062_ZERO_JOB_HISTORY = (42673421928, "cc25be204a4252409a96208f83c23040e1261714")
+
+
+# Four observed completed jobs from the exhausted November 15-16 source cycle.
+# They close that cycle and cannot satisfy a current predecessor slot.
+P062_EXHAUSTED_CLOCK_CYCLE = (
+    (
+        43764109938,
+        132965253155,
+        "prometheus-oras-qualification",
+        "eb31efb4b80e16f1e1197b4f73e8677e8db45179",
+        "codex/dependency-alertmanager-remediation",
+        1,
+        "completed",
+        "success",
+        "completed",
+        "success",
+        "2026-11-15T21:31:08Z",
+        "2026-11-15T21:33:48Z",
+    ),
+    (
+        43808568629,
+        133105082212,
+        "prometheus-source-qualification",
+        "e91033b4528a83782de3e7dc1e73e6def398348a",
+        "codex/dependency-alertmanager-remediation",
+        1,
+        "completed",
+        "success",
+        "completed",
+        "success",
+        "2026-11-16T05:11:48Z",
+        "2026-11-16T05:21:36Z",
+    ),
+    (
+        43808568629,
+        133105082497,
+        "prometheus-ghcr-package-qualification",
+        "e91033b4528a83782de3e7dc1e73e6def398348a",
+        "codex/dependency-alertmanager-remediation",
+        1,
+        "completed",
+        "success",
+        "completed",
+        "success",
+        "2026-11-16T05:11:48Z",
+        "2026-11-16T05:12:04Z",
+    ),
+    (
+        43810831152,
+        133111903061,
+        "prometheus-source-build-pair",
+        "e91033b4528a83782de3e7dc1e73e6def398348a",
+        "codex/dependency-alertmanager-remediation",
+        1,
+        "completed",
+        "success",
+        "completed",
+        "success",
+        "2026-11-16T05:31:54Z",
+        "2026-11-16T05:50:42Z",
+    ),
+)
+
+
+def _p062_stage_admission(api: GitHubRead, root: Path, purpose: str) -> dict[str, Any]:
+    """One fixed PR2494 successor; caller release is separate from this observation."""
+    require(
+        purpose in P062_JOB_NAMES
+        and os.environ.get("GITHUB_REF") == P062_REF
+        and os.environ.get("GITHUB_ACTIONS") == "true"
+        and os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+        and os.environ.get("GITHUB_REPOSITORY") == GHCR_REPOSITORY
+        and os.environ.get("GITHUB_REPOSITORY_ID") == "1043311030"
+        and os.environ.get("GITHUB_RUN_ATTEMPT") == "1"
+        and platform.system() == "Linux"
+        and platform.machine() in ("x86_64", "amd64"),
+        "p062_manual_hosted_first_attempt",
+    )
+    raw_run = os.environ.get("GITHUB_RUN_ID", "")
+    head = os.environ.get("GITHUB_SHA", "")
+    require(
+        re.fullmatch(r"[1-9][0-9]*", raw_run) is not None
+        and re.fullmatch(r"[0-9a-f]{40}", head) is not None,
+        "p062_runtime_coordinates",
+    )
+    run_id = int(raw_run)
+    prefix = "/repos/" + GHCR_REPOSITORY
+    current = api.json(prefix + f"/actions/runs/{run_id}")
+    workflow = api.json(prefix + "/actions/workflows/build.yml")
+    exact_data(
+        {key: workflow.get(key) for key in ("id", "path")},
+        {"id": 199904435, "path": ".github/workflows/build.yml"},
+    )
+    pr = authenticate_pr_source(api, 2494, head, head, P062_REF)
+    require(pr.get("state") == "open" and pr.get("merged") is False, "p062_open_own_PR")
+    source_files = api.source_files(head, (*PRODUCER_FILES, MANIFEST_PATH))
+    authenticate_material_files(root, source_files, api.deadline)
+    manifest = read_image_manifest(root / MANIFEST_PATH, preparation=True)
+    require(
+        manifest["phase"] == "source_prepared"
+        and manifest["selection"] is None
+        and manifest["candidate"] is None,
+        "p062_prepared_null_outputs",
+    )
+    # This new source-bound problem is exactly the maintained1274 declaration.
+    exact_data(manifest["inputs"]["go"], declared_inputs()["go"])
+    expected_inputs = declared_inputs()
+    coordinates = manifest["inputs"]["oras"]["retained"]
+    if purpose == "tool":
+        require(coordinates is None, "p062_P0_retained_must_be_null")
+    else:
+        require(coordinates is not None, "p062_P1_requires_actual_T")
+        expected_inputs["oras"]["retained"] = coordinates
+    exact_data(manifest["inputs"], expected_inputs)
+    endpoint = prefix + "/actions/workflows/build.yml/runs?event=workflow_dispatch"
+    page = api.json(endpoint + "&per_page=100&page=1")
+    runs = api.pages(endpoint, "workflow_runs", page["total_count"])
+    require(sum(r.get("id") == run_id for r in runs) == 1, "p062_current_run_in_census")
+    bound_current = next(r for r in runs if r.get("id") == run_id)
+    for key in (
+        "id",
+        "head_sha",
+        "head_branch",
+        "run_attempt",
+        "event",
+        "workflow_id",
+        "status",
+        "conclusion",
+    ):
+        exact_data(bound_current.get(key), current.get(key))
+    require(
+        current.get("head_sha") == head
+        and current.get("head_branch") == P062_REF[11:]
+        and current.get("status") == "in_progress"
+        and current.get("conclusion") is None,
+        "p062_current_run_identity",
+    )
+    historical: list[tuple[Any, ...]] = []
+    successors: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    current_jobs: list[dict[str, Any]] = []
+    names = set(P062_JOB_NAMES.values()) | {P062_COMPANION}
+    expected_history = P062_SPENT_HISTORY + P062_EXHAUSTED_CLOCK_CYCLE
+    historical_ids = {row[0] for row in expected_history}
+    zero_job_runs = 0
+    seen_jobs: set[int] = set()
+    for run in runs:
+        require(type(run.get("id")) is int and run["id"] > 0, "p062_run_ID_type")
+        jobs_endpoint = prefix + f'/actions/runs/{run["id"]}/jobs?filter=all'
+        jp = api.json(jobs_endpoint + "&per_page=100&page=1")
+        jobs = api.pages(jobs_endpoint, "jobs", jp["total_count"])
+        relevant = [j for j in jobs if j.get("name") in names and j.get("conclusion") != "skipped"]
+        if run["id"] == P062_ZERO_JOB_HISTORY[0]:
+            for key, expected in {
+                "id": P062_ZERO_JOB_HISTORY[0],
+                "head_sha": P062_ZERO_JOB_HISTORY[1],
+                "head_branch": "codex/dependency-alertmanager-remediation",
+                "event": "workflow_dispatch",
+                "workflow_id": 199904435,
+                "run_attempt": 1,
+                "status": "completed",
+                "conclusion": "failure",
+                "created_at": "2026-11-09T18:22:11Z",
+                "updated_at": "2026-11-09T18:23:02Z",
+            }.items():
+                exact_data(run.get(key), expected)
+            for key in ("repository", "head_repository"):
+                require(type(run.get(key)) is dict, "p062_zero_job_repository_object")
+                exact_data(run[key].get("id"), 1043311030)
+            require(not jobs, "p062_zero_job_history_changed")
+            zero_job_runs += 1
+        if not relevant:
+            require(run.get("id") != run_id, "p062_current_job_missing")
+            continue
+        for key, value in (
+            ("workflow_id", 199904435),
+            ("run_attempt", 1),
+            ("event", "workflow_dispatch"),
+        ):
+            exact_data(run.get(key), value)
+        for key in ("repository", "head_repository"):
+            exact_data(run.get(key, {}).get("id"), 1043311030)
+        for job in relevant:
+            require(
+                type(job.get("id")) is int and job["id"] > 0 and job["id"] not in seen_jobs,
+                "p062_unique_native_job",
+            )
+            seen_jobs.add(job["id"])
+            exact_data(job.get("run_id"), run["id"])
+            exact_data(job.get("run_attempt"), 1)
+            exact_data(job.get("head_sha"), run["head_sha"])
+            if run["id"] == run_id:
+                current_jobs.append(job)
+            elif run["id"] in historical_ids:
+                historical.append(
+                    (
+                        run["id"],
+                        job["id"],
+                        job["name"],
+                        run["head_sha"],
+                        run["head_branch"],
+                        run["run_attempt"],
+                        run["status"],
+                        run["conclusion"],
+                        job["status"],
+                        job["conclusion"],
+                        job.get("started_at"),
+                        job.get("completed_at"),
+                    )
+                )
+            else:
+                require(
+                    run.get("head_branch") == P062_REF[11:]
+                    and run.get("status") == "completed"
+                    and run.get("conclusion") == "success"
+                    and job.get("status") == "completed"
+                    and job.get("conclusion") == "success",
+                    "p062_successor_spent_or_unknown",
+                )
+                successors.append((run, job))
+    require(zero_job_runs == 1, "p062_zero_job_history_cardinality")
+    exact_data(sorted(historical), list(expected_history))
+    expected_current_names = {P062_JOB_NAMES[purpose]} | (
+        {P062_COMPANION} if purpose == "qualification" else set()
+    )
+    require(
+        len(current_jobs) == len(expected_current_names)
+        and {j["name"] for j in current_jobs} == expected_current_names,
+        "p062_current_purpose_inventory",
+    )
+    selected = next(j for j in current_jobs if j["name"] == P062_JOB_NAMES[purpose])
+    require(
+        selected.get("status") == "in_progress" and selected.get("conclusion") is None,
+        "p062_current_job_in_progress",
+    )
+    expected_prior = [] if purpose == "tool" else [P062_JOB_NAMES["tool"]]
+    if purpose == "pair":
+        expected_prior += [P062_JOB_NAMES["qualification"], P062_COMPANION]
+    require(
+        sorted(j["name"] for _, j in successors) == sorted(expected_prior),
+        "p062_nonrenewable_stage_prefix",
+    )
+    if purpose != "tool":
+        tool_run, tool_job = next(
+            row for row in successors if row[1]["name"] == P062_JOB_NAMES["tool"]
+        )
+        require(
+            tool_run["id"] == coordinates["run_id"]
+            and tool_run["head_sha"] == coordinates["source_head"]
+            and tool_run["head_sha"] != head,
+            "p062_actual_T_source_join",
+        )
+        authenticate_pr_source(api, 2494, tool_run["head_sha"], head, P062_REF)
+        require_native_ancestor(api, tool_run["head_sha"], head)
+        original = api.source_files(tool_run["head_sha"], (*PRODUCER_FILES, MANIFEST_PATH))
+        require(
+            all(original[name] == source_files[name] for name in PRODUCER_FILES),
+            "p062_raw_producer_unchanged",
+        )
+        p0 = one_object(original[MANIFEST_PATH])
+        expected_p0 = copy.deepcopy(manifest)
+        expected_p0["inputs"]["oras"]["retained"] = None
+        exact_data(p0, expected_p0)
+        # Explicitly compare the existing own-output-free projection on both heads.
+        projection = tool_input_projection(root)
+        exact_data(projection["inputs"], p0["inputs"])
+        for name in PRODUCER_FILES:
+            exact_data(
+                projection["raw_producer"][name],
+                {"bytes": len(original[name]), "sha256": sha(original[name])},
+            )
+        ordered_jobs = [tool_job]
+        if purpose == "pair":
+            qrun, qjob = next(
+                row for row in successors if row[1]["name"] == P062_JOB_NAMES["qualification"]
+            )
+            companion_run, _ = next(row for row in successors if row[1]["name"] == P062_COMPANION)
+            require(
+                qrun["head_sha"] == head and companion_run["id"] == qrun["id"],
+                "p062_same_P1_qualification_pair",
+            )
+            ordered_jobs.append(qjob)
+            companion_job = next(row[1] for row in successors if row[1]["name"] == P062_COMPANION)
+            require(
+                type(companion_job.get("completed_at")) is str
+                and type(selected.get("started_at")) is str
+                and datetime.fromisoformat(companion_job["completed_at"].replace("Z", "+00:00"))
+                < datetime.fromisoformat(selected["started_at"].replace("Z", "+00:00")),
+                "p062_companion_precedes_pair",
+            )
+        ordered_jobs.append(selected)
+        for prior, following in zip(ordered_jobs, ordered_jobs[1:]):
+            end, start = prior.get("completed_at"), following.get("started_at")
+            require(
+                type(end) is str
+                and type(start) is str
+                and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", end)
+                is not None
+                and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", start)
+                is not None
+                and datetime.fromisoformat(end.replace("Z", "+00:00"))
+                < datetime.fromisoformat(start.replace("Z", "+00:00")),
+                "p062_stage_chronology",
+            )
+    return {
+        "run_id": run_id,
+        "head": head,
+        "ref": P062_REF,
+        "workflow_id": 199904435,
+        "job": P062_JOB_NAMES[purpose],
+        "job_id": selected["id"],
+        "pr_number": 2494,
+        "producer_epoch": "xnet062",
+        "budget": 2 if purpose == "pair" else 1,
+        "actual_prior_invocations": [
+            {"run_id": r["id"], "job_id": j["id"], "job": j["name"], "head": r["head_sha"]}
+            for r, j in successors
+        ],
+    }
+
+
+def manual_hosted_admission(
+    api: GitHubRead,
+    purpose: str,
+    *,
+    prefetch_predecessor: str | None = None,
+    producer_root: Path | None = None,
+) -> dict[str, Any]:
+    if os.environ.get("GITHUB_REF") == P062_REF:
+        require(
+            producer_root is not None and prefetch_predecessor is None,
+            "p062_explicit_owner_no_retry_selector",
+        )
+        return _p062_stage_admission(api, cast(Path, producer_root), purpose)
+    require(
+        prefetch_predecessor is None
+        or (
+            purpose == "tool"
+            and prefetch_predecessor
+            in (TOOL_PREFETCH_PREDECESSOR, TOOL_PREFETCH_TWO_PREDECESSORS, TOOL_THREE_PREDECESSORS)
+        ),
+        "tool_prefetch_explicit_predecessor",
+    )
+    require(
+        purpose in ("tool", "pair")
+        and platform.system() == "Linux"
+        and platform.machine() in ("x86_64", "amd64")
+        and os.environ.get("GITHUB_ACTIONS") == "true"
+        and os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+        and os.environ.get("GITHUB_REPOSITORY") == GHCR_REPOSITORY
+        and os.environ.get("GITHUB_REPOSITORY_ID") == "1043311030"
+        and os.environ.get("GITHUB_RUN_ATTEMPT") == "1",
+        "manual_hosted_first_attempt",
+    )
+    run_id = int(os.environ["GITHUB_RUN_ID"])
+    head, ref = os.environ["GITHUB_SHA"], os.environ["GITHUB_REF"]
+    current = api.json(f"/repos/{GHCR_REPOSITORY}/actions/runs/{run_id}")
+    workflow = api.json(f"/repos/{GHCR_REPOSITORY}/actions/workflows/build.yml")
+    require(
+        current.get("head_sha") == head
+        and current.get("run_attempt") == 1
+        and type(current.get("run_attempt")) is int
+        and type(workflow.get("id")) is int
+        and workflow["id"] > 0
+        and current.get("repository", {}).get("id") == 1043311030
+        and current.get("head_repository", {}).get("id") == 1043311030
+        and current.get("event") == "workflow_dispatch"
+        and current.get("workflow_id") == workflow.get("id")
+        and workflow.get("path") == ".github/workflows/build.yml",
+        "manual_authenticated_run",
+    )
+    endpoint = f"/repos/{GHCR_REPOSITORY}/actions/workflows/build.yml/runs?event=workflow_dispatch"
+    page = api.json(endpoint + "&per_page=100&page=1")
+    history = api.pages(endpoint, "workflow_runs", page["total_count"])
+    job_name = (
+        "prometheus-oras-qualification" if purpose == "tool" else "prometheus-source-build-pair"
+    )
+    observed = []
+    observed_sources: dict[tuple[int, int], tuple[Any, Any]] = {}
+    for run in history:
+        if run["id"] == run_id:
+            continue
+        jobs_endpoint = f'/repos/{GHCR_REPOSITORY}/actions/runs/{run["id"]}/jobs?filter=all'
+        jobs_page = api.json(jobs_endpoint + "&per_page=100&page=1")
+        jobs = api.pages(jobs_endpoint, "jobs", jobs_page["total_count"])
+        observed += [
+            {
+                "run_id": run["id"],
+                "job_id": job["id"],
+                "status": job.get("status"),
+                "conclusion": job.get("conclusion"),
+            }
+            for job in jobs
+            if job.get("name") == job_name and job.get("conclusion") != "skipped"
+        ]
+        for job in jobs:
+            if job.get("name") == job_name and job.get("conclusion") != "skipped":
+                key = (run["id"], job["id"])
+                require(key not in observed_sources, "manual_history_duplicate_job")
+                observed_sources[key] = (job.get("run_id"), job.get("head_sha"))
+
+    # AM07 is one explicitly admitted continuation, not a renewable history policy.
+    if ref == "refs/heads/codex/python-setup-security-stabilization":
+        require(prefetch_predecessor is None, "stabilization_has_no_legacy_retry_selector")
+        pr = api.json(f"/repos/{GHCR_REPOSITORY}/pulls/2497")
+        require(
+            type(pr) is dict
+            and pr.get("number") == 2497
+            and pr.get("state") == "open"
+            and type(pr.get("head")) is dict
+            and type(pr.get("base")) is dict
+            and pr["head"].get("ref") == "codex/python-setup-security-stabilization"
+            and pr["head"].get("sha") == head
+            and pr["head"].get("repo", {}).get("id") == 1043311030
+            and pr["base"].get("ref") == "main"
+            and pr["base"].get("repo", {}).get("id") == 1043311030
+            and current.get("id") == run_id
+            and current.get("head_branch") == "codex/python-setup-security-stabilization",
+            "stabilization_current_PR_source",
+        )
+        expected_spent_runs = (
+            (
+                (
+                    38170923494,
+                    114563178711,
+                    "5de54811121079eadbd3f5d8dbbb8720f712530a",
+                    "codex/dependency-native-runtime-remediation",
+                    "failure",
+                ),
+                (
+                    38192419687,
+                    114627819440,
+                    "15097adaa871a900370f6c57a512fe862dddb041",
+                    "codex/dependency-native-runtime-remediation",
+                    "failure",
+                ),
+                (
+                    38239428418,
+                    114778090287,
+                    "f632572057453d57975a397a5b2db64894204be0",
+                    "codex/dependency-native-runtime-remediation",
+                    "failure",
+                ),
+                (
+                    38269614712,
+                    114880342307,
+                    "a18d636138bbab67e96c902b1c61f690263c8b55",
+                    "codex/dependency-native-runtime-remediation",
+                    "success",
+                ),
+                (
+                    39020247533,
+                    117360452632,
+                    "9c1b48f8b3a63bf827543cf69090505c1f157fc6",
+                    "codex/consolidate-legacy-ownership-guard",
+                    "success",
+                ),
+                (
+                    40188825249,
+                    121155232821,
+                    "c22d641bc0d4dce56925114c827be6d712db7070",
+                    "codex/python-setup-security-stabilization",
+                    "success",
+                ),
+            )
+            if purpose == "tool"
+            else (
+                (
+                    38291450453,
+                    114952275845,
+                    "b732222719f70fa592218d2255324850843e9eea",
+                    "codex/dependency-native-runtime-remediation",
+                    "success",
+                ),
+                (
+                    39033193167,
+                    117397709770,
+                    "e2b86644a9a0264098f57f1bbca5914a3438fbe6",
+                    "codex/consolidate-legacy-ownership-guard",
+                    "success",
+                ),
+                (
+                    40222244853,
+                    121256136190,
+                    "7e275934593fa83749c5d89054c019fd4f7c6e89",
+                    "codex/python-setup-security-stabilization",
+                    "success",
+                ),
+            )
+        )
+        expected_rows = [
+            {"run_id": r, "job_id": j, "status": "completed", "conclusion": outcome}
+            for r, j, _source, _branch, outcome in expected_spent_runs
+        ]
+        require(
+            sorted(observed, key=lambda value: (value["run_id"], value["job_id"])) == expected_rows,
+            "stabilization_complete_spent_history",
+        )
+        for prior_run, prior_job, prior_source, prior_branch, outcome in expected_spent_runs:
+            runs = [row for row in history if row.get("id") == prior_run]
+            require(len(runs) == 1, "stabilization_prior_run_unique")
+            prior = runs[0]
+            require(
+                prior.get("head_sha") == prior_source
+                and prior.get("head_branch") == prior_branch
+                and type(prior.get("run_attempt")) is int
+                and prior["run_attempt"] == 1
+                and prior.get("event") == "workflow_dispatch"
+                and prior.get("workflow_id") == workflow["id"]
+                and prior.get("status") == "completed"
+                and prior.get("conclusion") == outcome
+                and prior.get("repository", {}).get("id") == 1043311030
+                and prior.get("head_repository", {}).get("id") == 1043311030,
+                "stabilization_prior_run_identity",
+            )
+            bound = observed_sources.get((prior_run, prior_job))
+            require(
+                bound == (prior_run, prior_source),
+                "stabilization_prior_job_identity",
+            )
+        current_endpoint = f"/repos/{GHCR_REPOSITORY}/actions/runs/{run_id}/attempts/1/jobs"
+        current_page = api.json(current_endpoint + "?per_page=100&page=1")
+        current_jobs = api.pages(current_endpoint, "jobs", current_page["total_count"])
+        selected = [row for row in current_jobs if row.get("name") == job_name]
+        require(
+            len(selected) == 1
+            and selected[0].get("run_id") == run_id
+            and selected[0].get("head_sha") == head
+            and selected[0].get("status") == "in_progress",
+            "stabilization_current_job_identity",
+        )
+        return {
+            "run_id": run_id,
+            "head": head,
+            "ref": ref,
+            "workflow_id": workflow["id"],
+            "job": job_name,
+            "actual_prior_invocations": observed,
+            "budget": 1 if purpose == "tool" else 2,
+        }
+    if prefetch_predecessor is None:
+        require(not observed, "nonrenewable_hosted_invocation_budget_spent_or_unknown")
+    else:
+        expected_history = [
+            {
+                "run_id": 38170923494,
+                "job_id": 114563178711,
+                "status": "completed",
+                "conclusion": "failure",
+            }
+        ]
+        if prefetch_predecessor in (TOOL_PREFETCH_TWO_PREDECESSORS, TOOL_THREE_PREDECESSORS):
+            expected_history.append(
+                {
+                    "run_id": 38192419687,
+                    "job_id": 114627819440,
+                    "status": "completed",
+                    "conclusion": "failure",
+                }
+            )
+        if prefetch_predecessor == TOOL_THREE_PREDECESSORS:
+            expected_history.append(
+                {
+                    "run_id": 38239428418,
+                    "job_id": 114778090287,
+                    "status": "completed",
+                    "conclusion": "failure",
+                }
+            )
+        observed.sort(key=lambda row: (row["run_id"], row["job_id"]))
+        require(
+            run_id not in (38170923494, 38192419687, 38239428418)
+            and current.get("id") == run_id
+            and current.get("head_branch") == "codex/dependency-native-runtime-remediation"
+            and observed == expected_history,
+            (
+                "tool_prefetch_complete_singleton_history"
+                if prefetch_predecessor == TOOL_PREFETCH_PREDECESSOR
+                else (
+                    "tool_complete_three_history"
+                    if prefetch_predecessor == TOOL_THREE_PREDECESSORS
+                    else "tool_prefetch_complete_two_history"
+                )
+            ),
+        )
+        archive = api.evidence / "tool-prefetch-predecessor.zip"
+        prior = authenticated_artifact(
+            api,
+            11713828762,
+            archive,
+            expected_run=38170923494,
+            expected_job=job_name,
+            expected_head="5de54811121079eadbd3f5d8dbbb8720f712530a",
+            purpose="tool_prefetch_precompile_failure",
+        )
+        require(
+            prior["job"].get("id") == 114563178711
+            and prior["run"].get("head_branch") == "codex/dependency-native-runtime-remediation"
+            and ref == "refs/heads/codex/dependency-native-runtime-remediation"
+            and prior["artifact"].get("name") == "prometheus-oras-38170923494-1"
+            and archive.stat().st_size == TOOL_PREFETCH_ARCHIVE["bytes"]
+            and file_hash(archive) == TOOL_PREFETCH_ARCHIVE["sha256"],
+            "tool_prefetch_authenticated_predecessor",
+        )
+        files = _zip_members(archive)
+        expected_files = {
+            "tool.json",
+            "go-members.json",
+            "oras-source-members.json",
+            *(
+                f"GitHub-{number}.{suffix}"
+                for number in range(1, 36)
+                for suffix in ("json", "stdout", "stderr")
+            ),
+            *(
+                f"tool-{name}.{suffix}"
+                for name in ("version", "download", "verify")
+                for suffix in ("stdout", "stderr")
+            ),
+        }
+        require(set(files) == expected_files, "tool_prefetch_complete_failed_inventory")
+        report = one_object(files["tool.json"])
+        require(
+            set(report)
+            == {
+                "identity",
+                "source_revision",
+                "source_tree",
+                "original_locks",
+                "admission",
+                "input_projection",
+                "input_digest",
+                "tool_compile_invocations",
+                "Prometheus_compile_invocations",
+                "failure",
+                "cleanup",
+                "native_commands",
+            }
+            and report.get("identity") == "PulsePlate-rebuilt ORAS 1.3.4"
+            and report.get("source_revision") == ORAS_REVISION
+            and report.get("source_tree") == ORAS_TREE
+            and type(report.get("tool_compile_invocations")) is int
+            and report["tool_compile_invocations"] == 0
+            and type(report.get("Prometheus_compile_invocations")) is int
+            and report["Prometheus_compile_invocations"] == 0,
+            "tool_prefetch_failed_before_compile",
+        )
+        exact_data(
+            report["failure"],
+            {"class": "QualificationError", "code": "prefetch_original_locks_source"},
+        )
+        exact_data(report["cleanup"], [])
+        exact_data(report["original_locks"], ORAS_LOCKS)
+        exact_data(
+            report["admission"],
+            {
+                "run_id": 38170923494,
+                "head": "5de54811121079eadbd3f5d8dbbb8720f712530a",
+                "ref": ref,
+                "workflow_id": workflow["id"],
+                "job": job_name,
+                "actual_prior_invocations": [],
+                "budget": 1,
+            },
+        )
+        old_files = api.source_files(
+            "5de54811121079eadbd3f5d8dbbb8720f712530a", (*PRODUCER_FILES, MANIFEST_PATH)
+        )
+        old_manifest = one_object(old_files[MANIFEST_PATH])
+        require(old_manifest.get("schema") == IMAGE_SCHEMA, "tool_prefetch_historical_manifest")
+        old_inputs = copy.deepcopy(old_manifest["inputs"])
+        old_inputs["oras"]["retained"] = None
+        historical = {
+            "inputs": old_inputs,
+            "raw_producer": {
+                name: {"bytes": len(old_files[name]), "sha256": sha(old_files[name])}
+                for name in PRODUCER_FILES
+            },
+        }
+        exact_data(report["input_projection"], historical)
+        require(
+            report["input_digest"]
+            == TOOL_PREFETCH_INPUT_DIGEST
+            == "sha256:" + sha(canonical_data(historical)),
+            "tool_prefetch_reviewed_historical_producer",
+        )
+        # This digest binds the actual OLD reviewed prefetch-before-start producer,
+        # independently of the corrected producer authenticated by qualify_tool.
+        go_inventory = json.loads(files["go-members.json"])
+        require(
+            sha(files["oras-source-members.json"])
+            == old_inputs["oras"]["canonical_inventory_sha256"]
+            and type(go_inventory) is list
+            and len(go_inventory) == GO.files,
+            "tool_prefetch_acquired_source_inventories",
+        )
+        records = report["native_commands"]
+        require(type(records) is list and len(records) == 3, "tool_prefetch_exact_native_prefix")
+        prior_work = Path("/home/runner/work/_temp/prometheus-oras-38170923494-1")
+        environment = clean_environment(
+            prior_work / "tool-home",
+            prior_work / "tool-tmp",
+            prior_work / "tool-cache",
+            prior_work / "tool-modules",
+            offline=False,
+        )
+        for row, name, command in zip(
+            records,
+            ("version", "download", "verify"),
+            (["version"], ["mod", "download", "-json", "all"], ["mod", "verify"]),
+        ):
+            require(
+                type(row) is dict
+                and set(row)
+                == {
+                    "argv",
+                    "cwd",
+                    "environment",
+                    "exit",
+                    "failure",
+                    "stdout",
+                    "stdout_sha256",
+                    "stderr",
+                    "stderr_sha256",
+                }
+                and type(row["exit"]) is int
+                and row["exit"] == 0
+                and row["failure"] is None
+                and row["argv"] == [str(prior_work / "go/bin/go"), *command]
+                and row["cwd"] == str(prior_work / "source"),
+                "tool_prefetch_exact_native_prefix",
+            )
+            exact_data(row["environment"], environment)
+            for suffix in ("stdout", "stderr"):
+                member = f"tool-{name}.{suffix}"
+                require(
+                    row[suffix] == str(prior_work / "evidence" / member)
+                    and row[suffix + "_sha256"] == sha(files[member]),
+                    "tool_prefetch_native_output_binding",
+                )
+        require(
+            files["tool-version.stdout"] == GO_VERSION.encode()
+            and files["tool-verify.stdout"] == b"all modules verified\n"
+            and all(
+                files[f"tool-{name}.stderr"] == b"" for name in ("version", "download", "verify")
+            ),
+            "tool_prefetch_native_success_outputs",
+        )
+        require(
+            bool(decode_modules(files["tool-download.stdout"])), "tool_prefetch_download_inventory"
+        )
+        for number in range(1, 36):
+            record = one_object(files[f"GitHub-{number}.json"])
+            argv = record.get("argv")
+            read_only = (
+                argv == ["/usr/bin/gh", "auth", "status", "--hostname", "github.com"]
+                if number == 1
+                else (
+                    type(argv) is list
+                    and len(argv) == 7
+                    and argv[:6]
+                    == ["/usr/bin/gh", "api", "--hostname", "github.com", "--method", "GET"]
+                    and type(argv[6]) is str
+                    and argv[6].startswith("/repos/" + GHCR_REPOSITORY + "/")
+                )
+            )
+            require(
+                type(record.get("exit")) is int
+                and record["exit"] == 0
+                and read_only
+                and record.get("stdout_bytes") == len(files[f"GitHub-{number}.stdout"])
+                and record.get("stdout_sha256") == sha(files[f"GitHub-{number}.stdout"])
+                and record.get("stderr_sha256") == sha(files[f"GitHub-{number}.stderr"]),
+                "tool_prefetch_complete_API_observations",
+            )
+        observed[0][
+            "precompile_disposition"
+        ] = "selected_known_prefetch_failure; no qualified output; historical post-lock bytes unknown"
+    if prefetch_predecessor in (TOOL_PREFETCH_TWO_PREDECESSORS, TOOL_THREE_PREDECESSORS):
+        second_archive = api.evidence / "tool-prefetch-second-predecessor.zip"
+        second = authenticated_artifact(
+            api,
+            11722041486,
+            second_archive,
+            expected_run=38192419687,
+            expected_job=job_name,
+            expected_head="15097adaa871a900370f6c57a512fe862dddb041",
+            purpose="tool_prefetch_precompile_failure",
+        )
+        require(
+            second["job"].get("id") == 114627819440
+            and second["run"].get("head_branch") == "codex/dependency-native-runtime-remediation"
+            and second["artifact"].get("name") == "prometheus-oras-38192419687-1"
+            and second_archive.stat().st_size == TOOL_PREFETCH_SECOND_ARCHIVE["bytes"]
+            and file_hash(second_archive) == TOOL_PREFETCH_SECOND_ARCHIVE["sha256"],
+            "tool_prefetch_second_authenticated_predecessor",
+        )
+        second_files = _zip_members(second_archive)
+        second_report = one_object(second_files["tool.json"])
+        require(
+            set(second_report) == set(report) | {"public_modules"}
+            and second_report.get("identity") == "PulsePlate-rebuilt ORAS 1.3.4"
+            and second_report.get("source_revision") == ORAS_REVISION
+            and second_report.get("source_tree") == ORAS_TREE
+            and type(second_report.get("tool_compile_invocations")) is int
+            and second_report["tool_compile_invocations"] == 0
+            and type(second_report.get("Prometheus_compile_invocations")) is int
+            and second_report["Prometheus_compile_invocations"] == 0,
+            "tool_prefetch_second_before_compile",
+        )
+        exact_data(
+            second_report["failure"], {"class": "QualificationError", "code": "native_failed"}
+        )
+        exact_data(second_report["original_locks"], ORAS_LOCKS)
+        exact_data(
+            second_report["admission"],
+            {
+                "run_id": 38192419687,
+                "head": "15097adaa871a900370f6c57a512fe862dddb041",
+                "ref": ref,
+                "workflow_id": workflow["id"],
+                "job": job_name,
+                "actual_prior_invocations": [observed[0]],
+                "budget": 1,
+            },
+        )
+        historical_files = api.source_files(
+            "15097adaa871a900370f6c57a512fe862dddb041", (*PRODUCER_FILES, MANIFEST_PATH)
+        )
+        old_manifest = one_object(historical_files[MANIFEST_PATH])
+        require(old_manifest.get("schema") == IMAGE_SCHEMA, "tool_prefetch_historical_manifest")
+        old_inputs = copy.deepcopy(old_manifest["inputs"])
+        old_inputs["oras"]["retained"] = None
+        projection = {
+            "inputs": old_inputs,
+            "raw_producer": {
+                name: {"bytes": len(historical_files[name]), "sha256": sha(historical_files[name])}
+                for name in PRODUCER_FILES
+            },
+        }
+        exact_data(second_report["input_projection"], projection)
+        require(
+            second_report["input_digest"]
+            == TOOL_PREFETCH_SECOND_INPUT_DIGEST
+            == "sha256:" + sha(canonical_data(projection)),
+            "tool_prefetch_second_source_projection",
+        )
+        require(
+            second_files["tool-prefetch-predecessor.zip"] == archive.read_bytes(),
+            "tool_prefetch_second_original_predecessor_bytes",
+        )
+        go_members = json.loads(second_files["go-members.json"])
+        source_members = json.loads(second_files["oras-source-members.json"])
+        require(
+            type(go_members) is list
+            and len(go_members) == GO.files
+            and type(source_members) is list
+            and len(source_members) == ORAS_SOURCE.files
+            and sha(second_files["oras-source-members.json"])
+            == old_inputs["oras"]["canonical_inventory_sha256"],
+            "tool_prefetch_second_source_inventory",
+        )
+        prefetch = one_object(second_files["tool-prefetch.json"])
+        exact_data(set(prefetch), {"before", "after", "failure", "snapshot_errors"})
+        require(
+            prefetch["failure"] is None and prefetch["snapshot_errors"] == [],
+            "tool_prefetch_second_prefetch_failure",
+        )
+        exact_data(prefetch["after"], prefetch["before"])
+        source_inventory = [
+            {
+                "path": row["path"],
+                "size": row["size"],
+                "sha256": row["sha256"],
+                "mode": 0o755 if row["git_mode"] == "100755" else 0o644,
+            }
+            for row in source_members
+        ]
+        exact_data(prefetch["before"]["source_inventory"], source_inventory)
+        for lock, digest in ORAS_LOCKS.items():
+            before_bytes = second_files["tool-prefetch-before-" + lock]
+            require(
+                before_bytes == second_files["tool-prefetch-after-" + lock]
+                and sha(before_bytes) == digest,
+                "tool_prefetch_second_original_lock_bytes",
+            )
+            exact_data(
+                prefetch["before"]["locks"][lock],
+                {"bytes": len(before_bytes), "sha256": digest, "mode": 0o644},
+            )
+        records = second_report["native_commands"]
+        require(
+            type(records) is list
+            and len(records) == 30
+            and sha(canonical_data(records)) == TOOL_PREFETCH_SECOND_NATIVE_DIGEST,
+            "tool_prefetch_second_native_records",
+        )
+        work = Path("/home/runner/work/_temp/prometheus-oras-38192419687-1")
+        expected_files = {
+            "tool.json",
+            "go-members.json",
+            "oras-source-members.json",
+            "tool-prefetch.json",
+            "tool-prefetch-predecessor.zip",
+            *(
+                "tool-prefetch-" + phase + "-" + lock
+                for phase in ("before", "after")
+                for lock in ORAS_LOCKS
+            ),
+            *(
+                f"GitHub-{n}.{suffix}"
+                for n in range(1, 50)
+                for suffix in ("json", "stdout", "stderr")
+            ),
+        }
+        online_environment = clean_environment(
+            work / "tool-home",
+            work / "tool-tmp",
+            work / "tool-cache",
+            work / "tool-modules",
+            offline=False,
+        )
+        for row, command in zip(
+            records[:3], (["version"], ["mod", "download", "-json"], ["mod", "verify"])
+        ):
+            require(
+                row["argv"] == [str(work / "go/bin/go"), *command]
+                and row["cwd"] == str(work / "source"),
+                "tool_prefetch_second_original_prefix",
+            )
+            exact_data(row["environment"], online_environment)
+        decode_modules(second_files["tool-download.stdout"])
+        require(
+            type(second_report["public_modules"]) is dict
+            and type(second_report["public_modules"].get("files")) is int
+            and second_report["public_modules"]["files"] > 0
+            and second_report["public_modules"].get("download_stdout_sha256")
+            == sha(second_files["tool-download.stdout"]),
+            "tool_prefetch_second_cache_observation",
+        )
+        for index, row in enumerate(records):
+            require(
+                type(row) is dict
+                and set(row) == set(report["native_commands"][0])
+                and type(row["exit"]) is int
+                and row["exit"] == (1 if index == 17 else 0)
+                and row["failure"] is None,
+                "tool_prefetch_second_native_status",
+            )
+            for suffix in ("stdout", "stderr"):
+                member = Path(row[suffix]).name
+                require(
+                    row[suffix] == str(work / "evidence" / member)
+                    and member in second_files
+                    and row[suffix + "_sha256"] == sha(second_files[member]),
+                    "tool_prefetch_second_native_output_binding",
+                )
+                expected_files.add(member)
+        require(set(second_files) == expected_files, "tool_prefetch_second_complete_inventory")
+        require(
+            second_files["tool-version.stdout"] == GO_VERSION.encode()
+            and second_files["tool-verify.stdout"] == b"all modules verified\n"
+            and second_files["tool-version-native.stdout"] == GO_VERSION.encode()
+            and second_files["tool-verify-native.stdout"] == b"all modules verified\n"
+            and second_files["tool-modules-native.stdout"] == b""
+            and sha(second_files["tool-modules-native.stderr"])
+            == TOOL_PREFETCH_SECOND_STDERR_DIGEST,
+            "tool_prefetch_second_offline_rejection",
+        )
+        for n in range(1, 50):
+            record = one_object(second_files[f"GitHub-{n}.json"])
+            argv = record.get("argv")
+            require(
+                type(record.get("exit")) is int
+                and record["exit"] == 0
+                and (
+                    argv == ["/usr/bin/gh", "auth", "status", "--hostname", "github.com"]
+                    if n == 1
+                    else type(argv) is list
+                    and len(argv) == 7
+                    and argv[:6]
+                    == ["/usr/bin/gh", "api", "--hostname", "github.com", "--method", "GET"]
+                    and type(argv[6]) is str
+                    and argv[6].startswith("/repos/" + GHCR_REPOSITORY + "/")
+                )
+                and record.get("stdout_bytes") == len(second_files[f"GitHub-{n}.stdout"])
+                and record.get("stdout_sha256") == sha(second_files[f"GitHub-{n}.stdout"])
+                and record.get("stderr_sha256") == sha(second_files[f"GitHub-{n}.stderr"]),
+                "tool_prefetch_second_complete_API",
+            )
+        names = []
+        docker_environment = {
+            "PATH": "/usr/bin:/bin",
+            "HOME": str(work),
+            "LANG": "C.UTF-8",
+            "DOCKER_CONFIG": str(work / "docker-config"),
+        }
+        for number, (kind, command) in enumerate(
+            (
+                ("version", ["version"]),
+                ("verify", ["mod", "verify"]),
+                ("modules", ["list", "-mod=readonly", "-m", "-json", "all"]),
+            )
+        ):
+            create_index = 5 + 5 * number
+            create = records[create_index]["argv"]
+            name = create[create.index("--name") + 1]
+            owner = create[create.index("--label") + 1].removeprefix(LABEL + "=")
+            expected = {
+                "image": HISTORICAL_BASE_CONFIG,
+                "owner": owner,
+                "command": command,
+                "mounts": {
+                    "/src": str(work / "source"),
+                    "/usr/local/go": str(work / "go"),
+                    "/modules": str(work / "tool-modules"),
+                },
+            }
+            image = one_object(second_files[f"tool-{kind}-base.stdout"])
+            require(
+                image.get("Id") == HISTORICAL_BASE_CONFIG
+                and image.get("Os") == "linux"
+                and image.get("Architecture") == "amd64"
+                and HISTORICAL_BASE in image.get("RepoDigests", [])
+                and not image.get("Config", {}).get("Volumes"),
+                "tool_prefetch_second_fixed_base",
+            )
+            create_member = f"tool-{kind}-create.stdout"
+            require(
+                records[create_index]["stdout"] == str(work / "evidence" / create_member)
+                and records[create_index - 1]["stdout"]
+                == str(work / "evidence" / f"tool-{kind}-base.stdout"),
+                "tool_prefetch_second_identity_record_join",
+            )
+            identifier = second_files[create_member].decode("ascii").strip()
+            require(
+                re.fullmatch(r"[0-9a-f]{64}", identifier) is not None,
+                "tool_prefetch_second_create_ID",
+            )
+            expected["container_id"] = identifier
+            expected["image_relation"] = native_base_identity(image, current=False)
+            environment = dict(value.split("=", 1) for value in image["Config"].get("Env", []))
+            environment.update(
+                clean_environment(
+                    GUEST_TMP, GUEST_TMP, GUEST_TMP / "gocache", Path("/modules"), offline=True
+                )
+            )
+            expected["environment"] = environment
+            # The immutable native-record digest binds every historical argv byte;
+            # prior hosted mount paths are data, not current host directories.
+            require(
+                create[:4] == ["/usr/bin/docker", "--config", str(work / "docker-config"), "create"]
+                and create[-len(command) - 1 :] == [HISTORICAL_BASE_CONFIG, *command],
+                "tool_prefetch_second_exact_offline_argv",
+            )
+            for phase in ("before", "cleanup-inspect"):
+                member = (
+                    f"tool-{kind}-before.stdout"
+                    if phase == "before"
+                    else name + "-cleanup-inspect.stdout"
+                )
+                values = json.loads(second_files[member])
+                require(type(values) is list and len(values) == 1, "tool_prefetch_second_inspect")
+                validate_container(values[0], name, expected)
+                if phase == "cleanup-inspect":
+                    state = values[0]["State"]
+                    require(
+                        state.get("Running") is False
+                        and type(state.get("ExitCode")) is int
+                        and state["ExitCode"] == (1 if kind == "modules" else 0)
+                        and state.get("OOMKilled") is False,
+                        "tool_prefetch_second_native_terminal",
+                    )
+            require(
+                records[create_index + 2]["argv"]
+                == [
+                    "/usr/bin/docker",
+                    "--config",
+                    str(work / "docker-config"),
+                    "start",
+                    "--attach",
+                    name,
+                ],
+                "tool_prefetch_second_start",
+            )
+            require(
+                name not in second_files[name + "-cleanup-absence.stdout"].decode().splitlines(),
+                "tool_prefetch_second_owned_absence",
+            )
+            cleanup_index = 18 + number * 4
+            require(
+                records[cleanup_index]["argv"]
+                == [
+                    "/usr/bin/docker",
+                    "--config",
+                    str(work / "docker-config"),
+                    "ps",
+                    "--all",
+                    "--format",
+                    "{{.Names}}",
+                ]
+                and records[cleanup_index + 1]["argv"]
+                == ["/usr/bin/docker", "--config", str(work / "docker-config"), "inspect", name]
+                and records[cleanup_index + 2]["argv"]
+                == [
+                    "/usr/bin/docker",
+                    "--config",
+                    str(work / "docker-config"),
+                    "rm",
+                    "--force",
+                    name,
+                ]
+                and records[cleanup_index + 3]["argv"] == records[cleanup_index]["argv"],
+                "tool_prefetch_second_exact_cleanup",
+            )
+            names.append(name)
+        exact_data(
+            second_report["cleanup"], [{"name": name, "native_absent": True} for name in names]
+        )
+        for row in records[3:]:
+            exact_data(row["environment"], docker_environment)
+            require(row["cwd"] == str(work), "tool_prefetch_second_native_cwd")
+        observed[1][
+            "precompile_disposition"
+        ] = "selected_known_offline_metadata_failure; FAILED/SPENT; no compiler or qualified output"
+    if prefetch_predecessor == TOOL_THREE_PREDECESSORS:
+        third_archive = api.evidence / "tool-postcompile-predecessor.zip"
+        third = authenticated_artifact(
+            api,
+            11742856046,
+            third_archive,
+            expected_run=38239428418,
+            expected_job=job_name,
+            expected_head="f632572057453d57975a397a5b2db64894204be0",
+            purpose="tool_postcompile_layout_failure",
+        )
+        require(
+            third["job"].get("id") == 114778090287
+            and third["run"].get("head_branch") == "codex/dependency-native-runtime-remediation"
+            and third["artifact"].get("name") == "prometheus-oras-38239428418-1"
+            and third_archive.stat().st_size == TOOL_THIRD_ARCHIVE["bytes"]
+            and file_hash(third_archive) == TOOL_THIRD_ARCHIVE["sha256"],
+            "tool_third_authenticated_failure",
+        )
+        data = _zip_members(third_archive)
+        require({"tool.json", "invocation-start.json"} <= set(data), "tool_third_report_keys")
+        final = one_object(data["tool.json"])
+        start = one_object(data["invocation-start.json"])
+        require(
+            set(final) == set(second_report) | {"binary", "command_graph", "full_modules"}
+            and set(start) == set(final) - {"binary", "cleanup", "native_commands"},
+            "tool_third_report_keys",
+        )
+        for value in (start, final):
+            require(
+                type(value.get("tool_compile_invocations")) is int
+                and value["tool_compile_invocations"] == 1
+                and type(value.get("Prometheus_compile_invocations")) is int
+                and value["Prometheus_compile_invocations"] == 0,
+                "tool_third_actual_compiler_consumed",
+            )
+        exact_data(start["failure"], None)
+        exact_data(final["failure"], {"class": "QualificationError", "code": "layout_regular_leaf"})
+        for report_key in set(start) - {"failure"}:
+            exact_data(start[report_key], final[report_key])
+        exact_data(final["identity"], "PulsePlate-rebuilt ORAS 1.3.4")
+        exact_data(final["source_revision"], ORAS_REVISION)
+        exact_data(final["source_tree"], ORAS_TREE)
+        exact_data(final["original_locks"], ORAS_LOCKS)
+        exact_data(final["binary"], TOOL_THIRD_BINARY_OBSERVATION)
+        exact_data(
+            final["admission"],
+            {
+                "run_id": 38239428418,
+                "head": "f632572057453d57975a397a5b2db64894204be0",
+                "ref": ref,
+                "workflow_id": workflow["id"],
+                "job": job_name,
+                "actual_prior_invocations": observed[:2],
+                "budget": 1,
+            },
+        )
+        historical_files = api.source_files(
+            "f632572057453d57975a397a5b2db64894204be0", (*PRODUCER_FILES, MANIFEST_PATH)
+        )
+        old_manifest = one_object(historical_files[MANIFEST_PATH])
+        require(old_manifest.get("schema") == IMAGE_SCHEMA, "tool_prefetch_historical_manifest")
+        inputs = copy.deepcopy(old_manifest["inputs"])
+        inputs["oras"]["retained"] = None
+        historical = {
+            "inputs": inputs,
+            "raw_producer": {
+                name: {"bytes": len(historical_files[name]), "sha256": sha(historical_files[name])}
+                for name in PRODUCER_FILES
+            },
+        }
+        exact_data(final["input_projection"], historical)
+        require(
+            final["input_digest"]
+            == TOOL_THIRD_INPUT_DIGEST
+            == "sha256:" + sha(canonical_data(historical)),
+            "tool_third_source_projection",
+        )
+        require(
+            data["tool-prefetch-predecessor.zip"] == archive.read_bytes()
+            and data["tool-prefetch-second-predecessor.zip"] == second_archive.read_bytes(),
+            "tool_third_original_predecessors",
+        )
+        source_members = json.loads(data["oras-source-members.json"])
+        go_members = json.loads(data["go-members.json"])
+        require(
+            type(source_members) is list
+            and len(source_members) == ORAS_SOURCE.files
+            and sha(data["oras-source-members.json"])
+            == inputs["oras"]["canonical_inventory_sha256"]
+            and type(go_members) is list
+            and len(go_members) == GO.files,
+            "tool_third_source_inventories",
+        )
+        records = final["native_commands"]
+        require(type(records) is list and len(records) == 72, "tool_third_native_records")
+        require(
+            all(
+                type(row) is dict
+                and set(row) == set(report["native_commands"][0])
+                and type(row.get("exit")) is int
+                and row["exit"] == 0
+                and row["failure"] is None
+                for row in records
+            ),
+            "tool_third_native_status",
+        )
+        require(
+            sha(canonical_data(records)) == TOOL_THIRD_NATIVE_DIGEST, "tool_third_native_records"
+        )
+        work = Path("/home/runner/work/_temp/prometheus-oras-38239428418-1")
+        phases = (
+            "before",
+            "after",
+            *(
+                name + "-" + phase
+                for name in ("version", "download", "verify", "selected", "graph")
+                for phase in ("before", "after")
+            ),
+        )
+        expected_files = {
+            "tool.json",
+            "invocation-start.json",
+            "go-members.json",
+            "oras-source-members.json",
+            "tool-prefetch.json",
+            "tool-prefetch-cache-before-freeze.json",
+            "tool-prefetch-cache-frozen.json",
+            "tool-prefetch-predecessor.zip",
+            "tool-prefetch-second-predecessor.zip",
+            *("tool-prefetch-" + phase + "-" + lock for phase in phases for lock in ORAS_LOCKS),
+            *(
+                f"GitHub-{number}.{suffix}"
+                for number in range(1, 64)
+                for suffix in ("json", "stdout", "stderr")
+            ),
+        }
+        for row in records:
+            require(
+                type(row["argv"]) is list
+                and bool(row["argv"])
+                and all(type(arg) is str for arg in row["argv"])
+                and Path(row["argv"][0]).is_absolute(),
+                "tool_third_native_argv",
+            )
+            for suffix in ("stdout", "stderr"):
+                member = Path(row[suffix]).name
+                require(
+                    row[suffix] == str(work / "evidence" / member)
+                    and member in data
+                    and row[suffix + "_sha256"] == sha(data[member]),
+                    "tool_third_native_output_binding",
+                )
+                expected_files.add(member)
+        require(
+            set(data) == expected_files and len(data) == 366, "tool_third_complete_failed_inventory"
+        )
+        prefetch = one_object(data["tool-prefetch.json"])
+        require(
+            set(prefetch) == set(phases) | {"failure", "snapshot_errors", "commands"}
+            and prefetch["failure"] is None
+            and prefetch["snapshot_errors"] == [],
+            "tool_third_prefetch_complete",
+        )
+        before = prefetch["before"]
+        go_binary = [row for row in go_members if row.get("path") == "bin/go"]
+        require(
+            len(go_binary) == 1
+            and go_binary[0].get("git_mode") == "100755"
+            and before.get("Go_binary_sha256") == go_binary[0].get("sha256"),
+            "tool_third_qualified_Go_identity",
+        )
+        exact_data(
+            before["source_inventory"],
+            [
+                {
+                    "path": row["path"],
+                    "size": row["size"],
+                    "sha256": row["sha256"],
+                    "mode": 0o755 if row["git_mode"] == "100755" else 0o644,
+                }
+                for row in source_members
+            ],
+        )
+        for phase in phases:
+            exact_data(prefetch[phase], before)
+            for lock, digest in ORAS_LOCKS.items():
+                raw = data["tool-prefetch-" + phase + "-" + lock]
+                require(sha(raw) == digest, "tool_third_original_lock_bytes")
+                exact_data(
+                    before["locks"][lock], {"bytes": len(raw), "sha256": digest, "mode": 0o644}
+                )
+        online = clean_environment(
+            work / "tool-home",
+            work / "tool-tmp",
+            work / "tool-cache",
+            work / "tool-modules",
+            offline=False,
+        )
+        prefix = (
+            ("version", ["version"]),
+            ("download", ["mod", "download", "-json"]),
+            ("verify", ["mod", "verify"]),
+            ("selected", ["list", "-mod=readonly", "-m", "-json", "all"]),
+            ("graph", ["mod", "graph"]),
+        )
+        exact_data(
+            prefetch["commands"],
+            [
+                {
+                    "name": name,
+                    "argv": command,
+                    "stdout_sha256": sha(data["tool-" + name + ".stdout"]),
+                }
+                for name, command in prefix
+            ],
+        )
+        for row, (name, command) in zip(records[:5], prefix):
+            require(
+                row["argv"] == [str(work / "go/bin/go"), *command]
+                and row["cwd"] == str(work / "source"),
+                "tool_third_prefetch_prefix",
+            )
+            exact_data(row["environment"], online)
+        decode_modules(data["tool-download.stdout"])
+        decode_selected_modules(data["tool-selected.stdout"], root_module="oras.land/oras")
+        require(bool(data["tool-graph.stdout"].strip()), "tool_third_online_graph")
+        frozen = json.loads(data["tool-prefetch-cache-frozen.json"])
+        original_cache = json.loads(data["tool-prefetch-cache-before-freeze.json"])
+        require(
+            type(frozen) is list
+            and type(original_cache) is list
+            and len(frozen) == len(original_cache)
+            and all(type(row.get("mode")) is int and row["mode"] == 0o444 for row in frozen),
+            "tool_third_frozen_cache",
+        )
+        exact_data(
+            [{key: value for key, value in row.items() if key != "mode"} for row in frozen],
+            [{key: value for key, value in row.items() if key != "mode"} for row in original_cache],
+        )
+        exact_data(
+            final["public_modules"],
+            {
+                "files": len(frozen),
+                "inventory_sha256": sha(canonical_data(frozen)),
+                "download_stdout_sha256": sha(data["tool-download.stdout"]),
+            },
+        )
+        exact_data(
+            final["full_modules"],
+            decode_selected_modules(
+                data["tool-modules-native.stdout"], root_module="oras.land/oras"
+            ),
+        )
+        exact_data(final["command_graph"], tool_packages(data["tool-packages-native.stdout"]))
+        require(
+            data["tool-version.stdout"] == data["tool-version-native.stdout"] == GO_VERSION.encode()
+            and data["tool-verify.stdout"]
+            == data["tool-verify-native.stdout"]
+            == b"all modules verified\n",
+            "tool_third_offline_success",
+        )
+        for number in range(1, 64):
+            record = one_object(data[f"GitHub-{number}.json"])
+            argv = record.get("argv")
+            require(
+                type(record.get("exit")) is int
+                and record["exit"] == 0
+                and (
+                    argv == ["/usr/bin/gh", "auth", "status", "--hostname", "github.com"]
+                    if number == 1
+                    else type(argv) is list
+                    and len(argv) == 7
+                    and argv[:6]
+                    == ["/usr/bin/gh", "api", "--hostname", "github.com", "--method", "GET"]
+                    and type(argv[6]) is str
+                    and argv[6].startswith("/repos/" + GHCR_REPOSITORY + "/")
+                )
+                and record.get("stdout_bytes") == len(data[f"GitHub-{number}.stdout"])
+                and record.get("stdout_sha256") == sha(data[f"GitHub-{number}.stdout"])
+                and record.get("stderr_sha256") == sha(data[f"GitHub-{number}.stderr"]),
+                "tool_third_complete_API",
+            )
+        docker_env = {
+            "PATH": "/usr/bin:/bin",
+            "HOME": str(work),
+            "LANG": "C.UTF-8",
+            "DOCKER_CONFIG": str(work / "docker-config"),
+        }
+        commands = (
+            ("version", ["version"]),
+            ("verify", ["mod", "verify"]),
+            ("modules", ["list", "-mod=readonly", "-m", "-json", "all"]),
+            ("graph", ["mod", "graph"]),
+            ("packages", ["list", "-mod=readonly", "-deps", "-json", ORAS_COMMAND]),
+            (
+                "compile",
+                [
+                    "build",
+                    "-mod=readonly",
+                    "-trimpath",
+                    "-buildvcs=false",
+                    "-p=1",
+                    "-ldflags=" + ORAS_METADATA,
+                    "-o",
+                    "/output/oras",
+                    ORAS_COMMAND,
+                ],
+            ),
+            ("buildinfo", ["version", "-m", "/output/oras"]),
+        )
+        names = []
+        for number, (name, command) in enumerate(commands):
+            create_index = 7 + number * 5
+            create = records[create_index]["argv"]
+            container = create[create.index("--name") + 1]
+            owner = create[create.index("--label") + 1].removeprefix(LABEL + "=")
+            expected = {
+                "image": HISTORICAL_BASE_CONFIG,
+                "owner": owner,
+                "command": command,
+                "mounts": {
+                    "/src": str(work / "source"),
+                    "/usr/local/go": str(work / "go"),
+                    "/modules": str(work / "tool-modules"),
+                },
+            }
+            image = one_object(data["tool-" + name + "-base.stdout"])
+            require(
+                image.get("Id") == HISTORICAL_BASE_CONFIG
+                and image.get("Os") == "linux"
+                and image.get("Architecture") == "amd64"
+                and HISTORICAL_BASE in image.get("RepoDigests", [])
+                and not image.get("Config", {}).get("Volumes"),
+                "tool_third_fixed_base",
+            )
+            create_member = "tool-" + name + "-create.stdout"
+            require(
+                records[create_index]["stdout"] == str(work / "evidence" / create_member)
+                and records[create_index - 1]["stdout"]
+                == str(work / "evidence" / ("tool-" + name + "-base.stdout")),
+                "tool_third_identity_record_join",
+            )
+            identifier = data[create_member].decode("ascii").strip()
+            require(re.fullmatch(r"[0-9a-f]{64}", identifier) is not None, "tool_third_create_ID")
+            expected["container_id"] = identifier
+            expected["image_relation"] = native_base_identity(image, current=False)
+            environment = dict(value.split("=", 1) for value in image["Config"].get("Env", []))
+            environment.update(
+                clean_environment(
+                    GUEST_TMP, GUEST_TMP, GUEST_TMP / "gocache", Path("/modules"), offline=True
+                )
+            )
+            if number >= 5:
+                expected["output"] = str(work / "compiled")
+                environment.update(TMPDIR="/output/tmp", GOCACHE="/output/cache")
+            expected["environment"] = environment
+            require(
+                create[:4] == ["/usr/bin/docker", "--config", str(work / "docker-config"), "create"]
+                and create[-len(command) - 1 :] == [HISTORICAL_BASE_CONFIG, *command],
+                "tool_third_exact_offline_argv",
+            )
+            for member in (
+                "tool-" + name + "-before.stdout",
+                "tool-" + name + "-terminal.stdout",
+                container + "-cleanup-inspect.stdout",
+            ):
+                values = json.loads(data[member])
+                require(type(values) is list and len(values) == 1, "tool_third_owned_inspect")
+                validate_container(values[0], container, expected)
+                state = values[0]["State"]
+                require(
+                    state.get("Running") is False
+                    and type(state.get("ExitCode")) is int
+                    and state["ExitCode"] == 0
+                    and state.get("OOMKilled") is False,
+                    "tool_third_native_terminal",
+                )
+            require(
+                records[create_index + 2]["argv"]
+                == [
+                    "/usr/bin/docker",
+                    "--config",
+                    str(work / "docker-config"),
+                    "start",
+                    "--attach",
+                    container,
+                ],
+                "tool_third_native_start",
+            )
+            cleanup_index = 44 + number * 4
+            inventory = [
+                "/usr/bin/docker",
+                "--config",
+                str(work / "docker-config"),
+                "ps",
+                "--all",
+                "--format",
+                "{{.Names}}",
+            ]
+            require(
+                records[cleanup_index]["argv"] == inventory
+                and records[cleanup_index + 1]["argv"]
+                == [
+                    "/usr/bin/docker",
+                    "--config",
+                    str(work / "docker-config"),
+                    "inspect",
+                    container,
+                ]
+                and records[cleanup_index + 2]["argv"]
+                == [
+                    "/usr/bin/docker",
+                    "--config",
+                    str(work / "docker-config"),
+                    "rm",
+                    "--force",
+                    container,
+                ]
+                and records[cleanup_index + 3]["argv"] == inventory
+                and container in data[container + "-cleanup-inventory.stdout"].decode().splitlines()
+                and container
+                not in data[container + "-cleanup-absence.stdout"].decode().splitlines(),
+                "tool_third_owned_cleanup",
+            )
+            names.append(container)
+        exact_data(final["cleanup"], [{"name": name, "native_absent": True} for name in names])
+        for row in records[5:]:
+            exact_data(row["environment"], docker_env)
+            require(row["cwd"] == str(work), "tool_third_native_cwd")
+        binary = str(work / "compiled/oras")
+        require(
+            records[41]["argv"] == [binary, "version"]
+            and records[42]["argv"] == [binary, "cp", "--help"]
+            and records[43]["argv"]
+            == [binary, "cp", "--to-oci-layout", HISTORICAL_BASE, str(work / "vendor") + ":base"],
+            "tool_third_postcompile_phase",
+        )
+        observed[2][
+            "postcompile_disposition"
+        ] = "FAILED/SPENT; actual Tool compiler1, Prom0; no retained binary, native format, scan or qualified output; first rejected stat unknown"
+    return {
+        "run_id": run_id,
+        "head": head,
+        "ref": ref,
+        "workflow_id": workflow["id"],
+        "job": job_name,
+        "actual_prior_invocations": observed,
+        "budget": 2 if purpose == "pair" or prefetch_predecessor == TOOL_THREE_PREDECESSORS else 1,
+    }
+
+
+def finite_go(
+    native: Native,
+    work: Path,
+    docker: str,
+    config: Path,
+    docker_env: dict[str, str],
+    source: Path,
+    go: Path,
+    modules: Path,
+    owned: dict[str, dict[str, Any]],
+    label: str,
+    command: list[str],
+    *,
+    output: Path | None = None,
+    compile_seconds: int | None = None,
+) -> bytes:
+    name, owner = "pp-prom-" + uuid.uuid4().hex[:16], uuid.uuid4().hex
+    image = one_object(
+        native.run(
+            [docker, "--config", str(config), "image", "inspect", "--format", "{{json .}}", BASE],
+            label + "-base",
+            docker_env,
+            cwd=work,
+        )
+    )
+    relation = native_base_identity(image)
+    environment = dict(value.split("=", 1) for value in image["Config"].get("Env", []))
+    environment.update(
+        clean_environment(
+            GUEST_TMP, GUEST_TMP, GUEST_TMP / "gocache", Path("/modules"), offline=True
+        )
+    )
+    if output is not None:
+        environment.update(TMPDIR="/output/tmp", GOCACHE="/output/cache")
+    expected = {
+        "image": relation["engine_id"],
+        "image_relation": relation,
+        "owner": owner,
+        "command": command,
+        "environment": environment,
+        "mounts": {"/src": str(source), "/usr/local/go": str(go), "/modules": str(modules)},
+    }
+    if output is not None:
+        expected["output"] = str(output)
+    argv = (
+        sandbox_arguments(
+            docker, config, relation["operand"], name, owner, source, go, modules, output=output
+        )
+        + command
+    )
+    create_owned(native, argv, name, expected, owned, label, docker_env, work)
+    actual = native_one_image(
+        native.run(
+            [docker, "--config", str(config), "inspect", expected["container_id"]],
+            label + "-before",
+            docker_env,
+            cwd=work,
+        )
+    )
+    validate_container(actual, name, expected)
+    raw = native.run(
+        [docker, "--config", str(config), "start", "--attach", expected["container_id"]],
+        label + "-native",
+        docker_env,
+        cwd=work,
+        maximum_seconds=compile_seconds,
+        watched_output=output if compile_seconds is not None else None,
+    )
+    actual = native_one_image(
+        native.run(
+            [docker, "--config", str(config), "inspect", expected["container_id"]],
+            label + "-terminal",
+            docker_env,
+            cwd=work,
+        )
+    )
+    validate_container(actual, name, expected)
+    require(
+        actual["State"].get("Running") is False
+        and actual["State"].get("ExitCode") == 0
+        and type(actual["State"].get("ExitCode")) is int
+        and actual["State"].get("OOMKilled") is False,
+        "finite_go_terminal",
+    )
+    return raw
+
+
+def prefetch_modules(
+    native: Native,
+    work: Path,
+    source: Path,
+    go: Path,
+    label: str,
+    locks: dict[str, str],
+    *,
+    root_module: str = ROOT_MODULE,
+    compiler_artifact: Artifact | None = None,
+) -> tuple[Path, dict[str, Any]]:
+    compiler_artifact = Artifact.canonical(
+        CURRENT_GO if compiler_artifact is None else compiler_artifact
+    )
+    require(compiler_artifact.name == "go", "compiler_artifact_role")
+    exact_data(vars(compiler_artifact), vars(CURRENT_GO))
+    require(root_module in (ROOT_MODULE, "oras.land/oras"), "prefetch_finite_root")
+    modules = work / (label + "-modules")
+    fresh_directory(modules, 0o755)
+    home, tmp, cache = (work / (label + "-" + value) for value in ("home", "tmp", "cache"))
+    for path in (home, tmp, cache):
+        fresh_directory(path)
+    online = clean_environment(home, tmp, cache, modules, offline=False)
+    binary = str(go / "bin/go")
+    observations: dict[str, Any] = {"snapshot_errors": [], "failure": None, "commands": []}
+
+    def snapshot(phase: str) -> dict[str, Any]:
+        state: dict[str, Any] = {"locks": {}, "source_inventory": None, "Go_binary_sha256": None}
+        observations[phase] = state
+        for name in locks:
+            path = source / name
+            digest = file_hash(path, native.deadline)
+            raw = path.read_bytes()
+            require(sha(raw) == digest, "prefetch_snapshot_lock_changed")
+            destination = native.evidence / f"{label}-prefetch-{phase}-{name}"
+            with destination.open("xb") as output:
+                output.write(raw)
+            destination.chmod(0o600)
+            state["locks"][name] = {
+                "bytes": len(raw),
+                "sha256": digest,
+                "mode": stat.S_IMODE(path.lstat().st_mode),
+            }
+        state["source_inventory"] = tree_inventory(source, deadline=native.deadline)
+        state["Go_binary_sha256"] = file_hash(go / "bin/go", native.deadline)
+        return state
+
+    primary: BaseException | None = None
+    downloads = b""
+    try:
+        before = snapshot("before")
+        require(
+            all(before["locks"][name]["sha256"] == digest for name, digest in locks.items()),
+            "prefetch_original_locks_source",
+        )
+        commands = (
+            ("version", ["version"]),
+            ("download", ["mod", "download", "-json"]),
+            ("verify", ["mod", "verify"]),
+            ("selected", ["list", "-mod=readonly", "-m", "-json", "all"]),
+            ("graph", ["mod", "graph"]),
+        )
+        for name, command in commands:
+            require(snapshot(name + "-before") == before, "prefetch_original_locks_source")
+            command_primary: BaseException | None = None
+            try:
+                raw = native.run([binary, *command], label + "-" + name, online, cwd=source)
+                if name == "version":
+                    require(raw.decode() == compiler_artifact.go_version, "prefetch_qualified_Go")
+                elif name == "download":
+                    decode_modules(raw)
+                    downloads = raw
+                elif name == "selected":
+                    decode_selected_modules(raw, root_module=root_module)
+                elif name == "graph":
+                    require(
+                        bool(raw.decode("utf-8", errors="strict").strip()),
+                        "empty_native_module_graph",
+                    )
+                observations["commands"].append(
+                    {"name": name, "argv": command, "stdout_sha256": sha(raw)}
+                )
+            except BaseException as error:
+                command_primary = error
+                raise
+            finally:
+                try:
+                    require(snapshot(name + "-after") == before, "prefetch_original_locks_source")
+                except BaseException as error:
+                    observations["snapshot_errors"].append(
+                        {
+                            "phase": name + "-after",
+                            "class": type(error).__name__,
+                            "code": diagnostic_code(error),
+                        }
+                    )
+                    if command_primary is None:
+                        raise
+                    command_primary.add_note(
+                        "Prefetch command after-state failed: " + type(error).__name__
+                    )
+        require(snapshot("after") == before, "prefetch_original_locks_source")
+    except BaseException as error:
+        primary = error
+        observations["failure"] = {"class": type(error).__name__, "code": diagnostic_code(error)}
+        raise
+    finally:
+        if "after" not in observations:
+            try:
+                snapshot("after")
+            except BaseException as error:
+                observations["snapshot_errors"].append(
+                    {
+                        "phase": "after",
+                        "class": type(error).__name__,
+                        "code": diagnostic_code(error),
+                    }
+                )
+                if primary is None:
+                    primary = error
+                else:
+                    primary.add_note(
+                        "Prefetch after-state snapshot failed: " + type(error).__name__
+                    )
+        try:
+            (native.evidence / f"{label}-prefetch.json").write_bytes(canonical_data(observations))
+        except BaseException as error:
+            if primary is None:
+                raise
+            primary.add_note("Prefetch diagnostic write failed: " + type(error).__name__)
+        if primary is not None and observations["failure"] is None:
+            raise primary
+    inventory = tree_inventory(modules, deadline=native.deadline)
+    (native.evidence / f"{label}-prefetch-cache-before-freeze.json").write_bytes(
+        canonical_data(inventory)
+    )
+    for path in modules.rglob("*"):
+        info = path.lstat()
+        require(stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode), "prefetch_cache_type")
+        path.chmod(0o555 if stat.S_ISDIR(info.st_mode) else 0o444)
+    modules.chmod(0o555)
+    inventory = tree_inventory(modules, deadline=native.deadline)
+    (native.evidence / f"{label}-prefetch-cache-frozen.json").write_bytes(canonical_data(inventory))
+    return modules, {
+        "inventory_sha256": sha(canonical_data(inventory)),
+        "download_stdout_sha256": sha(downloads),
+        "files": len(inventory),
+    }
+
+
+def tool_packages(raw: bytes) -> dict[str, Any]:
+    packages = decode_objects(raw)
+    indexed: dict[str, dict[str, Any]] = {}
+    for value in packages:
+        path = value.get("ImportPath")
+        require(
+            type(path) is str
+            and bool(path)
+            and path not in indexed
+            and not value.get("Error")
+            and not value.get("DepsErrors")
+            and not value.get("Incomplete"),
+            "ORAS_package_identity_error",
+        )
+        indexed[cast(str, path)] = value
+    require(
+        ORAS_COMMAND in indexed and indexed[ORAS_COMMAND].get("Name") == "main",
+        "ORAS_command_graph",
+    )
+    for value in indexed.values():
+        mapping = value.get("ImportMap", {})
+        require(
+            type(mapping) is dict
+            and type(value.get("Imports", [])) is list
+            and all(mapping.get(name, name) in indexed for name in value.get("Imports", [])),
+            "ORAS_complete_command_graph",
+        )
+    forbidden = sorted(
+        path
+        for path in indexed
+        if path == "golang.org/x/crypto/ssh"
+        or path.startswith("golang.org/x/crypto/ssh/")
+        or path == "golang.org/x/crypto/openpgp"
+        or path.startswith("golang.org/x/crypto/openpgp/")
+    )
+    require(not forbidden, "ORAS_SSH_OpenPGP_imports_HOLD")
+    return {
+        "command": ORAS_COMMAND,
+        "packages": len(indexed),
+        "package_paths": sorted(indexed),
+        "SSH_OpenPGP_paths": forbidden,
+        "scope": "exact Linux amd64 CGO0 command graph",
+    }
+
+
+def selection_from_graph(graph: dict[str, Any]) -> dict[str, Any]:
+    manifest = one_object(graph["manifest_raw"])
+    selection = {
+        "repository": IMAGE_REPOSITORY,
+        "platform": "linux/amd64",
+        "root_media_type": OCI_MANIFEST,
+        "manifest_digest": "sha256:" + sha(graph["manifest_raw"]),
+        "config_digest": manifest["config"]["digest"],
+        "layers": manifest["layers"],
+        "diff_ids": graph["diff_ids"],
+        "runtime_ref": IMAGE_REPOSITORY + "@sha256:" + sha(graph["manifest_raw"]),
+        "binaries": {
+            name: {"sha256": sha(graph["files"][name]), "version": "3.15.0"}
+            for name in ("prometheus", "promtool")
+        },
+        "ui_inventory_sha256": sha(canonical_data(UI_FILES)),
+        "source_revision": REVISION,
+        "version": "3.15.0",
+    }
+    validate_selection(selection)
+    return selection
+
+
+def _native_product_save(
+    path: Path, graph: dict[str, Any], image: dict[str, Any], deadline: float, maximum: int
+) -> dict[str, Any]:
+    """Only the observed product schema2 save; source layers remain opaque raw bytes."""
+    engine = _digest(image.get("Id"))
+    content = {"blobs/sha256/" + graph["config_digest"][7:]: graph["config_raw"]}
+    content.update(
+        ("blobs/sha256/" + digest[7:], raw)
+        for digest, raw in zip(graph["diff_ids"], graph["expanded_layers"], strict=True)
+    )
+    manifest_name = "blobs/sha256/" + engine[7:]
+    metadata_names = {"index.json", "manifest.json", "oci-layout", manifest_name}
+    directories = {"blobs", "blobs/sha256"}
+    expected_names = set(content) | metadata_names | directories
+    require(len(expected_names) == len(graph["diff_ids"]) + 7, "product_save_unique_graph")
+    before_hash = file_hash(path, deadline, maximum_bytes=maximum)
+    before = path.lstat()
+    require(
+        0 < before.st_size <= maximum and before.st_uid == os.getuid(), "product_save_file_size"
+    )
+    metadata: dict[str, bytes] = {}
+    seen: set[str] = set()
+    offset = 0
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, "rb") as stream:
+        current = os.fstat(stream.fileno())
+        require(
+            stat.S_ISREG(current.st_mode)
+            and current.st_nlink == 1
+            and (current.st_dev, current.st_ino, current.st_size)
+            == (before.st_dev, before.st_ino, before.st_size),
+            "product_save_file_identity",
+        )
+        with tarfile.open(fileobj=stream, mode="r:") as archive:
+            for member in archive:
+                check_deadline(deadline)
+                name = member.name
+                require(name in expected_names and name not in seen, "product_save_inventory")
+                require(
+                    member.offset == offset
+                    and member.offset_data == offset + 512
+                    and not member.pax_headers
+                    and not archive.pax_headers
+                    and member.sparse is None
+                    and not member.linkname
+                    and member.uid == member.gid == member.mtime == 0
+                    and member.uname == member.gname == "",
+                    "product_save_header",
+                )
+                stream.seek(member.offset)
+                header = stream.read(512)
+                literal_name = name + "/" if name in directories else name
+                require(
+                    header[:100] == literal_name.encode("ascii").ljust(100, b"\0")
+                    and header[345:500] == bytes(155),
+                    "product_save_literal_path",
+                )
+                seen.add(name)
+                if name in directories:
+                    require(
+                        member.type == tarfile.DIRTYPE
+                        and member.size == 0
+                        and member.mode == 0o755,
+                        "product_save_directory",
+                    )
+                else:
+                    mode = 0o644 if name in {"index.json", "manifest.json"} else 0o444
+                    require(
+                        member.type == tarfile.REGTYPE and member.mode == mode,
+                        "product_save_regular",
+                    )
+                    source = archive.extractfile(member)
+                    require(source is not None, "product_save_member")
+                    source = cast(BinaryIO, source)
+                    if name in content:
+                        expected = memoryview(content[name])
+                        require(member.size == len(expected), "product_save_content_size")
+                        digest, position = hashlib.sha256(), 0
+                        while position < len(expected):
+                            check_deadline(deadline)
+                            chunk = source.read(min(1024**2, len(expected) - position))
+                            require(
+                                bool(chunk) and chunk == expected[position : position + len(chunk)],
+                                "product_save_content_bytes",
+                            )
+                            digest.update(chunk)
+                            position += len(chunk)
+                        require(
+                            source.read(1) == b"" and digest.hexdigest() == name.rsplit("/", 1)[1],
+                            "product_save_content_digest",
+                        )
+                    else:
+                        require(0 < member.size <= MAX_NATIVE_OUTPUT, "product_save_metadata_bound")
+                        metadata[name] = source.read(member.size + 1)
+                        require(len(metadata[name]) == member.size, "product_save_metadata_size")
+                offset = member.offset_data + ((member.size + 511) // 512) * 512
+                require(offset <= before.st_size, "product_save_member_bound")
+            require(seen == expected_names, "product_save_inventory")
+            stream.seek(offset)
+            tail = stream.read(10241)
+            require(
+                1024 <= len(tail) <= 10240
+                and len(tail) % 512 == 0
+                and not any(tail)
+                and stream.read(1) == b"",
+                "product_save_trailer",
+            )
+    raw = metadata[manifest_name]
+    require("sha256:" + sha(raw) == engine, "product_save_manifest_digest")
+    native_manifest = one_object(raw)
+    expected_manifest = {
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+        "config": {
+            "mediaType": "application/vnd.docker.container.image.v1+json",
+            "digest": graph["config_digest"],
+            "size": len(graph["config_raw"]),
+        },
+        "layers": [
+            {
+                "mediaType": "application/vnd.docker.image.rootfs.diff.tar",
+                "digest": digest,
+                "size": len(layer),
+            }
+            for digest, layer in zip(graph["diff_ids"], graph["expanded_layers"], strict=True)
+        ],
+    }
+    exact_data(native_manifest, expected_manifest)
+    export_descriptor = {
+        "mediaType": expected_manifest["mediaType"],
+        "digest": engine,
+        "size": len(raw),
+    }
+    # Save by immutable ID is untagged; live tagged custody is a separate relation.
+    tagged_descriptor = {
+        **export_descriptor,
+        "annotations": {
+            "io.containerd.image.name": "docker.io/library/pulseplate-prometheus:candidate",
+            "org.opencontainers.image.ref.name": "candidate",
+        },
+    }
+    exact_data(image.get("Descriptor"), tagged_descriptor)
+    exact_data(
+        one_object(metadata["index.json"]),
+        {
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [export_descriptor],
+        },
+    )
+    exact_data(one_object(metadata["oci-layout"]), {"imageLayoutVersion": "1.0.0"})
+    compatibility = json.loads(
+        metadata["manifest.json"], object_pairs_hook=unique_object, parse_constant=reject_constant
+    )
+    exact_data(
+        compatibility,
+        [
+            {
+                "Config": "blobs/sha256/" + graph["config_digest"][7:],
+                "RepoTags": None,
+                "Layers": ["blobs/sha256/" + digest[7:] for digest in graph["diff_ids"]],
+            }
+        ],
+    )
+    require(
+        all(
+            getattr(path.lstat(), field) == getattr(before, field)
+            for field in (
+                "st_dev",
+                "st_ino",
+                "st_mode",
+                "st_nlink",
+                "st_size",
+                "st_mtime_ns",
+                "st_ctime_ns",
+            )
+        )
+        and file_hash(path, deadline, maximum_bytes=maximum) == before_hash,
+        "product_save_changed",
+    )
+    return tagged_descriptor
+
+
+def _native_product_container(actual: dict[str, Any], expected: dict[str, Any], stage: str) -> None:
+    """Product-only custody; never broaden the compiler/BASE/Go profiles."""
+    identifier = expected.get("container_id")
+    require(
+        type(identifier) is str
+        and re.fullmatch(r"[0-9a-f]{64}", identifier) is not None
+        and actual.get("Id") == identifier
+        and actual.get("Name") == "/" + expected["name"]
+        and actual.get("Image") == expected["image"],
+        "product_container_identity",
+    )
+    config, host, state = actual.get("Config"), actual.get("HostConfig"), actual.get("State")
+    require(
+        type(config) is dict and type(host) is dict and type(state) is dict,
+        "product_container_objects",
+    )
+    config, host, state = cast(dict, config), cast(dict, host), cast(dict, state)
+    exact_data({key: config.get(key) for key in expected["config"]}, expected["config"])
+    require(
+        config.get("Image") == expected["image"]
+        and config.get("Volumes") in (None, {})
+        and actual.get("Mounts") == [],
+        "product_container_operand_mounts",
+    )
+    exact_data(actual.get("Path"), expected["config"]["Entrypoint"][0])
+    exact_data(actual.get("Args"), expected["config"]["Cmd"])
+    if expected["descriptor"] is None:
+        require("ImageManifestDescriptor" not in actual, "product_classic_container_descriptor")
+    else:
+        exact_data(
+            actual.get("ImageManifestDescriptor"),
+            {
+                **expected["descriptor"],
+                "platform": {"architecture": "amd64", "os": "linux"},
+            },
+        )
+    exact_data(
+        {
+            key: host.get(key)
+            for key in (
+                "NetworkMode",
+                "ReadonlyRootfs",
+                "Privileged",
+                "NanoCpus",
+                "Memory",
+                "PidsLimit",
+                "CapDrop",
+                "AutoRemove",
+                "RestartPolicy",
+            )
+        },
+        {
+            "NetworkMode": "none",
+            "ReadonlyRootfs": True,
+            "Privileged": False,
+            "NanoCpus": 2000000000,
+            "Memory": 4294967296,
+            "PidsLimit": 128,
+            "CapDrop": ["ALL"],
+            "AutoRemove": False,
+            "RestartPolicy": {"Name": "no", "MaximumRetryCount": 0},
+        },
+    )
+    require(
+        host.get("CapAdd") in (None, [])
+        and host.get("SecurityOpt") in (["no-new-privileges"], ["no-new-privileges:true"])
+        and host.get("Binds") in (None, [])
+        and host.get("VolumesFrom") in (None, [])
+        and host.get("Tmpfs") in (None, {})
+        and host.get("Devices") == []
+        and host.get("DeviceRequests") in (None, [])
+        and host.get("PidMode") == host.get("UTSMode") == ""
+        and host.get("IpcMode") == "private",
+        "product_container_isolation",
+    )
+    require(
+        type(state.get("Running")) is bool
+        and state.get("Paused") is False
+        and state.get("Restarting") is False
+        and state.get("Dead") is False
+        and type(state.get("ExitCode")) is int
+        and type(state.get("Pid")) is int,
+        "product_container_state",
+    )
+    if stage == "created" or expected["role"] == "copy":
+        require(
+            state.get("Status") == "created"
+            and state["Running"] is False
+            and state.get("Pid") == 0
+            and state["ExitCode"] == 0
+            and state.get("OOMKilled") is False
+            and state.get("Error") == ""
+            and state.get("StartedAt") == "0001-01-01T00:00:00Z",
+            "product_container_unstarted",
+        )
+    elif stage == "terminal":
+        require(
+            state.get("Status") == "exited"
+            and state["Running"] is False
+            and state.get("Pid") == 0
+            and state["ExitCode"] == 0
+            and state.get("OOMKilled") is False
+            and state.get("Error") == "",
+            "product_container_completion",
+        )
+    else:
+        require(
+            stage == "cleanup"
+            and state.get("Status") in ("created", "exited", "running")
+            and state["Running"] is (state["Status"] == "running"),
+            "product_container_cleanup_state",
+        )
+
+
+def native_import(
+    native: Native,
+    work: Path,
+    docker: str,
+    config: Path,
+    env: dict[str, str],
+    archive: Path,
+    graph: dict[str, Any],
+    *,
+    synthetic: bool,
+    compiler_artifact: Artifact,
+) -> dict[str, Any]:
+    compiler_artifact = Artifact.canonical(compiler_artifact)
+    require(compiler_artifact.name == "go", "compiler_artifact_role")
+    compiler_version = compiler_artifact.go_version.split()[2].encode()
+    compiler_pattern = rb"\b" + re.escape(compiler_version) + rb"\b"
+    validate_docker_archive(archive, graph)
+    prefix = [docker, "--config", str(config)]
+    tag = "pulseplate-prometheus:candidate"
+
+    def run(args: list[str], label: str, *, cleaning: bool = False) -> bytes:
+        return native.run(prefix + args, label, env, cwd=work, cleaning=cleaning)
+
+    def inventory(kind: str, label: str, *, cleaning: bool = False) -> list[tuple[str, str]]:
+        args = (
+            ["image", "ls", "--all", "--no-trunc", "--format", "{{.ID}}\t{{.Repository}}:{{.Tag}}"]
+            if kind == "image"
+            else ["ps", "--all", "--no-trunc", "--format", "{{.ID}}\t{{.Names}}"]
+        )
+        raw = run(args, label, cleaning=cleaning)
+        require(not raw or raw.endswith(b"\n"), "product_inventory_terminal")
+        pattern = (
+            r"sha256:[0-9a-f]{64}\t[!-~]+:[!-~]+"
+            if kind == "image"
+            else r"[0-9a-f]{64}\t[A-Za-z0-9][A-Za-z0-9_.-]*"
+        )
+        lines = raw.decode("ascii").splitlines()
+        require(
+            len(lines) <= 250000
+            and all(re.fullmatch(pattern, row) for row in lines)
+            and len(lines) == len(set(lines)),
+            "product_inventory_rows",
+        )
+        rows = [(row.split("\t", 1)[0], row.split("\t", 1)[1]) for row in lines]
+        # Docker's exact Tag=<none> sentinel may repeat under a named repository.
+        # Keep every row/ID; only real mutable tags participate in name uniqueness.
+        names = [name for _, name in rows if kind != "image" or name.rsplit(":", 1)[1] != "<none>"]
+        require(len(names) == len(set(names)), "product_inventory_ambiguous_names")
+        if kind == "container":
+            require(
+                len(rows) == len({identifier for identifier, _ in rows}),
+                "product_inventory_ambiguous_ids",
+            )
+        return rows
+
+    before = inventory("image", "import-inventory")
+    preexisting_ids = {row[0] for row in before}
+    require(all(row[1] != tag for row in before), "native_import_tag_collision")
+    owned: dict[str, dict[str, Any]] = {}
+    engine: str | None = None
+    admitted = False
+    primary: BaseException | None = None
+    captures: dict[str, Any] = {}
+    removals: list[dict[str, Any]] = []
+    load_attempted = False
+    try:
+        load_attempted = True
+        run(["load", "--input", str(archive)], "import-load")
+        image = one_object(run(["image", "inspect", "--format", "{{json .}}", tag], "import-image"))
+        engine = _digest(image.get("Id"))
+        require(engine not in preexisting_ids, "product_preexisting_image_HOLD")
+        require(
+            (image.get("Os"), image.get("Architecture")) == ("linux", "amd64"),
+            "native_import_identity",
+        )
+        exact_data(image.get("RootFS"), {"Type": "layers", "Layers": graph["diff_ids"]})
+        image_config = one_object(graph["config_raw"])["config"]
+        actual_config = image.get("Config")
+        require(
+            type(actual_config) is dict
+            and actual_config.get("Volumes") in (None, {})
+            and actual_config.get("OnBuild") in (None, []),
+            "native_import_config",
+        )
+        actual_config = cast(dict[str, Any], actual_config)
+        exact_data({key: actual_config.get(key) for key in image_config}, image_config)
+        exact_data(image.get("RepoTags"), [tag])
+        saved_descriptor = None
+        if engine == graph["config_digest"]:
+            require(
+                "Descriptor" not in image and image.get("RepoDigests") in (None, []),
+                "product_classic_descriptor",
+            )
+        else:
+            exact_data(image.get("RepoDigests"), ["pulseplate-prometheus@" + engine])
+            save_directory = native.evidence / "import-save"
+            fresh_directory(save_directory)
+            saved = save_directory / "native.tar"
+            maximum = (
+                sum(
+                    ((len(raw) + 511) // 512) * 512
+                    for raw in [graph["config_raw"], *graph["expanded_layers"]]
+                )
+                + 4 * MAX_NATIVE_OUTPUT
+                + (len(graph["diff_ids"]) + 7) * 512
+                + 10240
+            )
+            require(maximum <= MAX_COMPILE_OUTPUT_BYTES, "product_save_derived_bound")
+            require(
+                shutil.disk_usage(save_directory).free >= maximum + 512 * 1024**2,
+                "product_save_free_space_HOLD",
+            )
+            native.run(
+                prefix + ["image", "save", "--output", str(saved), engine],
+                "import-save",
+                env,
+                cwd=work,
+                watched_output=save_directory,
+            )
+            require(set(save_directory.iterdir()) == {saved}, "product_save_output_inventory")
+            saved_descriptor = _native_product_save(saved, graph, image, native.deadline, maximum)
+        admitted = True
+        for role in (("copy",) if synthetic else ("copy", "prometheus", "promtool")):
+            name = "pp-prom-format-" + uuid.uuid4().hex
+            owner = uuid.uuid4().hex
+            prior_containers = inventory("container", "import-" + role + "-before-create")
+            require(all(row[1] != name for row in prior_containers), "product_container_collision")
+            expected_config = copy.deepcopy(image_config)
+            expected_config["Labels"] = {**image_config.get("Labels", {}), LABEL: owner}
+            if role != "copy":
+                expected_config.update(Entrypoint=["/bin/" + role], Cmd=["--version"])
+            expected = {
+                "name": name,
+                "role": role,
+                "image": engine,
+                "descriptor": saved_descriptor,
+                "config": expected_config,
+                "prior_ids": [row[0] for row in prior_containers],
+            }
+            argv = prefix + [
+                "create",
+                "--pull",
+                "never",
+                "--name",
+                name,
+                "--label",
+                LABEL + "=" + owner,
+                "--network",
+                "none",
+                "--read-only",
+                "--user",
+                "65532:65532",
+                "--cap-drop",
+                "ALL",
+                "--security-opt",
+                "no-new-privileges",
+                "--cpus",
+                "2",
+                "--memory",
+                "4g",
+                "--pids-limit",
+                "128",
+            ]
+            if role != "copy":
+                argv += ["--entrypoint", "/bin/" + role]
+            argv += [engine] + ([] if role == "copy" else ["--version"])
+            create_owned(native, argv, name, expected, owned, "import-" + role, env, work)
+            identifier = expected["container_id"]
+            require(identifier not in expected["prior_ids"], "product_preexisting_container_HOLD")
+            actual = one_object(
+                run(
+                    ["inspect", "--format", "{{json .}}", identifier],
+                    "import-" + role + "-prestart",
+                )
+            )
+            _native_product_container(actual, expected, "created")
+            if role == "copy":
+                for index, path in enumerate(
+                    (
+                        "/usr/bin/prometheus",
+                        "/bin/prometheus",
+                        "/usr/bin/promtool",
+                        "/bin/promtool",
+                        "/etc/prometheus/prometheus.yml",
+                        "/LICENSE",
+                        "/NOTICE",
+                    )
+                ):
+                    _native_product_container(
+                        one_object(
+                            run(
+                                ["inspect", "--format", "{{json .}}", identifier],
+                                "import-copy-before-" + str(index),
+                            )
+                        ),
+                        expected,
+                        "created",
+                    )
+                    raw = native.run(
+                        [docker, "--config", str(config), "cp", identifier + ":" + path, "-"],
+                        "import-copy-" + str(index),
+                        env,
+                        cwd=work,
+                        output_bound=257 * 1024**2,
+                    )
+                    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as stream:
+                        members = stream.getmembers()
+                        require(
+                            len(members) == 1 and members[0].isreg() and members[0].linkname == "",
+                            "native_copy_one_regular_file",
+                        )
+                        member = members[0]
+                        filename = PurePosixPath(path).name
+                        expected_bytes = graph["files"][filename]
+                        source = stream.extractfile(member)
+                        require(
+                            source is not None
+                            and member.name == filename
+                            and member.uid == member.gid == 0
+                            and member.mode
+                            == (0o755 if filename in ("prometheus", "promtool") else 0o644)
+                            and member.size == len(expected_bytes)
+                            and source.read() == expected_bytes,
+                            "native_copy_physical_alias_bytes_modes",
+                        )
+                        captures[path] = {
+                            "tar_sha256": sha(raw),
+                            "file_sha256": sha(expected_bytes),
+                            "header": {
+                                "name": member.name,
+                                "mode": member.mode,
+                                "uid": member.uid,
+                                "gid": member.gid,
+                                "size": member.size,
+                            },
+                        }
+                    # Preserve complete native tar bytes losslessly without retaining several
+                    # uncompressed copies of the same large binaries in the Actions archive.
+                    original = native.evidence / ("import-copy-" + str(index) + ".stdout")
+                    compressed = original.with_suffix(original.suffix + ".gz")
+                    with (
+                        compressed.open("xb") as target,
+                        gzip.GzipFile(
+                            filename="", fileobj=target, mode="wb", mtime=0, compresslevel=6
+                        ) as gzip_output,
+                    ):
+                        gzip_output.write(raw)
+                    require(
+                        _gunzip(compressed.read_bytes(), 257 * 1024**2) == raw,
+                        "native_copy_lossless_retention",
+                    )
+                    native.records[-1].update(
+                        stdout=str(compressed),
+                        stdout_encoding="gzip",
+                        stdout_stored_sha256=file_hash(compressed),
+                    )
+                    captures[path]["retained_tar_gzip_sha256"] = file_hash(compressed)
+                    original.unlink()
+                _native_product_container(
+                    one_object(
+                        run(
+                            ["inspect", "--format", "{{json .}}", identifier],
+                            "import-copy-terminal",
+                        )
+                    ),
+                    expected,
+                    "created",
+                )
+            else:
+                output = run(["start", "--attach", identifier], "import-" + role + "-version")
+                _native_product_container(
+                    one_object(
+                        run(
+                            ["inspect", "--format", "{{json .}}", identifier],
+                            "import-" + role + "-terminal",
+                        )
+                    ),
+                    expected,
+                    "terminal",
+                )
+                require(
+                    re.search(rb"\bversion 3\.15\.0\b", output) is not None
+                    and REVISION.encode() in output
+                    and re.search(compiler_pattern, output) is not None,
+                    "native_candidate_version_revision_compiler",
+                )
+    except BaseException as error:
+        primary = error
+        raise
+    finally:
+        try:
+            if native.cleanup_deadline is None:
+                native.begin_cleanup()
+            for name, expected in owned.items():
+                try:
+                    rows = inventory("container", name + "-cleanup-inventory", cleaning=True)
+                    identifier = expected.get("container_id")
+                    require(
+                        identifier is not None and identifier not in expected["prior_ids"],
+                        "product_missing_created_ID_HOLD",
+                    )
+                    identifier = cast(str, identifier)
+                    if (identifier, name) not in rows:
+                        require(
+                            all(row[0] != identifier and row[1] != name for row in rows),
+                            "product_container_replaced_HOLD",
+                        )
+                    else:
+                        actual = one_object(
+                            run(
+                                ["inspect", "--format", "{{json .}}", identifier],
+                                name + "-cleanup-inspect",
+                                cleaning=True,
+                            )
+                        )
+                        _native_product_container(actual, expected, "cleanup")
+                        run(
+                            [
+                                "rm",
+                                *(["--force"] if actual["State"]["Running"] else []),
+                                identifier,
+                            ],
+                            name + "-cleanup-remove",
+                            cleaning=True,
+                        )
+                        rows = inventory("container", name + "-cleanup-absence", cleaning=True)
+                        require(
+                            all(row[0] != identifier and row[1] != name for row in rows),
+                            "product_container_survives",
+                        )
+                    removals.append({"name": name, "container_id": identifier, "absent": True})
+                except BaseException as error:
+                    removals.append(
+                        {
+                            "name": name,
+                            "failure": type(error).__name__,
+                            "code": diagnostic_code(error),
+                        }
+                    )
+            if load_attempted:
+                rows = inventory("image", "import-image-cleanup-inventory", cleaning=True)
+                selected = [row for row in rows if row[1] == tag or row[0] == engine]
+                if selected:
+                    require(
+                        admitted
+                        and engine is not None
+                        and engine not in preexisting_ids
+                        and not any("failure" in row for row in removals)
+                        and selected == [(engine, tag)],
+                        "product_image_cleanup_ownership_HOLD",
+                    )
+                    engine = cast(str, engine)
+                    actual_image = one_object(
+                        run(
+                            ["image", "inspect", "--format", "{{json .}}", engine],
+                            "import-image-before-remove",
+                            cleaning=True,
+                        )
+                    )
+                    for field in (
+                        "Id",
+                        "RepoTags",
+                        "RepoDigests",
+                        "Os",
+                        "Architecture",
+                        "RootFS",
+                        "Config",
+                        "Descriptor",
+                    ):
+                        exact_data(actual_image.get(field), image.get(field))
+                    run(["image", "rm", engine], "import-image-remove", cleaning=True)
+                    rows = inventory("image", "import-image-absence", cleaning=True)
+                    require(
+                        all(row[0] != engine and row[1] != tag for row in rows),
+                        "native_format_image_survives",
+                    )
+                if engine is None:
+                    require(
+                        {row[0] for row in rows} <= preexisting_ids,
+                        "product_unbound_load_effect_HOLD",
+                    )
+                    removals.append({"image": None, "tag_absent": True, "no_new_image_ids": True})
+                else:
+                    removals.append({"image": engine, "absent": True})
+        except BaseException as error:
+            removals.append({"failure": type(error).__name__, "code": diagnostic_code(error)})
+        try:
+            with (native.evidence / "import-cleanup.json").open("xb") as output_file:
+                output_file.write(canonical_data(removals))
+        except BaseException as error:
+            removals.append({"failure": type(error).__name__, "code": diagnostic_code(error)})
+        if primary is not None:
+            # The received work error stays primary; cleanup diagnostics are independent.
+            try:
+                setattr(primary, "native_import_cleanup", removals)
+            except BaseException as diagnostic_error:
+                # Optional attachment cannot replace the received work failure.
+                removals.append({"diagnostic_failure": type(diagnostic_error).__name__})
+        else:
+            require(not any("failure" in row for row in removals), "product_import_cleanup_failed")
+    return {
+        "status": "observed_synthetic_format_only" if synthetic else "observed_real_native_import",
+        "image_config_id": graph["config_digest"],
+        "diff_ids": graph["diff_ids"],
+        "copies": captures,
+        "synthetic_executed": False,
+    }
+
+
+def tool_scan_inventory(
+    raw: bytes,
+    subject: str,
+    *,
+    compiler_artifact: Artifact | None = None,
+) -> dict[str, Any]:
+    """Validate observation structure/coverage/privacy, never classify its findings."""
+    compiler_artifact = Artifact.canonical(
+        CURRENT_GO if compiler_artifact is None else compiler_artifact
+    )
+    require(compiler_artifact.name == "go", "compiler_artifact_role")
+    require(
+        type(subject) is str and Path(subject).is_absolute() and ".." not in Path(subject).parts,
+        "tool_scan_subject_coordinate",
+    )
+    value = one_object(raw)
+    require(
+        type(value.get("SchemaVersion")) is int
+        and value["SchemaVersion"] == 2
+        and value.get("ArtifactName") == subject
+        and value.get("ArtifactType") == "filesystem"
+        and type(value.get("Trivy")) is dict
+        and value["Trivy"].get("Version") == "0.74.0"
+        and type(value.get("Results")) is list
+        and bool(value["Results"]),
+        "tool_full_scan_schema_subject",
+    )
+    findings, missing_secrets, targets = [], 0, []
+    for row in value["Results"]:
+        require(
+            type(row) is dict
+            and type(row.get("Target")) is str
+            and bool(row["Target"])
+            and type(row.get("Class")) is str
+            and type(row.get("Type")) is str,
+            "tool_full_result_identity",
+        )
+        require(
+            "Secrets" not in row or (type(row["Secrets"]) is list and not row["Secrets"]),
+            "tool_detected_secret_HOLD_private_report",
+        )
+        missing_secrets += "Secrets" not in row
+        require(type(row.get("Vulnerabilities", [])) is list, "tool_full_finding_inventory")
+        for finding in row.get("Vulnerabilities", []):
+            require(
+                type(finding) is dict
+                and all(
+                    type(finding.get(name)) is str and finding[name]
+                    for name in ("VulnerabilityID", "PkgName", "InstalledVersion", "Severity")
+                )
+                and finding["Severity"] in ("UNKNOWN", "LOW", "MEDIUM", "HIGH", "CRITICAL"),
+                "tool_full_finding_types",
+            )
+            findings.append(finding)
+        if (row["Target"], row["Class"], row["Type"]) == ("usr/bin/oras", "lang-pkgs", "gobinary"):
+            targets.append(row)
+    require(
+        len(targets) == 1 and len(value["Results"]) == 1, "tool_complete_named_target_inventory"
+    )
+    packages = targets[0].get("Packages")
+    require(
+        type(packages) is list
+        and bool(packages)
+        and all(
+            type(row) is dict
+            and type(row.get("Name")) is str
+            and row["Name"]
+            and type(row.get("Version")) is str
+            and row["Version"]
+            for row in packages
+        ),
+        "tool_listed_package_identity",
+    )
+    require(
+        len({(row["Name"], row["Version"]) for row in packages}) == len(packages)
+        and [row["Version"] for row in packages if row["Name"] == "stdlib"]
+        == ["v" + compiler_artifact.go_version.split()[2].removeprefix("go")],
+        "tool_native_Go_scanner_coverage",
+    )
+    identities = {(row["Name"], row["Version"]) for row in packages}
+    require(
+        all((row["PkgName"], row["InstalledVersion"]) in identities for row in findings),
+        "tool_finding_listed_package_binding",
+    )
+    return {"all_findings": findings, "Secrets_fields_absent": missing_secrets}
+
+
+def scan_tool(
+    native: Native,
+    work: Path,
+    binary: Path,
+    env: dict[str, str],
+    *,
+    compiler_artifact: Artifact | None = None,
+) -> dict[str, Any]:
+    compiler_artifact = Artifact.canonical(
+        CURRENT_GO if compiler_artifact is None else compiler_artifact
+    )
+    require(compiler_artifact.name == "go", "compiler_artifact_role")
+    exact_data(vars(compiler_artifact), vars(CURRENT_GO))
+    scanner = shutil.which("trivy")
+    require(scanner is not None and Path(scanner).is_absolute(), "tool_native_scanner_missing")
+    scanner = cast(str, scanner)
+    version = native.run([scanner, "--version"], "tool-scanner-version", env, cwd=work)
+    require(
+        re.search(rb"^Version: 0\.74\.0$", version, re.MULTILINE) is not None,
+        "tool_pinned_scanner_version",
+    )
+    cache = Path(os.environ["PROMETHEUS_TOOL_TRIVY_CACHE"])
+    real_directory(cache)
+    db = {
+        name: {"bytes": (cache / name).stat().st_size, "sha256": file_hash(cache / name)}
+        for name in ("db/trivy.db", "db/metadata.json")
+    }
+    rootfs = work / "tool-rootfs"
+    fresh_directory(rootfs)
+    (rootfs / "usr/bin").mkdir(parents=True)
+    shutil.copyfile(binary, rootfs / "usr/bin/oras")
+    (rootfs / "usr/bin/oras").chmod(0o755)
+    config, ignore, report = (
+        work / "empty-trivy.yaml",
+        work / "empty.trivyignore",
+        work / "tool-full.private.json",
+    )
+    config.write_bytes(b"{}\n")
+    ignore.write_bytes(b"")
+    before = file_hash(binary)
+    native.run(
+        [
+            scanner,
+            "rootfs",
+            "--config",
+            str(config),
+            "--cache-dir",
+            str(cache),
+            "--skip-db-update",
+            "--skip-java-db-update",
+            "--skip-vex-repo-update",
+            "--offline-scan",
+            "--skip-version-check",
+            "--disable-telemetry",
+            "--scanners",
+            "vuln,secret",
+            "--pkg-types",
+            "library",
+            "--list-all-pkgs",
+            "--severity",
+            "UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL",
+            "--format",
+            "json",
+            "--exit-code",
+            "0",
+            "--ignore-unfixed=false",
+            "--ignorefile",
+            str(ignore),
+            "--timeout",
+            "300s",
+            "--output",
+            str(report),
+            str(rootfs),
+        ],
+        "tool-full-scan",
+        env,
+        cwd=work,
+        maximum_seconds=330,
+    )
+    require(
+        file_hash(binary) == before
+        and file_hash(rootfs / "usr/bin/oras") == before
+        and {
+            name: {"bytes": (cache / name).stat().st_size, "sha256": file_hash(cache / name)}
+            for name in db
+        }
+        == db,
+        "tool_scan_subject_DB_changed",
+    )
+    inventory = tool_scan_inventory(
+        report.read_bytes(), str(rootfs), compiler_artifact=compiler_artifact
+    )
+    destination = native.evidence / "tool-full.raw.json"
+    require(not destination.exists(), "tool_full_publication_fresh")
+    os.rename(report, destination)
+    coverage_description = (
+        "Native successful vuln,secret invocation on this executable rootfs; omitted Secrets "
+        "fields remain omitted. No forced empty list or zero-secret claim."
+    )
+    return {
+        "binary_sha256": before,
+        "scanner_sha256": file_hash(Path(scanner)),
+        "report_sha256": file_hash(destination),
+        "DB": db,
+        **inventory,
+        "subject": str(rootfs),
+        "native_argv": native.records[-1]["argv"],
+        "native_exit": native.records[-1]["exit"],
+        "secret_coverage": coverage_description,
+        "scope": "Current native inventory; independent complete advisory applicability review remains required",
+    }
+
+
+def qualify_tool(
+    work: Path,
+    root: Path,
+    seconds: int,
+    cleanup: int,
+    *,
+    prefetch_predecessor: str | None = None,
+    compiler_artifact: Artifact | None = None,
+) -> dict[str, Any]:
+    compiler_artifact = Artifact.canonical(
+        CURRENT_GO if compiler_artifact is None else compiler_artifact
+    )
+    require(compiler_artifact.name == "go", "compiler_artifact_role")
+    exact_data(vars(compiler_artifact), vars(CURRENT_GO))
+    require(
+        type(seconds) is int
+        and 0 < seconds <= 1800
+        and type(cleanup) is int
+        and 0 < cleanup <= 120,
+        "tool_operation_budget",
+    )
+    fresh_directory(work)
+    evidence = work / "evidence"
+    fresh_directory(evidence)
+    native = Native(evidence, time.monotonic() + seconds, cleanup)
+    api = GitHubRead(work / "GitHub-private", evidence, native.deadline, cleanup)
+    try:
+        admission = manual_hosted_admission(
+            api, "tool", prefetch_predecessor=prefetch_predecessor, producer_root=root
+        )
+        require(
+            admission.get("ref") == "refs/heads/codex/python-setup-security-stabilization"
+            or admission.get("producer_epoch") == "xnet062",
+            "current_tool_requires_stabilization_admission",
+        )
+        authenticate_producer_inputs(
+            api, root, admission["head"], tool=True, compiler_artifact=compiler_artifact
+        )
+    finally:
+        api.close()
+    projection = tool_input_projection(root, compiler_artifact=compiler_artifact)
+    report: dict[str, Any] = {
+        "identity": "PulsePlate-rebuilt ORAS 1.3.4",
+        "source_revision": ORAS_REVISION,
+        "source_tree": ORAS_TREE,
+        "original_locks": ORAS_LOCKS,
+        "admission": admission,
+        "input_projection": projection,
+        "input_digest": "sha256:" + sha(canonical_data(projection)),
+        "tool_compile_invocations": 0,
+        "Prometheus_compile_invocations": 0,
+        "failure": None,
+    }
+    docker = shutil.which("docker")
+    require(docker is not None and Path(docker).is_absolute(), "tool_Docker_missing")
+    docker = cast(str, docker)
+    config = work / "docker-config"
+    fresh_directory(config)
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": str(work),
+        "DOCKER_CONFIG": str(config),
+        "LANG": "C.UTF-8",
+    }
+    owned: dict[str, dict[str, Any]] = {}
+    primary: BaseException | None = None
+    try:
+        downloads = work / "downloads"
+        fresh_directory(downloads)
+        for artifact in (ORAS_SOURCE, compiler_artifact):
+            acquire(artifact, downloads / artifact.name, native.deadline)
+        source, go = work / "source", work / "go"
+        for artifact, path in ((ORAS_SOURCE, source), (compiler_artifact, go)):
+            rows = extract(artifact, downloads / artifact.name, path, native.deadline)
+            (evidence / (artifact.name + "-members.json")).write_bytes(canonical_data(rows))
+        require(
+            all(file_hash(source / name) == value for name, value in ORAS_LOCKS.items())
+            and file_hash(source / "LICENSE") == ORAS_LICENSE,
+            "tool_source_locks_license",
+        )
+        modules, report["public_modules"] = prefetch_modules(
+            native,
+            work,
+            source,
+            go,
+            "tool",
+            ORAS_LOCKS,
+            root_module="oras.land/oras",
+            compiler_artifact=compiler_artifact,
+        )
+        native.run(
+            [docker, "--config", str(config), "pull", "--platform", "linux/amd64", BASE],
+            "tool-base-pull",
+            env,
+            cwd=work,
+        )
+        before_source, before_cache = tree_inventory(source), tree_inventory(modules)
+        commands = (
+            ("version", ["version"]),
+            ("verify", ["mod", "verify"]),
+            ("modules", ["list", "-mod=readonly", "-m", "-json", "all"]),
+            ("graph", ["mod", "graph"]),
+            ("packages", ["list", "-mod=readonly", "-deps", "-json", ORAS_COMMAND]),
+        )
+        for label, command in commands:
+            raw = finite_go(
+                native,
+                work,
+                docker,
+                config,
+                env,
+                source,
+                go,
+                modules,
+                owned,
+                "tool-" + label,
+                command,
+            )
+            if label == "version":
+                require(raw.decode() == compiler_artifact.go_version, "tool_offline_compiler")
+            elif label == "modules":
+                report["full_modules"] = decode_selected_modules(raw, root_module="oras.land/oras")
+                require(
+                    all("Replace" not in row for row in report["full_modules"].values()),
+                    "ORAS_unchanged_source_replacements",
+                )
+            elif label == "packages":
+                report["command_graph"] = tool_packages(raw)
+        output = work / "compiled"
+        require(
+            sum(path.is_file() for path in evidence.rglob("*")) <= 3500,
+            "tool_precompile_transport_member_reserve",
+        )
+        fresh_directory(output, 0o777)
+        output.chmod(0o777)
+        for name in ("cache", "tmp"):
+            fresh_directory(output / name, 0o777)
+            (output / name).chmod(0o777)
+        report["tool_compile_invocations"] += 1
+        (evidence / "invocation-start.json").write_bytes(canonical_data(report))
+        finite_go(
+            native,
+            work,
+            docker,
+            config,
+            env,
+            source,
+            go,
+            modules,
+            owned,
+            "tool-compile",
+            [
+                "build",
+                "-mod=readonly",
+                "-trimpath",
+                "-buildvcs=false",
+                "-p=1",
+                "-ldflags=" + ORAS_METADATA,
+                "-o",
+                "/output/oras",
+                ORAS_COMMAND,
+            ],
+            output=output,
+            compile_seconds=600,
+        )
+        binary = output / "oras"
+        raw = binary.read_bytes()
+        require(raw[:6] == b"\x7fELF\x02\x01" and raw[18:20] == b"\x3e\x00", "tool_amd64_ELF")
+        report["binary"] = {"bytes": len(raw), "sha256": sha(raw)}
+        buildinfo = finite_go(
+            native,
+            work,
+            docker,
+            config,
+            env,
+            source,
+            go,
+            modules,
+            owned,
+            "tool-buildinfo",
+            ["version", "-m", "/output/oras"],
+            output=output,
+        )
+        require(
+            compiler_artifact.go_version.split()[2].encode() in buildinfo
+            and ORAS_COMMAND.encode() in buildinfo
+            and b"\tbuild\tCGO_ENABLED=0" in buildinfo
+            and b"\t=>\t" not in buildinfo,
+            "tool_native_buildinfo",
+        )
+        for label, command in (("version", ["version"]), ("help", ["cp", "--help"])):
+            raw = native.run([str(binary), *command], "ORAS-" + label, env, cwd=work)
+            if label == "version":
+                require(
+                    b"1.3.4" in raw
+                    and ORAS_REVISION.encode() in raw
+                    and compiler_artifact.go_version.split()[2].encode() in raw,
+                    "tool_native_version",
+                )
+            else:
+                require(
+                    b"--from-oci-layout" in raw and b"--to-oci-layout" in raw,
+                    "tool_native_copy_help",
+                )
+        vendor = work / "vendor"
+        native.run(
+            [str(binary), "cp", "--to-oci-layout", BASE, str(vendor) + ":base"],
+            "ORAS-authenticated-base",
+            env,
+            cwd=work,
+        )
+        base = base_graph(vendor)
+        files = {
+            name: b"PulsePlate synthetic format probe only\n"
+            for name in ("prometheus", "promtool", "prometheus.yml", "LICENSE", "NOTICE")
+        }
+        layout, archive = work / "format", work / "format.docker.tar"
+        construct_image(base, files, layout, archive, synthetic=True)
+        graph = validate_oci_graph(layout, base, synthetic=True)
+        copied = work / "format-copy"
+        native.run(
+            [
+                str(binary),
+                "cp",
+                "--from-oci-layout",
+                "--to-oci-layout",
+                str(layout) + "@" + graph["manifest_digest"],
+                str(copied) + ":format-probe",
+            ],
+            "ORAS-local-format-copy",
+            env,
+            cwd=work,
+        )
+        compare_pair(graph, validate_oci_graph(copied, base, synthetic=True))
+        # The format import closes its own custody before this operation continues.
+        require(native.cleanup_deadline is None, "cleanup_deadline_already_started")
+        format_native = Native(native.evidence, native.deadline, native.cleanup)
+        try:
+            report["native_format"] = native_import(
+                format_native,
+                work,
+                docker,
+                config,
+                env,
+                archive,
+                graph,
+                synthetic=True,
+                compiler_artifact=compiler_artifact,
+            )
+            check_deadline(native.deadline)
+        except BaseException:
+            format_cleanup_deadline = format_native.cleanup_deadline
+            if format_cleanup_deadline is not None and (
+                native.cleanup_deadline is None or format_cleanup_deadline < native.cleanup_deadline
+            ):
+                native.cleanup_deadline = format_cleanup_deadline
+            raise
+        finally:
+            native.records.extend(format_native.records)
+        report["native_scan"] = scan_tool(
+            native, work, binary, env, compiler_artifact=compiler_artifact
+        )
+        require(
+            tree_inventory(source) == before_source and tree_inventory(modules) == before_cache,
+            "tool_readonly_inputs_changed",
+        )
+        require(
+            all(file_hash(source / name) == value for name, value in ORAS_LOCKS.items()),
+            "tool_original_locks_after",
+        )
+        destination = evidence / "oras"
+        shutil.copyfile(binary, destination)
+        destination.chmod(0o755)
+        shutil.copyfile(source / "LICENSE", evidence / "LICENSE")
+        pack_layout(vendor, evidence / "vendor.oci.tar")
+    except BaseException as error:
+        primary = error
+        report["failure"] = {"class": type(error).__name__, "code": diagnostic_code(error)}
+        rejection = getattr(error, "layout_rejection", None)
+        if rejection is not None:
+            report["failure"]["layout_rejection"] = rejection
+        raise
+    finally:
+        cleanup_error: BaseException | None = None
+        try:
+            if native.cleanup_deadline is None:
+                native.begin_cleanup()
+            report["cleanup"] = cleanup_owned(native, docker, config, owned, env, work)
+            require(not any("failure" in row for row in report["cleanup"]), "tool_cleanup_failed")
+        except BaseException as error:
+            cleanup_error = error
+            failure = {"class": type(error).__name__, "code": diagnostic_code(error)}
+            if "cleanup" not in report:
+                report["cleanup"] = [{"failure": failure["class"], "code": failure["code"]}]
+            if primary is None:
+                report["failure"] = failure
+        else:
+            if primary is None:
+                report["status"] = "observed_tool_and_synthetic_format_only"
+
+        report["native_commands"] = native.records
+        try:
+            (evidence / "tool.json").write_bytes(canonical_data(report))
+        except BaseException as error:
+            if primary is None and cleanup_error is None:
+                raise
+            # The structured summary is unavailable. Keep the raw captures and
+            # expose only bounded secondary diagnostics beside the first error.
+            diagnostics = [("report", error)]
+            if primary is not None and cleanup_error is not None:
+                diagnostics.insert(0, ("cleanup", cleanup_error))
+            for stage, secondary in diagnostics:
+                try:
+                    detail = diagnostic_code(secondary) or type(secondary).__name__
+                    print(f"Tool {stage} also failed: {detail}", file=sys.stderr)
+                except BaseException as diagnostic_error:
+                    # Diagnostic rendering cannot replace an active failure.
+                    report["diagnostic_failure"] = type(diagnostic_error).__name__
+        if primary is None and cleanup_error is not None:
+            raise cleanup_error
+    return report
+
+
+def retained_tool(
+    api: GitHubRead,
+    root: Path,
+    work: Path,
+    *,
+    compiler_artifact: Artifact | None = None,
+) -> tuple[Path, dict[str, Any]]:
+    compiler_artifact = Artifact.canonical(
+        CURRENT_GO if compiler_artifact is None else compiler_artifact
+    )
+    require(compiler_artifact.name == "go", "compiler_artifact_role")
+    manifest = read_image_manifest(
+        root / MANIFEST_PATH, preparation=True, compiler_artifact=compiler_artifact
+    )
+    coordinates = manifest["inputs"]["oras"]["retained"]
+    require(coordinates is not None, "qualified_retained_tool_not_selected")
+    archive = work / "tool-input.zip"
+    authenticated = authenticated_artifact(
+        api,
+        coordinates["artifact_id"],
+        archive,
+        expected_run=coordinates["run_id"],
+        expected_job="prometheus-oras-qualification",
+        expected_head=coordinates["source_head"],
+    )
+    require(
+        authenticated["artifact"].get("name") == coordinates["artifact_name"]
+        and authenticated["artifact"].get("digest") == coordinates["artifact_digest"],
+        "retained_tool_API_coordinates",
+    )
+    authenticate_producer_inputs(
+        api, root, coordinates["source_head"], tool=True, compiler_artifact=compiler_artifact
+    )
+    files = _zip_members(archive)
+    require(
+        {"oras", "tool.json", "LICENSE", "vendor.oci.tar", "tool-full.raw.json"} <= set(files),
+        "retained_tool_payload",
+    )
+    report = one_object(files["tool.json"])
+    projection = tool_input_projection(root, compiler_artifact=compiler_artifact)
+    require(
+        report.get("status") == "observed_tool_and_synthetic_format_only"
+        and report.get("failure") is None
+        and report.get("tool_compile_invocations") == 1
+        and type(report.get("tool_compile_invocations")) is int
+        and report.get("Prometheus_compile_invocations") == 0
+        and report.get("source_revision") == ORAS_REVISION
+        and report.get("source_tree") == ORAS_TREE,
+        "retained_tool_native_outcome",
+    )
+    exact_data(report.get("original_locks"), ORAS_LOCKS)
+    exact_data(report.get("input_projection"), projection)
+    require(
+        report.get("input_digest")
+        == coordinates["input_digest"]
+        == "sha256:" + sha(canonical_data(projection)),
+        "retained_tool_input_binding",
+    )
+    require(
+        sha(files["oras"]) == coordinates["binary_sha256"]
+        and len(files["oras"]) == coordinates["binary_bytes"]
+        and report.get("binary") == {"bytes": len(files["oras"]), "sha256": sha(files["oras"])}
+        and sha(files["LICENSE"]) == ORAS_LICENSE,
+        "retained_tool_binary_license",
+    )
+    require(
+        report.get("command_graph", {}).get("SSH_OpenPGP_paths") == []
+        and report.get("native_format", {}).get("status") == "observed_synthetic_format_only"
+        and report.get("native_scan", {}).get("report_sha256") == sha(files["tool-full.raw.json"]),
+        "retained_tool_graph_format_scan_binding",
+    )
+    scan = report["native_scan"]
+    inventory = tool_scan_inventory(
+        files["tool-full.raw.json"], scan.get("subject"), compiler_artifact=compiler_artifact
+    )
+    for name, value in inventory.items():
+        exact_data(scan.get(name), value)
+    require(
+        scan.get("binary_sha256") == coordinates["binary_sha256"]
+        and type(scan.get("native_exit")) is int
+        and scan["native_exit"] == 0
+        and type(scan.get("scanner_sha256")) is str,
+        "retained_tool_scan_subject_execution",
+    )
+    _digest("sha256:" + scan["scanner_sha256"])
+    require(
+        type(scan.get("DB")) is dict and set(scan["DB"]) == {"db/trivy.db", "db/metadata.json"},
+        "retained_tool_scan_DB_inventory",
+    )
+    for value in scan["DB"].values():
+        require(
+            type(value) is dict
+            and set(value) == {"bytes", "sha256"}
+            and type(value["bytes"]) is int
+            and value["bytes"] > 0,
+            "retained_tool_scan_DB_type",
+        )
+        _digest("sha256:" + value["sha256"])
+    exact_data(report.get("command_graph"), tool_packages(files["tool-packages-native.stdout"]))
+    exact_data(
+        report.get("full_modules"),
+        decode_selected_modules(files["tool-modules-native.stdout"], root_module="oras.land/oras"),
+    )
+    require(
+        all("Replace" not in row for row in report["full_modules"].values()),
+        "retained_tool_original_module_graph",
+    )
+    commands = report.get("native_commands")
+    require(
+        type(commands) is list
+        and bool(commands)
+        and all(
+            row.get("exit") == 0 and type(row.get("exit")) is int and row.get("failure") is None
+            for row in commands
+        )
+        and type(report.get("cleanup")) is list
+        and all(row.get("native_absent") is True for row in report["cleanup"]),
+        "retained_tool_positive_native_predecessors",
+    )
+    commands = cast(list[dict[str, Any]], commands)
+    scans = [row for row in commands if row.get("argv") == scan.get("native_argv")]
+    require(
+        len(scans) == 1
+        and scans[0]["exit"] == scan["native_exit"]
+        and type(scan["native_argv"]) is list
+        and scan["native_argv"][-1] == scan["subject"]
+        and "--scanners" in scan["native_argv"]
+        and scan["native_argv"][scan["native_argv"].index("--scanners") + 1] == "vuln,secret",
+        "retained_tool_exact_native_scan_command",
+    )
+    binary = work / "oras"
+    with binary.open("xb") as output:
+        output.write(files["oras"])
+    binary.chmod(0o755)
+    vendor = work / "vendor"
+    unpack_layout(files["vendor.oci.tar"], vendor)
+    base = base_graph(vendor)
+    return binary, {
+        "base": base,
+        "vendor": vendor,
+        "coordinates": coordinates,
+        "report_sha256": sha(files["tool.json"]),
+    }
+
+
+def build_pair(
+    work: Path,
+    root: Path,
+    seconds: int,
+    cleanup: int,
+    *,
+    compiler_artifact: Artifact | None = None,
+) -> dict[str, Any]:
+    compiler_artifact = Artifact.canonical(
+        CURRENT_GO if compiler_artifact is None else compiler_artifact
+    )
+    require(compiler_artifact.name == "go", "compiler_artifact_role")
+    exact_data(vars(compiler_artifact), vars(CURRENT_GO))
+    require(
+        type(seconds) is int
+        and 0 < seconds <= 3600
+        and type(cleanup) is int
+        and 0 < cleanup <= 120,
+        "Prometheus_pair_budget",
+    )
+    fresh_directory(work)
+    evidence = work / "evidence"
+    fresh_directory(evidence)
+    preparatory = Native(evidence, time.monotonic() + 900, cleanup)
+    manifest = read_image_manifest(
+        root / MANIFEST_PATH, preparation=True, compiler_artifact=compiler_artifact
+    )
+    require(manifest["phase"] == "source_prepared", "pair_preparation_phase_only")
+    api = GitHubRead(work / "GitHub-private", evidence, preparatory.deadline, cleanup)
+    try:
+        admission = manual_hosted_admission(api, "pair", producer_root=root)
+        require(
+            admission.get("ref") == "refs/heads/codex/python-setup-security-stabilization"
+            or admission.get("producer_epoch") == "xnet062",
+            "current_pair_requires_stabilization_admission",
+        )
+        authenticate_producer_inputs(
+            api, root, admission["head"], compiler_artifact=compiler_artifact
+        )
+        tool, tool_record = retained_tool(api, root, work, compiler_artifact=compiler_artifact)
+        qualification = work / "xnet-qualified-input.zip"
+        qualified = _current_qualification_artifact(api, root, admission, qualification)
+        current_epoch = admission.get("producer_epoch") == "xnet062"
+        qroot = None
+        if current_epoch:
+            # Both hosted jobs use the same explicit runner layout; report argv/cwd
+            # never chooses the expected mount/source roots.
+            runner_temp = Path(os.environ.get("RUNNER_TEMP", ""))
+            require(
+                runner_temp == Path("/home/runner/work/_temp")
+                and work.parent == runner_temp
+                and root == Path("/home/runner/work/PulsePlate/PulsePlate"),
+                "p062_Q_hosted_layout_HOLD",
+            )
+            qroot = runner_temp / f'prometheus-source-{qualified["run"]["id"]}-1'
+        derived = qualification_locks(
+            qualification,
+            producer_root=root,
+            artifact_digest=qualified["artifact"]["digest"],
+            qualified=qualified if current_epoch else None,
+            qualification_root=qroot,
+            vendor_base=tool_record["base"] if current_epoch else None,
+            compiler_artifact=compiler_artifact,
+        )
+    finally:
+        api.close()
+    downloads = work / "downloads"
+    fresh_directory(downloads)
+    for artifact in (SOURCE, compiler_artifact, UI, CHECKSUMS):
+        acquire(artifact, downloads / artifact.name, preparatory.deadline)
+    require(
+        (downloads / "checksums")
+        .read_text()
+        .splitlines()
+        .count(UI.digest + "  prometheus-web-ui-3.15.0.tar.gz")
+        == 1,
+        "pair_official_matching_UI",
+    )
+    go, ui = work / "go", work / "ui"
+    extract(compiler_artifact, downloads / "go", go, preparatory.deadline)
+    extract(UI, downloads / "ui", ui, preparatory.deadline)
+    require(file_hash(go / "LICENSE") == GO_LICENSE, "pair_Go_license")
+    docker = shutil.which("docker")
+    require(docker is not None and Path(docker).is_absolute(), "pair_Docker_missing")
+    docker = cast(str, docker)
+    config = work / "docker-config"
+    fresh_directory(config)
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": str(work),
+        "DOCKER_CONFIG": str(config),
+        "LANG": "C.UTF-8",
+    }
+    preparatory.run(
+        [docker, "--config", str(config), "pull", "--platform", "linux/amd64", BASE],
+        "pair-base-pull",
+        env,
+        cwd=work,
+    )
+    report: dict[str, Any] = {
+        "admission": admission,
+        "source_revision": REVISION,
+        "logical_build_invocations": 0,
+        "binary_compile_starts": 0,
+        "automatic_retries": 0,
+        "qualification_input_zip_sha256": file_hash(qualification),
+        "tool_sha256": file_hash(tool),
+        "builds": [],
+        "failure": None,
+    }
+    owned: dict[str, dict[str, Any]] = {}
+    natives, graphs, projections = [], [], []
+    cleanup_native = Native(evidence, time.monotonic() + 2 * seconds + 600, cleanup)
+    try:
+        require(
+            sum(path.is_file() for path in evidence.rglob("*")) <= 3500,
+            "pair_precompile_transport_member_reserve",
+        )
+        require(shutil.disk_usage(work).free >= 12 * 1024**3, "pair_hosted_free_space_reserve_HOLD")
+        for label in ("a", "b"):
+            started = time.monotonic()
+            lane = work / label
+            fresh_directory(lane)
+            lane_evidence = evidence / label
+            fresh_directory(lane_evidence)
+            native = Native(lane_evidence, started + seconds, cleanup)
+            natives.append(native)
+            report["logical_build_invocations"] += 1
+            (evidence / (label + "-invocation-start.json")).write_bytes(canonical_data(report))
+            source = lane / "source"
+            extract(SOURCE, downloads / "source", source, native.deadline)
+            locks_unchanged(source)
+            for name, raw in derived.items():
+                (source / name).write_bytes(raw)
+            transform = stage_ui(source, ui, native.deadline)
+            require(
+                (source / "VERSION").read_bytes() == b"3.15.0\n"
+                and all(
+                    file_hash(source / name) == value for name, value in SOURCE_LICENSES.items()
+                ),
+                "pair_authentic_source_licenses",
+            )
+            modules, module_record = prefetch_modules(
+                native,
+                lane,
+                source,
+                go,
+                label,
+                manifest["inputs"]["source"]["derived_locks"],
+                compiler_artifact=compiler_artifact,
+            )
+            source_inventory, module_inventory = tree_inventory(source), tree_inventory(modules)
+            observations, graph_hashes = {}, {}
+            for binary in ("prometheus", "promtool"):
+                raw = finite_go(
+                    native,
+                    lane,
+                    docker,
+                    config,
+                    env,
+                    source,
+                    go,
+                    modules,
+                    owned,
+                    label + "-" + binary + "-graph",
+                    [
+                        "list",
+                        "-mod=readonly",
+                        "-deps",
+                        "-json",
+                        "-tags=netgo,builtinassets",
+                        "./cmd/" + binary,
+                    ],
+                )
+                observations[binary] = decode_packages(raw, binary)
+                graph_hashes[binary] = sha(raw)
+            acquired = {
+                "source": sha(canonical_data(source_inventory)),
+                "go": compiler_artifact.digest,
+                "modules": module_record["inventory_sha256"],
+                "UI_transform": transform,
+                "tool_implementations": {
+                    "oras_sha256": file_hash(tool),
+                    "python_executable_sha256": file_hash(
+                        Path(sys.executable).resolve(strict=True)
+                    ),
+                    "python_version": sys.version,
+                    "zlib": zlib.ZLIB_RUNTIME_VERSION,
+                },
+            }
+            projection = producer_projection(root, acquired, compiler_artifact=compiler_artifact)
+            projections.append(projection)
+            output = lane / "output"
+            fresh_directory(output, 0o777)
+            output.chmod(0o777)
+            for name in ("tmp", "cache"):
+                fresh_directory(output / name, 0o777)
+                (output / name).chmod(0o777)
+            for binary in ("prometheus", "promtool"):
+                report["binary_compile_starts"] += 1
+                (evidence / (label + "-" + binary + "-compile-start.json")).write_bytes(
+                    canonical_data(report)
+                )
+                finite_go(
+                    native,
+                    lane,
+                    docker,
+                    config,
+                    env,
+                    source,
+                    go,
+                    modules,
+                    owned,
+                    label + "-" + binary + "-compile",
+                    [
+                        "build",
+                        "-mod=readonly",
+                        "-p=1",
+                        "-trimpath",
+                        "-buildvcs=false",
+                        "-tags=netgo,builtinassets",
+                        "-ldflags=" + PROMETHEUS_METADATA,
+                        "-o",
+                        "/output/" + binary,
+                        "./cmd/" + binary,
+                    ],
+                    output=output,
+                    compile_seconds=max(1, int(native.deadline - time.monotonic())),
+                )
+                finite_go(
+                    native,
+                    lane,
+                    docker,
+                    config,
+                    env,
+                    source,
+                    go,
+                    modules,
+                    owned,
+                    label + "-" + binary + "-buildinfo",
+                    ["version", "-m", "/output/" + binary],
+                    output=output,
+                )
+            require(
+                tree_inventory(source) == source_inventory
+                and tree_inventory(modules) == module_inventory
+                and all(
+                    file_hash(source / name) == value
+                    for name, value in manifest["inputs"]["source"]["derived_locks"].items()
+                ),
+                "pair_readonly_compilation_inputs",
+            )
+            files = {name: (output / name).read_bytes() for name in ("prometheus", "promtool")}
+            files.update(
+                {
+                    "prometheus.yml": (
+                        source / "documentation/examples/prometheus.yml"
+                    ).read_bytes(),
+                    "LICENSE": (source / "LICENSE").read_bytes(),
+                    "NOTICE": (source / "NOTICE").read_bytes(),
+                }
+            )
+            layout, archive = lane / "image", lane / "image.docker.tar"
+            result = construct_image(tool_record["base"], files, layout, archive)
+            graph = validate_oci_graph(layout, tool_record["base"])
+            validate_docker_archive(archive, graph)
+            pack_layout(layout, lane / "image.oci.tar")
+            check_deadline(native.deadline)
+            graphs.append(graph)
+            # A finished image and its complete raw observations survive a B failure.
+            # Only the successful invocation's disposable compiler cache/tmp are removed.
+            finite_go(
+                native,
+                lane,
+                docker,
+                config,
+                env,
+                source,
+                go,
+                modules,
+                owned,
+                label + "-compiler-cache-clean",
+                ["clean", "-cache"],
+                output=output,
+            )
+            removals = cleanup_owned(native, docker, config, owned, env, lane, cleaning=False)
+            require(
+                not any("failure" in row for row in removals), "logical_build_container_cleanup"
+            )
+            owned.clear()
+            for scratch in (output / "cache", output / "tmp"):
+                require(
+                    scratch.parent == output
+                    and scratch.name in ("cache", "tmp")
+                    and not scratch.is_symlink(),
+                    "compile_scratch_exact_path",
+                )
+                shutil.rmtree(scratch)
+                require(
+                    not scratch.exists() and not scratch.is_symlink(), "compile_scratch_survives"
+                )
+            for name in ("image.oci.tar", "image.docker.tar"):
+                os.rename(lane / name, lane_evidence / name)
+            check_deadline(native.deadline)
+            report["builds"].append(
+                {
+                    "label": label,
+                    "logical_build_elapsed_seconds": time.monotonic() - started,
+                    "outputs": result,
+                    "OCI_archive_sha256": file_hash(lane_evidence / "image.oci.tar"),
+                    "index_sha256": file_hash(layout / "index.json"),
+                    "graph_sha256": graph_hashes,
+                    "command_graphs": observations,
+                    "input_digest": sha(canonical_data(projection)),
+                    "cleanup": removals,
+                    "compile_cache_tmp_absent": True,
+                    "growth_check": "Periodic size/free-space observation with a stop threshold; not filesystem quota enforcement",
+                }
+            )
+        require(
+            report["logical_build_invocations"] == 2 and report["binary_compile_starts"] == 4,
+            "exact_two_logical_builds_both_commands",
+        )
+        compare_pair(graphs[0], graphs[1])
+        exact_data(projections[0], projections[1])
+        for key in ("OCI_archive_sha256", "index_sha256", "graph_sha256"):
+            exact_data(report["builds"][0][key], report["builds"][1][key])
+        require(
+            file_hash(evidence / "a/image.docker.tar")
+            == file_hash(evidence / "b/image.docker.tar"),
+            "pair_Docker_archives_byte_equal",
+        )
+        for label, graph in zip(("a", "b"), graphs, strict=True):
+            observation = Native(evidence / label, time.monotonic() + 300, cleanup)
+            natives.append(observation)
+            native_started = time.monotonic()
+            report["builds"][0 if label == "a" else 1]["native_import"] = native_import(
+                observation,
+                work / label,
+                docker,
+                config,
+                env,
+                evidence / label / "image.docker.tar",
+                graph,
+                synthetic=False,
+                compiler_artifact=compiler_artifact,
+            )
+            check_deadline(observation.deadline)
+            report["builds"][0 if label == "a" else 1]["post_build_native_elapsed_seconds"] = (
+                time.monotonic() - native_started
+            )
+        selection = selection_from_graph(graphs[0])
+        report["selection"] = selection
+        report["input_projection"] = projections[0]
+        report["input_projection_sha256"] = sha(canonical_data(projections[0]))
+        report["raw_producer"] = projections[0]["raw_producer"]
+        for name in ("image.oci.tar", "image.docker.tar"):
+            os.rename(evidence / "a" / name, evidence / name)
+        report["status"] = "observed_equal_real_source_pair"
+    except BaseException as error:
+        report["failure"] = {"class": type(error).__name__, "code": diagnostic_code(error)}
+        rejection = getattr(error, "layout_rejection", None)
+        if rejection is not None:
+            report["failure"]["layout_rejection"] = rejection
+        raise
+    finally:
+        previous_cleanup = [
+            native.cleanup_deadline for native in natives if native.cleanup_deadline is not None
+        ]
+        if previous_cleanup:
+            cleanup_native.cleanup_deadline = min(previous_cleanup)
+        else:
+            cleanup_native.begin_cleanup()
+        report["cleanup"] = cleanup_owned(cleanup_native, docker, config, owned, env, work)
+        report["native_commands"] = (
+            preparatory.records
+            + [row for native in natives for row in native.records]
+            + cleanup_native.records
+        )
+        (evidence / "pair.json").write_bytes(canonical_data(report))
+    require(not any("failure" in row for row in report["cleanup"]), "pair_cleanup_failed")
+    native_report = {
+        "selection": report["selection"],
+        "native_imports": [row["native_import"] for row in report["builds"]],
+    }
+    (evidence / "native.json").write_bytes(canonical_data(native_report))
+    return report
+
+
+def candidate_payload(api: GitHubRead, root: Path, work: Path) -> dict[str, Any]:
+    manifest = read_image_manifest(root / MANIFEST_PATH)
+    candidate, selection = manifest["candidate"], manifest["selection"]
+    producer, coordinates = candidate["producer"], candidate["artifact"]
+    archive = work / "candidate.zip"
+    authenticated = authenticated_artifact(
+        api,
+        coordinates["id"],
+        archive,
+        expected_run=producer["run_id"],
+        expected_job="prometheus-source-build-pair",
+        expected_head=producer["source_head"],
+    )
+    observed = authenticated["artifact"]
+    require(
+        observed.get("name") == coordinates["name"]
+        and observed.get("digest") == coordinates["digest"]
+        and observed.get("size_in_bytes") == coordinates["size"]
+        and observed.get("expires_at") == coordinates["expires_at"]
+        and authenticated["workflow"].get("id") == producer["workflow_id"]
+        and [authenticated["job"].get("id")] == producer["job_ids"],
+        "candidate_native_API_coordinates",
+    )
+    require(file_hash(archive) == coordinates["archive_sha256"], "candidate_transport_SHA")
+    authenticate_producer_inputs(api, root, producer["source_head"])
+    files = _zip_members(archive)
+    required = {
+        "image.oci.tar",
+        "image.docker.tar",
+        "pair.json",
+        "native.json",
+        "sbom.spdx.json",
+        "provenance-bundle.jsonl",
+        "sbom-bundle.jsonl",
+    }
+    require(required <= set(files), "candidate_complete_retained_payload")
+    mapping = {
+        "image.oci.tar": "oci_archive_sha256",
+        "image.docker.tar": "docker_archive_sha256",
+        "pair.json": "pair_report_sha256",
+        "native.json": "native_report_sha256",
+        "sbom.spdx.json": "spdx_sha256",
+        "provenance-bundle.jsonl": "provenance_bundle_sha256",
+        "sbom-bundle.jsonl": "sbom_bundle_sha256",
+    }
+    require(
+        all(sha(files[name]) == candidate["outputs"][key] for name, key in mapping.items()),
+        "candidate_all_output_hashes",
+    )
+    report = one_object(files["pair.json"])
+    require(
+        report.get("status") == "observed_equal_real_source_pair"
+        and report.get("failure") is None
+        and report.get("logical_build_invocations") == 2
+        and type(report.get("logical_build_invocations")) is int
+        and report.get("binary_compile_starts") == 4
+        and type(report.get("binary_compile_starts")) is int
+        and report.get("automatic_retries") == 0
+        and type(report.get("automatic_retries")) is int,
+        "candidate_exact_pair_outcome",
+    )
+    exact_data(report.get("selection"), selection)
+    exact_data(report.get("raw_producer"), producer["raw_producer"])
+    projection = report.get("input_projection")
+    require(
+        type(projection) is dict
+        and projection.get("inputs") == manifest["inputs"]
+        and projection.get("raw_producer") == producer["raw_producer"]
+        and report.get("input_projection_sha256")
+        == producer["input_projection_sha256"]
+        == sha(canonical_data(projection)),
+        "candidate_projection_positive_equivalence",
+    )
+    projection = cast(dict[str, Any], projection)
+    exact_data(projection, producer_projection(root, projection.get("acquired")))
+    exact_data(report.get("admission", {}).get("head"), producer["source_head"])
+    exact_data(report["admission"].get("ref"), producer["source_ref"])
+    exact_data(report["admission"].get("run_id"), producer["run_id"])
+    exact_data(report["admission"].get("workflow_id"), producer["workflow_id"])
+    require(
+        type(report.get("builds")) is list
+        and len(report["builds"]) == 2
+        and [row.get("label") for row in report["builds"]] == ["a", "b"],
+        "candidate_both_observed_builds",
+    )
+    for row in report["builds"]:
+        require(
+            type(row.get("logical_build_elapsed_seconds")) in (float, int)
+            and 0 < row["logical_build_elapsed_seconds"] <= 3600
+            and type(row.get("post_build_native_elapsed_seconds")) in (float, int)
+            and 0 < row["post_build_native_elapsed_seconds"] <= 300
+            and row.get("input_digest") == producer["input_projection_sha256"]
+            and row.get("native_import", {}).get("status") == "observed_real_native_import"
+            and row["native_import"].get("image_config_id") == selection["config_digest"],
+            "candidate_native_build_bound",
+        )
+    for key in (
+        "outputs",
+        "OCI_archive_sha256",
+        "index_sha256",
+        "graph_sha256",
+        "command_graphs",
+        "input_digest",
+    ):
+        exact_data(report["builds"][0][key], report["builds"][1][key])
+    require(
+        type(report.get("native_commands")) is list
+        and bool(report["native_commands"])
+        and all(
+            row.get("exit") == 0 and type(row.get("exit")) is int and row.get("failure") is None
+            for row in report["native_commands"]
+        )
+        and type(report.get("cleanup")) is list
+        and all(row.get("native_absent") is True for row in report["cleanup"]),
+        "candidate_positive_native_cleanup",
+    )
+    spdx = one_object(files["sbom.spdx.json"])
+    require(
+        spdx.get("spdxVersion") == "SPDX-2.3"
+        and type(spdx.get("packages")) is list
+        and bool(spdx["packages"]),
+        "candidate_real_SPDX_inventory",
+    )
+    payload = work / "candidate"
+    fresh_directory(payload)
+    for name in required:
+        with (payload / name).open("xb") as output:
+            output.write(files[name])
+        (payload / name).chmod(0o600)
+    # The base comes from the independently retained, already qualified tool input.
+    tool, tool_record = retained_tool(api, root, work)
+    layout = payload / "oci"
+    unpack_layout(files["image.oci.tar"], layout)
+    graph = validate_oci_graph(layout, tool_record["base"])
+    validate_docker_archive(payload / "image.docker.tar", graph)
+    exact_data(selection_from_graph(graph), selection)
+    native = one_object(files["native.json"])
+    exact_data(native.get("selection"), selection)
+    exact_data(native.get("native_imports"), [row["native_import"] for row in report["builds"]])
+    return {
+        "selection": selection,
+        "layout": layout,
+        "docker_archive": payload / "image.docker.tar",
+        "graph": graph,
+        "tool": tool,
+        "tool_record": tool_record,
+        "pair": report,
+        "payload": payload,
+        "authenticated": authenticated,
+    }
+
+
+def native_image_contract(image: Any, selection: dict[str, Any], *, local: bool = False) -> None:
+    validate_selection(selection)
+    require(
+        type(image) is dict
+        and image.get("Id") == selection["config_digest"]
+        and (image.get("Os"), image.get("Architecture")) == ("linux", "amd64")
+        and image.get("RootFS", {}).get("Layers") == selection["diff_ids"],
+        "consumer_native_config_layers",
+    )
+    config = image.get("Config")
+    require(
+        type(config) is dict
+        and config.get("User") == "65532:65532"
+        and config.get("Entrypoint") == ["/bin/prometheus"]
+        and config.get("WorkingDir") == "/prometheus"
+        and config.get("Cmd")
+        == ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.path=/prometheus"]
+        and config.get("Volumes") in (None, {}),
+        "consumer_native_runtime_contract",
+    )
+    if not local:
+        require(
+            type(image.get("RepoDigests")) is list
+            and selection["runtime_ref"] in image["RepoDigests"],
+            "consumer_published_immutable_subject",
+        )
+
+
+def _require_consumer_current(
+    api: GitHubRead, event: dict[str, Any], event_name: str, head: str
+) -> None:
+    """Recheck live event coordinates after admission/wait and before credential use."""
+    if event_name == "pull_request":
+        pr = api.json(f'/repos/{GHCR_REPOSITORY}/pulls/{event["number"]}')
+        expected = event["pull_request"]
+        require(
+            type(pr) is dict
+            and pr.get("state") == "open"
+            and pr.get("head", {}).get("sha") == head
+            and pr.get("base", {}).get("sha") == expected["base"]["sha"]
+            and pr.get("base", {}).get("ref") == "main"
+            and pr.get("head", {}).get("repo", {}).get("id") == 1043311030
+            and pr.get("base", {}).get("repo", {}).get("id") == 1043311030,
+            "consumer_route_binding",
+        )
+    elif not (event_name == "push" and event.get("ref", "").startswith("refs/tags/v")):
+        current = api.json(f"/repos/{GHCR_REPOSITORY}/git/ref/heads/main")
+        require(current.get("object", {}).get("sha") == head, "consumer_current_main")
+
+
+def select_pr_evidence_route(api: GitHubRead, root: Path, event: dict[str, Any], head: str) -> str:
+    """Select a PR expectation with read credentials only; consume reauthenticates it."""
+    require(
+        not any(
+            os.environ.get(name)
+            for name in ("GHCR_READ_TOKEN", "GHCR_TOKEN", "DOCKER_CONFIG", "DOCKER_AUTH_CONFIG")
+        ),
+        "consumer_selection_registry_credentials",
+    )
+    admission = event_admission(api, root, event, "pull_request", head)
+    _require_consumer_current(api, event, "pull_request", head)
+    routes = {
+        "changed_pr_candidate": "changed_pr_candidate",
+        "historical_pr_candidate": "historical_pr_candidate",
+        "unchanged_published": "unchanged_pr_published",
+    }
+    require(admission["mode"] in routes, "consumer_route_binding")
+    return routes[admission["mode"]]
+
+
+def _bind_consumer_route(
+    event: dict[str, Any], event_name: str, head: str, admission: dict[str, Any]
+) -> None:
+    """Cross-bind the expected workflow alias to the exact fresh event/admission relation."""
+    route = os.environ.get("PROMETHEUS_CREDENTIAL_ROUTE")
+    require(
+        route
+        in (
+            "changed_pr_candidate",
+            "historical_pr_candidate",
+            "unchanged_pr_published",
+            "trusted_published",
+        ),
+        "consumer_credential_route",
+    )
+    mode = admission.get("mode")
+    require(admission.get("head") == head, "consumer_route_binding")
+    if event_name == "pull_request":
+        allowed = {
+            "changed_pr_candidate": "changed_pr_candidate",
+            "historical_pr_candidate": "historical_pr_candidate",
+            "unchanged_pr_published": "unchanged_published",
+        }
+        require(route in allowed and allowed[route] == mode, "consumer_route_binding")
+        expected = event["pull_request"]["base"]["sha"] if mode == "unchanged_published" else None
+        require(admission.get("publisher_head") == expected, "consumer_route_binding")
+    else:
+        require(
+            route == "trusted_published"
+            and event_name in ("push", "schedule", "workflow_dispatch")
+            and mode in ("unchanged_published", "new_main_selection", "historical_main_recovery")
+            and admission.get("publisher_head") == head,
+            "consumer_route_binding",
+        )
+        if mode != "unchanged_published":
+            require(
+                event_name == "push" and event.get("ref") == "refs/heads/main",
+                "consumer_route_binding",
+            )
+
+
+def consume_image(work: Path, root: Path, seconds: int, cleanup: int) -> dict[str, Any]:
+    require(
+        type(seconds) is int
+        and 0 < seconds <= 1800
+        and type(cleanup) is int
+        and 0 < cleanup <= 120,
+        "consumer_budget",
+    )
+    fresh_directory(work)
+    evidence = work / "evidence"
+    fresh_directory(evidence)
+    native = Native(evidence, time.monotonic() + seconds, cleanup)
+    event = one_object(Path(os.environ["GITHUB_EVENT_PATH"]).read_bytes())
+    head = (
+        event["pull_request"]["head"]["sha"]
+        if os.environ["GITHUB_EVENT_NAME"] == "pull_request"
+        else os.environ["GITHUB_SHA"]
+    )
+    docker = shutil.which("docker")
+    require(docker is not None and Path(docker).is_absolute(), "consumer_native_Docker_missing")
+    docker = cast(str, docker)
+    config = work / "docker-config"
+    fresh_directory(config)
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": str(work),
+        "DOCKER_CONFIG": str(config),
+        "LANG": "C.UTF-8",
+    }
+    api = GitHubRead(work / "GitHub-private", evidence, native.deadline, cleanup)
+    payload = None
+    reader: Path | None = None
+    reader_identity: tuple[int, int] | None = None
+    primary: BaseException | None = None
+    cleanup_error: BaseException | None = None
+    try:
+        admission = event_admission(api, root, event, os.environ["GITHUB_EVENT_NAME"], head)
+        _bind_consumer_route(event, os.environ["GITHUB_EVENT_NAME"], head, admission)
+        # Admission binds H first. Never retain an earlier unbound selection.
+        selection = read_image_manifest(root / MANIFEST_PATH)["selection"]
+        if admission["mode"] in ("changed_pr_candidate", "historical_pr_candidate"):
+            require(not os.environ.get("GHCR_READ_TOKEN"), "consumer_candidate_registry_token")
+            _require_consumer_current(api, event, os.environ["GITHUB_EVENT_NAME"], head)
+            selected_root = candidate_source_root(api, root, work, admission)
+            payload = candidate_payload(api, selected_root, work)
+            _require_consumer_current(api, event, os.environ["GITHUB_EVENT_NAME"], head)
+        else:
+            # No registry availability probe can substitute for a positive publisher.
+            while True:
+                check_deadline(native.deadline)
+                try:
+                    admission["publication_predecessor"] = require_publication_predecessor(
+                        api, admission["publisher_head"]
+                    )
+                    break
+                except QualificationError as error:
+                    if str(error) not in (
+                        "positive_publication_predecessor_missing",
+                        "positive_publication_predecessor_active",
+                    ):
+                        raise
+                    check_deadline(native.deadline)
+                    time.sleep(min(5, max(0, native.deadline - time.monotonic())))
+            identity, versions = existing_public_package(api)
+            tag = "prometheus-3.15.0-" + selection["manifest_digest"][7:]
+            require(
+                immutable_tag_state(versions, tag, selection["manifest_digest"]),
+                "consumer_published_subject_missing",
+            )
+            admission["public_package"] = identity
+            _require_consumer_current(api, event, os.environ["GITHUB_EVENT_NAME"], head)
+            token = os.environ.get("GHCR_READ_TOKEN")
+            if not isinstance(token, str) or not token:
+                raise QualificationError("consumer_registry_token_missing")
+            owner = os.environ.get("GITHUB_REPOSITORY_OWNER")
+            require(
+                isinstance(owner, str) and owner.lower() == GHCR_OWNER.lower(),
+                "consumer_registry_owner",
+            )
+            owner = cast(str, owner)
+            runner = Path(os.environ["RUNNER_TEMP"])
+            real_directory(runner)
+            name = (
+                "prometheus-consumer-auth-"
+                + os.environ["GITHUB_RUN_ID"]
+                + "-"
+                + os.environ["GITHUB_RUN_ATTEMPT"]
+            )
+            reader = runner / name
+            require(
+                reader.parent == runner and reader.name == name, "consumer_owned_registry_config"
+            )
+            fresh_directory(reader)
+            info = reader.lstat()
+            reader_identity = (info.st_dev, info.st_ino)
+            published_env = {**env, "HOME": str(api.private / "home"), "DOCKER_CONFIG": str(reader)}
+            api._capture(
+                [
+                    docker,
+                    "--config",
+                    str(reader),
+                    "login",
+                    "ghcr.io",
+                    "--username",
+                    owner,
+                    "--password-stdin",
+                ],
+                MAX_NATIVE_OUTPUT,
+                environment=published_env,
+                input_data=token.encode() + b"\n",
+            )
+            credential = reader / "config.json"
+            info = credential.lstat()
+            require(
+                {path.name for path in reader.iterdir()} == {"config.json"}
+                and stat.S_ISREG(info.st_mode)
+                and info.st_uid == os.getuid()
+                and info.st_nlink == 1
+                and stat.S_IMODE(info.st_mode) == 0o600,
+                "consumer_credential_leaf",
+            )
+            api._capture(
+                [
+                    docker,
+                    "--config",
+                    str(reader),
+                    "pull",
+                    "--platform",
+                    "linux/amd64",
+                    selection["runtime_ref"],
+                ],
+                MAX_NATIVE_OUTPUT,
+                environment=published_env,
+            )
+            raw = api._capture(
+                [
+                    docker,
+                    "--config",
+                    str(reader),
+                    "buildx",
+                    "imagetools",
+                    "inspect",
+                    "--raw",
+                    selection["runtime_ref"],
+                ],
+                1024**2,
+                environment=published_env,
+            )
+            require("sha256:" + sha(raw) == selection["manifest_digest"], "published_raw_OCI_root")
+            observed_root = one_object(raw)
+            descriptor = _descriptor(observed_root.get("config"), OCI_CONFIG)
+            require(
+                descriptor["digest"] == selection["config_digest"], "published_config_descriptor"
+            )
+            exact_data(
+                observed_root,
+                {
+                    "schemaVersion": 2,
+                    "mediaType": OCI_MANIFEST,
+                    "config": descriptor,
+                    "layers": selection["layers"],
+                },
+            )
+    except BaseException as error:
+        primary = error
+    finally:
+        try:
+            api.close()
+            if reader is not None:
+                check_deadline(api.begin_cleanup())
+                info = reader.lstat()
+                require(
+                    stat.S_ISDIR(info.st_mode)
+                    and info.st_uid == os.getuid()
+                    and stat.S_IMODE(info.st_mode) == 0o700
+                    and (info.st_dev, info.st_ino) == reader_identity,
+                    "consumer_credential_directory_identity",
+                )
+                require(
+                    {path.name for path in reader.iterdir()} in ({"config.json"}, set()),
+                    "consumer_credential_members",
+                )
+                credential = reader / "config.json"
+                if credential.exists() or credential.is_symlink():
+                    info = credential.lstat()
+                    require(
+                        stat.S_ISREG(info.st_mode)
+                        and info.st_uid == os.getuid()
+                        and info.st_nlink == 1
+                        and stat.S_IMODE(info.st_mode) == 0o600,
+                        "consumer_credential_cleanup_leaf",
+                    )
+                    credential.unlink()
+                reader.rmdir()
+                require(
+                    not reader.exists() and not reader.is_symlink(),
+                    "consumer_credential_cleanup_absence",
+                )
+        except BaseException as error:
+            cleanup_error = error
+    if primary is not None:
+        if cleanup_error is not None:
+            print(
+                "Consumer cleanup also failed:"
+                + (diagnostic_code(cleanup_error) or type(cleanup_error).__name__),
+                file=sys.stderr,
+            )
+        raise primary
+    if cleanup_error is not None:
+        raise cleanup_error
+    if admission["mode"] in ("changed_pr_candidate", "historical_pr_candidate"):
+        component = consumer_result(admission["mode"], "success", "skipped")
+    elif admission["mode"] in ("new_main_selection", "historical_main_recovery"):
+        component = consumer_result(admission["mode"], "success", "success")
+    else:
+        component = consumer_result(admission["mode"], "skipped", "skipped")
+    if payload is not None:
+        native.run(
+            [docker, "--config", str(config), "load", "--input", str(payload["docker_archive"])],
+            "candidate-load",
+            env,
+            cwd=work,
+        )
+        runtime = selection["config_digest"]
+    else:
+        runtime = selection["runtime_ref"]
+    image = one_object(
+        native.run(
+            [
+                docker,
+                "--config",
+                str(config),
+                "image",
+                "inspect",
+                "--format",
+                "{{json .}}",
+                runtime,
+            ],
+            "consumer-native-image",
+            env,
+            cwd=work,
+        )
+    )
+    native_image_contract(image, selection, local=payload is not None)
+    result = {
+        "admission": admission,
+        "component_consumption": component,
+        "selection": selection,
+        "runtime_ref": runtime,
+        "native_image": image,
+        "native_commands": native.records,
+        "boundary": "Image admission only; existing promtool/runtime/security checks remain mandatory",
+    }
+    (evidence / "consumer.json").write_bytes(canonical_data(result))
+    return result
+
+
+PACKAGE_VERSION_COUNT_MAX = 20000
+PACKAGE_VERSION_CAPTURE_BYTES_MAX = 1024**2
+PACKAGE_VERSION_STDOUT_BYTES_MAX = 64 * 1024**2
+
+
+def existing_public_package(api: GitHubRead) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    repository = api.json("/repos/" + GHCR_REPOSITORY)
+    endpoint = GHCR_REQUESTS[1]
+    package_argv = [api.gh, "api", "--hostname", "github.com", "--method", "GET", endpoint]
+    package = one_object(api._capture(package_argv, 1024**2))
+    identity = ghcr_identity(repository, package)
+    require(
+        identity["repository"]["id"] == 1043311030
+        and identity["owner"]["id"] == 169792616
+        and identity["package"]["id"] == 9374404,
+        "existing_public_package_exact_IDs",
+    )
+    raw_count = package.get("version_count")
+    require(
+        type(raw_count) is int and 0 <= raw_count <= PACKAGE_VERSION_COUNT_MAX,
+        "package_version_count",
+    )
+    count = cast(int, raw_count)
+    versions: list[dict[str, Any]] = []
+    seen_ids: set[int] = set()
+    stdout_bytes = 0
+    terminal_page = count // 100 + 1
+    for page in range(1, terminal_page + 1):
+        remaining = PACKAGE_VERSION_STDOUT_BYTES_MAX - stdout_bytes
+        require(remaining > 0, "package_inventory_stdout_bound")
+        raw = api._capture(
+            [
+                api.gh,
+                "api",
+                "--hostname",
+                "github.com",
+                "--method",
+                "GET",
+                endpoint + f"/versions?per_page=100&page={page}",
+            ],
+            min(PACKAGE_VERSION_CAPTURE_BYTES_MAX, remaining),
+        )
+        stdout_bytes += len(raw)
+        require(stdout_bytes <= PACKAGE_VERSION_STDOUT_BYTES_MAX, "package_inventory_stdout_bound")
+        values = json.loads(raw, object_pairs_hook=unique_object, parse_constant=reject_constant)
+        require(
+            type(values) is list
+            and len(values) <= 100
+            and all(
+                type(row) is dict and type(row.get("id")) is int and row["id"] > 0 for row in values
+            ),
+            "package_native_versions",
+        )
+        expected_rows = count % 100 if page == terminal_page else 100
+        require(
+            len(values) == expected_rows and len(versions) + len(values) <= count,
+            "package_complete_inventory_count",
+        )
+        page_ids = {row["id"] for row in values}
+        require(
+            len(page_ids) == len(values) and not seen_ids.intersection(page_ids),
+            "package_pagination_distinct",
+        )
+        seen_ids.update(page_ids)
+        versions.extend(values)
+    require(len(versions) == count, "package_complete_inventory_count")
+    after_repository = api.json("/repos/" + GHCR_REPOSITORY)
+    after_package = one_object(api._capture(package_argv, 1024**2))
+    after_identity = ghcr_identity(after_repository, after_package)
+    after_count = after_package.get("version_count")
+    require(
+        after_identity == identity and type(after_count) is int and after_count == count,
+        "package_inventory_identity_or_count_drift",
+    )
+    return identity, versions
+
+
+def immutable_tag_state(versions: list[dict[str, Any]], tag: str, digest: str) -> bool:
+    matches = []
+    for version in versions:
+        tags = version.get("metadata", {}).get("container", {}).get("tags")
+        require(
+            type(tags) is list and all(type(value) is str for value in tags),
+            "package_native_tag_inventory",
+        )
+        if tag in tags:
+            matches.append(version)
+    require(
+        len(matches) <= 1 and all(row.get("name") == digest for row in matches),
+        "immutable_tag_existing_other_subject_HOLD",
+    )
+    return bool(matches)
+
+
+def promote_image(work: Path, root: Path, seconds: int, cleanup: int) -> dict[str, Any]:
+    require(
+        type(seconds) is int
+        and 0 < seconds <= 1800
+        and type(cleanup) is int
+        and 0 < cleanup <= 120
+        and os.environ.get("GITHUB_EVENT_NAME") == "push"
+        and os.environ.get("GITHUB_REF") == "refs/heads/main"
+        and os.environ.get("GITHUB_REPOSITORY") == GHCR_REPOSITORY
+        and os.environ.get("GITHUB_REPOSITORY_ID") == "1043311030",
+        "main_only_promotion",
+    )
+    fresh_directory(work)
+    evidence = work / "evidence"
+    fresh_directory(evidence)
+    api = GitHubRead(work / "GitHub-private", evidence, time.monotonic() + seconds, cleanup)
+    config: Path | None = None
+    config_identity: tuple[int, int] | None = None
+    primary: BaseException | None = None
+    cleanup_error: BaseException | None = None
+    result: dict[str, Any] | None = None
+    try:
+        event = one_object(Path(os.environ["GITHUB_EVENT_PATH"]).read_bytes())
+        head = os.environ["GITHUB_SHA"]
+        admission = event_admission(api, root, event, "push", head)
+        require(
+            admission["mode"]
+            in ("new_main_selection", "historical_main_recovery", "unchanged_published"),
+            "publisher_event_table",
+        )
+        run_text = os.environ.get("GITHUB_RUN_ID", "")
+        attempt_text = os.environ.get("GITHUB_RUN_ATTEMPT", "")
+        require(
+            re.fullmatch(r"[1-9][0-9]*", run_text) is not None
+            and re.fullmatch(r"[1-9][0-9]*", attempt_text) is not None,
+            "publisher_run_attempt_coordinates",
+        )
+        run_id, attempt = int(run_text), int(attempt_text)
+        run_url = f"https://api.github.com/repos/{GHCR_REPOSITORY}/actions/runs/{run_text}"
+        endpoint = f"/repos/{GHCR_REPOSITORY}/actions/runs/{run_text}/attempts/{attempt_text}/jobs"
+        # Observe the whole same-run backend writer, including its attestations.
+        # Valid pending states share this publication deadline; failed reads never retry.
+        selected_ids: dict[str, int] | None = None
+        previous_publish_status: str | None = None
+        for observation in range(16):
+            check_deadline(api.deadline)
+            page = api.json(endpoint + "?per_page=100&page=1")
+            count = page.get("total_count") if type(page) is dict else None
+            require(
+                type(count) is int and 0 <= count <= 100,
+                "publisher_jobs_count",
+            )
+            jobs = api.pages(endpoint, "jobs", cast(int, count))
+            selected: dict[str, dict[str, Any]] = {}
+            for name in ("build", "security-scan", "publish"):
+                required = [row for row in jobs if row.get("name") == name]
+                require(len(required) == 1, "publisher_selected_job_cardinality")
+                row = required[0]
+                require(
+                    all(
+                        type(row.get(key)) is int and row[key] > 0
+                        for key in ("id", "run_id", "run_attempt")
+                    )
+                    and row["run_id"] == run_id
+                    and row["run_attempt"] == attempt
+                    and row.get("head_sha") == head
+                    and row.get("head_branch") == "main"
+                    and row.get("run_url") == run_url,
+                    "publisher_selected_job_identity",
+                )
+                selected[name] = row
+            current_ids = {name: row["id"] for name, row in selected.items()}
+            require(
+                selected_ids is None or selected_ids == current_ids,
+                "publisher_selected_job_identity_drift",
+            )
+            selected_ids = current_ids
+            for name in ("build", "security-scan"):
+                require(
+                    selected[name].get("status") == "completed"
+                    and selected[name].get("conclusion") == "success",
+                    "publisher_positive_build_security_predecessors",
+                )
+            writer = selected["publish"]
+            status = writer.get("status")
+            require(
+                status in ("queued", "in_progress", "completed") and "conclusion" in writer,
+                "publisher_backend_publish_state",
+            )
+            require(
+                previous_publish_status != "in_progress" or status != "queued",
+                "publisher_backend_publish_regression",
+            )
+            if status == "completed":
+                require(writer["conclusion"] == "success", "publisher_backend_publish_success")
+                break
+            require(writer["conclusion"] is None, "publisher_backend_publish_state")
+            previous_publish_status = status
+            require(observation < 15, "publisher_backend_publish_wait_bound")
+            check_deadline(api.deadline)
+            time.sleep(min(60, max(0, api.deadline - time.monotonic())))
+            check_deadline(api.deadline)
+        manifest = read_image_manifest(root / MANIFEST_PATH)
+        selection = manifest["selection"]
+        candidate = None
+        predecessor = None
+        if admission["mode"] in ("new_main_selection", "historical_main_recovery"):
+            # Complete source, artifact, tool, native/scanner and input admission
+            # before creating or logging in to any registry-writer directory.
+            selected_root = candidate_source_root(api, root, work, admission)
+            candidate = candidate_payload(api, selected_root, work)
+            tool = candidate["tool"]
+            expected_tool = candidate["tool_record"]["coordinates"]["binary_sha256"]
+            require(file_hash(tool) == expected_tool, "publisher_retained_tool_changed")
+        else:
+            predecessor = require_publication_predecessor(api, event["before"])
+        current = api.json(f"/repos/{GHCR_REPOSITORY}/git/ref/heads/main")
+        require(current.get("object", {}).get("sha") == head, "publisher_main_before_inventory")
+        identity, before = existing_public_package(api)
+        tag = "prometheus-3.15.0-" + selection["manifest_digest"][7:]
+        present = immutable_tag_state(before, tag, selection["manifest_digest"])
+        if candidate is None:
+            require(present, "unchanged_published_subject_missing")
+        docker = shutil.which("docker")
+        require(docker is not None and Path(docker).is_absolute(), "publisher_Docker_missing")
+        docker = cast(str, docker)
+        owner = os.environ.get("GITHUB_REPOSITORY_OWNER")
+        if not isinstance(owner, str) or owner.lower() != GHCR_OWNER.lower():
+            raise QualificationError("publisher_registry_owner")
+        current = api.json(f"/repos/{GHCR_REPOSITORY}/git/ref/heads/main")
+        require(current.get("object", {}).get("sha") == head, "publisher_main_before_credentials")
+        result = {
+            "head": head,
+            "admission": admission,
+            "package": identity,
+            "selection": selection,
+            "tag": tag,
+            "copy_invocations": 0,
+            "compile_invocations": 0,
+            "verify_retained_bundles": candidate is not None,
+            "provenance": "Original same-repository PR producer; main copies retained bytes without rebuilding",
+        }
+        # Registry credentials activate only after the complete admission above.
+        runner = Path(os.environ["RUNNER_TEMP"])
+        real_directory(runner)
+        name = (
+            "prometheus-publisher-auth-"
+            + os.environ["GITHUB_RUN_ID"]
+            + "-"
+            + os.environ["GITHUB_RUN_ATTEMPT"]
+        )
+        config = runner / name
+        require(
+            config.parent == runner and config.name == name, "publisher_owned_credential_directory"
+        )
+        fresh_directory(config)
+        directory = config.lstat()
+        config_identity = (directory.st_dev, directory.st_ino)
+        credential = config / "config.json"
+        env = {
+            "PATH": "/usr/bin:/bin",
+            "HOME": str(api.private / "home"),
+            "DOCKER_CONFIG": str(config),
+            "LANG": "C.UTF-8",
+        }
+        writer_token = os.environ.get("GITHUB_TOKEN")
+        if not isinstance(writer_token, str) or not writer_token:
+            raise QualificationError("publisher_registry_token_missing")
+        api._capture(
+            [
+                docker,
+                "--config",
+                str(config),
+                "login",
+                "ghcr.io",
+                "--username",
+                owner,
+                "--password-stdin",
+            ],
+            2 * 1024**2,
+            environment=env,
+            input_data=writer_token.encode() + b"\n",
+        )
+        info = credential.lstat()
+        require(
+            {path.name for path in config.iterdir()} == {"config.json"}
+            and stat.S_ISREG(info.st_mode)
+            and info.st_uid == os.getuid()
+            and info.st_nlink == 1
+            and stat.S_IMODE(info.st_mode) == 0o600,
+            "publisher_credential_leaf",
+        )
+        if candidate is not None:
+            if not present:
+                current = api.json(f"/repos/{GHCR_REPOSITORY}/git/ref/heads/main")
+                require(current.get("object", {}).get("sha") == head, "publisher_main_before_write")
+                api._capture(
+                    [
+                        str(tool),
+                        "cp",
+                        "--registry-config",
+                        str(credential),
+                        "--from-oci-layout",
+                        str(candidate["layout"]) + "@" + selection["manifest_digest"],
+                        IMAGE_REPOSITORY + ":" + tag,
+                    ],
+                    2 * 1024**2,
+                    environment=env,
+                )
+                result["copy_invocations"] = 1
+            pullback = work / "pullback"
+            api._capture(
+                [
+                    str(tool),
+                    "cp",
+                    "--registry-config",
+                    str(credential),
+                    "--to-oci-layout",
+                    selection["runtime_ref"],
+                    str(pullback) + ":pullback",
+                ],
+                2 * 1024**2,
+                environment=env,
+            )
+            graph = validate_oci_graph(pullback, candidate["tool_record"]["base"])
+            compare_pair(candidate["graph"], graph)
+            pack_layout(pullback, evidence / "published-pullback.oci.tar")
+            result["pullback_SHA256"] = file_hash(evidence / "published-pullback.oci.tar")
+            original = manifest["candidate"]["producer"]
+            result["original_producer"] = original
+            for filename in ("sbom.spdx.json", "provenance-bundle.jsonl", "sbom-bundle.jsonl"):
+                shutil.copyfile(candidate["payload"] / filename, evidence / filename)
+            # OCI verification still needs this authenticated registry lifetime.
+            # Verify retained original PR bundles, never an API-only attestation lookup.
+            for bundle, output, predicate in (
+                ("provenance-bundle.jsonl", "original-provenance-verification.json", None),
+                (
+                    "sbom-bundle.jsonl",
+                    "original-sbom-verification.json",
+                    "https://spdx.dev/Document/v2.3",
+                ),
+            ):
+                argv = [
+                    api.gh,
+                    "attestation",
+                    "verify",
+                    "oci://" + selection["runtime_ref"],
+                    "--repo",
+                    GHCR_REPOSITORY,
+                    "--bundle",
+                    str(evidence / bundle),
+                    "--signer-workflow",
+                    GHCR_REPOSITORY + "/.github/workflows/build.yml",
+                    "--source-digest",
+                    original["source_head"],
+                    "--source-ref",
+                    original["source_ref"],
+                ]
+                if predicate is not None:
+                    argv += ["--predicate-type", predicate]
+                argv += ["--deny-self-hosted-runners", "--format", "json"]
+                verified = api._capture(
+                    argv,
+                    16 * 1024**2,
+                    environment={**api.environment, "DOCKER_CONFIG": str(config)},
+                )
+                (evidence / output).write_bytes(verified)
+        else:
+            result["publication_predecessor"] = predecessor
+            raw = api._capture(
+                [
+                    docker,
+                    "--config",
+                    str(config),
+                    "buildx",
+                    "imagetools",
+                    "inspect",
+                    "--raw",
+                    selection["runtime_ref"],
+                ],
+                1024**2,
+                environment=env,
+            )
+            require(
+                "sha256:" + sha(raw) == selection["manifest_digest"],
+                "unchanged_published_raw_digest",
+            )
+        after_identity, after = existing_public_package(api)
+        exact_data(after_identity, identity)
+        require(
+            immutable_tag_state(after, tag, selection["manifest_digest"]),
+            "published_existing_package_readback",
+        )
+        current = api.json(f"/repos/{GHCR_REPOSITORY}/git/ref/heads/main")
+        require(current.get("object", {}).get("sha") == head, "publisher_main_after_write")
+        result["status"] = "observed_published_exact_immutable_subject"
+        (evidence / "publication.json").write_bytes(canonical_data(result))
+    except BaseException as error:
+        primary = error
+    finally:
+        try:
+            # A failed/uncertain group check retains BOTH private auth directories.
+            api.close()
+            if config is not None:
+                check_deadline(api.begin_cleanup())
+                directory = config.lstat()
+                require(
+                    stat.S_ISDIR(directory.st_mode)
+                    and directory.st_uid == os.getuid()
+                    and stat.S_IMODE(directory.st_mode) == 0o700
+                    and (directory.st_dev, directory.st_ino) == config_identity,
+                    "publisher_credential_directory_identity",
+                )
+                require(
+                    {path.name for path in config.iterdir()} in ({"config.json"}, set()),
+                    "publisher_credential_members",
+                )
+                credential = config / "config.json"
+                if credential.exists() or credential.is_symlink():
+                    info = credential.lstat()
+                    require(
+                        stat.S_ISREG(info.st_mode)
+                        and info.st_uid == os.getuid()
+                        and info.st_nlink == 1
+                        and stat.S_IMODE(info.st_mode) == 0o600,
+                        "publisher_credential_cleanup_leaf",
+                    )
+                    credential.unlink()
+                config.rmdir()
+                require(
+                    not config.exists() and not config.is_symlink(),
+                    "publisher_credential_cleanup_absence",
+                )
+        except BaseException as error:
+            cleanup_error = error
+    if primary is not None:
+        if cleanup_error is not None:
+            print(
+                "Publisher cleanup also failed:"
+                + (diagnostic_code(cleanup_error) or type(cleanup_error).__name__),
+                file=sys.stderr,
+            )
+        raise primary
+    if cleanup_error is not None:
+        raise cleanup_error
+    require(result is not None, "publisher_result_missing")
+    return cast(dict[str, Any], result)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    parser.add_argument(
+        "--operation",
+        choices=(
+            "metadata",
+            "tool",
+            "pair",
+            "consume",
+            "promote",
+            "read-manifest",
+            "inspect-image",
+        ),
+        default="metadata",
+    )
+    parser.add_argument("--manifest", type=Path)
+    parser.add_argument("--field", choices=("runtime_ref", "selection"), default="selection")
+    derivation = parser.add_mutually_exclusive_group()
+    derivation.add_argument("--derive-xnet060", action="store_true")
+    derivation.add_argument("--derive-xnet062", action="store_true")
+    parser.add_argument("--work-dir", type=Path)
+    parser.add_argument("--timeout-seconds", type=int)
+    parser.add_argument("--cleanup-seconds", type=int)
+    parser.add_argument("--qualify-existing-ghcr-package", action="store_true")
+    parser.add_argument("--public-output", type=Path)
+    parser.add_argument("--tool-prefetch-predecessor")
+    args = parser.parse_args()
+    if args.tool_prefetch_predecessor is not None and args.operation != "tool":
+        parser.error("The failed prefetch predecessor belongs only to the manual tool operation")
+    root = Path(__file__).resolve(strict=True).parents[2]
+    manifest_path = args.manifest if args.manifest is not None else root / MANIFEST_PATH
+    if args.operation != "metadata" and (
+        args.derive_xnet060
+        or args.derive_xnet062
+        or args.qualify_existing_ghcr_package
+        or args.public_output is not None
+    ):
+        parser.error("Native producer/consumer operations cannot combine with metadata selectors")
+    if args.operation not in ("read-manifest", "inspect-image") and (
+        args.work_dir is None or args.timeout_seconds is None or args.cleanup_seconds is None
+    ):
+        parser.error(
+            "An owned work directory, operation deadline and cleanup deadline are required"
+        )
+    if (args.derive_xnet060 or args.derive_xnet062) and (
+        args.qualify_existing_ghcr_package or args.public_output is not None
+    ):
+        parser.error("Module derivation cannot combine with GHCR/public output")
+    if args.qualify_existing_ghcr_package != (args.public_output is not None):
+        parser.error("GHCR selector and public output are required together")
+    signal.signal(signal.SIGTERM, interrupt)
+    signal.signal(signal.SIGINT, interrupt)
+    try:
+        if args.operation in ("read-manifest", "inspect-image"):
+            manifest = read_image_manifest(manifest_path)
+            if args.operation == "inspect-image":
+                raw = sys.stdin.buffer.read(1024**2 + 1)
+                require(0 < len(raw) <= 1024**2, "native_inspect_input_bound")
+                images = json.loads(
+                    raw, object_pairs_hook=unique_object, parse_constant=reject_constant
+                )
+                require(type(images) is list and len(images) == 1, "native_inspect_one_image")
+                native_image_contract(images[0], manifest["selection"])
+            elif args.field == "runtime_ref":
+                print(manifest["selection"]["runtime_ref"])
+            else:
+                print(canonical_data(manifest["selection"]).decode())
+            return 0
+        result = None
+        if args.operation == "tool":
+            result = qualify_tool(
+                args.work_dir,
+                root,
+                args.timeout_seconds,
+                args.cleanup_seconds,
+                prefetch_predecessor=args.tool_prefetch_predecessor,
+            )
+        elif args.operation == "pair":
+            result = build_pair(args.work_dir, root, args.timeout_seconds, args.cleanup_seconds)
+        elif args.operation == "consume":
+            result = consume_image(args.work_dir, root, args.timeout_seconds, args.cleanup_seconds)
+        elif args.operation == "promote":
+            result = promote_image(args.work_dir, root, args.timeout_seconds, args.cleanup_seconds)
+        elif args.qualify_existing_ghcr_package:
+            qualify_existing_ghcr_package(
+                args.work_dir, args.public_output, args.timeout_seconds, args.cleanup_seconds
+            )
+        elif args.operation == "metadata":
+            if args.derive_xnet062:
+                qualify(
+                    args.work_dir, args.timeout_seconds, args.cleanup_seconds, derive_xnet062=True
+                )
+            elif args.derive_xnet060:
+                qualify(
+                    args.work_dir, args.timeout_seconds, args.cleanup_seconds, derive_xnet060=True
+                )
+            else:
+                qualify(args.work_dir, args.timeout_seconds, args.cleanup_seconds)
+        if result is not None and os.environ.get("GITHUB_OUTPUT"):
+            outputs = {}
+            if args.operation == "tool":
+                outputs = {
+                    "binary_sha256": result["binary"]["sha256"],
+                    "binary_bytes": result["binary"]["bytes"],
+                    "input_digest": result["input_digest"],
+                }
+            elif args.operation in ("pair", "consume", "promote"):
+                selection = result["selection"]
+                outputs = {
+                    "manifest_digest": selection["manifest_digest"],
+                    "config_digest": selection["config_digest"],
+                    "source_revision": selection["source_revision"],
+                    "runtime_ref": result.get("runtime_ref", selection["runtime_ref"]),
+                }
+                if args.operation == "promote":
+                    original = read_image_manifest(root / MANIFEST_PATH)["candidate"]["producer"]
+                    outputs.update(
+                        source_head=original["source_head"],
+                        source_ref=original["source_ref"],
+                        original_run_id=original["run_id"],
+                        verify_retained_bundles=str(result["verify_retained_bundles"]).lower(),
+                    )
+            with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+                for key, value in outputs.items():
+                    require(
+                        "\n" not in str(value) and "\r" not in str(value),
+                        "native_output_single_line",
+                    )
+                    output.write(key + "=" + str(value) + "\n")
+    except (Exception, KeyboardInterrupt) as error:
+        code = diagnostic_code(error)
+        print(
+            "Prometheus qualification failed: "
+            + type(error).__name__
+            + (":" + code if code else ""),
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        "Finite operation observed; downstream readiness and publication gates remain separate."
+        if args.operation != "metadata"
+        else (
+            "Existing GHCR identity observed."
+            if args.qualify_existing_ghcr_package
+            else "Prometheus package metadata captured; advisory and binary review pending."
+        )
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

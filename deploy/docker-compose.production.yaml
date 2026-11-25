@@ -1,0 +1,171 @@
+networks:
+  web:
+    external: false
+    # Pin the subnet so uvicorn can safely trust forwarded headers only from this
+    # internal Docker network (instead of "*"). If this subnet conflicts with
+    # your host/VPC, change it and keep --forwarded-allow-ips in sync below.
+    ipam:
+      config:
+        - subnet: 172.30.100.0/24
+  observability:
+    internal: true
+  alerting:
+    internal: true
+  smtp-egress:
+    driver: bridge
+
+secrets:
+  pulseplate_metrics_scrape_key:
+    file: ./secrets/pulseplate_metrics_scrape_key
+  alertmanager_smtp_key:
+    file: ./secrets/alertmanager_smtp_key
+
+services:
+  app:
+    image: ${IMAGE_REF:?IMAGE_REF is required}
+    restart: unless-stopped
+    networks: [web, observability]
+    secrets:
+      - pulseplate_metrics_scrape_key
+    expose:
+      - "8000"
+    env_file:
+      - .env
+    environment:
+      - ENVIRONMENT=production
+      # Production uses an external managed PostgreSQL instance.
+      - DATABASE_URL=${DATABASE_URL:?DATABASE_URL is required}
+      - FOOD_UPDATE_SCHEDULER_MODE=${FOOD_UPDATE_SCHEDULER_MODE:-external}
+    volumes:
+      - food_db_cache:/app/cache/food_db
+    command: >
+      uvicorn app.main:app --host 0.0.0.0 --port 8000
+      --proxy-headers
+      --forwarded-allow-ips="172.30.100.0/24"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/ready').read()",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  worker:
+    image: ${IMAGE_REF:?IMAGE_REF is required}
+    profiles: ["scheduler-external"]
+    restart: unless-stopped
+    networks: [web]
+    environment:
+      - PRIVATE_EXPORTS_ENABLED=false
+      - ENVIRONMENT=production
+      - DATABASE_URL=${DATABASE_URL:?DATABASE_URL is required}
+      - FOOD_UPDATE_SCHEDULER_MODE=${FOOD_UPDATE_SCHEDULER_MODE:-external}
+    command: python -m core.food_apis.scheduler --serve
+    depends_on:
+      app:
+        condition: service_healthy
+    volumes:
+      - food_db_cache:/app/cache/food_db
+    healthcheck:
+      disable: true
+
+  prometheus:
+    image: ${PROMETHEUS_RUNTIME_REF:?Set the canonical manifest-derived Prometheus immutable subject}
+    platform: linux/amd64
+    user: "65532:65532"
+    restart: unless-stopped
+    networks: [observability, alerting]
+    environment:
+      - PULSEPLATE_ENVIRONMENT=production
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=45d
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alias-alerts.yml:/etc/prometheus/alias-alerts.yml:ro
+      - prometheus_data:/prometheus
+    secrets:
+      - pulseplate_metrics_scrape_key
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/bin/promtool", "check", "ready", "--url=http://localhost:9090"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  alertmanager:
+    image: ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:873bc6cfae14edcf9f2acf2d81f9863f98ee8f78623125a7e02642a66e3bbe27
+    platform: linux/amd64
+    user: "65534:65534"
+    profiles: ["alerting"]
+    restart: unless-stopped
+    read_only: true
+    networks:
+      alerting:
+        gw_priority: 1
+      smtp-egress:
+        gw_priority: 2
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+      - --cluster.listen-address=
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    secrets:
+      - alertmanager_smtp_key
+    tmpfs:
+      - /alertmanager:size=16m,mode=0700,uid=65534,gid=65534,noexec,nosuid
+    healthcheck:
+      test: ["CMD", "/bin/wget", "-q", "-T", "5", "-O", "/dev/null", "http://127.0.0.1:9093/-/ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  caddy:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile.caddy-spa
+      args:
+        VITE_API_BASE: ${VITE_API_BASE:-/api/v1}
+    restart: unless-stopped
+    networks: [web]
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - PRODUCTION_DOMAIN=${PRODUCTION_DOMAIN}
+      - STAGING_FALLBACK_DOMAIN=${STAGING_FALLBACK_DOMAIN:-pulseplate-staging.duckdns.org}
+    volumes:
+      - ./Caddyfile.production:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "caddy", "version"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  food_db_cache:
+  caddy_data:
+  caddy_config:
+  prometheus_data:

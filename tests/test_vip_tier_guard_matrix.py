@@ -1,0 +1,329 @@
+"""VIP Tier Guard Matrix Test
+
+RU: Матричный тест для проверки tier guard на всех VIP endpoints.
+EN: Matrix test for tier guard enforcement across all VIP endpoints.
+
+This is the canonical source of truth for VIP tier denial matrix (FREE/PRO → 403, VIP → 2xx).
+Do not duplicate this matrix in other test files.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Literal
+
+import pytest
+from fastapi.testclient import TestClient
+from httpx import Response
+
+from app.middleware.api_tiers import TEST_KEY_PRO, TEST_KEY_VIP
+
+VIP_DENY_MESSAGE = "API key does not have VIP tier access. Upgrade to VIP to access this feature."
+
+
+@dataclass(frozen=True)
+class VipCase:
+    """VIP endpoint test case.
+
+    RU: Тестовый кейс для VIP endpoint.
+    EN: Test case for VIP endpoint.
+    """
+
+    method: Literal["GET", "POST"]
+    path: str
+    payload: dict[str, Any] | None = None
+    params: dict[str, str] | None = None
+
+
+def _auto_repair_guard_payload() -> dict[str, Any]:
+    nutrient_names = (
+        "iron_mg",
+        "calcium_mg",
+        "magnesium_mg",
+        "zinc_mg",
+        "potassium_mg",
+        "iodine_ug",
+        "selenium_ug",
+        "folate_ug",
+        "b12_ug",
+        "vitamin_d_iu",
+        "vitamin_a_ug",
+        "vitamin_c_mg",
+    )
+    return {
+        "week_plan": {
+            "days": [
+                {
+                    "day": "Monday",
+                    "meals": [
+                        {
+                            "ingredients": [{"name": "rice", "amount": 200, "unit": "g"}],
+                            "nutrients": {
+                                "kcal": 0.0,
+                                "protein_g": 0.0,
+                                "fat_g": 0.0,
+                                "carbs_g": 0.0,
+                                "fiber_g": 0.0,
+                                **{name: 0.0 for name in nutrient_names},
+                            },
+                        }
+                    ],
+                }
+            ]
+        },
+        "targets": {
+            "iron_mg": [6.0, 8.0, 45.0],
+            "calcium_mg": [800.0, 1000.0, 2500.0],
+            "magnesium_mg": [300.0, 400.0, 700.0],
+            "zinc_mg": [8.0, 11.0, 40.0],
+            "potassium_mg": [3500.0, 4700.0, 5000.0],
+            "iodine_ug": [130.0, 150.0, 1100.0],
+            "selenium_ug": [45.0, 55.0, 400.0],
+            "folate_ug": [320.0, 400.0, 1000.0],
+            "b12_ug": [2.0, 2.4, 100.0],
+            "vitamin_d_iu": [400.0, 600.0, 4000.0],
+            "vitamin_a_ug": [600.0, 900.0, 3000.0],
+            "vitamin_c_mg": [75.0, 90.0, 2000.0],
+        },
+        "strategy": "balanced",
+        "user_preferences": {},
+        "profile": {
+            "sex": "male",
+            "age": 30,
+            "height_cm": 175.0,
+            "weight_kg": 70.0,
+            "activity": "moderate",
+            "goal": "maintain",
+            "deficit_pct": None,
+            "surplus_pct": None,
+            "bodyfat": None,
+            "region": "BY",
+            "timezone": "UTC",
+            "diet_flags": [],
+            "life_stage": "adult",
+            "medical_conditions": [],
+        },
+        "daily_targets": {
+            "kcal_daily": 1800,
+            "macros": {"protein_g": 100, "fat_g": 60, "carbs_g": 215, "fiber_g": 30},
+            "water_ml_daily": 2000,
+            "activity": {
+                "moderate_aerobic_min": 150,
+                "vigorous_aerobic_min": 75,
+                "strength_sessions": 2,
+                "steps_daily": 8000,
+            },
+            "calculation_date": "2026-08-22",
+        },
+    }
+
+
+# Canonical list of all 17 VIP endpoints
+VIP_CASES: tuple[VipCase, ...] = (
+    # GET endpoints (9)
+    VipCase("GET", "/api/v1/vip/health"),
+    VipCase("GET", "/api/v1/vip/shoplist/formats"),
+    VipCase("GET", "/api/v1/vip/regions"),
+    VipCase(
+        "GET",
+        "/api/v1/vip/regions/es/search",
+        params={"query": "tomato"},
+    ),  # Path param: {region} = "es"
+    VipCase("GET", "/api/v1/vip/regions/es/categories"),
+    VipCase("GET", "/api/v1/vip/regions/es/stores"),
+    VipCase("GET", "/api/v1/vip/regions/compare/tomato"),
+    VipCase("GET", "/api/v1/vip/recipes/templates"),
+    VipCase("GET", "/api/v1/vip/auto-repair/strategies"),
+    # POST endpoints (8)
+    VipCase(
+        "POST",
+        "/api/v1/vip/menu/weekly/plan",
+        payload={
+            "sex": "female",
+            "age": 25,
+            "height_cm": 165.0,
+            "weight_kg": 60.0,
+            "activity": "light",
+            "goal": "loss",
+        },
+    ),
+    VipCase(
+        "POST",
+        "/api/v1/vip/menu/weekly/repair",
+        payload={"menu": {"days": 7, "meals": []}, "deficits": {"Ca": 200, "VitD": 100}},
+    ),
+    VipCase(
+        "POST",
+        "/api/v1/vip/shoplist/weekly",
+        payload={
+            "days": [
+                {
+                    "items": [
+                        {"food_id": "carrot", "qty": {"value": "100", "unit": "G"}, "form": "RAW"},
+                    ],
+                    "packaging_rules": [
+                        {
+                            "food_id": "carrot",
+                            "pack_size": {"value": "500", "unit": "G"},
+                            "rounding": "CEIL",
+                            "min_packs": 1,
+                        },
+                    ],
+                },
+            ],
+        },
+    ),
+    VipCase(
+        "POST",
+        "/api/v1/vip/shoplist/daily",
+        payload={
+            "items": [
+                {"food_id": "carrot", "qty": {"value": "100", "unit": "G"}, "form": "RAW"},
+            ],
+            "packaging_rules": [
+                {
+                    "food_id": "carrot",
+                    "pack_size": {"value": "500", "unit": "G"},
+                    "rounding": "CEIL",
+                    "min_packs": 1,
+                },
+            ],
+        },
+    ),
+    VipCase(
+        "POST",
+        "/api/v1/vip/recipes/synthesize",
+        payload={
+            "ingredients": [
+                {"name": "chicken", "amount": 300, "unit": "g"},
+                {"name": "vegetables", "amount": 200, "unit": "g"},
+            ],
+            "cuisine_preference": "asian",
+            "difficulty_preference": "easy",
+            "servings": 4,
+        },
+    ),
+    VipCase(
+        "POST",
+        "/api/v1/vip/recipes/weekly",
+        payload={
+            "week_plan": {
+                "days": [
+                    {
+                        "day": "Monday",
+                        "meals": [
+                            {
+                                "ingredients": [
+                                    {"name": "chicken", "amount": 200, "unit": "g"},
+                                    {"name": "rice", "amount": 150, "unit": "g"},
+                                ],
+                            },
+                        ],
+                    },
+                ],
+            },
+            "recipes_per_day": 1,
+        },
+    ),
+    VipCase(
+        "POST",
+        "/api/v1/vip/auto-repair/weekly",
+        payload=_auto_repair_guard_payload(),
+    ),
+    VipCase(
+        "POST",
+        "/api/v1/vip/auto-repair/suggestions",
+        payload={
+            "week_plan": {
+                "days": [
+                    {
+                        "day": "Monday",
+                        "meals": [{"ingredients": [{"name": "rice", "amount": 200, "unit": "g"}]}],
+                    },
+                ],
+            },
+            "targets": {
+                "iron_mg": 18.0,
+                "calcium_mg": 1000.0,
+            },
+        },
+    ),
+)
+
+
+def _headers_for_key(api_key: str) -> dict[str, str]:
+    """Return headers dict for API key.
+
+    RU: Возвращает заголовки для API ключа.
+    EN: Returns headers dict for API key.
+    """
+    return {"X-API-Key": api_key}
+
+
+def _assert_vip_denied(resp: Response) -> None:
+    """Assert VIP denial response (403).
+
+    RU: Проверяет ответ об отказе в доступе VIP (403).
+    EN: Asserts VIP denial response (403).
+
+    Note: require_vip_tier() raises HTTPException which returns FastAPI default format:
+    {"detail": "..."}.
+    """
+    assert resp.status_code == 403, f"Expected 403, got {resp.status_code}: {resp.text}"
+    data = resp.json()
+
+    # FastAPI HTTPException format: {"detail": "message"}
+    assert data.get("detail") == VIP_DENY_MESSAGE
+
+
+@pytest.mark.parametrize(
+    "api_key,expect_denied",
+    [
+        ("invalid_key", True),  # Invalid key (not PRO/VIP)
+        (TEST_KEY_PRO, True),  # PRO key
+        (TEST_KEY_VIP, False),  # VIP key
+    ],
+)
+@pytest.mark.parametrize("case", VIP_CASES)
+def test_vip_tier_guard_matrix(
+    monkeypatch: pytest.MonkeyPatch,
+    client: TestClient,
+    api_key: str,
+    expect_denied: bool,
+    case: VipCase,
+) -> None:
+    """Matrix test: all VIP endpoints must deny FREE/PRO with canonical envelope, and allow VIP (2xx).
+
+    RU: Матричный тест: все VIP endpoints должны отклонять FREE/PRO с каноническим envelope,
+    и разрешать VIP (2xx).
+    EN: Matrix test: all VIP endpoints must deny FREE/PRO with canonical envelope, and allow VIP (2xx).
+
+    IMPORTANT:
+    - Keep this file as the canonical guard-matrix.
+    - Do not duplicate this matrix across other vip_* tests.
+    - This test verifies tier guard enforcement, not business logic.
+    """
+    # Enable VIP module for test
+    monkeypatch.setenv("VIP_MODULE_ENABLED", "1")
+    monkeypatch.setenv("ALLOW_ANONYMOUS_API_KEYS", "false")
+    monkeypatch.setenv("APP_ENV", "local")
+    monkeypatch.setenv("DEBUG", "true")
+
+    headers = _headers_for_key(api_key)
+
+    if case.method == "GET":
+        if case.params:
+            resp = client.get(case.path, params=case.params, headers=headers)
+        else:
+            resp = client.get(case.path, headers=headers)
+    else:
+        assert case.payload is not None, f"POST case must provide payload: {case.path}"
+        resp = client.post(case.path, json=case.payload, headers=headers)
+
+    if expect_denied:
+        _assert_vip_denied(resp)
+    else:
+        # VIP should get 2xx (200/204/etc depending on endpoint)
+        assert (
+            200 <= resp.status_code < 300
+        ), f"VIP expected 2xx but got {resp.status_code} for {case.method} {case.path}: {resp.text}"

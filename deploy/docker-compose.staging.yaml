@@ -1,0 +1,237 @@
+# Optional staging runtime only. The canonical split deploy contract lives in
+# `deploy/docker-compose.production.yaml` and
+# `deploy/docker-compose.production.selfhosted.yaml`.
+# This file remains a temporary staging seam while the fallback-vhost / staging
+# deploy-enablement work tracked in
+# `docs/roadmap/BACKLOG_LEDGER.md#ledger-p1-remove-staging-tls-fallback-seam-after-full-staging-readiness`
+# is still open.
+networks:
+  web:
+    external: false
+  observability:
+    internal: true
+  alerting:
+    internal: true
+  smtp-egress:
+    driver: bridge
+  database:
+    internal: true
+
+secrets:
+  pulseplate_metrics_scrape_key:
+    file: ./secrets/pulseplate_metrics_scrape_key
+  alertmanager_smtp_key:
+    file: ./secrets/alertmanager_smtp_key
+  postgres_ca:
+    file: ./secrets/postgres_ca
+  postgres_server_crt:
+    file: ./secrets/postgres_server_crt
+  postgres_server_key:
+    file: ./secrets/postgres_server_key
+  postgres_password:
+    file: ./secrets/postgres_password
+  postgres_pgpass:
+    file: ./secrets/postgres_pgpass
+
+services:
+  postgres:
+    image: ghcr.io/katsiarynakavaleuskaya/pulseplate:postgres-15.19-pgvector0.8.6-alpine3.23@sha256:d4437ad4970b4099e4cb7d05b7fa625c7e6959949d1374f1f2d4bd4149ae5fa3
+    platform: linux/amd64
+    restart: always
+    networks: [database]
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:?POSTGRES_DB is required}
+      - POSTGRES_USER=${POSTGRES_USER:?POSTGRES_USER is required}
+      - POSTGRES_PASSWORD_FILE=/run/secrets/postgres_password
+      - PGDATA=/var/lib/postgresql/data
+    secrets:
+      - postgres_password
+      - postgres_server_crt
+      - postgres_server_key
+    command:
+      - -c
+      - ssl=on
+      - -c
+      - ssl_min_protocol_version=TLSv1.2
+      - -c
+      - ssl_cert_file=/run/secrets/postgres_server_crt
+      - -c
+      - ssl_key_file=/run/secrets/postgres_server_key
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf
+      - -c
+      - password_encryption=scram-sha-256
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres-pgvector/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  app:
+    image: ${STAGING_IMAGE_REF:?STAGING_IMAGE_REF is required}
+    env_file:
+      - ${STAGING_ENV_FILE:-/srv/pulseplate-staging/.env}   # server-local secrets
+    restart: always
+    networks: [web, observability, database]
+    secrets:
+      - pulseplate_metrics_scrape_key
+      - postgres_ca
+      - postgres_pgpass
+    expose:
+      - "8000"
+    environment:
+      - ENVIRONMENT=staging
+      - DATABASE_URL=postgresql+psycopg://${POSTGRES_USER:?POSTGRES_USER is required}@postgres:5432/${POSTGRES_DB:?POSTGRES_DB is required}?sslmode=verify-full&sslrootcert=/run/secrets/postgres_ca&passfile=/run/secrets/postgres_pgpass
+      - PGSSLMODE=verify-full
+      - PGPASSFILE=/run/secrets/postgres_pgpass
+      - FOOD_UPDATE_SCHEDULER_MODE=${FOOD_UPDATE_SCHEDULER_MODE:-external}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - food_db_cache:/app/cache/food_db
+    command: >
+      uvicorn app.main:app --host 0.0.0.0 --port 8000
+      --proxy-headers --forwarded-allow-ips="caddy"
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/ready').read()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  worker:
+    image: ${STAGING_IMAGE_REF:?STAGING_IMAGE_REF is required}
+    profiles: ["scheduler-external"]
+    restart: unless-stopped
+    networks: [web, database]
+    secrets:
+      - postgres_ca
+      - postgres_pgpass
+    environment:
+      - PRIVATE_EXPORTS_ENABLED=false
+      - ENVIRONMENT=staging
+      - DATABASE_URL=postgresql+psycopg://${POSTGRES_USER:?POSTGRES_USER is required}@postgres:5432/${POSTGRES_DB:?POSTGRES_DB is required}?sslmode=verify-full&sslrootcert=/run/secrets/postgres_ca&passfile=/run/secrets/postgres_pgpass
+      - PGSSLMODE=verify-full
+      - PGPASSFILE=/run/secrets/postgres_pgpass
+      - FOOD_UPDATE_SCHEDULER_MODE=${FOOD_UPDATE_SCHEDULER_MODE:-external}
+    command: python -m core.food_apis.scheduler --serve
+    depends_on:
+      postgres:
+        condition: service_healthy
+      app:
+        condition: service_healthy
+    volumes:
+      - food_db_cache:/app/cache/food_db
+    healthcheck:
+      disable: true
+
+  prometheus:
+    image: ${PROMETHEUS_RUNTIME_REF:?Set the canonical manifest-derived Prometheus immutable subject}
+    platform: linux/amd64
+    user: "65532:65532"
+    restart: unless-stopped
+    networks: [observability, alerting]
+    environment:
+      - PULSEPLATE_ENVIRONMENT=staging
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=45d
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alias-alerts.yml:/etc/prometheus/alias-alerts.yml:ro
+      - prometheus_data:/prometheus
+    secrets:
+      - pulseplate_metrics_scrape_key
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/bin/promtool", "check", "ready", "--url=http://localhost:9090"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  alertmanager:
+    image: ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:873bc6cfae14edcf9f2acf2d81f9863f98ee8f78623125a7e02642a66e3bbe27
+    platform: linux/amd64
+    user: "65534:65534"
+    profiles: ["alerting"]
+    restart: unless-stopped
+    read_only: true
+    networks:
+      alerting:
+        gw_priority: 1
+      smtp-egress:
+        gw_priority: 2
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+      - --cluster.listen-address=
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    secrets:
+      - alertmanager_smtp_key
+    tmpfs:
+      - /alertmanager:size=16m,mode=0700,uid=65534,gid=65534,noexec,nosuid
+    healthcheck:
+      test: ["CMD", "/bin/wget", "-q", "-T", "5", "-O", "/dev/null", "http://127.0.0.1:9093/-/ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  caddy:
+    image: ${STAGING_CADDY_IMAGE_REF:?STAGING_CADDY_IMAGE_REF is required}
+    restart: always
+    networks: [web]
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - STAGING_DOMAIN=${STAGING_DOMAIN}
+    volumes:
+      - /srv/pulseplate-staging/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      app:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+    name: pulseplate-staging_postgres_data_v5
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/pulseplate-staging-data/postgres
+  food_db_cache:
+  caddy_data:
+  caddy_config:
+  prometheus_data:
+    name: pulseplate-staging_prometheus_data_v5
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/pulseplate-staging-data/prometheus

@@ -1,0 +1,553 @@
+# -*- coding: utf-8 -*-
+"""
+RU: Тесты для повышения покрытия app/routers/foods.py
+EN: Coverage boost tests for app/routers/foods.py
+"""
+
+import importlib
+from unittest.mock import MagicMock, patch
+
+import pytest
+from fastapi.testclient import TestClient
+
+from app.routers.foods import router
+from app.services.search_meili import MeiliSearchBackend, ShadowSearchBackend
+
+app_metrics = importlib.import_module("app.metrics")
+
+
+class TestFoodsRouterCoverage:
+    """Test class for foods router coverage boost."""
+
+    client: TestClient
+
+    @pytest.fixture(autouse=True)
+    def _bind_client(self, client: TestClient) -> None:
+        """Expose the canonical function-scoped client to class methods."""
+        self.client = client
+
+    def test_router_configuration(self) -> None:
+        """Test router configuration."""
+        assert "foods" in router.tags
+
+    @patch("app.routers.foods.food_store.search_foods")
+    def test_list_foods_success(self, mock_search_foods: MagicMock) -> None:
+        """Test list_foods endpoint success."""
+        mock_search_foods.return_value = [
+            {
+                "id": "1",
+                "canonical_name": "apple",
+                "kcal": 52,
+                "protein_g": 0.3,
+                "fat_g": 0.2,
+                "carbs_g": 14.0,
+            },
+            {
+                "id": "2",
+                "canonical_name": "banana",
+                "kcal": 89,
+                "protein_g": 1.1,
+                "fat_g": 0.3,
+                "carbs_g": 23.0,
+            },
+        ]
+
+        response = self.client.get("/api/v1/foods?query=apple&limit=10&offset=0")
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("application/json")
+
+        data = response.json()
+        assert len(data) == 2
+        assert data[0]["name"] == "apple"
+        assert data[0]["kcal"] == 52
+        assert data[1]["name"] == "banana"
+        assert data[1]["kcal"] == 89
+
+    def test_list_foods_coerces_bad_nutrition_confidence_safely(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """List hits must not raise on corrupt DB cells; bool/NaN → 0, valid strings kept."""
+
+        def fake_search_foods(*_a: object, **_kw: object) -> list[dict[str, object]]:
+            return [
+                {
+                    "id": "1",
+                    "canonical_name": "apple",
+                    "kcal": 52,
+                    "protein_g": 0.3,
+                    "fat_g": 0.2,
+                    "carbs_g": 14.0,
+                    "nutrition_confidence": True,
+                },
+                {
+                    "id": "2",
+                    "canonical_name": "banana",
+                    "kcal": 89,
+                    "protein_g": 1.1,
+                    "fat_g": 0.3,
+                    "carbs_g": 23.0,
+                    "nutrition_confidence": float("nan"),
+                },
+                {
+                    "id": "3",
+                    "canonical_name": "oat",
+                    "kcal": 10,
+                    "protein_g": 0.0,
+                    "fat_g": 0.0,
+                    "carbs_g": 0.0,
+                    "nutrition_confidence": " 0.5 ",
+                },
+                {
+                    "id": "4",
+                    "canonical_name": "bad-str",
+                    "kcal": 1,
+                    "protein_g": 0.0,
+                    "fat_g": 0.0,
+                    "carbs_g": 0.0,
+                    "nutrition_confidence": "not-a-float",
+                },
+                {
+                    "id": "5",
+                    "canonical_name": "no-key",
+                    "kcal": 2,
+                    "protein_g": 0.0,
+                    "fat_g": 0.0,
+                    "carbs_g": 0.0,
+                },
+                {
+                    "id": "6",
+                    "canonical_name": "explicit-none",
+                    "kcal": 3,
+                    "protein_g": 0.0,
+                    "fat_g": 0.0,
+                    "carbs_g": 0.0,
+                    "nutrition_confidence": None,
+                },
+                {
+                    "id": "7",
+                    "canonical_name": "wrong-type",
+                    "kcal": 4,
+                    "protein_g": 0.0,
+                    "fat_g": 0.0,
+                    "carbs_g": 0.0,
+                    "nutrition_confidence": [],
+                },
+                {
+                    "id": "8",
+                    "canonical_name": "neg-num",
+                    "kcal": 5,
+                    "protein_g": 0.0,
+                    "fat_g": 0.0,
+                    "carbs_g": 0.0,
+                    "nutrition_confidence": -0.1,
+                },
+                {
+                    "id": "9",
+                    "canonical_name": "inf-num",
+                    "kcal": 6,
+                    "protein_g": 0.0,
+                    "fat_g": 0.0,
+                    "carbs_g": 0.0,
+                    "nutrition_confidence": float("inf"),
+                },
+                {
+                    "id": "10",
+                    "canonical_name": "neg-str",
+                    "kcal": 7,
+                    "protein_g": 0.0,
+                    "fat_g": 0.0,
+                    "carbs_g": 0.0,
+                    "nutrition_confidence": "-3",
+                },
+            ]
+
+        monkeypatch.setattr("app.routers.foods.food_store.search_foods", fake_search_foods)
+        response = self.client.get("/api/v1/foods?query=x&limit=10&offset=0")
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("application/json")
+        data = response.json()
+        assert data[0]["nutrition_confidence"] == 0.0
+        assert data[1]["nutrition_confidence"] == 0.0
+        assert data[2]["nutrition_confidence"] == pytest.approx(0.5)
+        assert data[3]["nutrition_confidence"] == 0.0
+        assert data[4]["nutrition_confidence"] == 0.0
+        assert data[5]["nutrition_confidence"] == 0.0
+        assert data[6]["nutrition_confidence"] == 0.0
+        assert data[7]["nutrition_confidence"] == 0.0
+        assert data[8]["nutrition_confidence"] == 0.0
+        assert data[9]["nutrition_confidence"] == 0.0
+
+    @patch("app.routers.foods.food_store.search_foods")
+    def test_list_foods_empty_query(self, mock_search_foods: MagicMock) -> None:
+        """Test list_foods with empty query."""
+        mock_search_foods.return_value = []
+
+        response = self.client.get("/api/v1/foods?query=&limit=10&offset=0")
+        assert response.status_code == 200
+
+        assert response.headers["content-type"].startswith("application/json")
+        data = response.json()
+        assert data == []
+
+    @patch("app.routers.foods.food_store.search_foods")
+    def test_list_foods_no_query(self, mock_search_foods: MagicMock) -> None:
+        """Test list_foods without query parameter."""
+        mock_search_foods.return_value = [
+            {
+                "id": "1",
+                "canonical_name": "apple",
+                "kcal": 52,
+                "protein_g": 0.3,
+                "fat_g": 0.2,
+                "carbs_g": 14.0,
+            }
+        ]
+
+        response = self.client.get("/api/v1/foods?limit=10&offset=0")
+        assert response.status_code == 200
+
+        assert response.headers["content-type"].startswith("application/json")
+        data = response.json()
+        assert len(data) == 1
+        assert data[0]["name"] == "apple"
+
+    def test_list_foods_limit_too_high(self) -> None:
+        """Test list_foods with limit too high."""
+        response = self.client.get("/api/v1/foods?limit=101")
+        assert response.status_code == 422
+        assert response.headers["content-type"].startswith("application/json")
+        assert "limit must be in [1,100]" in response.json()["detail"]
+
+    def test_list_foods_limit_too_low(self) -> None:
+        """Test list_foods with limit too low."""
+        response = self.client.get("/api/v1/foods?limit=0")
+        assert response.status_code == 422
+        assert response.headers["content-type"].startswith("application/json")
+        assert "limit must be in [1,100]" in response.json()["detail"]
+
+    def test_list_foods_limit_negative(self) -> None:
+        """Test list_foods with negative limit."""
+        response = self.client.get("/api/v1/foods?limit=-1")
+        assert response.status_code == 422
+        assert response.headers["content-type"].startswith("application/json")
+        assert "limit must be in [1,100]" in response.json()["detail"]
+
+    def test_list_foods_limit_maximum(self) -> None:
+        """Test list_foods with maximum limit."""
+        with patch("app.routers.foods.food_store.search_foods") as mock_search_foods:
+            mock_search_foods.return_value = []
+
+            response = self.client.get("/api/v1/foods?limit=100")
+            assert response.status_code == 200
+
+    def test_list_foods_limit_minimum(self) -> None:
+        """Test list_foods with minimum limit."""
+        with patch("app.routers.foods.food_store.search_foods") as mock_search_foods:
+            mock_search_foods.return_value = []
+
+            response = self.client.get("/api/v1/foods?limit=1")
+            assert response.status_code == 200
+
+    @patch("app.routers.foods.food_store.search_foods")
+    def test_list_foods_with_offset(self, mock_search_foods: MagicMock) -> None:
+        """Test list_foods with offset."""
+        mock_search_foods.return_value = [
+            {
+                "id": "2",
+                "canonical_name": "banana",
+                "kcal": 89,
+                "protein_g": 1.1,
+                "fat_g": 0.3,
+                "carbs_g": 23.0,
+            }
+        ]
+
+        response = self.client.get("/api/v1/foods?query=fruit&limit=10&offset=5")
+        assert response.status_code == 200
+
+        assert response.headers["content-type"].startswith("application/json")
+        data = response.json()
+        assert len(data) == 1
+        assert data[0]["name"] == "banana"
+
+    @patch("app.routers.foods.food_store.search_foods")
+    def test_list_foods_long_query(self, mock_search_foods: MagicMock) -> None:
+        """Test list_foods with long query."""
+        long_query = "a" * 64  # Exactly 64 characters
+        mock_search_foods.return_value = []
+
+        response = self.client.get(f"/api/v1/foods?query={long_query}")
+        assert response.status_code == 200
+
+    def test_list_foods_query_too_long(self) -> None:
+        """Test list_foods with query too long."""
+        long_query = "a" * 65  # More than 64 characters
+        response = self.client.get(f"/api/v1/foods?query={long_query}")
+        assert response.status_code == 422
+
+    @patch("app.routers.foods.food_store.get_food")
+    def test_get_food_success(self, mock_get_food: MagicMock) -> None:
+        """Test get_food endpoint success."""
+        mock_get_food.return_value = {
+            "id": "1",
+            "canonical_name": "apple",
+            "kcal": 52,
+            "protein_g": 0.3,
+            "fat_g": 0.2,
+            "carbs_g": 14.0,
+            "fiber_g": 2.4,
+            "Fe_mg": 0.1,
+            "Ca_mg": 6.0,
+            "K_mg": 107.0,
+            "Mg_mg": 5.0,
+            "VitD_IU": 0,
+            "B12_ug": 0,
+            "Folate_ug": 3.0,
+            "Iodine_ug": 0,
+            "per_g": 100.0,
+            "price_per_100g": 0.5,
+            "flags": ["organic"],
+            "version_date": "2024-01-01",
+        }
+
+        response = self.client.get("/api/v1/foods/1")
+        assert response.status_code == 200
+
+        assert response.headers["content-type"].startswith("application/json")
+        data = response.json()
+        assert data["id"] == "1"
+        assert data["canonical_name"] == "apple"
+        assert data["kcal"] == 52
+        assert data["protein_g"] == 0.3
+
+    @patch("app.routers.foods.food_store.get_food")
+    def test_get_food_not_found(self, mock_get_food: MagicMock) -> None:
+        """Test get_food endpoint when food not found."""
+        mock_get_food.return_value = None
+
+        response = self.client.get("/api/v1/foods/999")
+        assert response.status_code == 404
+        assert response.headers["content-type"].startswith("application/json")
+        assert "Food not found" in response.json()["detail"]
+
+    @patch("app.routers.foods.food_store.get_food")
+    def test_get_food_with_special_characters(self, mock_get_food: MagicMock) -> None:
+        """Test get_food with special characters in ID."""
+        mock_get_food.return_value = {
+            "id": "food-123_abc",
+            "canonical_name": "special food",
+            "kcal": 100,
+            "protein_g": 5.0,
+            "fat_g": 2.0,
+            "carbs_g": 15.0,
+            "fiber_g": 3.0,
+            "Fe_mg": 1.0,
+            "Ca_mg": 50.0,
+            "K_mg": 200.0,
+            "Mg_mg": 20.0,
+            "VitD_IU": 10.0,
+            "B12_ug": 1.0,
+            "Folate_ug": 25.0,
+            "Iodine_ug": 5.0,
+            "per_g": 100.0,
+            "price_per_100g": 1.0,
+            "flags": [],
+            "version_date": "2024-01-01",
+        }
+
+        response = self.client.get("/api/v1/foods/food-123_abc")
+        assert response.status_code == 200
+
+        assert response.headers["content-type"].startswith("application/json")
+        data = response.json()
+        assert data["id"] == "food-123_abc"
+        assert data["canonical_name"] == "special food"
+
+    @patch("app.routers.foods.food_store.get_food")
+    def test_get_food_with_numeric_id(self, mock_get_food: MagicMock) -> None:
+        """Test get_food with numeric ID."""
+        mock_get_food.return_value = {
+            "id": "123",
+            "canonical_name": "numeric food",
+            "kcal": 75,
+            "protein_g": 3.0,
+            "fat_g": 1.5,
+            "carbs_g": 12.0,
+            "fiber_g": 2.0,
+            "Fe_mg": 0.5,
+            "Ca_mg": 30.0,
+            "K_mg": 150.0,
+            "Mg_mg": 15.0,
+            "VitD_IU": 5.0,
+            "B12_ug": 0.5,
+            "Folate_ug": 15.0,
+            "Iodine_ug": 3.0,
+            "per_g": 100.0,
+            "price_per_100g": 0.8,
+            "flags": ["local"],
+            "version_date": "2024-01-01",
+        }
+
+        response = self.client.get("/api/v1/foods/123")
+        assert response.status_code == 200
+
+        assert response.headers["content-type"].startswith("application/json")
+        data = response.json()
+        assert data["id"] == "123"
+        assert data["canonical_name"] == "numeric food"
+
+
+def test_foods_route_contract_remains_stable_with_meili_backend(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = MeiliSearchBackend(
+        base_url="https://meili.example",
+        index_name="foods",
+        show_performance_details=True,
+        transport=lambda *_args: {
+            "hits": [
+                {
+                    "id": "m-1",
+                    "name": "Apple",
+                    "kcal": 52,
+                    "protein_g": 0.3,
+                    "fat_g": 0.2,
+                    "carbs_g": 14.0,
+                }
+            ],
+            "processingTimeMs": 21,
+        },
+    )
+
+    monkeypatch.setattr("app.routers.foods.food_store.get_search_backend", lambda: backend)
+
+    response = client.get("/api/v1/foods?query=apple&limit=10&offset=0")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json() == [
+        {
+            "id": "m-1",
+            "name": "Apple",
+            "kcal": 52.0,
+            "protein_g": 0.3,
+            "fat_g": 0.2,
+            "carbs_g": 14.0,
+            "nutrition_confidence": 0.0,
+        }
+    ]
+
+
+def test_foods_route_contract_remains_stable_with_shadow_backend(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _BaselineBackend:
+        def search_foods(
+            self, query: str, limit: int = 20, offset: int = 0
+        ) -> list[dict[str, object]]:
+            return [
+                {
+                    "id": "b-1",
+                    "canonical_name": "Baseline Apple",
+                    "kcal": 51,
+                    "protein_g": 0.2,
+                    "fat_g": 0.1,
+                    "carbs_g": 13.0,
+                }
+            ]
+
+    shadow_backend = MeiliSearchBackend(
+        base_url="https://meili.example",
+        index_name="foods",
+        show_performance_details=True,
+        search_strategy_label="hybrid_shadow",
+        transport=lambda *_args: {
+            "hits": [
+                {
+                    "id": "shadow-1",
+                    "name": "Shadow Apple",
+                    "kcal": 55,
+                    "protein_g": 0.4,
+                    "fat_g": 0.3,
+                    "carbs_g": 15.0,
+                }
+            ],
+            "processingTimeMs": 19,
+            "performanceDetails": {"tokenization": {"durationMs": 2}},
+        },
+    )
+    backend = ShadowSearchBackend(
+        baseline_backend=_BaselineBackend(),
+        shadow_backend=shadow_backend,
+        shadow_runner=lambda task: task(),
+    )
+
+    monkeypatch.setattr("app.routers.foods.food_store.get_search_backend", lambda: backend)
+
+    response = client.get("/api/v1/foods/search?query=apple&limit=10&offset=0")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json() == [
+        {
+            "id": "b-1",
+            "name": "Baseline Apple",
+            "kcal": 51.0,
+            "protein_g": 0.2,
+            "fat_g": 0.1,
+            "carbs_g": 13.0,
+            "nutrition_confidence": 0.0,
+        }
+    ]
+
+
+def test_metrics_scrape_includes_meili_observability_series(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert app_metrics.FOOD_SEARCH_MEILI_PERF_EVENTS_TOTAL is not None
+
+    backend = MeiliSearchBackend(
+        base_url="https://meili.example",
+        index_name="foods",
+        show_performance_details=True,
+        transport=lambda *_args: {
+            "hits": [
+                {
+                    "id": "m-2",
+                    "name": "Apple",
+                    "kcal": 52,
+                    "protein_g": 0.3,
+                    "fat_g": 0.2,
+                    "carbs_g": 14.0,
+                }
+            ],
+            "processingTimeMs": 25,
+            "performanceDetails": {
+                "wait for permit": "295.29µs",
+                "search > tokenize": "436.67µs",
+                "search > format": "288.54µs",
+                "degraded": False,
+            },
+        },
+    )
+
+    monkeypatch.setattr("app.routers.foods.food_store.get_search_backend", lambda: backend)
+
+    search_response = client.get("/api/v1/foods?query=apple&limit=10&offset=0")
+    assert search_response.status_code == 200
+
+    metrics_response = client.get("/metrics")
+    assert metrics_response.status_code == 200
+    assert metrics_response.headers["content-type"].startswith("text/plain")
+    metrics_body = metrics_response.text
+    assert "food_search_meili_perf_events_total" in metrics_body
+    assert "food_search_meili_processing_time_ms_bucket" in metrics_body
+    assert "food_search_meili_stage_processing_time_ms_bucket" in metrics_body
+    assert 'strategy="meili"' in metrics_body
+    assert 'perf_state="captured"' in metrics_body
+    assert 'stage="authorization"' in metrics_body
+    assert 'stage="tokenization"' in metrics_body
+    assert "query=apple" not in metrics_body

@@ -1,0 +1,85 @@
+import type { ButtonHTMLAttributes, PropsWithChildren } from 'react';
+
+export type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'destructive' | 'success' | 'warning';
+type ButtonSize = 'sm' | 'md' | 'lg';
+
+interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
+  variant?: ButtonVariant;
+  size?: ButtonSize;
+  fullWidth?: boolean;
+  loading?: boolean;
+  loadingLabel?: string;
+}
+
+const variantClasses: Record<ButtonVariant, string> = {
+  primary:
+    'bg-[var(--color-primary)] text-[var(--color-primary-foreground)] hover:opacity-95 hover:shadow-md',
+  secondary:
+    'border border-[var(--color-border)] bg-[var(--color-bg)] text-[var(--color-text)] hover:bg-[var(--color-surface)] hover:shadow-sm',
+  ghost: 'bg-transparent text-[var(--color-text)] hover:bg-[var(--color-surface-muted)]',
+  destructive:
+    'border border-[var(--color-destructive-border)] bg-[var(--color-destructive-bg)] text-[var(--color-destructive-foreground)] hover:bg-[var(--color-destructive-bg-hover)] hover:shadow-[var(--shadow-destructive)]',
+  success:
+    'bg-[var(--color-success)] text-[var(--color-primary-foreground)] hover:opacity-95 hover:shadow-md',
+  warning:
+    'bg-[var(--color-warning)] text-[var(--color-text)] hover:opacity-95 hover:shadow-md',
+};
+
+const sizeClasses: Record<ButtonSize, string> = {
+  sm: 'min-h-[44px] px-4 py-2 text-sm',
+  md: 'min-h-[44px] px-6 py-3 text-sm',
+  lg: 'min-h-[48px] px-6 py-4 text-base',
+};
+
+export function buttonClasses({
+  variant = 'primary',
+  size = 'md',
+  fullWidth = false,
+  className = '',
+}: {
+  variant?: ButtonVariant;
+  size?: ButtonSize;
+  fullWidth?: boolean;
+  className?: string;
+}) {
+  return [
+    'rounded-xl font-semibold transition-all active:scale-95 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--color-primary)] motion-reduce:transition-none motion-reduce:active:scale-100 disabled:cursor-not-allowed disabled:opacity-60',
+    variantClasses[variant],
+    sizeClasses[size],
+    fullWidth ? 'w-full' : '',
+    className,
+  ]
+    .join(' ')
+    .trim();
+}
+
+const DEFAULT_LOADING_LABEL = 'Loading…';
+
+export function Button({
+  children,
+  className = '',
+  variant = 'primary',
+  size = 'md',
+  fullWidth = false,
+  type = 'button',
+  loading = false,
+  loadingLabel = DEFAULT_LOADING_LABEL,
+  disabled,
+  ...props
+}: PropsWithChildren<ButtonProps>) {
+  const isDisabled = Boolean(disabled) || loading;
+  return (
+    <button
+      {...props}
+      className={buttonClasses({ variant, size, fullWidth, className })}
+      type={type}
+      aria-busy={loading ? true : undefined}
+      aria-live={loading ? 'polite' : undefined}
+      disabled={isDisabled}
+    >
+      {loading ? loadingLabel : children}
+    </button>
+  );
+}
+
+export default Button;

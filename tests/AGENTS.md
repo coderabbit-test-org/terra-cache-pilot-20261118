@@ -1,0 +1,836 @@
+# Agent instructions (scope: tests/ and subdirectories)
+
+## Scope and layout
+
+- This AGENTS.md applies to: `tests/` and below.
+- Key directories: `tests/` (pytest suite), `conftest.py` (shared fixtures).
+
+## Commands (run from repo root)
+
+- Local validation: root `AGENTS.md` → Hard Gates and
+  `RUNBOOK_AGENT.md` → Quality Gates own the narrow bundle and machine budget.
+- Targeted: run `pytest tests/<path> -q` through repo-approved Python/activation.
+- Heavy test and coverage evidence comes from canonical current-head CI under
+  the root contract; this section does not authorize a full local suite.
+
+## Conventions
+
+- Give distinct test scenarios unique function names within each module or class namespace; a later definition with the same name silently replaces the earlier test. Use parametrization with distinct case IDs when scenarios share one test body. After adding or changing regression scenarios, confirm that pytest collects each intended case ID.
+- Use pytest fixtures from `conftest.py`; keep tests isolated.
+- For a negative test targeting a specific guard, start from a valid complete
+  baseline, change the intended input, and assert the guard's stable diagnostic
+  or an equivalent branch-specific observable; an arbitrary exception or failure
+  at an earlier prerequisite is insufficient. When a prerequisite or admission
+  boundary changes, recheck every case whose intended branch evidence was
+  previously masked.
+  A non-autouse fixture with module scope, defined in the owning test module,
+  may share a real complete baseline through explicit dependencies before
+  mutation only within an unchanged input/rule lifetime. Baseline errors must
+  fail setup; every mutant still runs the real complete guard and proves its
+  independent cause. Changed inputs or rules require a fresh baseline, never
+  a cached validator verdict.
+- Temporary Git repositories must use `git_env_without_parent_state()` and
+  `safe_git_config_args()` from `scripts/orchestration/creative_code_patch_workspace.py`
+  for Git subprocesses. Pass the sanitized environment to tools such as
+  `diff-cover` that invoke Git internally. A temporary `cwd` alone does not
+  isolate inherited commit-hook Git state. Regressions must point inherited
+  Git variables at a separate synthetic parent and preserve its config, HEAD
+  and existing index bytes; never use the real checkout as the negative fixture.
+- Before copying an isolated fixture's `.git` directory, disable automatic
+  housekeeping locally with `maintenance.auto=false` and `gc.auto=0` before
+  its first object-writing Git command. Preserve the existing sanitized
+  environment, config clamps and complete copy/admission assertions; do not
+  repair copy races by ignoring disappearing Git lock files.
+- The [docs path-leakage guard](guards/test_security_devtooling_regression_guards.py)
+  checks the proposed Git index only for local `PRE_COMMIT=1` with empty
+  `CI` and `GITHUB_ACTIONS`; it requires a real `origin/main` merge-base and
+  rejects unreadable or conflicting index state. Ordinary and CI runs retain
+  committed-HEAD checks; unstaged content cannot repair a staged leak.
+- Maintain >=97% total coverage; add tests for new branches.
+- Never mock `builtins.__import__` or `builtins.float`.
+- Preserve xdist DB isolation: each worker gets its own SQLite path.
+- Prefer `monkeypatch` over global mutations; avoid real sleeps.
+- Retry/cleanup unit tests must supply deterministic oracle results while
+  asserting real owned-resource cleanup and attempt counts. Keep actual process
+  execution and timeout enforcement in their owning sandbox/integration tests;
+  do not make cleanup correctness depend on host process-start latency.
+  For positive real-process exit fixtures, coordinate release after a stable owned
+  identity witness; require a fresh genuine inactive census within the original cap.
+  Keep unknown/exec identity negatives independent and retain private state when
+  ownership or cleanup absence is uncertain.
+- Main-test shard processes share one checkout and Git common directory. A
+  helper that needs PR ancestry must use the already available full local graph
+  before any depth-limited fetch; canonical full-history CI must never add a
+  shallow boundary while another shard evaluates Git evidence. If a future
+  shallow fallback must run in parallel, isolate it in a temporary repository
+  or assign it to a serialized owner instead of mutating shared refs,
+  replacement objects, grafts, or `.git/shallow`.
+- Workflow tests for pinned external verifier output must exercise the successful
+  consumer path using an observed native output shape, as well as rejection
+  paths. Keep statement-schema and predicate-schema versions independent;
+  command-token assertions or a stubbed verifier do not prove native format
+  compatibility or cryptographic verification.
+- **Prefer `monkeypatch.setattr()` over `@patch` decorator** — `@patch` on `@contextmanager` targets
+  fails silently under Python 3.12 + xdist (see `docs/ENGINEERING_LESSONS.md` lesson 11).
+  Use autouse `monkeypatch.setenv()` fixtures instead of `os.environ` mutation in `setup_method()`.
+- **Do not add async pytest markers to tests selected by the pre-commit backend-tests hook.**
+  CI lint may run `scripts/run-backend-tests-pre-commit.sh` without
+  `pytest-asyncio` loaded even when the local venv has it. For diff-coverage or
+  changed-file tests selected by that hook, prefer sync tests that call simple
+  coroutines with `asyncio.run(...)` or exercise routes through `TestClient`.
+  After editing selected tests, scan the whole selected bundle for
+  `pytest.mark.asyncio` and `async def`, then run the backend-tests hook command
+  and `pre-commit run --all-files`. See `docs/ENGINEERING_LESSONS.md` lesson 25.
+- Canonical lifespan tests must use `TestClient` as a context manager or call
+  `_application_lifespan_with_hooks(...)` through synchronous `asyncio.run(...)`
+  tests. Inject `LifespanHooks`; do not patch `lifespan.__wrapped__.__globals__`
+  or fan one scheduler mock across package or legacy facades.
+- Shared client fixtures (`client`, `test_client`, `app_client`,
+  `isolated_test_client`, and `client_with_vip_access`) live only in
+  `tests/conftest.py` and must enter `tests._client.open_test_client(...)`.
+  The managed wrapper owns one lifespan, exact `dependency_overrides`
+  restoration, and temporary finite SlowAPI limiter isolation.
+- Singleton-reset discovery reads only concrete `app` / `main_app` bindings
+  observed during the finite loaded-module traversal; do not invoke arbitrary
+  lazy module exports. Later client lifecycle and limiter ownership remain with
+  `tests._client.open_test_client(...)`, respecting explicit rate-limit opt-in.
+- The root `MetricsAwareTestClient` assignment is a temporary PR-TC2
+  compatibility bridge. Do not add another patch owner or new callers of raw
+  `make_test_client()`, `get_client()`, or `TestClient(...)` in shared provider
+  modules.
+- Legacy synchronous scheduler wrappers, their helper module, and the
+  `app_module` module-table alias are retired. Scheduler lifecycle tests inject
+  canonical `LifespanHooks`; they must not recreate the removed compatibility
+  rail through facade patching or module-table mutation.
+- Admin scheduler tests must patch only the consumer binding
+  `app.services.admin_operations.get_update_scheduler`. Do not patch scheduler
+  access through `app`, `legacy_app`, core singleton state, private override
+  names, or `sys.modules`.
+- Scheduler-access ownership tests must assert lazy core delegation, exact
+  package/service callable identity, retired legacy alias absence, import-order
+  safety, and fail-closed calls when the optional core module is unavailable.
+  Use sync tests with `asyncio.run(...)` for directly exercised coroutines.
+  The admin import probe passes only its six declared operational environment
+  keys plus explicit synthetic settings, installs its three named Python
+  connection controls before product imports, and preserves socket construction,
+  local socketpair and asyncio. Nonzero/timeout diagnostics stay fixed and must
+  not render captured streams. These bounded test controls do not establish
+  OS isolation or universal credential/network exclusion. New retirement
+  import-order controls reuse the protected fresh-process retirement harness;
+  preserve exact lifespan wiring before main and after canonical main bootstrap
+  plus actual managed lifecycle/cleanup evidence.
+- Admin route tests must assert deterministic success, exact sanitized failure
+  details, and exact missing/invalid API-key `403` responses. Broad multi-status
+  assertions are not evidence for this route family.
+- Legacy weekly-plan route tests patch only the consumer binding
+  `app.routers.legacy_premium_weekly_plan.get_weekly_menu_builder`. Do not patch
+  `app.make_weekly_menu`, `legacy_app.make_weekly_menu`, package dictionaries,
+  `sys.modules`, or deleted resolver helpers to control that route.
+- Weekly-menu access tests must distinguish exact canonical-module absence from
+  transitive module, symbol, plain import, and non-callable-export failures.
+  Route tests assert exact `403`/`400`/`422`/`500`/`503` contracts and prove
+  builder/executor non-calls on short-circuit paths; broad allowed-status
+  assertions are not evidence.
+- Premium BMR service tests inject an immutable `BMRDependencies` value directly
+  into `app.services.pro_nutrition_bmr.calculate_bmr_response`. Do not restore
+  patches against `legacy_app`, the `app` facade, module tables, or deleted
+  nutrition-wrapper symbols. Assert exact feature/auth ordering, finite input
+  and dependency-output boundaries, sanitized errors/logs, and response parity
+  for both retained routes.
+- For extracted legacy AI routes (e.g. `/insight`, `/api/v1/insight`), prefer
+  client/route behavior tests against `app.main` or the canonical router.
+  The focused ownership oracle must prove exact absence of the retired Insight
+  facade bindings and canonical-owner presence. Only that bounded adversarial
+  oracle may temporarily inject an absent `legacy_app` attribute with
+  `monkeypatch.setattr(..., raising=False)` to prove the canonical router ignores
+  facade state; monkeypatch cleanup must restore absence. Patch transparency,
+  quota, provider, and execution dependencies on
+  their request-time consumer, `app.services.insight_compat`, and patch the
+  route input guard on `app.security.agent_input_guard`; do not patch facade
+  bindings, package dictionaries, `sys.modules`, or private per-carrier
+  resolvers outside that exact independence oracle. Keep the ownership oracle
+  finite over canonical modules, the exact retired-name set, the two route
+  models, and the sibling runtime-test family; do not grow a partial Python
+  interpreter to chase assignment or spelling variants.
+- BMI retirement tests reuse `_run_legacy_retirement_probe` with its finite
+  environment, network denial and genuinely different import sequences.
+  Only `test_bmi_route_uses_service_visualization_bindings_not_facades` may
+  temporarily inject the absent `legacy_app.MATPLOTLIB_AVAILABLE` and
+  `legacy_app.generate_bmi_visualization` attributes with `raising=False`.
+  Use one child `monkeypatch.context()`; assert both absent before and after,
+  controlled identities inside, exact JSON service result and zero facade calls.
+  Patch existing package attributes with ordinary raising behavior and assert
+  restored identity/value after the context. Patch the canonical service at its
+  actual consumer; do not restore model/tuple bindings, mutate dictionaries or
+  `sys.modules`, or extend this exception to ordinary consumers/fixtures.
+- **When fixing `@patch` tests, scan ALL sibling files** for the same pattern
+  (e.g., `_boost.py`, `_v2.py` variants). Fixing one file and missing its twin is a recurring incident.
+- Repo policy guards must not reference temporary/untracked files; AST scan path lists must filter by `.exists()`.
+- Npm dependency guards that claim safety for every tracked lock occurrence must
+  inspect opaque inner-graph metadata on **every** lock package record before
+  checking target versions. Reuse the existing shared lock-v3 admission for
+  `hasShrinkwrap`, both bundled-dependency fields, and `inBundle`; test a
+  non-target carrier, malformed values, and valid empty controls. A safe
+  target pin or outer `packages` map alone does not prove the installed graph.
+- `ui_labels` is a required part of `WHOTargetsResponse` contract (SoT: `app/schemas/premium_contracts.py`); assert ES anchor string (`"Calorías diarias"`) in snapshot tests and do not feature-gate this contract after implementation.
+- Any new authenticated, paid-tier, hidden mutating, or object-identifier API route must be registered in `tests/security/_api_authz_contracts.py` with method, path, authentication class, minimum tier, principal source, ownership policy, OpenAPI exposure, and a cross-principal negative test where applicable.
+
+### WebSocket/realtime test invariants
+
+- See canonical WebSocket/realtime invariants in root `AGENTS.md`.
+
+### CI external network guard (`httpx` / `requests`)
+
+When `CI=true` or `BLOCK_TEST_NETWORK` is set (unless `ALLOW_TEST_NETWORK=true`), autouse fixture
+`tests/conftest.py::_block_external_network_in_ci` patches `httpx.Client.request`,
+`httpx.AsyncClient.request`, and `requests.Session.request` so URLs must use an **allowlisted host**
+before any transport (including `httpx.MockTransport`) runs.
+
+**Allowlisted hostnames:** `127.0.0.1`, `localhost`, `::1`, `testserver`, plus any comma-separated
+entries in `TEST_NETWORK_ALLOWED_HOSTS`.
+
+**Implication for tests:** Fake Meili or other httpx clients must use e.g. `http://127.0.0.1` or
+`http://localhost:7700` as `base_url`, not arbitrary hostnames like `meili.test`, or CI raises
+`AssertionError: External HTTP blocked in tests`.
+
+### Module purge / reload invariant (xdist stability)
+
+Some tests intentionally purge/reload modules (e.g., via `module_purge.purge_modules(...)` or
+`importlib.reload(...)`) to validate import-time wiring. Under xdist, this can create **stale**
+module references and CI-only flakes if a test patches a module object captured before the purge.
+
+**Hard rules:**
+
+- If a test (directly or indirectly) purges/reloads modules (including `module_purge.purge_modules(...)`
+  or `importlib.reload(...)`), it **MUST** resolve modules at runtime before patching/using them
+  (preferred: `importlib.import_module("legacy_app")`).
+- Avoid `from pkg.mod import name` in purge/reload-sensitive code paths: imported symbols can become
+  stale after module re-import, breaking `monkeypatch.setattr()` and causing order-dependent flakes.
+  This usually manifests as “patch applied but request path still uses real code”.
+
+### SQLite test bootstrap rule (xdist / nightly)
+
+Schema-creating test consumers must call `core.db.load_canonical_orm_metadata()`
+before `Base.metadata.create_all`, using the existing shared fixtures where
+applicable. Root `AGENTS.md` → Mapped schema-creation registration owns the
+exact mapped set and fail-closed registration/configuration contract. Do not
+replace the loader with ad-hoc model imports or copy its table inventory here.
+Teardown must be idempotent and preserve the original failure; cleanup must not
+turn missing required schema into a passing test.
+
+- Schema-missing failures must use `pytest.fail()` (not `RuntimeError`).
+- Expected schema must be derived from SoT (`Base.metadata` or shared constant), never hardcoded in fixtures.
+- Use the canonical loader before mapped schema creation; do not infer complete
+  registration from whichever model modules a previous test happened to import.
+
+### SQLite threading and engine SoT (xdist)
+
+**Hard rules for SQLite in tests:**
+
+1. **File-based SQLite only** under xdist (no `:memory:` — each worker needs isolated DB file).
+2. **Per-worker DB path** must include `PYTEST_XDIST_WORKER` env var (e.g., `test_db_gw0.sqlite3`).
+3. **NullPool required** for file-based SQLite to prevent connection reuse across threads.
+4. **`check_same_thread=False`** must be set in `connect_args` (TestClient + anyio may use threads).
+5. **Single-engine SoT**: app code must use the same engine/URL as test fixture (no dual-engine topology).
+
+**Troubleshooting:**
+
+- `sqlite3.ProgrammingError: SQLite objects created in a thread...` → verify `NullPool` + `check_same_thread=False`.
+- `no such table: <table>` → check engine URL consistency (fixture vs app) via `test_sqlite_engine_sot.py` guard.
+- `Database locked` errors → verify per-worker isolation (each worker has unique DB file path).
+
+**Guard test:** `tests/test_sqlite_engine_sot.py` enforces engine/URL consistency and per-worker isolation.
+
+- **RU:** Любой тест, меняющий `DATABASE_URL`, обязан вызывать reset `_RAW_ENGINE` до и после (и возвращать env).
+- **EN:** Any test mutating `DATABASE_URL` must reset `_RAW_ENGINE` before and after (and restore env).
+- **RU:** Fixture `configure_sqlite_database` — source of truth и всегда делает hard-reset `_RAW_ENGINE`.
+- **EN:** `configure_sqlite_database` fixture is SoT and always hard-resets `_RAW_ENGINE`.
+
+## Coverage / diff-cover (process invariant)
+
+- CI coverage thresholds are owned by root `AGENTS.md`: diff coverage must be
+  at least 97%. Prefer focused behavioral tests; no competing 100% threshold.
+- If CI reports diff-cover gaps, add focused `*_diff_coverage.py` tests rather than weakening production checks.
+  Preferred placement: `tests/vip/test_<feature>_diff_coverage.py` for VIP features, or `tests/test_<feature>_diff_coverage.py` alongside the related unit tests.
+  Example: `tests/vip/test_pdf_export_diff_coverage.py`.
+
+### ❌ Anti-pattern: testing dead code for coverage
+
+**Rule**: If diff-cover shows uncovered code that has **zero call sites** → **delete it**, don't write tests.
+
+Tests must protect **behavior**, not "lines that exist". Writing tests for unused helpers:
+
+- Legitimizes dead code
+- Creates maintenance debt
+- Masks architectural drift
+
+**Before adding a test**, verify the code is actually used:
+
+```bash
+git grep -n "function_name" -- app core
+```
+
+If no call sites → delete the code, not cover it.
+
+### Diff-cover file visibility rule
+
+**Problem**: CI runs all tests, but `diff-cover` attributes coverage only to **changed files** in the PR diff.
+A standalone new test file may not be included in diff-cover's comparison, causing "missing coverage" even when tests pass.
+
+**Rule**: When adding tests to cover lines in a **modified source file**, prefer adding them to an **already-modified test file** in the PR (or ensure the new test file is explicitly included in the diff).
+
+- ✅ **Preferred**: Add coverage-tail tests to `tests/test_<feature>.py` if that file is already modified in the PR.
+- ⚠️ **Alternative**: If creating a new test file, verify it appears in `git diff --name-only origin/main...HEAD` and that diff-cover includes it in the comparison.
+
+**Example (PR-490B)**: Coverage-tail tests for `core/bmi/engine.py` were moved from a standalone file into `tests/test_bmi_visualization_spec.py` (already modified in the PR) to ensure diff-cover correctly detects coverage.
+
+**OPS context tooling coverage:** the canonical `test-pr` job measures
+`scripts/ops/ops_context_report.py` with its focused tests in a separate coverage
+data file/XML, outside the application runtime omission list. The producer must
+prove that the XML contains the intended source with a nonempty executable-line
+inventory. `diff-coverage` consumes both XML reports under the existing 97%
+changed-line threshold; missing tooling evidence fails. Application coverage
+configuration and Codecov's application report remain separate. The owning
+workflow contract tests live in `test_ci_workflow_pr_size_governance_contract.py`.
+This measurement is neither a per-file readiness threshold nor proof of overall
+application total coverage.
+The selector regressions in `test_ci_risk_profile.py` must exercise each authoritative
+OPS input as an isolated change, so companion changes cannot mask a missing route
+to the required coverage jobs.
+
+**Tier 1 `test-pr` routing** (`.github/workflows/ci.yml`): PRs that select route or LLM contract groups must include the relevant route, OpenAPI, helper, and contract tests so `coverage.xml` used by the `diff-coverage` job covers touched backend surfaces. The canonical group membership lives in `.github/workflows/ci.yml`; keep this file focused on the invariant instead of duplicating workflow test lists.
+
+### Reliable local diff-cover check (prevents phantom gaps)
+
+**Problem**: diff-cover may show "missing lines" if coverage.xml is stale or from wrong test session.
+
+**Evidence procedure:** use the canonical current-head CI coverage artifact and
+verify its head/base and selected test scope. For local diagnosis, generate only
+the admitted focused coverage evidence with repo-approved Python and retain the
+command and output. Do not delete or overwrite another run's artifacts or start
+full local coverage because a report is stale. Thresholds, readiness meaning and
+the local budget remain in root `AGENTS.md` and `RUNBOOK_AGENT.md`.
+
+**Why this works**:
+
+- Fresh coverage.xml ensures no stale data
+- `origin/main` comparison ensures correct baseline
+- Clean working tree prevents diff-cover from seeing uncommitted changes
+
+## PDF export tests (PR-8b)
+
+### Test structure
+
+- Unit tests for data preparation: test `build_pdf_lines()` without PDF rendering (no reportlab dependency).
+- API tests for PDF bytes: verify `%PDF` header and non-empty content (no snapshot comparisons).
+- ImportError → 501 tests: verify that missing reportlab raises 501 with frozen error contract.
+
+### Key test files
+
+- `tests/vip/test_pdf_export_pr8b.py`: PR-8b specific tests (deterministic ordering, grouping, totals).
+- `tests/vip/test_pdf_export_diff_coverage.py`: diff-cover targeted tests.
+
+### Test invariants
+
+- Do NOT compare PDF bytes directly (non-deterministic due to timestamps/metadata).
+- Test data preparation (`PdfLine` objects) for determinism and correctness.
+- Test PDF generation only for basic validity (header + length).
+- Use `monkeypatch` to simulate `ImportError` for 501 tests (target `_lazy_reportlab`).
+
+## Optional dependencies testing rule (hard)
+
+CI may have optional deps installed (e.g. prometheus_client, reportlab).
+Therefore tests MUST NOT assume optional deps are missing.
+
+### Required pattern
+
+To test fallback paths for optional deps:
+
+- Use `monkeypatch` to force failure (preferred):
+  - patch `prometheus_client.generate_latest` to raise
+  - patch lazy import helper to raise ImportError
+- Do NOT rely on `response.json()` unless you have asserted JSON Content-Type.
+
+### Forbidden
+
+- Relying on ImportError in CI without monkeypatch
+- Using sys.modules purge / import hacks unless explicitly allowed by contract
+
+## Patchability rule for optional deps (enforced)
+
+When production code uses optional dependencies (e.g. prometheus_client, reportlab),
+imports MUST remain patchable for tests.
+
+### Required pattern (patchable)
+
+- `import prometheus_client`
+- use `prometheus_client.generate_latest()` and `prometheus_client.CONTENT_TYPE_LATEST`
+
+### Forbidden pattern (breaks monkeypatch)
+
+- `from prometheus_client import generate_latest, CONTENT_TYPE_LATEST`
+
+**Why:** Direct imports break `monkeypatch.setattr()` because the symbol is already bound at module import time.
+
+**Monkeypatch target rule:**
+- Monkeypatch target must match the symbol used by production code.
+- If production uses `import prometheus_client` → patch `prometheus_client.generate_latest`.
+- If production uses `from X import Y` → patch at use-site: `app.middleware.metrics.Y` (if needed).
+- Always verify patch target matches production call site.
+
+**Prefer conftest fixtures:**
+- Don't define local `TestClient` fixture if repo already has canonical `app`/`client` fixture in `conftest.py`.
+- Local fixtures may bypass important test setup (environment variables, middleware, etc.).
+
+**Avoid flaky parsing:**
+- When asserting a metric series exists, prefer `_metric_value()` with exact labels over regex that matches "first POST/200".
+- Regex-based parsing can be fragile if metrics order changes or multiple series exist.
+
+## Metrics endpoint testing contract (hard)
+
+### `/metrics` has two valid response modes
+
+1) **Happy path**: Prometheus exposition format
+   - `Content-Type` starts with `text/plain`
+   - Response body is bytes/text (NOT JSON)
+
+2) **Fallback**: JSON error envelope (when exporter fails at runtime)
+   - `Content-Type` starts with `application/json`
+   - Response body is JSON with `"error"` key (and optional `"detail"`)
+
+### Hard test rule
+
+Tests MUST NOT assume that `/metrics` returns JSON by default.
+
+If a test expects JSON from `/metrics`, it MUST force exporter failure explicitly via `monkeypatch`,
+e.g. patch `prometheus_client.generate_latest` to raise.
+
+### Required snippet (copy/paste)
+
+```python
+import prometheus_client
+
+def _boom() -> bytes:
+    raise RuntimeError("boom")
+
+monkeypatch.setattr(prometheus_client, "generate_latest", _boom)
+
+resp = client.get("/metrics")
+assert resp.status_code == 200
+assert resp.headers["content-type"].startswith("application/json")
+data = resp.json()
+assert "error" in data
+```
+
+### Forbidden
+
+- Calling `response.json()` on `/metrics` without asserting JSON `Content-Type` first
+- "Fixing" a red CI by changing `/metrics` to always return JSON
+
+## Metrics fallback tests (must be deterministic)
+
+If a test expects JSON from `/metrics`, it MUST follow this exact order:
+
+1. **Force exporter failure via monkeypatch** (before making request)
+2. **Make request** to `/metrics`
+3. **Assert status_code == 200**
+4. **Assert Content-Type starts with `application/json`** (prevents JSONDecodeError)
+5. **Call `response.json()`** and assert error keys
+
+**Required pattern:**
+```python
+import prometheus_client
+
+def _boom() -> bytes:
+    raise RuntimeError("Prometheus exporter unavailable")
+
+monkeypatch.setattr(prometheus_client, "generate_latest", _boom)
+
+response = client.get("/metrics")
+assert response.status_code == 200
+assert response.headers["content-type"].startswith("application/json")
+data = response.json()
+assert "error" in data
+```
+
+**Why this order matters:**
+- Monkeypatch must happen before request (otherwise exporter succeeds)
+- Content-Type check prevents JSONDecodeError if fallback didn't trigger
+- Never assume optional deps are missing in CI
+
+## Route template tests (breaking change policy)
+
+Tests that assert exact route template paths (e.g., `/api/v1/bmi/calculate`) are **intentional contract tests**.
+
+**Changing a route template is a breaking change for metrics label contract.**
+
+If you change a route template:
+- Update the test assertion in the same PR
+- Update `app/AGENTS.md` if the route label policy changes
+- Document the breaking change in PR description
+
+**Example:** If `/api/v1/bmi/calculate` becomes `/api/v2/bmi/calculate`, update:
+- `tests/test_metrics.py::test_metrics_includes_route_template` (assertion)
+- Any other tests that hardcode the route path
+- `app/AGENTS.md` if metrics contract changes
+
+## Content-Type assertions
+
+- For Prometheus responses: assert `Content-Type` starts with `text/plain`
+  (do not assert exact version/charset).
+- For JSON error envelopes: assert `Content-Type` starts with `application/json`
+  before calling `response.json()`.
+- Never call `response.json()` unless `Content-Type` starts with `application/json`
+  (prevents JSONDecodeError on text/plain endpoints like `/metrics`).
+
+**Forbidden:**
+- ❌ `assert response.headers["content-type"] == CONTENT_TYPE_LATEST` (exact equality)
+- ❌ `assert response.headers["content-type"] == "text/plain; version=0.0.4"` (version pinning)
+
+**Allowed:**
+- ✅ `assert response.headers["content-type"].startswith("text/plain")`
+- ✅ `assert response.headers["content-type"].startswith("application/json")`
+
+## Forbidden in tests
+
+- Do not mutate `sys.modules` (no `del sys.modules[...]`, no `sys.modules[...] = ...`).
+  Use `patch()` / `monkeypatch.setattr()` instead.
+  For FastAPI endpoints, prefer `tests/_route_patch.patch_route_dependency()`.
+
+To verify:
+
+- `pytest -q tests/test_repo_policy_sys_modules.py`
+
+## CI red rule (enforced)
+
+For failed required CI on the current PR (see root `AGENTS.md` → Command results
+and failure scope for pending, diagnostic no-match and other-owned lanes):
+
+- ❌ Do NOT push additional unrelated refactors.
+- ❌ Do NOT claim "tests are wrong" or "CI issue" without committing the fixing patch.
+- ❌ Do NOT label failures as "test problem" — submit the patch in the same PR.
+- ✅ Required steps:
+  1) Identify failing test(s) and reproduce locally.
+  2) Fix code or tests in the same PR.
+  3) Update AGENTS.md if the fix changes/clarifies a contract.
+  4) Re-run the relevant failed gate and root local narrow bundle.
+- **No green, no merge, no exceptions.**
+
+**Red CI means unfinished work. You either fix it in this PR or you don't push. "Tests are wrong" is only acceptable with a patch that updates the tests + documents the contract change.**
+
+## Workflow rules (global)
+
+Global workflow rules (CI recovery, Definition of Done, canonical commands) live in root `AGENTS.md`.
+Follow its local narrow bundle, current-head CI/review evidence and push policy
+(force push is forbidden). This scope file grants no full local verification budget.
+See canonical "Local-only artifacts (hard rule)" in root `AGENTS.md`.
+
+This file (`tests/AGENTS.md`) contains ONLY test-specific rules (diff coverage, mocking constraints, forbidden patterns).
+
+## Guard tests (docs registry)
+
+The repo uses deterministic, repo-local “guard tests” to prevent instruction drift.
+
+- **Agent registry guard**: `tests/test_agent_docs_registry_guard.py`
+  - **What it enforces**:
+    - `.cursor/agents/*.md` entries with YAML frontmatter `name:` must be registered in:
+      - `docs/agents/index.md` (the **"## Available Agents"** table only)
+      - `docs/orchestration/AGENT_CONTEXT_MAP.md`
+    - Canonical protocol references must not be accidentally removed from:
+      - `AGENTS.md`
+      - `docs/orchestration/workflow.md`
+  - **How to run**:
+
+    ```bash
+    pytest -q tests/test_agent_docs_registry_guard.py
+    ```
+
+  - **How to fix failures**:
+    - If an agent spec is added/renamed in `.cursor/agents/`, update the index and context map in the same PR.
+    - Keep the agent table under the `## Available Agents` heading in `docs/agents/index.md`.
+
+- **Workflow action pin guards (Node 24 and CodeQL)**: `tests/test_ci_workflow_pr_size_governance_contract.py`
+  - **What it enforces**:
+    - Every active `github/codeql-action/{init,analyze,upload-sarif}` reference uses the verified full commit pin at the exact expected workflow location and version annotation.
+    - Trivy and upload-artifact steps retain exact reviewed option inventories, counts and runtime annotations. When adding or changing those steps, update the finite expected contracts and run this module alongside the behavioral Docker/Caddy tests; keep exact equality and pin checks intact.
+  - **How to run**:
+
+```bash
+pytest -q tests/test_ci_workflow_pr_size_governance_contract.py
+```
+
+## Guard tests (repo policy scanner stability)
+
+- **Repo policy guard**: `tests/test_repo_policy_guards.py`
+  - **What it enforces**:
+    - Import hygiene and architecture guardrails across `app/`, `core/`, and `tests/`.
+    - Forbidden patterns (`sys.modules` poisoning, dynamic imports in protected scopes, etc.).
+  - **Stability contract**:
+    - Scanner reads must tolerate transient helper files under xdist (FileNotFound between glob and read).
+    - Missing-at-read-time transient files are skipped, not treated as policy violations.
+    - `tests/test_repo_policy_guards.py` is explicitly admitted to
+      `MAIN_CI_DIAGNOSTIC_EXACT` because its registration-authority manifest normalizes
+      interpreter-sensitive typing identities and must remain stable across supported Python
+      versions; this exact admission is not a complete inventory of Python-sensitive tests.
+  - **How to run**:
+
+```bash
+pytest -q tests/test_repo_policy_guards.py
+```
+
+- **Dependency vulnerability floor guard**: `tests/test_dependency_security_guard.py`
+  - **Ownership:** Current dependency floors and profile inventories belong to
+    this canonical guard. Consumer and installer tests retain their own behavior
+    and fallback assertions; do not duplicate historical remediation pins as
+    current-version equality checks or maintain a second floor inventory.
+    Historical pins belong in transition evidence. Run the owning suites
+    independently; consumer/installer tests must not import or invoke the
+    dependency-security tests as delegated assertions.
+    Before retiring a duplicate check, preserve its complete carrier coverage
+    at the canonical owner: optional absence must not exempt present optional
+    carriers from the retained validation rules.
+  - **What it enforces**:
+    - `cryptography` must stay at or above the current floor declared in
+      `tests/fixtures/dependency_security_schema.json` across the canonical
+      closed inventory declared by
+      `tests/test_dependency_security_guard.py::REQUIREMENT_SURFACES`, currently
+      ten shared requirement surfaces.
+    - Optional dependency profiles are outside the `min_versions` all-surfaces
+      contract unless the guard gains explicit per-surface targeting.
+    - All `cryptography` declarations in each file are checked (not only the first match).
+    - Every `CURRENT_ENFORCED_RUNTIME_FLOORS` carrier must be unconditional and
+      range carriers must include the configured current floor; an exact lock
+      pin may advance above that floor, but each governed lock package must have
+      exactly one carrier containing exactly one `==` pin. A matching `>=`
+      token cannot hide an exclusion or inactive marker.
+    - Requirement parsing must tolerate inline comments and reject environment
+      markers on governed all-surfaces floor carriers.
+    - Historical remediation discovery must fail closed on a present but
+      unversioned `cryptography` carrier; current owner-snapshot JSON must equal
+      its immutable introduction evidence; `I_R` remains a range operation and
+      cannot drift into the exact-pin operation reserved for `C_R`.
+    - Every live `CRYPTOGRAPHY_INTENT_SURFACES` member must contain exactly one
+      canonical `cryptography` carrier derived from the current schema floor:
+      source manifests use `>=floor,<next-major`, while `constraints.txt` uses
+      `>=floor`; extras, markers, direct URLs, duplicate carriers, and other
+      operation-class drift fail closed. The immutable owner snapshot remains
+      historical admission evidence, not live dependency authority, so a later
+      schema-driven floor rotation does not rewrite that receipt.
+  - **How to run**:
+    ```bash
+    pytest -q tests/test_dependency_security_guard.py
+    ```
+
+  - **How to fix failures**:
+    - Bump `cryptography` floor/version in the affected requirements files.
+    - Regenerate lock files if needed, then re-run pre-commit + guard tests.
+
+- **Docs Phase1 gates guard**: `tests/test_docs_phase1_gates.py`
+  - **What it enforces**:
+    - `docs/audit/*.md` changed in PRs must not contain unresolved `PR: TBD`.
+    - Changed docs under `docs/audit/` and `docs/security/` must include at least one `file:line` evidence anchor.
+  - **How to run**:
+    ```bash
+    pytest -q tests/test_docs_phase1_gates.py
+    python scripts/ci/check_docs_phase1_gates.py --files docs/audit/your_audit.md docs/security/your_security_doc.md
+    ```
+  - **How to fix failures**:
+    - Replace `PR: TBD` with final PR number or commit SHA in audit docs.
+    - Add explicit evidence anchors like `path/to/file.py:123`.
+    - Fix markdown style issues reported by `markdownlint-cli2` on changed `.md` files.
+
+- **PR Body Phase2 gates guard**: `tests/test_pr_body_phase2_gates.py`
+  - **What it enforces**:
+    - PR body contains `## Discussion Thread Pass` and `### Fixed in Commit Mapping`.
+    - Checkboxes `Discussion-thread pass completed` and `Fixed in commit mapping completed` are checked.
+    - In body-only fallback mode, mapping contains either comment-to-commit lines (`url -> sha`) or `No actionable review comments`.
+    - When the canonical artifact exists, PR body is mirror-only and does not need duplicated URL→SHA lines.
+  - **How to run**:
+    ```bash
+    pytest -q tests/test_pr_body_phase2_gates.py
+    python scripts/ci/check_pr_body_phase2_gates.py --pr-number 999 --body "## Discussion Thread Pass
+    - [x] Discussion-thread pass completed
+    - [x] Fixed in commit mapping completed
+    ### Fixed in Commit Mapping
+    - canonical artifact: docs/review/PR_999_FIXED_MAPPING.md"
+    ```
+  - **How to fix failures**:
+    - Update PR body using template sections exactly (headings + checkbox labels).
+    - Mark both checkboxes as completed after discussion-thread pass.
+    - Add explicit mapping entries for each addressed bot review comment in the canonical artifact.
+
+- **Wellness language BLOCKER guard**: `tests/guards/test_wellness_language_blockers_guard.py`
+  - **What it enforces**:
+    - `docs/` must not contain medical/diagnostic claims (wellness-only posture).
+    - Blocks RU: лечит, вылечит, вылечим, исцелит, диагноз, диагностирую, диагностирует.
+    - Blocks EN: we cure, we diagnose, will cure, will diagnose, cures your, cures the.
+  - **How to run**:
+    ```bash
+    pytest -q tests/guards/test_wellness_language_blockers_guard.py
+    ```
+  - **How to fix failures**:
+    - Remove/rewrite medical claims in docs.
+    - Or add to `tests/guards/wellness_language_allowlist.txt` (path-anchored regex).
+    - Or add in-file marker `pulseplate-allow:blocker-example` for policy/example lines.
+
+## Type hints policy (tests)
+
+### Hard rules
+
+- ❌ Never "fix" a failing test by loosening type hints (e.g., `Optional[T]` → `Any`)
+- ❌ Never change production type hints to satisfy mocks
+- ❌ Never add `# type: ignore` unless:
+  - exact error code is specified (`# type: ignore[arg-type]`)
+  - and comment explains why
+
+### Allowed in tests
+
+- `Any` **only** in fake/stub objects
+- `Protocol` or `Callable[..., T]` preferred over `Any`
+- `cast(T, value)` allowed at test boundaries
+- `Optional[T]` only if production code can actually return `None`
+
+### SQLAlchemy / Pydantic specifics
+
+- Never change `Mapped[T]` / `nullable` in models to satisfy tests
+- If relationship breaks typing → fix import order/model registration, not hints
+- Pydantic v2: prefer real validators over `# type: ignore`
+
+### Smell checklist
+
+If tempted to:
+
+- add `Optional` "just to make mypy shut up"
+- replace concrete type with `Any`
+- add multiple `# type: ignore` in a row
+
+⛔ STOP — the test or mock is wrong, not the type hint.
+
+## Import hygiene (hard rules)
+
+### API-key dependency cutover tests
+
+- Patch `app.get_api_key`, `app.routers.api_key`, or FastAPI
+  `dependency_overrides`; do not patch private API-key state in `legacy_app.py`.
+- Assert canonical callable identity and module ownership for protected route
+  dependencies after an ownership cutover.
+- Reload coverage must resolve current module objects at runtime. Do not retain
+  stale `from ... import ...` callables across a coordinated module purge.
+- Warning and error-hygiene tests must prove concurrency safety and absence of
+  credential-like exception text in logs.
+- Do not grow architecture-guard tests by enumerating intentionally obfuscated
+  language constructions outside the documented threat model. Prefer runtime
+  callable-identity and behavior tests for production security contracts.
+
+- Do NOT use `importlib.util.spec_from_file_location`,
+  `module_from_spec`, or `exec_module` in tests
+  (exceptions are explicitly whitelisted in guard tests).
+- Do NOT mutate `sys.modules` in tests.
+- `sys.path.insert` is only allowed in `conftest.py`
+  and `test_test_pro_access_coverage.py`.
+- `TESTING=true` must be set before importing `app`
+  (handled centrally in `pytest_configure`).
+- Tests that intentionally exercise the live GoPlus/AgentGuard bridge must opt
+  in with `monkeypatch.setenv("GOPLUS_AGENTGUARD_IN_TESTS", "true")`; pytest's
+  own `PYTEST_CURRENT_TEST` marker is the only allowed broad signal for the
+  default bridge bypass, so `TESTING=true` alone must not suppress the live
+  runtime path.
+- If a test imports symbols from `app`,
+  a guard-test must assert their presence.
+
+## PDF export tests (hard rules)
+
+- ❌ No snapshot tests of raw PDF bytes (metadata/ordering/timezone/renderer variance is inherently flaky).
+- ✅ Prefer testing prepared “render rows” / data-model output for determinism and content.
+- ✅ If rendering is exercised, assert only coarse properties:
+  - `bytes` is non-empty (and optionally above a small minimum length)
+  - expected key strings are present (via text extraction or by validating prepared rows)
+- ✅ Required regression: missing optional PDF dependency (`ImportError(reportlab)`) returns HTTP `501`
+  and preserves the established error contract shape.
+
+## No namespace duplication in tests (xdist stability)
+
+### Forbidden in tests
+
+- Dynamic module loading:
+  - `spec_from_file_location`, `module_from_spec`, `exec_module`
+- Path hacks:
+  - `sys.path.insert`
+- Module injection:
+  - `sys.modules[...] = ...`, `del sys.modules[...]`
+
+### Allowed exceptions (must be whitelisted)
+
+- `tests/conftest.py`
+- `tests/test_test_pro_access_coverage.py`
+- `tests/test_ensure_database_versions.py`
+
+### Required import pattern
+
+- Import production modules by package path:
+  - ✅ `import app.services.recipe_store as recipe_store`
+  - ✅ `from app import app`
+  - ❌ never load `app/services/X.py` by file path
+
+### Import hygiene exceptions (intentional)
+
+Dynamic imports allowed only for script-style tests:
+
+- `tests/test_test_pro_access_coverage.py`
+- `tests/test_ensure_database_versions.py`
+- `tests/conftest.py` (xdist/db + env bootstrap)
+
+sys.path.insert allowed only in:
+
+- `tests/conftest.py`
+- `tests/test_test_pro_access_coverage.py`
+
+### Pre-commit verification
+
+```bash
+# 1. No dynamic imports (except whitelisted)
+git grep -nE "spec_from_file_location|module_from_spec|exec_module\(" tests \
+  | grep -vE "test_test_pro_access_coverage\.py|test_ensure_database_versions\.py|conftest\.py"
+
+# 2. No sys.path.insert (except allowed)
+git grep -n "sys\.path\.insert" tests \
+  | grep -vE "test_test_pro_access_coverage\.py|conftest\.py"
+
+# 3. No sys.modules mutations
+git grep -nE "sys\.modules\[[^]]+\]\s*=|del\s+sys\.modules\[" tests
+
+# All should return empty or only whitelisted files
+```
+
+### Find violators (excluding guard tests)
+
+```bash
+# Dynamic imports
+git grep -n "sys\.path\.insert" tests \
+  | grep -vE "conftest\.py|test_test_pro_access_coverage\.py|test_import_hygiene_guard\.py|test_repo_policy_guards\.py"
+
+# Recipe store anti-pattern
+rg -n "sys\.modules\.get\(\"recipe_store\"\)|recipe_store.*spec_from_file_location" tests
+```
+
+## Finite source-image producer tests
+
+- Native execution validators must derive expected compiler identity from the selected
+  canonical source context before native setup. Keep synthetic profiles complete and
+  expected stdout and wrong-version test literals independently authored; deriving
+  both the implementation and its test oracle from one selector masks identity drift.
+- For already-approved public-checksum annotations in source-image fixtures,
+  inspect the actual literal line after formatting and rerun the real detector.
+  Keep strict checksum assertions; formatting or AST equivalence alone does not
+  prove the annotation still applies.
+- Keep metadata, synthetic format observations and actual native candidate
+  evidence distinct. Synthetic selected-manifest fixtures exercise only parser
+  and caller rejection; they are not authenticated artifacts or build receipts.
+- Extend the existing Prometheus, Caddy, workflow and deploy suites with typed
+  counterexamples: missing/expired artifacts, changed raw producer bytes,
+  squash versus PR ancestry, unknown predecessor states, immutable tag collisions,
+  payload aliases/modes/diffIDs, and incoming material trying to replace trusted
+  helper code. Never weaken strict equality, scanners or coverage for preparation.
+- Source authoring uses affected focused tests. Native compiler/copy/import/SDK
+  observations require separate admitted hosted execution; mocks cannot supply
+  those outcomes. The local full-verify prohibition remains in root AGENTS.md.

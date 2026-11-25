@@ -1,0 +1,109 @@
+# Agent instructions (scope: core/evidence/ and subdirectories)
+
+## Evidence Graph Runtime sequencing
+
+Evidence Graph Runtime changes must preserve this separation:
+
+- Eval runners generate artifacts.
+- Evidence events normalize artifact metadata into deterministic event records.
+- Promotion ledger and replay consume normalized events in later PRs.
+- Semantic cache is a separate runtime optimization and must not be introduced
+  through evidence-event PRs.
+- GraphRAG / knowledge graph expansion is out of scope unless a later packet
+  explicitly opens that rail.
+- Karpathy/advisory wiki is workforce memory only and must not become
+  product-runtime or eval-event source of truth.
+
+For E2/E3-style work, keep `core/evidence/` pure and deterministic. Do not
+import FastAPI, providers, DB/session state, Redis/cache modules, eval runners,
+or advisory wiki modules from this package.
+
+## NOOS-1A offline relation audit
+
+`relations.py` owns typed, immutable claim-to-evidence links, world-relation
+assertions, and structural assessments over one supplied finite inventory.
+Keep assessment separate from assertion, preserve every explicit revision, and
+include every represented adverse link for the exact claim/context/time key.
+A positive causal structural result only means the declared method, review and
+adjudication references satisfy the offline matrix for that supplied scope.
+It never authenticates a reviewer or grants product/runtime authority. The
+JSONL reader and private report writer belong only to
+`scripts/evals/evidence_relation_audit.py`; do not move I/O into this package
+or export these new types through the general `core.evidence` facade.
+
+The read-only federation projection must re-admit original exact classes,
+tuple containers, primitives and literal-false authority fields before any
+serializer replaces fields with constants or equality can alias bool/int.
+Preserve canonical causal structural True with exact bool type. Reject existing
+raw source/reference cardinality overbounds before materialization, then reuse
+the whole canonical parser/audit. Exact seeds and explicit revision/dependency
+closure remain finite; inspection metadata and source rail references are
+informational only, never E1 lineage, promotion, serving or answer authority.
+
+Canonical input/adverse-reference limits do not bound derived fanout. Before
+whole qualification, serialization or fingerprint material allocation, budget
+the actual derived representation, including repeated non-adverse references.
+Apply that bound to every public reconstruction/serialization entry point,
+after canonical whole-source admission/audit. Reject the whole operation;
+retain complete records and successful canonical bytes rather than truncating
+or substituting a new raw-source cap.
+
+E3 promotion ledger/replay changes may add append-only promotion contracts and
+dry-run replay summaries only. They must not write files, call runtime stores,
+create promotion side effects, or duplicate `core/knowledge/promotion.py`.
+
+## E4 active metadata admission
+
+E4 admission logic must stay pure and deterministic.
+
+Allowed:
+
+- policy/input/decision dataclasses
+- deterministic `allow_execute`, `allow_promote`, and `allow_serve` decisions
+- explicit `now` / timestamp input
+- `reason_codes`, `blocking_reasons`, and `warnings`
+- metadata validation
+
+Forbidden:
+
+- runtime writes
+- DB/session access
+- provider calls
+- FastAPI/router imports
+- eval runner imports
+- semantic cache, Redis, or GPTCache imports
+- GraphRAG runtime imports
+- advisory wiki/local support-plane imports
+- product knowledge-promotion rewrites
+
+Admission decisions are gates, not side effects. They may block future
+promotion/serve actions, but this package must not perform those actions.
+
+## E5 advisory wiki bridge
+
+E5 bridge logic must stay pure, deterministic mapping only. Reviewers must
+verify that wiki bridge changes do not introduce compiler behavior, runtime
+authority, local support-plane mutation, or product-truth claims.
+
+Allowed:
+
+- advisory wiki artifact reference dataclasses
+- advisory `EvidenceAssetRef` mapping
+- advisory admission metadata adapters
+- deterministic IDs, fingerprints, idempotency keys, and serialization
+- metadata/path safety validation
+
+Forbidden:
+
+- wiki compiler rewrites
+- local support-plane mutation imports
+- `scripts/orchestration` imports
+- wiki ingest/promote/query/lint CLI imports
+- runtime writes or product serving behavior
+- runtime rail mapping for wiki artifacts
+- semantic cache, Redis, GPTCache, or GraphRAG imports
+- advisory wiki as product/runtime/eval source of truth
+
+Advisory wiki artifacts are workforce memory. They may be linked to advisory
+evidence assets for lineage and review, but they must not become canonical
+repo/runtime/DB/OpenAPI/test truth.

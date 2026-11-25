@@ -1,0 +1,47 @@
+name: 'Initialize Test Database'
+description: 'Initialize SQLite database for testing'
+runs:
+  using: 'composite'
+  steps:
+    - name: Initialize database
+      shell: bash
+      run: |
+        # Ensure database directory exists
+        mkdir -p cache
+
+        # Verify critical runtime dependencies are installed (explicit loop instead of list comprehension)
+        python <<'PYEOF'
+        import sys
+        required_modules = ["sqlalchemy", "fastapi", "pydantic"]
+        for module_name in required_modules:
+            try:
+                __import__(module_name)
+            except ImportError:
+                print(f"❌ Critical dependency missing: {module_name}")
+                print("Run: make venv-sync")
+                sys.exit(1)
+        print("✅ All critical dependencies available")
+        PYEOF
+
+        # Initialize database schema (create tables)
+        python -c "
+        import sys
+        sys.path.insert(0, '.')
+        import core.models  # noqa: F401 - ensure models are registered
+        from core.db import init_db
+        init_db()
+        print('✅ Database initialized successfully')
+        "
+        # Verify tables were created
+        python -c "
+        import sys
+        sys.path.insert(0, '.')
+        from core.db import session_scope
+        from sqlalchemy import inspect
+        with session_scope() as session:
+            inspector = inspect(session.bind)
+            tables = inspector.get_table_names()
+            tables_str = ', '.join(tables)
+            print(f\"✅ Found {len(tables)} tables: {tables_str}\")
+            assert 'users' in tables, 'users table not found'
+        "

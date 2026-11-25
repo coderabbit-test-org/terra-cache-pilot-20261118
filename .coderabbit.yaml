@@ -1,0 +1,35 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# CodeRabbit configuration for PulsePlate
+# Simple configuration for Cursor IDE extension
+
+# Basic settings
+language: en-US
+
+# Path-based instructions
+reviews:
+  profile: chill
+  # Canonical fixed mappings are generated and validated by repo-native gates.
+  # Excluding them prevents a reviewer-on-closeout recursion after the final seal.
+  path_filters:
+    - "!docs/review/PR_*_FIXED_MAPPING.md"
+  path_instructions:
+    - path: "**/*.py"
+      instructions: |
+        Focus on health/nutrition domain best practices.
+        Maintain 97% test coverage requirement.
+        Use FastAPI best practices for backend.
+        Prefer explicit over implicit code.
+        Add type hints for all functions.
+        Use descriptive variable and function names.
+        Follow PEP 8 style guidelines.
+        Format all Python code with Black using max line length 100.
+        Use Pydantic v2 APIs (model_dump(), model_validate()) instead of deprecated v1 methods.
+    - path: "**/*.ts"
+      instructions: |
+        Follow Apple HIG guidelines for iOS components.
+        Prioritize user experience and accessibility.
+        Ensure all tests pass before suggesting changes.
+    - path: "tests/**"
+      instructions: |
+        Ensure tests use descriptive names and follow pytest best practices.
+        Maintain 97% test coverage requirement.

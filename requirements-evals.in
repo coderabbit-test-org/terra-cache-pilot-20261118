@@ -1,0 +1,10 @@
+# Offline eval profile for local RAGAS companion reports.
+#
+# Local/manual only: do not install from runtime, Docker, or generic CI profiles.
+
+# RAGAS native execution is disabled while GHSA-95ww-475f-pr4f and
+# GHSA-w8v5-vhqr-4h9v have no patched RAGAS / DiskCache dependency path.
+# Keep this profile as an explicit empty local/manual surface so dependency
+# graph submission and audit routing can prove no vulnerable eval deps are
+# tracked. The runner must remain importable and fail closed when native RAGAS
+# dependencies are unavailable.

@@ -1,0 +1,349 @@
+"""Test that OpenAPI generation is deterministic across multiple runs."""
+
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+_OPENAPI_MAKE_CMD = ["make", "openapi"]
+_OPENAPI_PIPELINE_ATTEMPTS = 2
+_SUBPROCESS_LOG_TAIL_LINES = 120
+
+
+def _sha256(path: Path) -> str:
+    """Calculate SHA256 hash of file."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _tail_log(log_text: str) -> str:
+    """Return a bounded tail for subprocess logs to keep pytest output readable."""
+    lines = log_text.splitlines()
+    return "\n".join(lines[-_SUBPROCESS_LOG_TAIL_LINES:])
+
+
+def _node_major_meets_nvmrc(repo_root: Path) -> bool:
+    """
+    Match scripts/frontend_npm.sh: `make openapi` fails when Node major < .nvmrc major.
+
+    RU: Локально без нужного Node major — скип; в CI (CI=true) — fail-closed, без «тихого» skip.
+    EN: Skip locally when Node is too old; in CI, callers must not skip silently.
+    """
+    nvmrc = repo_root / ".nvmrc"
+    if not nvmrc.is_file():
+        return True
+    first_segment = nvmrc.read_text(encoding="utf-8").strip().split(".")[0].lstrip("v")
+    try:
+        expected_major = int(first_segment)
+    except ValueError:
+        return False
+    proc = subprocess.run(
+        ["node", "-p", "parseInt(process.versions.node.split('.')[0], 10)"],
+        cwd=repo_root,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return False
+    try:
+        current_major = int((proc.stdout or "").strip())
+    except ValueError:
+        return False
+    return current_major >= expected_major
+
+
+def _run_openapi_pipeline(repo_root: Path) -> None:
+    """
+    Run `make openapi` with bounded retry and actionable failure diagnostics.
+
+    RU: В CI иногда бывают транзиентные падения npm/make.
+    Делаем 1 ретрай, но если команда стабильно падает — падаем с хвостом stdout/stderr.
+    EN: CI can hit transient npm/make failures.
+    We retry once, but still fail-closed with stdout/stderr tail if persistent.
+    """
+    last_process: subprocess.CompletedProcess[str] | None = None
+    env = os.environ.copy()
+    env["DEV_PYTHON"] = sys.executable
+    env["VENV_PYTHON"] = sys.executable
+    for _attempt in range(1, _OPENAPI_PIPELINE_ATTEMPTS + 1):
+        process = subprocess.run(
+            _OPENAPI_MAKE_CMD,
+            cwd=repo_root,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        last_process = process
+        if process.returncode == 0:
+            return
+
+    assert last_process is not None  # pragma: no cover - defensive, loop always runs
+    stdout_tail = _tail_log(last_process.stdout)
+    stderr_tail = _tail_log(last_process.stderr)
+    pytest.fail(
+        "\n".join(
+            [
+                f"`{' '.join(_OPENAPI_MAKE_CMD)}` failed "
+                f"after {_OPENAPI_PIPELINE_ATTEMPTS} attempts "
+                f"(exit={last_process.returncode}).",
+                "--- stdout (tail) ---",
+                stdout_tail or "<empty>",
+                "--- stderr (tail) ---",
+                stderr_tail or "<empty>",
+            ]
+        )
+    )
+
+
+def test_openapi_pipeline_uses_current_python_for_make(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Worktree runs must not fall back to an unrelated ``python3`` on PATH."""
+
+    calls: list[dict[str, object]] = []
+
+    def fake_run(
+        args: list[str],
+        *,
+        cwd: Path,
+        env: dict[str, str],
+        text: bool,
+        capture_output: bool,
+        check: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append(
+            {
+                "args": args,
+                "cwd": cwd,
+                "env": env,
+                "text": text,
+                "capture_output": capture_output,
+                "check": check,
+            }
+        )
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    _run_openapi_pipeline(tmp_path)
+
+    assert len(calls) == 1
+    env = calls[0]["env"]
+    assert isinstance(env, dict)
+    assert env["DEV_PYTHON"] == sys.executable
+    assert env["VENV_PYTHON"] == sys.executable
+
+
+def test_openapi_and_schema_ts_are_deterministic() -> None:
+    """
+    Verify that full OpenAPI pipeline produces identical output across runs.
+
+    This test ensures that:
+    - Normalization in scripts/generate_openapi.py works correctly
+    - openapi-typescript generates deterministic schema.ts with --alphabetize flag
+    - No drift occurs in openapi.json or schema.ts
+    - Full pipeline (make openapi) is deterministic for CI and local development
+    """
+    repo_root = Path(__file__).resolve().parents[1]
+
+    # This test is meant for the dedicated CI job that has Node/npm installed.
+    if not (shutil.which("node") and shutil.which("npm") and shutil.which("make")):
+        pytest.skip("OpenAPI determinism test requires node/npm/make toolchain")
+
+    if not _node_major_meets_nvmrc(repo_root):
+        if os.environ.get("CI") == "true":
+            pytest.fail(
+                "OpenAPI determinism must run in CI with Node major >= .nvmrc "
+                "(use node-version-file: env.FRONTEND_NODE_VERSION_FILE; "
+                "see scripts/frontend_npm.sh)."
+            )
+        pytest.skip(
+            "OpenAPI determinism test requires Node major >= .nvmrc "
+            "(same gate as scripts/frontend_npm.sh / make openapi)"
+        )
+    openapi_path = repo_root / "frontend" / "src" / "api" / "openapi.json"
+    schema_path = repo_root / "frontend" / "src" / "api" / "schema.ts"
+
+    # Run full pipeline twice (same as CI)
+    _run_openapi_pipeline(repo_root)
+    # Sanity-check: generator must produce FULL schema (no schema-only markers) and include
+    # key endpoints that were previously excluded behind schema-only mode.
+    schema = json.loads(openapi_path.read_text(encoding="utf-8"))
+    schema_ts = schema_path.read_text(encoding="utf-8")
+    info = schema.get("info") or {}
+    assert info.get("x-openapi-mode") != "schema-only"
+    paths = schema.get("paths") or {}
+    components = (schema.get("components") or {}).get("schemas") or {}
+    assert "/api/v1/pro/meal/weekly" in paths
+    assert "/api/v1/pro/nutrition/daily" in paths
+    assert "/api/v1/pro/nutrition/meal-log" in paths
+    assert "/api/v1/pro/bmi/calculate" in paths
+    assert "/api/v1/premium/plan/week-flexible" not in paths
+    assert "/api/v1/business/analyze" not in paths
+    assert "/api/v1/foods" not in paths
+    assert "/api/v1/restaurants/search" not in paths
+    assert "PremiumWeekPlanRequest" not in components
+    assert "PremiumWeekPlanResponse" not in components
+    assert "WeeklyMealPlanResponse" in components
+    assert "WeeklyMealPlanDayMenu" in components
+    assert "PremiumWeekPlanRequest" not in schema_ts
+    assert "PremiumWeekPlanResponse" not in schema_ts
+    assert 'daily_menus: components["schemas"]["WeeklyMealPlanDayMenu"][];' in schema_ts
+    assert "daily_menus: unknown[]" not in schema_ts
+
+    h1: tuple[str, str] = (_sha256(openapi_path), _sha256(schema_path))
+
+    _run_openapi_pipeline(repo_root)
+    h2: tuple[str, str] = (_sha256(openapi_path), _sha256(schema_path))
+
+    if h1 != h2:
+        lines: list[str] = ["Drift detected:"]
+        if h1[0] != h2[0]:
+            lines.append(f"  openapi.json: {h1[0]} != {h2[0]}")
+        if h1[1] != h2[1]:
+            lines.append(f"  schema.ts: {h1[1]} != {h2[1]}")
+        lines.append("This indicates non-deterministic generation.")
+        lines.append(
+            "Check scripts/generate_openapi.py and frontend/package.json "
+            "(openapi-typescript version/flags)."
+        )
+        pytest.fail("\n".join(lines))
+
+
+def test_register_pro_routes_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ensure PRO route registration short-circuits when already registered."""
+    from fastapi import FastAPI
+    from fastapi.routing import APIRouter
+
+    from app.routers.pro_registration import register_pro_routes
+
+    # Ensure feature flags do not accidentally alter the cached early-return path.
+    monkeypatch.setenv("FEATURE_PREMIUM_WEEK_ENABLED", "true")
+
+    app = FastAPI()
+
+    # Set cache to force idempotent early-return branch
+    sentinel_pro = APIRouter()
+    sentinel_week = APIRouter()
+    app.state._pro_routes_registered = True
+    app.state._cached_pro_router = sentinel_pro
+    app.state._cached_premium_week_router = sentinel_week
+
+    before = len(app.router.routes)
+    pro_router, premium_week_router = register_pro_routes(app)
+    after = len(app.router.routes)
+
+    assert after == before
+    assert pro_router is sentinel_pro
+    assert premium_week_router is sentinel_week
+
+
+def test_prune_unreferenced_schema_components_ignores_missing_components() -> None:
+    from app.bootstrap.openapi import _prune_unreferenced_schema_components
+
+    schema_without_components = {"openapi": "3.1.0", "paths": {}}
+    schema_without_schemas = {"components": {"securitySchemes": {"ApiKeyAuth": {}}}}
+
+    _prune_unreferenced_schema_components(schema_without_components)
+    _prune_unreferenced_schema_components(schema_without_schemas)
+
+    assert schema_without_components == {"openapi": "3.1.0", "paths": {}}
+    assert schema_without_schemas["components"]["securitySchemes"]["ApiKeyAuth"] == {}
+
+
+def test_prune_unreferenced_schema_components_skips_duplicates_and_missing_refs() -> None:
+    from app.bootstrap.openapi import _prune_unreferenced_schema_components
+
+    schema = {
+        "paths": {
+            "/api/v1/demo": {
+                "get": {
+                    "responses": {
+                        "200": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/PublicResponse"}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "components": {
+            "schemas": {
+                "PublicResponse": {
+                    "type": "object",
+                    "properties": {
+                        "items": {
+                            "type": "array",
+                            "items": {"$ref": "#/components/schemas/SharedItem"},
+                        },
+                        "duplicate": {"$ref": "#/components/schemas/SharedItem"},
+                        "missing": {"$ref": "#/components/schemas/MissingItem"},
+                    },
+                },
+                "SharedItem": {
+                    "type": "object",
+                    "properties": {
+                        "self": {"$ref": "#/components/schemas/SharedItem"},
+                    },
+                },
+                "UnusedSchema": {"type": "object"},
+            },
+            "securitySchemes": {"ApiKeyAuth": {"type": "apiKey", "in": "header", "name": "X-Key"}},
+        },
+    }
+
+    _prune_unreferenced_schema_components(schema)
+
+    retained = schema["components"]["schemas"]
+    assert set(retained) == {"PublicResponse", "SharedItem"}
+    assert "UnusedSchema" not in retained
+    assert schema["components"]["securitySchemes"]["ApiKeyAuth"]["type"] == "apiKey"
+
+
+def test_prune_unreferenced_schema_components_skips_non_dict_schema_nodes() -> None:
+    from app.bootstrap.openapi import _prune_unreferenced_schema_components
+
+    schema = {
+        "paths": {
+            "/api/v1/demo": {
+                "get": {
+                    "responses": {
+                        "200": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "oneOf": [
+                                            {"$ref": "#/components/schemas/PublicResponse"},
+                                            {"$ref": "#/components/schemas/BrokenNode"},
+                                        ]
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "components": {
+            "schemas": {
+                "PublicResponse": {"type": "object"},
+                "BrokenNode": "not-a-dict",
+            }
+        },
+    }
+
+    _prune_unreferenced_schema_components(schema)
+
+    retained = schema["components"]["schemas"]
+    assert "PublicResponse" in retained
+    assert "BrokenNode" not in retained

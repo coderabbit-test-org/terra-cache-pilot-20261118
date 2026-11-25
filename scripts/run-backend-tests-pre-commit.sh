@@ -1,0 +1,629 @@
+#!/usr/bin/env bash
+# Backend tests hook for pre-commit/pre-push
+# Runs pytest for changed Python files plus explicit cross-surface governance triggers
+#
+# Pre-push backend tests (smart diff runner):
+# The pre-push hook runs backend pytest for changed Python files plus explicitly mapped cross-surface governance triggers.
+#
+# Direct invocation without a selected stage:
+# 1) If upstream exists: diff `upstream..HEAD`
+# 2) Else: diff from merge-base against (origin/main|origin/master|main|master)
+# 3) If base cannot be resolved: fallback to last N commits (diagnostic mode)
+#
+# Debug:
+# - Set `PREPUSH_DEBUG=1` to print resolved upstream/base and file list.
+
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR"
+
+if [ "${SKIP_TESTS:-0}" = "1" ]; then
+    echo "⏩ SKIP_TESTS=1 set, skipping backend tests"
+    exit 0
+fi
+
+# Debug mode: set PREPUSH_DEBUG=1 to see detailed information
+DEBUG="${PREPUSH_DEBUG:-0}"
+log_debug() {
+    if [ "$DEBUG" = "1" ]; then
+        echo "🔎 [DEBUG] $*" >&2
+    fi
+}
+
+# Get changed files and derive Python/test-governance triggers
+# For pre-commit: check staged files
+# For pre-push: check files in commits that will be pushed
+# For ad-hoc local validation (`make validate-changed`): prefer current branch diff
+# against the nearest main/master merge-base instead of the pushed/unpushed delta.
+declare -a CHANGED_FILES=()
+declare -a PYTHON_CHANGES=()
+declare -a PYTEST_ARGS=("-q" "--tb=short")
+BRANCH_DIFF_MODE="${BRANCH_DIFF_MODE:-0}"
+BRANCH_DIFF_BASE_RESOLVED=0
+CHANGED_DIFF_MAX_BYTES=4194304
+DIFF_OUTPUT_FILE=""
+
+cleanup_diff_output() {
+    if [ -n "$DIFF_OUTPUT_FILE" ]; then
+        if rm -f -- "$DIFF_OUTPUT_FILE"; then
+            DIFF_OUTPUT_FILE=""
+        else
+            local cleanup_status=$?
+            echo "❌ Could not remove changed-file discovery output (exit ${cleanup_status})" >&2
+            return "$cleanup_status"
+        fi
+    fi
+}
+
+fail_discovery() {
+    local failure_status="$1"
+    trap - HUP INT TERM
+    # Preserve the discovery/signal failure even if cleanup also fails.
+    if cleanup_diff_output; then
+        :
+    fi
+    exit "$failure_status"
+}
+
+# Bash 3.2 can enter EXIT with status zero after a fatal nounset expansion.
+# Clean up explicitly, so an interpreter abort cannot become a successful hook.
+trap 'fail_discovery 129' HUP
+trap 'fail_discovery 130' INT
+trap 'fail_discovery 143' TERM
+
+refresh_python_changes() {
+    local changed_file
+    PYTHON_CHANGES=()
+    for changed_file in ${CHANGED_FILES[@]+"${CHANGED_FILES[@]}"}; do
+        if [[ "$changed_file" == *.py ]]; then
+            PYTHON_CHANGES+=("$changed_file")
+        fi
+    done
+}
+
+add_changed_file() {
+    local candidate="$1"
+    local existing
+    for existing in ${CHANGED_FILES[@]+"${CHANGED_FILES[@]}"}; do
+        if [ "$existing" = "$candidate" ]; then
+            return 0
+        fi
+    done
+    CHANGED_FILES+=("$candidate")
+}
+
+record_changed_files() {
+    local incoming
+    CHANGED_FILES=()
+    while IFS= read -r -d '' incoming; do
+        add_changed_file "$incoming"
+    done
+    refresh_python_changes
+}
+
+collect_git_diff() {
+    local diff_status
+    local diff_output_bytes
+
+    if DIFF_OUTPUT_FILE="$(mktemp "${TMPDIR:-/tmp}/pulseplate-backend-diff.XXXXXX")"; then
+        :
+    else
+        diff_status=$?
+        echo "❌ Could not allocate temporary storage for changed-file discovery" >&2
+        exit "$diff_status"
+    fi
+    if git diff --no-renames --name-only -z --diff-filter=ACMDT "$@" > "$DIFF_OUTPUT_FILE"; then
+        :
+    else
+        diff_status=$?
+        echo "❌ git diff failed while collecting changed files (exit ${diff_status})" >&2
+        fail_discovery "$diff_status"
+    fi
+
+    if diff_output_bytes="$(wc -c < "$DIFF_OUTPUT_FILE")"; then
+        :
+    else
+        diff_status=$?
+        echo "❌ Could not measure changed-file discovery output (exit ${diff_status})" >&2
+        fail_discovery "$diff_status"
+    fi
+    diff_output_bytes="${diff_output_bytes//[[:space:]]/}"
+    if ! [[ "$diff_output_bytes" =~ ^[0-9]+$ ]]; then
+        echo "❌ Could not measure changed-file discovery output" >&2
+        fail_discovery 1
+    fi
+    if [ "$diff_output_bytes" -gt "$CHANGED_DIFF_MAX_BYTES" ]; then
+        echo "❌ Changed-file discovery output exceeds the ${CHANGED_DIFF_MAX_BYTES}-byte limit" >&2
+        fail_discovery 1
+    fi
+
+    record_changed_files < "$DIFF_OUTPUT_FILE"
+    cleanup_diff_output
+}
+
+reference_exists() {
+    local reference="$1"
+    local discovery_status
+    # Native --verify accepts the exact optional refs below and the HEAD pseudoref.
+    if git show-ref --verify --quiet "$reference"; then
+        return 0
+    else
+        discovery_status=$?
+        if [ "$discovery_status" -eq 1 ]; then return 1; fi
+        echo "❌ git show-ref failed for $reference (exit ${discovery_status})" >&2
+        fail_discovery "$discovery_status"
+    fi
+}
+
+resolve_branch_diff_from_base() {
+    local base_branch
+    local base_sha=""
+    local discovery_status
+    log_debug "Trying merge-base branch diff against main/master candidates..."
+    for base_branch in refs/remotes/origin/main refs/remotes/origin/master refs/heads/main refs/heads/master; do
+        # merge-base uses 128 both for absent names and operational errors.
+        # Query exact optional refs first: show-ref's exit 1 means absent.
+        if reference_exists "$base_branch"; then
+            :
+        else
+            continue
+        fi
+        if base_sha=$(git merge-base HEAD "$base_branch"); then
+            :
+        else
+            discovery_status=$?
+            # Existing disjoint histories are a legitimate next-candidate case.
+            if [ "$discovery_status" -eq 1 ]; then continue; fi
+            echo "❌ git merge-base failed for $base_branch (exit ${discovery_status})" >&2
+            fail_discovery "$discovery_status"
+        fi
+        if [ -n "$base_sha" ]; then
+            BRANCH_DIFF_BASE_RESOLVED=1
+            log_debug "Merge-base with $base_branch: $base_sha"
+            collect_git_diff "$base_sha" HEAD
+            if [ ${#PYTHON_CHANGES[@]} -gt 0 ]; then
+                log_debug "Python change count (via branch diff $base_branch): ${#PYTHON_CHANGES[@]}"
+            fi
+            return 0
+        fi
+    done
+
+    # Absence is a normal fallback result; operational failures propagate from
+    # ordinary calls instead of being suppressed by a conditional function call.
+    return 0
+}
+
+required_target_merge_base() {
+    local target_name="${PR_SCOPE_BASE_REF:-main}"
+    local target="refs/remotes/origin/$target_name"
+    if [ "$1" = "refs/heads/$target_name" ]; then
+        echo "The branch being published cannot serve as its own comparison target." >&2
+        return 1
+    fi
+    git check-ref-format "$target" || return $?
+    git show-ref --verify --quiet "$target" || {
+        echo "Required fetched target is unavailable: $target" >&2
+        return 1
+    }
+    git merge-base "$target" HEAD
+}
+
+if [ -n "${PRE_COMMIT:-}" ]; then
+    if [ -z "${BACKEND_HOOK_CI_EVENT:-}" ]; then
+        collect_git_diff --cached
+    else
+        # Hosted lint uses the integration checkout on PRs and the event delta on pushes.
+        tested_head=$(git rev-parse --verify HEAD)
+        event_base=${BACKEND_HOOK_CI_BASE:?Missing hosted base SHA}
+        if [[ "$tested_head" != "${BACKEND_HOOK_CI_HEAD:?Missing hosted head SHA}" ||
+              ! "$event_base" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Hosted hook range does not match the checked-out event." >&2
+            exit 1
+        fi
+        case "$BACKEND_HOOK_CI_EVENT" in
+            pull_request) base_sha=$(git merge-base "$event_base" "$tested_head") ;;
+            push)
+                if [[ "$event_base" == 0000000000000000000000000000000000000000 ]]; then
+                    base_sha=$(required_target_merge_base "${GITHUB_REF:?Missing created branch ref}")
+                else
+                    base_sha=$(git rev-parse --verify "${event_base}^{commit}")
+                fi
+                ;;
+            *) echo "Unsupported hosted hook event." >&2; exit 1 ;;
+        esac
+        collect_git_diff "$base_sha" "$tested_head"
+    fi
+elif [ "${BACKEND_HOOK_REQUIRED_PUSH:-0}" = 1 ]; then
+    # Only the owned JUnit report option may augment this required invocation.
+    if [[ -n "${PYTEST_ADDOPTS:-}" ]]; then
+        if ! [[ "$PYTEST_ADDOPTS" =~ ^--junitxml=/[^[:space:]]+$ ]]; then
+            echo "Required push accepts only a single absolute --junitxml= report in PYTEST_ADDOPTS." >&2
+            exit 1
+        fi
+        PYTEST_ARGS+=("$PYTEST_ADDOPTS")
+        unset PYTEST_ADDOPTS
+    fi
+    # The framework may provide only the local source on its initial all-files push.
+    source_ref=${PRE_COMMIT_TO_REF:-${PRE_COMMIT_LOCAL_BRANCH:?Missing outgoing Git source}}
+    outgoing=$(git rev-parse --verify --end-of-options "${source_ref}^{commit}")
+    checkout=$(git rev-parse --verify HEAD)
+    dirty=$(git status --porcelain=v1 --untracked-files=normal --ignore-submodules=none)
+    if [[ "$outgoing" != "$checkout" || -n "$dirty" ]]; then
+        echo "Required push validation needs the clean checkout of the outgoing commit." >&2
+        exit 1
+    fi
+    base_sha=$(required_target_merge_base "${PRE_COMMIT_REMOTE_BRANCH:?Missing destination ref}")
+    collect_git_diff "$base_sha" "$outgoing"
+    BRANCH_DIFF_BASE_RESOLVED=1
+elif [ "$BRANCH_DIFF_MODE" = "1" ]; then
+    # Local validation command: diff the current branch against main/master merge-base.
+    resolve_branch_diff_from_base
+else
+    # Pre-push hook: check files in commits that will be pushed
+    # In pre-push, we need to compare what's being pushed with what's already on remote
+    # Pre-commit framework doesn't pass arguments, so we determine remote branch from git config
+    CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+
+    # Try to get remote tracking branch from git config
+    # Native upstream formatting succeeds with empty output when unconfigured.
+    if REMOTE_BRANCH=$(git for-each-ref --format='%(upstream)' -- "refs/heads/${CURRENT_BRANCH}"); then
+        :
+    else
+        fail_discovery "$?"
+    fi
+    log_debug "Current branch: $CURRENT_BRANCH"
+    log_debug "Upstream branch: ${REMOTE_BRANCH:-<not set>}"
+
+    if [ -n "$REMOTE_BRANCH" ] && reference_exists "$REMOTE_BRANCH"; then
+        # An observed ref must resolve to a real commit; errors cannot mean absent.
+        if REMOTE_SHA=$(git rev-parse --verify "${REMOTE_BRANCH}^{commit}"); then
+            :
+        else
+            fail_discovery "$?"
+        fi
+        log_debug "Upstream SHA: $REMOTE_SHA"
+        collect_git_diff "$REMOTE_SHA" HEAD
+        log_debug "Python change count (via upstream): ${#PYTHON_CHANGES[@]}"
+    fi
+
+    # Fallback: if we couldn't determine remote branch, try common patterns.
+    # Preserve package-manifest-only upstream deltas so cross-surface
+    # governance tests are not lost just because no Python files changed.
+    if [ ${#CHANGED_FILES[@]} -eq 0 ]; then
+        # Try origin/current_branch
+        REMOTE_BRANCH="refs/remotes/origin/${CURRENT_BRANCH}"
+        if reference_exists "$REMOTE_BRANCH"; then
+            if REMOTE_SHA=$(git rev-parse --verify "${REMOTE_BRANCH}^{commit}"); then
+                :
+            else
+                fail_discovery "$?"
+            fi
+            log_debug "Fallback remote branch: $REMOTE_BRANCH (SHA: $REMOTE_SHA)"
+            collect_git_diff "$REMOTE_SHA" HEAD
+            log_debug "Python change count (via fallback remote): ${#PYTHON_CHANGES[@]}"
+        fi
+    fi
+
+    # Last resort: compare branch diff against main/master using merge-base
+    if [ ${#CHANGED_FILES[@]} -eq 0 ]; then
+        resolve_branch_diff_from_base
+    fi
+fi
+
+declare -a EXTRA_TEST_FILES=()
+declare -a PYTHON_HELPER_SOURCE_FILES=(
+    "tests/security/_api_authz_contracts.py"
+)
+declare -a PYTHON_HELPER_TEST_TARGETS=(
+    "tests/security/test_api_authz_contract_static.py"
+)
+declare -a PYTHON_DEPENDENCY_TESTCLIENT_SURFACE_FILES=(
+    "REQUIREMENTS.md"
+    "docs/DEPENDENCY_MANAGEMENT.md"
+    "docs/contracts/PYTHON_DEPENDENCY_SURFACES.md"
+    "requirements-dev.in"
+    "requirements-dev.txt"
+    "requirements-ci-lite.in"
+    "requirements-ci-lite.txt"
+    "requirements-lock.txt"
+    "requirements-test.in"
+    "requirements-test.txt"
+    "scripts/ci/compile_locked_python_requirements.py"
+    "scripts/ci/check_httpx_testclient_compat.py"
+    "scripts/ci/check_python_dependency_surfaces.py"
+    "tests/compat/test_starlette_httpx2_testclient_compat.py"
+    "tests/test_httpx_testclient_compat_guard.py"
+    "tests/test_python_supply_chain_controls.py"
+)
+declare -a REVIEW_SOURCE_QUOTA_POLICY_SURFACE_FILES=(
+    "AGENTS.md"
+    "RUNBOOK_AGENT.md"
+    "docs/orchestration/PR_ORCHESTRATION_CONTRACT_MATRIX.md"
+    "docs/orchestration/REVIEW_SOURCE_DEGRADATION_POLICY.md"
+    "docs/orchestration/contracts/review_source_status.v1.json"
+    "scripts/ci/check_pr_merge_readiness.py"
+    "scripts/orchestration/pr_commit_identity.py"
+    "scripts/orchestration/pr_review_closeout.py"
+    "scripts/orchestration/pr_review_evidence.py"
+    "scripts/orchestration/review_source_status.py"
+    "scripts/run-backend-tests-pre-commit.sh"
+    "tests/guards/test_review_source_quota_policy_guard.py"
+)
+
+add_python_dependency_testclient_tests() {
+    # CI lint runs the pre-commit hook from the ci-lite dependency profile,
+    # where httpx2 is deliberately absent. Keep the httpx2-backed production
+    # canary on validate-changed/pre-push/focused pytest paths, while the
+    # pre-commit hook still enforces static and dependency-surface guards.
+    if [ -z "${PRE_COMMIT:-}" ]; then
+        EXTRA_TEST_FILES+=("tests/compat/test_starlette_httpx2_testclient_compat.py")
+    fi
+    EXTRA_TEST_FILES+=("tests/test_httpx_testclient_compat_guard.py")
+    EXTRA_TEST_FILES+=("tests/test_python_dependency_surfaces.py")
+    EXTRA_TEST_FILES+=("tests/test_python_supply_chain_controls.py")
+}
+
+add_extra_tests_for_changed_files() {
+    local file
+    for file in ${CHANGED_FILES[@]+"${CHANGED_FILES[@]}"}; do
+        # Keep the hook aligned with Dependabot's configured root/one-level
+        # .txt/.in carrier class. The Python policy is the content authority.
+        case "$file" in
+            *.txt | *.in)
+                case "$file" in
+                    */*/*) ;;
+                    *)
+                        EXTRA_TEST_FILES+=("tests/test_check_dependabot_python_policy.py")
+                        EXTRA_TEST_FILES+=("tests/test_dependency_security_guard.py")
+                        ;;
+                esac
+                ;;
+        esac
+        case "${file##*/}" in
+            package.json | package-lock.json | npm-shrinkwrap.json)
+                EXTRA_TEST_FILES+=("tests/test_root_npm_dependency_guards.py")
+                EXTRA_TEST_FILES+=("tests/test_frontend_dependency_guards.py")
+                ;;
+        esac
+        case "$file" in
+            docs/*)
+                EXTRA_TEST_FILES+=("tests/guards/test_security_devtooling_regression_guards.py::test_changed_docs_do_not_add_local_users_absolute_paths")
+                ;;
+        esac
+        case "$file" in
+            AGENTS.md | RUNBOOK_AGENT.md | docs/ENGINEERING_LESSONS.md)
+                EXTRA_TEST_FILES+=("tests/test_agent_docs_registry_guard.py")
+                ;;
+            .github/workflows/ci.yml)
+                EXTRA_TEST_FILES+=("tests/test_private_python_proxy_workflow_contract.py")
+                EXTRA_TEST_FILES+=("tests/test_ci_workflow_pr_size_governance_contract.py")
+                EXTRA_TEST_FILES+=("tests/test_pr_merge_readiness_gate.py")
+                ;;
+            .github/workflows/cd.yml)
+                EXTRA_TEST_FILES+=("tests/test_pgvector_compat.py::test_cd_exact_pgvector_image_proves_fresh_and_legacy_volume_contracts")
+                EXTRA_TEST_FILES+=("tests/test_pgvector_attestations.py::test_pg_scan_loop_retains_later_available_subjects_and_rejects_aggregate")
+                ;;
+            scripts/run-backend-tests-pre-commit.sh)
+                EXTRA_TEST_FILES+=("tests/test_pre_commit_hook_python_resolver.py")
+                ;;
+            frontend/package.json | frontend/package-lock.json)
+                EXTRA_TEST_FILES+=("tests/test_ci_workflow_pr_size_governance_contract.py")
+                EXTRA_TEST_FILES+=("tests/test_frontend_dependency_guards.py")
+                EXTRA_TEST_FILES+=("tests/test_python_supply_chain_controls.py")
+                ;;
+            .github/dependabot.yml | .github/dependabot.yaml)
+                EXTRA_TEST_FILES+=("tests/test_check_dependabot_python_policy.py")
+                ;;
+            scripts/ci/check_dependabot_python_policy.py | scripts/ci/check_python_dependency_surfaces.py | scripts/ci/dependabot_requirement_carriers.py | tests/test_check_dependabot_python_policy.py | docs/DEPENDENCY_MANAGEMENT.md | docs/contracts/PYTHON_DEPENDENCY_SURFACES.md)
+                EXTRA_TEST_FILES+=("tests/test_check_dependabot_python_policy.py")
+                ;;
+        esac
+        for dependency_file in "${PYTHON_DEPENDENCY_TESTCLIENT_SURFACE_FILES[@]}"; do
+            if [ "$file" = "$dependency_file" ]; then
+                add_python_dependency_testclient_tests
+                break
+            fi
+        done
+        for policy_file in "${REVIEW_SOURCE_QUOTA_POLICY_SURFACE_FILES[@]}"; do
+            if [ "$file" = "$policy_file" ]; then
+                EXTRA_TEST_FILES+=("tests/guards/test_review_source_quota_policy_guard.py")
+                EXTRA_TEST_FILES+=("tests/test_review_source_status.py")
+                EXTRA_TEST_FILES+=("tests/test_pr_review_material_seal.py")
+                EXTRA_TEST_FILES+=("tests/test_pr_merge_readiness_gate.py")
+                break
+            fi
+        done
+    done
+}
+
+add_extra_tests_for_changed_files
+
+add_helper_tests_for_python_change() {
+    local file="$1"
+    local index
+    local target
+    for index in "${!PYTHON_HELPER_SOURCE_FILES[@]}"; do
+        if [ "${PYTHON_HELPER_SOURCE_FILES[$index]}" != "$file" ]; then
+            continue
+        fi
+        target="${PYTHON_HELPER_TEST_TARGETS[$index]}"
+        if [ ! -f "$target" ]; then
+            echo "Missing mapped pytest target for helper file '$file': $target" >&2
+            exit 1
+        fi
+        FOUND_FOR_FILE+=("$target")
+        return 0
+    done
+    return 1
+}
+
+if [ ${#PYTHON_CHANGES[@]} -eq 0 ] && [ ${#EXTRA_TEST_FILES[@]} -eq 0 ]; then
+    if [ "$BRANCH_DIFF_MODE" = "1" ] && [ "$BRANCH_DIFF_BASE_RESOLVED" = "1" ]; then
+        echo "ℹ️  No Python or cross-surface governance files changed on the current branch"
+        exit 0
+    fi
+
+    # In pre-push, if no Python changes detected, it might mean:
+    # 1. No Python files were changed (legitimate skip)
+    # 2. We couldn't determine base for comparison (should still check recent commits as safety)
+    if [ -z "${PRE_COMMIT:-}" ]; then
+        # Pre-push: if we can't determine changes, check recent commits as safety measure
+        # This handles edge cases: new branch, detached HEAD, force-push scenarios
+        RECENT_COMMITS_FALLBACK="${RECENT_COMMITS_FALLBACK:-10}"
+        if ! [[ "$RECENT_COMMITS_FALLBACK" =~ ^[1-9][0-9]*$ ]]; then
+            echo "❌ RECENT_COMMITS_FALLBACK must be a positive integer, got: '$RECENT_COMMITS_FALLBACK'" >&2
+            exit 1
+        fi
+
+        COMMIT_COUNT=0
+        # A valid unborn HEAD has no history. A failed query of present history
+        # is an error, including output that cannot safely enter arithmetic.
+        if reference_exists HEAD; then
+            if COMMIT_COUNT=$(git rev-list --count HEAD); then
+                :
+            else
+                fail_discovery "$?"
+            fi
+        fi
+        if ! [[ "$COMMIT_COUNT" =~ ^[0-9]+$ ]]; then
+            echo "❌ git rev-list returned an invalid commit count" >&2
+            fail_discovery 1
+        fi
+        MAX_DEPTH=$((COMMIT_COUNT > 0 ? COMMIT_COUNT - 1 : 0))
+        FALLBACK_DEPTH="$RECENT_COMMITS_FALLBACK"
+        if [ "$FALLBACK_DEPTH" -gt "$MAX_DEPTH" ]; then
+            FALLBACK_DEPTH="$MAX_DEPTH"
+        fi
+        if [ "$FALLBACK_DEPTH" -le 0 ]; then
+            echo "ℹ️  Repository has insufficient history for fallback diff, skipping backend tests"
+            exit 0
+        fi
+
+        echo "⚠️  Could not determine changed Python files via upstream/base, checking last ${FALLBACK_DEPTH} commits as safety measure..."
+        collect_git_diff "HEAD~${FALLBACK_DEPTH}" HEAD
+        EXTRA_TEST_FILES=()
+        add_extra_tests_for_changed_files
+        log_debug "Python change count (via recent commits fallback, n=${FALLBACK_DEPTH}): ${#PYTHON_CHANGES[@]}"
+        if [ ${#PYTHON_CHANGES[@]} -eq 0 ] && [ ${#EXTRA_TEST_FILES[@]} -eq 0 ]; then
+            echo "ℹ️  No Python or cross-surface governance files changed in last ${FALLBACK_DEPTH} commits, skipping backend tests"
+            exit 0
+        fi
+        echo "ℹ️  Found Python or cross-surface governance changes in last ${FALLBACK_DEPTH} commits, running tests for safety"
+    else
+        # Pre-commit: no staged Python files, skip
+        echo "ℹ️  No Python or cross-surface governance files changed"
+        exit 0
+    fi
+fi
+
+# Extract test files that correspond to changed Python files
+declare -a TEST_FILES=()
+
+if [ ${#PYTHON_CHANGES[@]} -gt 0 ]; then
+    for file in "${PYTHON_CHANGES[@]}"; do
+        # Per-file test discovery
+        declare -a FOUND_FOR_FILE=()
+
+        # Helper modules under tests/ need executable test targets, not direct
+        # pytest collection of the helpers themselves.
+        if add_helper_tests_for_python_change "$file"; then
+            :
+        elif [ -n "${PRE_COMMIT:-}" ] && [ "$file" = "tests/compat/test_starlette_httpx2_testclient_compat.py" ]; then
+            # This canary needs httpx2, which is intentionally outside ci-lite.
+            :
+        # If the file is in tests/ directory, add it directly (but exclude conftest.py)
+        elif [[ $file == tests/* ]] && [[ $file == *.py ]] && [[ ! $(basename "$file") == conftest.py ]]; then
+            [ -f "$file" ] && FOUND_FOR_FILE+=("$file")
+        # Otherwise, check if corresponding test file exists
+        elif [[ $file == *.py ]] && [[ ! $file == test_*.py ]] && [[ ! $file == tests/* ]]; then
+            basename=$(basename "$file" .py)
+            dirname=$(dirname "$file")
+            dirname=${dirname#./}
+
+            # Common test file patterns
+            test_patterns=(
+                "tests/test_${basename}.py"
+                "tests/${dirname}/test_${basename}.py"
+                "${dirname}/test_${basename}.py"
+            )
+
+            for pattern in "${test_patterns[@]}"; do
+                [ -f "$pattern" ] && FOUND_FOR_FILE+=("$pattern") && break
+            done
+
+            # Fallback: search recursively if no test files found
+            if [ ${#FOUND_FOR_FILE[@]} -eq 0 ]; then
+                test_file=$(find tests -maxdepth 4 -type f -name "test_${basename}.py" -print -quit 2>/dev/null)
+                if [ -n "$test_file" ] && [ -f "$test_file" ]; then
+                    FOUND_FOR_FILE+=("$test_file")
+                fi
+            fi
+        fi
+
+        # Append per-file results to global TEST_FILES array
+        if [ ${#FOUND_FOR_FILE[@]} -gt 0 ]; then
+            TEST_FILES+=("${FOUND_FOR_FILE[@]}")
+        fi
+    done
+fi
+
+if [ ${#EXTRA_TEST_FILES[@]} -gt 0 ]; then
+    TEST_FILES+=("${EXTRA_TEST_FILES[@]}")
+fi
+
+if [ ${#TEST_FILES[@]} -gt 0 ]; then
+    # Resolve Python through the repo/worktree-aware hook resolver only after
+    # proving this hook has tests to run. This keeps always_run no-op commits
+    # independent from local virtualenv availability.
+    # shellcheck source=scripts/hooks/repo_python.sh
+    source "$ROOT_DIR/scripts/hooks/repo_python.sh"
+    REPO_PYTHON_BIN="$(resolve_repo_python "$ROOT_DIR")"
+    export VENV_PYTHON="$REPO_PYTHON_BIN"
+    PATH="$(dirname "$REPO_PYTHON_BIN"):$PATH"
+    export PATH
+
+    if ! "$REPO_PYTHON_BIN" -m pytest --version > /dev/null 2>&1; then
+        echo "❌ pytest not available through repo Python: $REPO_PYTHON_BIN" >&2
+        echo "   Run make venv or set absolute VENV_PYTHON to the repo environment." >&2
+        exit 1
+    fi
+
+    declare -a PYTEST_COMMAND=("$REPO_PYTHON_BIN" -m pytest)
+    log_debug "Using repo Python pytest via: ${PYTEST_COMMAND[*]}"
+
+    # Deduplicate test files
+    declare -a DEDUPED_TEST_FILES=()
+    for test_file in "${TEST_FILES[@]}"; do
+        test_file_seen=0
+        for deduped_test_file in ${DEDUPED_TEST_FILES[@]+"${DEDUPED_TEST_FILES[@]}"}; do
+            if [ "$deduped_test_file" = "$test_file" ]; then
+                test_file_seen=1
+                break
+            fi
+        done
+        if [ "$test_file_seen" = "0" ]; then
+            DEDUPED_TEST_FILES+=("$test_file")
+        fi
+    done
+    TEST_FILES=("${DEDUPED_TEST_FILES[@]}")
+    log_debug "Test files to run: ${TEST_FILES[*]}"
+
+    # Pre-commit: fast feedback is preferred; pre-push: report all failures.
+    if [ -n "${PRE_COMMIT:-}" ]; then
+        PYTEST_ARGS+=("-x")
+        log_debug "pytest fast-fail enabled (-x) for pre-commit"
+    fi
+
+    echo "Running tests: ${TEST_FILES[*]}"
+    # Use explicit exit code handling to ensure proper error propagation
+    if "${PYTEST_COMMAND[@]}" "${PYTEST_ARGS[@]}" "${TEST_FILES[@]}"; then
+        echo "✅ Backend tests passed"
+    else
+        echo "❌ Backend tests failed"
+        exit 1
+    fi
+else
+    log_debug "No test files found for ${#PYTHON_CHANGES[@]} Python changes"
+    echo "ℹ️  No corresponding test files found for changed Python files"
+fi

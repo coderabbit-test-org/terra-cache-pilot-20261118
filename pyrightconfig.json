@@ -1,0 +1,22 @@
+{
+  "pythonVersion": "3.13",
+  "typeCheckingMode": "basic",
+  "include": [
+    "**/*.py"
+  ],
+  "ignore": [
+    "tests/**",
+    "tests_strict/**"
+  ],
+  "exclude": [
+    "cache/**",
+    "test_cache/**",
+    "frontend/build/**",
+    "htmlcov/**",
+    "releases/**",
+    "data/**",
+    "external/**"
+  ],
+  "venvPath": ".",
+  "venv": ".venv"
+}

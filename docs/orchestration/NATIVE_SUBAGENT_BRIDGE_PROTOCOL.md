@@ -1,0 +1,201 @@
+# Native Subagent Bridge Protocol
+
+**Purpose:** Preserve PulsePlate repo-agent orchestration when the execution
+runtime exposes its own native subagents (for example, transport labels such as
+`worker`, `explorer`, or `default`).
+
+**Status:** Canonical for the runtime adapter layer. This protocol does not
+replace `AGENT_ROUTING_GRAPH.md`; it adapts that routing into a newer
+subagent-capable runtime.
+
+---
+
+## 1. Why this exists
+
+PulsePlate has two layers now:
+
+1. **Canonical orchestration layer**
+   - repo agent slugs from `.cursor/agents/*.md`
+   - coordinator-first routing
+   - SoT docs in `docs/orchestration/*`
+2. **Runtime transport layer**
+   - native executor types exposed by the host runtime
+   - examples: `default`, `worker`, `explorer` (Codex), or Kimi Code CLI
+
+Hard rule:
+
+- PulsePlate repo-agent slugs stay canonical.
+- Native executor names are **transport-only** and must not replace repo-agent
+  identity in packets, logs, or user-facing updates.
+
+---
+
+## 2. Canonical invariants
+
+1. Routing still resolves through `docs/orchestration/AGENT_ROUTING_GRAPH.md`.
+2. The coordinator still decides `primary_agent`, `secondary_agents`, and
+   `reviewer`.
+3. Native runtime subagents may be spawned only through coordinator-mediated
+   dispatch.
+4. Every spawned native subagent must carry the corresponding repo-agent
+   instruction file from `.cursor/agents/<slug>.md`.
+5. User-facing updates must identify the repo agent slug, not only the native
+   executor type.
+
+---
+
+## 3. Task packet contract
+
+`scripts/orchestration/task_bootstrap.py` must emit a
+`native_subagent_bridge` object with:
+
+- `protocol_version`
+- `transport`
+- `dispatch_policy`
+- `primary`
+- `secondary`
+- `advisory`
+- `reviewer`
+
+Each role binding includes:
+
+- `repo_agent_slug`
+- `display_name`
+- `native_agent_type`
+- `execution_mode`
+- `instruction_path`
+- `transport_rationale`
+- `dispatch_contract`
+
+Advisory collaborators are visible in the packet for transparency and are
+required role passes when explicitly requested. Advisory describes the
+contribution profile, not permission to skip execution.
+
+This makes the adapter explicit and testable without changing the canonical
+repo-agent routing contract.
+
+---
+
+## 4. Dispatch rules
+
+When a runtime supports native subagents:
+
+1. Read the task packet first.
+2. Use `primary_agent` / `secondary_agents` / `reviewer` as the canonical role
+   identities.
+3. Read `native_subagent_bridge` only to choose the host runtime transport type.
+4. Spawn `primary`, executable `secondary`, `reviewer`, and any `advisory`
+   binding whose dispatch contract sets `required_role_pass: true`.
+5. Treat advisory role passes as read-only / analysis-first unless their
+   explicit profile grants broader authority.
+6. Load the instruction path listed in the bridge entry.
+7. Load `required_context` and `recommended_skills` from the same task packet.
+8. In updates, describe the work using the repo-agent slug.
+
+Example:
+
+- Canonical role: `bug-hunter`
+- Native transport: `worker`
+- Correct user-facing update: `bug-hunter is triaging the regression`
+- Incorrect update: `worker is running`
+
+Reviewer rule:
+
+- reviewer bindings must use a read-only transport (`explorer`) even when the
+  base repo role is normally implemented via a write-capable transport.
+
+Creative-pilot synthesis has one narrow compatibility projection. An exact
+validated `creative_pilot_context.v2` with `phase: synthesis` contains exactly
+one canonical `synthesis:agent-coordinator` assignment. Its non-null
+`primary_agent` and `reviewer` fields both remain `agent-coordinator` only as
+legacy packet-shape aliases; they do not represent two dispatches or an
+independent-review claim. The runtime-neutral bridge emits one read-only
+`agent-coordinator` dispatch with `implementation_owner_override: false`.
+
+This projection fails closed if the context has another phase or assignment,
+if either alias changes, if secondary or advisory roles are present, if
+authority permits repository writes or provider calls, or if the packet adds
+implementation-owner flags, `dispatch_role_order`, required invariant-review
+composition, or non-canonical bridge/dispatch contracts. It does not change
+task packet schema `3.1`, bridge protocol `1.0`, ordinary reviewer separation,
+or any other creative-pilot phase.
+
+The exact synthesis projection also requires a declared
+`creative_pilot_workspace_source`. Before dispatch, the neutral consumer uses
+the canonical producer workspace reader to re-read a nonterminal
+`synthesis_ready` workspace and requires its rebuilt task context to equal the
+validated packet context exactly. Missing, stale, malformed, out-of-root,
+symlinked, wrong-phase, or differently revised sources fail closed. A validated
+byte-identical copy under the admitted workspace root remains equivalent because
+authority is bound to workspace content and revision, not to a literal pathname.
+The packet's canonical candidate-path set must equal the workspace target-file
+set, and its required context must equal the producer-owned context pack derived
+from that bound set and canonical route. The validated packet context is then
+projected into each synthesis dispatch entry so scoped agent instructions cannot
+be omitted or replaced by unrelated context.
+The consumer also rederives the packet domain from the bound goal, task class,
+and canonical candidate paths, then requires the declared domain and cluster to
+match the canonical routing graph before packet identity is accepted.
+
+Task-packet `candidate_paths` have one shared lexical authority:
+`context_pack.canonical_task_candidate_paths`. Producer mode accepts only exact
+built-in lists or tuples, canonical relative POSIX paths, a leading `./` alias
+for a non-root path, and lexical absolute paths inside the repository. Strict
+wire mode accepts only an exact built-in list already equal to the sorted,
+unique canonical projection. The exact token `.` is the sole repository-root
+sentinel; after every raw element validates, it absorbs valid sibling paths.
+Ordinary U+0020 spaces are preserved as identity-bearing characters only inside
+nonempty path components; they are never stripped or collapsed. Component-edge
+U+0020 and every other whitespace character are rejected. Producer relative,
+leading-`./`, and lexical in-repository absolute spellings converge to the same
+canonical path, while strict wire accepts only that exact relative fixed point.
+Root scope conservatively requires security review and all bounded invariant
+classes, remains distinct in packet identity, and does not by itself activate
+the judgment lane. Consumers must use the shared result before identity,
+security, invariant, judgment, or dispatch comparison; they must not strip,
+deduplicate, resolve, enumerate, or otherwise reinterpret raw packet paths.
+This grammar is metadata-only and makes no existence, symlink, access, touched
+file, implementation-authority, or merge-authority claim.
+
+---
+
+## 5. Scope boundary
+
+This protocol is an adapter only.
+
+It must not:
+
+- rewrite the routing graph,
+- invent runtime-only agent names as canonical roles,
+- bypass coordinator-first policy,
+- bypass scoped `AGENTS.md` or quality gates.
+
+---
+
+## 6. Implementation reference
+
+- Bridge module: `scripts/orchestration/native_subagent_bridge.py`
+- Packet builder: `scripts/orchestration/task_bootstrap.py`
+- Coordinator SoT: `.cursor/agents/agent-coordinator.md`
+- Workflow SoT: `docs/orchestration/workflow.md`
+- Kimi-specific bridge SoT: `docs/orchestration/KIMI_NATIVE_SUBAGENT_BRIDGE_PROTOCOL.md`
+
+---
+
+## 7. Security Notes
+
+- Native subagents must inherit the same repo constraints as the canonical
+  agent role.
+- The bridge must not create hidden autonomous routing outside coordinator
+  control.
+- Runtime executor labels must not be treated as permission grants.
+
+---
+
+## 8. Marketing & GTM
+
+- This change protects PulsePlate operator ergonomics during platform updates:
+  your team keeps the same agent language and SoT instead of retraining around
+  runtime-internal labels.
+- Clear repo-agent naming improves onboarding, debugging, and reviewability,
+  which reduces execution friction for future AI-assisted releases.

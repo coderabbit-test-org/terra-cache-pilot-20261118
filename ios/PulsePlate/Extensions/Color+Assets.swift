@@ -1,0 +1,111 @@
+import SwiftUI
+
+// MARK: - Color Assets Extension
+extension Color {
+    // MARK: - Brand Colors
+    // RU: Держим явные alias для стабильной совместимости между версиями Xcode.
+    // Автогенерацию asset symbol extensions отключаем в project settings.
+    // EN: Keep explicit aliases for stable compatibility across Xcode versions.
+    // Asset symbol extension autogeneration is disabled in project settings.
+    static let navy = PPDesignTokens.Brand.navy
+    static let appPrimary = PPDesignTokens.Brand.blue
+    static let accent = PPDesignTokens.Brand.green
+    static let gold = PPDesignTokens.Brand.gold
+
+    /// Red: #FF5D5D - Accent-only, critical states
+    static let heart = PPDesignTokens.Brand.red
+
+    // MARK: - Semantic Colors
+    static let success = PPDesignTokens.ColorToken.success
+    static let warning = PPDesignTokens.ColorToken.warning
+    static let error = PPDesignTokens.ColorToken.error
+    static let info = PPDesignTokens.ColorToken.info
+
+    // MARK: - Surface Colors
+    static let surface = PPDesignTokens.ColorToken.surface
+    static let surfaceElevated = PPDesignTokens.ColorToken.surfaceElevated
+    static let surfaceHighlight = PPDesignTokens.ColorToken.surfaceHighlight
+
+    // MARK: - Text Colors
+    static let textPrimary = PPDesignTokens.ColorToken.textPrimary
+    static let textSecondary = PPDesignTokens.ColorToken.textSecondary
+    static let textTertiary = PPDesignTokens.ColorToken.textTertiary
+
+    /// Maps backend segment color names to canonical semantic UI colors.
+    static func segmentSemanticColor(from colorString: String) -> Color {
+        switch colorString.lowercased() {
+        case "green":
+            return .success
+        case "red":
+            return .heart
+        case "orange", "yellow":
+            return .warning
+        case "blue", "purple":
+            return .appPrimary
+        default:
+            return .textTertiary
+        }
+    }
+}
+
+// MARK: - Color Hex Initializer
+extension Color {
+    init(hex: String) {
+        let hex = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
+        var int: UInt64 = 0
+        Scanner(string: hex).scanHexInt64(&int)
+        let a, r, g, b: UInt64
+        switch hex.count {
+        case 3: // RGB (12-bit)
+            (a, r, g, b) = (255, (int >> 8) * 17, (int >> 4 & 0xF) * 17, (int & 0xF) * 17)
+        case 6: // RGB (24-bit)
+            (a, r, g, b) = (255, int >> 16, int >> 8 & 0xFF, int & 0xFF)
+        case 8: // RRGGBBAA (32-bit)
+            (a, r, g, b) = (int & 0xFF, int >> 24, int >> 16 & 0xFF, int >> 8 & 0xFF)
+        default:
+            (a, r, g, b) = (1, 1, 1, 0)
+        }
+
+        self.init(
+            .sRGB,
+            red: Double(r) / 255,
+            green: Double(g) / 255,
+            blue:  Double(b) / 255,
+            opacity: Double(a) / 255
+        )
+    }
+}
+
+// MARK: - View Theme Extensions
+extension View {
+    /// Apply navy background - the main theme background used throughout the app
+    func navyBackground() -> some View {
+        self.background(Color.navy)
+    }
+
+    /// Apply glass card styling with consistent background and corner radius
+    func glassCardStyle() -> some View {
+        self
+            .background(PPDesignTokens.ColorToken.surface.opacity(0.8))
+            .clipShape(RoundedRectangle(cornerRadius: PPDesignTokens.Radius.medium, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: PPDesignTokens.Radius.medium, style: .continuous)
+                    .stroke(PPDesignTokens.ColorToken.strokeSubtle, lineWidth: 1)
+            )
+    }
+
+    /// Apply primary text color (white)
+    func primaryText() -> some View {
+        self.foregroundStyle(Color.textPrimary)
+    }
+
+    /// Apply secondary text color
+    func secondaryText() -> some View {
+        self.foregroundStyle(Color.textSecondary)
+    }
+
+    /// Apply tertiary text color
+    func tertiaryText() -> some View {
+        self.foregroundStyle(Color.textTertiary)
+    }
+}

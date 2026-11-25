@@ -1,0 +1,4 @@
+/* English Info.plist Localization */
+"NSHealthShareUsageDescription" = "PulsePlate reads Health nutrition and body weight data to show wellness progress and planning with your consent.";
+"CFBundleDisplayName" = "PulsePlate";
+"CFBundleName" = "PulsePlate";

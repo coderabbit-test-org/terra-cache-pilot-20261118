@@ -1,0 +1,459 @@
+# Providers Implementation — Detailed Analysis
+
+**Originally drafted:** 2026-01-12
+**Purpose:** Document how `providers/` is implemented and how it is wired into runtime through the canonical AI bounded-context seam (`core/ai/*`) and the legacy insight adapters.
+
+---
+
+## 📋 Current State (Facts)
+
+### Directory Structure
+
+```text
+providers/
+├── __init__.py      # ProviderBase Protocol
+├── grok.py          # xAI Grok provider
+├── ollama.py        # Local Ollama provider
+├── pico.py          # Pico provider (Ollama-compatible)
+├── stub.py          # Stub provider (for tests)
+└── AGENTS.md        # Provider-specific rules
+```
+
+### What Providers Are
+
+**LLM Providers** (Language Model Providers):
+- Abstract interface: `ProviderBase` (Protocol)
+- Implementations: `GrokProvider`, `OllamaProvider`, `PicoProvider`, `StubProvider`
+- Purpose: Provide LLM (Large Language Model) capabilities for AI features
+
+**Not to be confused with:**
+- Catalog providers (`app/services/catalog_adapter.py`) — different domain (food catalog)
+- Shoplist providers (`core/catalog/provider.py`) — different domain (shopping list)
+
+---
+
+### Development-only FitChef Agent API option
+
+The optional `PerplexityAgentProvider` is selected only by the two shared
+FitChef text/structured execution paths in `app/services/fitchef_runtime.py:224`.
+`FITCHEF_AGENT_API_ENABLED` defaults to `false`; absent/false keeps the existing
+`llm.get_provider()` selection, including the configured Sonar baseline. CBT
+coach insight and generic insight retain their existing selectors. This option
+does not change public routes, response models, OpenAPI, or retrieval ownership.
+
+Enabled requests require explicit developer-like raw environment labels through
+`settings.is_raw_explicit_developer_env()`. Production, staging, unknown, or
+absent labels fail closed before quota consumption or client allocation. Missing
+or invalid key, model, reasoning effort, flag, or oversized prompt also fails
+before quota consumption. The current feature/tier/input/RAG/audit gates retain
+their order, including the `provider://default` audit target.
+
+| Setting or boundary | Reviewed value |
+| --- | --- |
+| API transport | Existing `AsyncOpenAI` Responses SDK; fixed `https://api.perplexity.ai/v1` |
+| Model | Exactly one of `openai/gpt-6-luna`, `openai/gpt-6-sol`, `openai/gpt-6.1-sol`; explicit configuration |
+| Reasoning effort | Explicit `none` or `low` |
+| Tools and storage option | `tools=[]`, `store=false` |
+| Attempt budget | SDK retries and redirects disabled; no automatic Sonar reroute or second paid attempt |
+| Limits | 45-second SDK timeout; 32,768-byte prompt and output bounds; 2,048 output tokens |
+| Response admission | Completed, error-free, exact requested model, one final assistant text message; no tool output |
+
+The provider allocates an explicitly redirect-disabled owned HTTPX client only
+inside quota-admitted generation and closes owned resources on success, failure,
+SDK allocation error, and cancellation. Injected clients remain caller-owned:
+unsafe redirect-following or closed clients fail before quota/client allocation,
+are rechecked before generation, and are never mutated or closed by the adapter.
+The native SDK request-options hook copies its options and pins
+`follow_redirects=False` for each send, including when a borrowed client flag
+changes after admission. A redirect stops after the initial request and becomes
+the existing sanitized unavailable error; no second destination receives body
+or credentials (`providers/perplexity_agent.py:48`).
+
+Adapter-created SDK instances explicitly disable the `OPENAI_ORG_ID`,
+`OPENAI_PROJECT_ID`, and `OPENAI_WEBHOOK_SECRET` constructor defaults. The
+native request hook removes exactly `OpenAI-Organization` and `OpenAI-Project`
+from each prepared request after HTTPX merges default headers, using its
+case-insensitive header API. Borrowed client defaults remain unchanged. This
+covers the named SDK/default-header sources; arbitrary later caller auth,
+event-hook, or transport mutations are outside this guarantee. Webhook evidence
+concerns SDK state, not an outgoing webhook header
+(`providers/perplexity_agent.py:56`).
+
+The explicit 6.1 identifier is an internal configuration option, tested through
+the real SDK with mock transport. The retained single real transport smoke used
+Luna. Neither catalog naming nor deterministic acceptance proves key-specific
+6.1 availability, live reasoning support, coaching quality, billing, privacy,
+or activation. The option remains disabled by default.
+
+The provider adapter sanitizes SDK exceptions
+without attaching raw SDK errors, prompt, key, or response body to logged
+tracebacks. A request-local `ContextVar` filter suppresses all records on exactly
+`openai._base_client` and `openai._response` during the entire active or inherited
+Agent request context, including nested SDK calls and child tasks that outlive
+the parent context reset. Independent contexts outside Agent retain diagnostics;
+this makes no broader concurrent/nested SDK observability promise
+(`providers/perplexity_agent.py:25`).
+Existing public timeout `504`,
+provider-unavailable `503`, and user quota `429` contracts remain unchanged.
+Text still enters the current structured draft, wellness validation, and
+template fallback path. It supplies no planner, nutrition, entitlement, action,
+source-support, or clinical authority. Deterministic SDK/route tests live in
+`tests/test_perplexity_agent_provider.py:81`.
+
+This option is admitted only for synthetic development experiments. Agent API
+`store=false` must not be treated as proof of zero retention, privacy consent,
+answer quality, or release readiness. Real-user activation remains blocked on
+reviewed Agent privacy/consent and the separately owned high-distress validator
+prerequisite #2430. Three exploratory development cases are transport/comparison
+evidence only; NOOS-1C owns later locale, task-specific routing, and Luna/Sol
+promotion. Search API research remains a separate retrieval lane.
+
+---
+
+## 🔍 Implementation Details
+
+### 1. ProviderBase Protocol
+
+**File:** `providers/__init__.py`
+
+```python
+class ProviderBase(Protocol):
+    """Базовый интерфейс для всех LLM-провайдеров."""
+    name: str
+    async def generate(self, text: str) -> str:
+        raise NotImplementedError("Provider must implement .generate(text)")
+```
+
+**Design:**
+- Protocol-based (structural typing)
+- Minimal interface: `name` + `generate(text)` method
+- Async-first (all providers are async)
+
+**Rationale:**
+- Allows multiple implementations (grok, ollama, pico, stub)
+- Easy to swap providers via env var (`LLM_PROVIDER`)
+- Testable via stub provider
+
+---
+
+### 2. GrokProvider (xAI)
+
+**File:** `providers/grok.py`
+
+**Implementation:**
+- Uses OpenAI-compatible SDK (`AsyncOpenAI`)
+- Endpoint: `https://api.x.ai/v1` (default)
+- Model: `grok-4-latest` (default)
+- API key: from env (`GROK_API_KEY` or `XAI_API_KEY`)
+- Retry logic: 3 attempts with exponential backoff
+
+**Key features:**
+- Network calls via `httpx` (async)
+- Error handling: wraps exceptions in `RuntimeError`
+- Timeout: 30s (default, configurable)
+
+**Rationale:**
+- xAI provides OpenAI-compatible API
+- Reuse existing OpenAI SDK (less code)
+- Production-ready provider for cloud LLM
+
+---
+
+### 3. OllamaProvider (Local)
+
+**File:** `providers/ollama.py`
+
+**Implementation:**
+- Local/self-hosted Ollama server
+- Endpoint: `http://localhost:11434` (default)
+- Model: `llama3.1:8b` (default)
+- Timeout: 1.5s (short, for fast 503 responses)
+- Retry logic: 3 attempts with exponential backoff
+
+**Key features:**
+- Two API methods: `/api/chat` (preferred) + `/api/generate` (fallback)
+- Handles multiple response formats (compatible implementations)
+- Fast timeout → quick 503 if Ollama unavailable
+- Network errors → `RuntimeError("ollama_unavailable")`
+
+**Rationale:**
+- Privacy: local models, no data leaves machine
+- Cost: free (self-hosted)
+- Flexibility: can use any Ollama-compatible model
+- Fast failure: short timeout prevents hanging requests
+
+---
+
+### 4. PicoProvider (Ollama-Compatible)
+
+**File:** `providers/pico.py`
+
+**Implementation:**
+- Ollama-compatible provider (alternative to Ollama)
+- Endpoint: same as Ollama (default: `http://localhost:11434`)
+- Model: same as Ollama (default: `llama3.1:8b`)
+- Timeout: 5.0s (longer than Ollama)
+
+**Key features:**
+- Sync + async fallback (for test compatibility)
+- Handles multiple response formats
+- Error handling: wraps in `RuntimeError`
+
+**Rationale:**
+- Alternative to Ollama (if user prefers Pico)
+- Same API contract as Ollama (easy swap)
+- Test compatibility (sync client for monkeypatch)
+
+---
+
+### 5. StubProvider (Testing)
+
+**File:** `providers/stub.py`
+
+**Implementation:**
+- No network calls
+- Deterministic output: `[stub @ {timestamp}] Insight: {text[:120]}`
+- Synchronous (not async, but compatible)
+
+**Rationale:**
+- Fast tests (no network)
+- Deterministic (predictable output)
+- No external dependencies
+
+---
+
+## 🔗 Integration Point: `llm.py`
+
+**File:** `llm.py` (root level)
+
+**Purpose:** Factory function to get LLM provider based on env var.
+
+**Implementation:**
+```python
+# Lazy imports (fail-soft if provider unavailable)
+try:
+    from providers.grok import GrokProvider as _GrokProvider
+except ImportError:
+    GrokProvider = None
+
+try:
+    from providers.ollama import OllamaProvider as _OllamaProvider
+except ImportError:
+    OllamaProvider = None
+
+# Factory function
+def get_provider():
+    val = os.getenv("LLM_PROVIDER", "").strip().lower()
+    if val == "grok":
+        return GrokProvider(...) or GrokLiteProvider()
+    if val == "ollama":
+        return OllamaProvider(...) or OllamaLiteProvider()
+    if val == "stub":
+        return StubProvider()
+    return None
+```
+
+**Rationale:**
+- Fail-soft: if provider unavailable → fallback to "lite" provider
+- Lite providers: offline fallback (no network, returns formatted text)
+- Env-based selection: easy to switch providers
+
+---
+
+## ✅ Current Runtime Usage: WIRED (via `core/ai/*` + legacy insight adapters)
+
+### Evidence: Providers are used via `legacy_app.py → app/services/insight_application_service.py → core/ai/* → llm.py → providers/*`
+
+**1. Insight endpoints remain compatibility adapters in `legacy_app.py`**
+
+- Evidence:
+  - `legacy_app.py:2168-2187` defines HTTP routes:
+    - `POST /api/v1/insight` (API key gated)
+    - `POST /insight` (legacy path)
+
+**2. The shared application service owns endpoint orchestration, not `legacy_app.py`**
+
+- Evidence:
+  - `app/services/insight_application_service.py` executes shared `/insight` orchestration
+  - `app/services/insight_runtime.py` owns traced `provider.generate(...)` execution
+
+**3. `core/ai/*` is the canonical provider/runtime preparation seam**
+
+- Evidence:
+  - `core/ai/insight_runtime.py` prepares `PhilosophicalRuntime`, route decision, transparency notice, and provider selection
+  - `legacy_app.py` keeps HTTPException mapping and route wrappers as thin adapters for compatibility/tests
+
+**4. `llm.py` imports `providers/*` and selects provider by env var**
+
+- Evidence:
+  - `llm.py:57-79` — optional imports of `providers.grok`, `providers.ollama`, `providers.pico`
+  - `llm.py:91-153` — `get_provider()` selects provider based on `LLM_PROVIDER`
+
+**Conclusion:** `providers/` is wired into runtime through the canonical `core/ai/*` seam, with `llm.get_provider()` acting as the low-level factory/adapter layer and legacy routes remaining thin HTTP compatibility wrappers.
+
+---
+
+## 🎯 Why Providers Exist (Design Rationale)
+
+### Original Intent (Inferred)
+
+**Purpose:** Provide LLM capabilities for AI features (e.g., nutrition insights, recipe synthesis).
+
+**Design decisions:**
+1. **Multiple providers** → flexibility (cloud vs local)
+2. **Protocol-based** → easy to swap implementations
+3. **Fail-soft** → graceful degradation (lite providers)
+4. **Env-based selection** → no code changes to switch providers
+
+### Current Status
+
+**Implemented:**
+- ✅ Provider interfaces (Protocol)
+- ✅ Multiple implementations (grok, ollama, pico, stub)
+- ✅ Factory function (`llm.py`)
+- ✅ Tests (unit tests for each provider)
+
+**Runtime wiring (current):**
+- ✅ Insight endpoints stay in `legacy_app.py` as thin wrappers
+- ✅ Shared app service and tracing adapters live in `app/services/*`
+- ✅ Canonical provider/runtime preparation now enters through `core/ai/*`
+
+**Historical note (superseded):**
+- Earlier versions of this doc claimed providers were “not wired into runtime” because `app/routers/` did not import them.
+  That was incomplete: the wiring lives in `legacy_app.py` (root module), not in `app/routers/`.
+
+---
+
+## 📊 Provider Usage Analysis
+
+### Where Providers Are Used
+
+**1. `llm.py` (root):**
+- Imports all providers
+- Factory function `get_provider()`
+- Lite providers (fallback)
+
+**2. Tests:**
+- `tests/test_providers_unit.py` — unit tests
+- `tests/test_llm*.py` — integration tests
+- `tests/test_llm_import_coverage.py` — import coverage
+
+**3. Scripts:**
+- `ollama_diagnostic.sh` — diagnostic script
+- `ollama_monitor.sh` — monitoring script
+
+**4. Documentation:**
+- `docs/finetune/README.md` — mentions providers
+- `docs/archive/2025-09-16/` — historical docs
+
+### Direct Provider Imports
+
+FitChef runtime lazily imports the development-only Agent adapter at
+`app/services/fitchef_runtime.py:241`; ordinary default selection continues
+through `llm.get_provider()`. Route handlers retain service delegation.
+
+**1. `app/routers/` (directly):**
+- `app/routers/legacy_insight.py:50` delegates to
+  `app/services/insight_compat.py:13` and the shared app service seam; provider
+  preparation remains
+  in `core/ai/insight_runtime.py` and ordinary selection in `llm.py`.
+
+**2. `app/services/` (directly):**
+- The optional FitChef selector imports `providers.perplexity_agent` only after
+  explicit flag and development-environment admission.
+
+**3. Core domain:**
+- AI runtime preparation lives in `core/ai/insight_runtime.py:174`; the deeper
+  philosophical runtime executes `provider.generate(...)` at
+  `core/insight/philosophical_runtime.py:490`. Provider text remains advisory
+  and does not own nutrition, planner, or entitlement calculations.
+
+---
+
+## 🔮 Future Integration (Not Current)
+
+### Potential Use Cases
+
+**1. Nutrition Insights:**
+- `/api/v1/vip/insight` endpoint
+- Uses LLM to generate nutrition insights
+- Requires VIP tier
+
+**2. Recipe Synthesis:**
+- AI-generated recipes
+- Uses LLM to create custom recipes
+- Requires VIP tier
+
+**3. Meal Planning:**
+- AI-assisted meal planning
+- Uses LLM for suggestions
+- Requires PRO/VIP tier
+
+### Why Not Connected Yet
+
+**Possible reasons:**
+1. Feature not ready (still in development)
+2. Waiting for LLM infrastructure (Ollama setup, API keys)
+3. Prioritizing other features first
+4. Design decision: keep LLM optional/experimental
+
+---
+
+## ✅ Verification: Providers wired into runtime
+
+Evidence pointers (runtime truth):
+
+- `legacy_app.py` — insight HTTP endpoints exist (`/api/v1/insight`, `/insight`) as compatibility adapters
+- `legacy_app.py:2066-2076` — lazy loader imports `llm.get_provider`
+- `legacy_app.py:2098-2117` — calls `provider.generate(...)`
+- `llm.py:57-79` + `91-153` — imports/selects `providers/*` via `LLM_PROVIDER`
+
+---
+
+## 📝 Implications for OpenAPI stability
+
+### OpenAPI Stability
+
+**Fact:** `providers/` is wired into runtime via insight endpoints (legacy_app → llm → providers).
+
+**Implication for OpenAPI:**
+- Providers are not OpenAPI consumers themselves, but they are part of runtime behavior via insight endpoints.
+- OpenAPI stability policy still primarily serves thin clients (web types from OpenAPI) and unknown external consumers.
+- See ADR: `docs/architecture/ADR-002-openapi-schema-only-mode.md` (schema-only contract + exit criteria).
+
+**OpenAPI Stability Rationale (separate from providers):**
+- Web frontend generates types from OpenAPI (`openapi.json` → `schema.ts`)
+- External OpenAPI consumers are unknown
+- iOS is manual today (does not depend on OpenAPI)
+
+**Conclusion:** OpenAPI stability policy is driven by web type generation and unknown external consumers, **not by providers** (providers are not OpenAPI consumers).
+
+---
+
+## 🎯 Summary
+
+**What providers are:**
+- LLM provider implementations (grok, ollama, pico, stub)
+- Abstracted via `ProviderBase` Protocol
+- Selected via env var (`LLM_PROVIDER`)
+- Factory function in `llm.py`
+
+**Current status:**
+- ✅ Implemented (code exists)
+- ✅ Wired into runtime via `core/ai/*`, shared app insight services, and `llm.get_provider()`
+- ✅ Tested (unit tests exist)
+
+**Why they exist:**
+- Future AI features (insights, recipe synthesis)
+- Flexibility (cloud vs local LLM)
+- Fail-soft design (graceful degradation)
+
+**For PR-521:**
+- Providers are potential future OpenAPI consumers
+- Cannot assume they won't use OpenAPI in future
+- Therefore: keep deprecated aliases in schema (vendor extensions only)
+
+---
+
+**Last updated:** 2026-02-02
+**Status:** Providers exist and are wired into runtime via insight endpoints

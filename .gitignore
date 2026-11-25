@@ -1,0 +1,410 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+*.pyo
+*.pyd
+
+# 🐳 Docker Best Practices Reminder:
+# - Always test builds locally: make docker-build
+# - Clean old images: make docker-clean-images
+# - See DOCKER_BEST_PRACTICES.md for full guidelines
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+# Allow committed frontend utilities while keeping surrounding build dirs ignored
+!frontend/src/lib/
+!frontend/src/lib/**
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+#  Usually these files are written by a python script from a template
+#  before PyInstaller builds the exe, so as to inject date/other infos into it.
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+coverage*.xml
+*.cov.xml
+junit.xml
+pytest_report.xml
+test_results.xml
+tests/results*.xml
+frontend/tests/*.xml
+frontend/test-results/
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+.ruff_cache/
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff:
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+.python-version
+
+# pipenv
+#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
+#   However, in case of collaboration, if having platform-specific dependencies or dependencies
+#   having no cross-platform support, pipenv may install dependencies that don't work, or not
+#   install all needed dependencies.
+#Pipfile.lock
+
+# PEP 582; used by e.g. github.com/David-OConnor/pyflow
+__pypackages__/
+
+# Celery stuff
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
+
+# Environments
+.env
+.venv
+.venv_*/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# IDE
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.claude/
+*.swp
+*.swo
+*~
+
+# Cursor MCP config (contains authentication tokens)
+.cursor/mcp.json
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Project specific
+data/evals/rag_weekly_*.jsonl
+# Keep the committed smoke fixture while hiding strict weekly/manual datasets.
+!data/evals/pulseplate_rag_eval_sample.jsonl
+!data/evals/pulseplate_rag_eval_validity_sample.jsonl
+!data/evals/pulseplate_judgment_eval_validity_sample.jsonl
+# Local raw food dumps (W1); keep snapshots README only
+data/raw/*
+!data/raw/snapshots/
+data/raw/snapshots/*
+!data/raw/snapshots/README.md
+# Generated analysis artifacts
+bayesian_quality_report.json
+bayesian_analysis_results.json
+bayesian_analysis_results_updated.json
+# uv package manager binary (executable file)
+uv
+test_execution_history.json
+
+*.log
+*.pid
+*.seed
+*.pid.lock
+
+# Coverage reports
+coverage_report_detailed.txt
+coverage.xml
+htmlcov/
+coverage_html/
+cov_html/
+
+# Cache directories
+cache/
+test_cache/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+
+# API keys and secrets
+.env.local
+.env.production
+.env.staging
+api_keys.txt
+secrets.txt
+.key
+*.key
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Log files
+logs/
+*.log
+
+# Node modules (if any)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Agent run summaries (local artifacts; never commit)
+artifacts/agent_runs/
+artifacts/orchestration/
+artifacts/evals/
+artifacts/rag_eval/
+artifacts/security_lab/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Local development
+local/
+dev/
+worktrees/
+.qoder/
+!docs/dev/
+!docs/dev/**
+debug_*.py
+reproduce_*.py
+
+# Allow tests under tests/ (do not ignore them)
+!tests/**
+# But still ignore __pycache__ and temporary files in tests/
+tests/**/__pycache__/
+tests/__pycache__/
+test_output.txt
+
+# Xcode user-specific files
+xcuserdata/
+*.xcuserstate
+*.xcuserdatad/
+
+# Large media files (over 500KB)
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+*.m4v
+*.3gp
+*.flv
+*.wmv
+*.asf
+*.rm
+*.rmvb
+*.vob
+*.ogv
+*.ogg
+*.drc
+*.gif
+*.gifv
+*.mng
+*.qt
+*.yuv
+*.amv
+*.m4p
+*.mpg
+*.mp2
+*.mpeg
+*.mpe
+*.mpv
+*.m2v
+*.svi
+*.3g2
+*.mxf
+*.roq
+*.nsv
+*.f4v
+*.f4p
+*.f4a
+*.f4b
+
+# Large image files in build/temp directories only
+ios/temp_animation/
+ios/temp_icons/
+ios/build/
+ios/tmp/
+build/
+tmp/
+temp/
+**/temp_*/
+**/build_*/
+**/export_*/
+
+# Large raw image files (over 500KB) in specific directories
+**/temp_*/*.png
+**/temp_*/*.jpg
+**/temp_*/*.jpeg
+**/temp_*/*.gif
+**/temp_*/*.bmp
+**/temp_*/*.tiff
+**/temp_*/*.tif
+**/temp_*/*.webp
+**/temp_*/*.svg
+**/temp_*/*.ico
+**/temp_*/*.psd
+**/temp_*/*.ai
+**/temp_*/*.eps
+**/temp_*/*.raw
+**/temp_*/*.cr2
+**/temp_*/*.nef
+**/temp_*/*.orf
+**/temp_*/*.sr2
+**/temp_*/*.arw
+**/temp_*/*.dng
+**/temp_*/*.rw2
+**/temp_*/*.pef
+**/temp_*/*.srw
+**/temp_*/*.x3f
+**/temp_*/*.mrw
+**/temp_*/*.raf
+**/temp_*/*.dcr
+**/temp_*/*.kdc
+**/temp_*/*.mos
+**/temp_*/*.mef
+**/temp_*/*.erf
+**/temp_*/*.3fr
+**/temp_*/*.ari
+**/temp_*/*.bay
+**/temp_*/*.cap
+**/temp_*/*.crw
+**/temp_*/*.dcs
+**/temp_*/*.drf
+**/temp_*/*.eip
+**/temp_*/*.fff
+**/temp_*/*.iiq
+**/temp_*/*.k25
+**/temp_*/*.kc2
+**/temp_*/*.mdc
+**/temp_*/*.nrw
+**/temp_*/*.ptx
+**/temp_*/*.pxn
+**/temp_*/*.r3d
+**/temp_*/*.rwl
+**/temp_*/*.rwz
+**/temp_*/*.srf
+
+# Specific iOS PulsePlate project files
+ios/PulsePlate/Assets.xcassets/FitChefAnimation.imageset/*.mp4
+ios/PulsePlate/Assets.xcassets/FitChef.imageset/fitchef@*.png
+ios/PulsePlate/Resources/MP4/*.mp4
+ios/PulsePlate/Resources/*.mp4
+ios/PulsePlate/Assets.xcassets/*/20250913_1212_FitChef*.mp4
+ios/20250913_1212_FitChef*
+
+# Temporary animation files
+ios/temp_animation/
+ios/20250913_1212_FitChef*
+ios/.build/
+frontend/tsconfig.node.tsbuildinfo
+frontend/tsconfig.node.tsbuildinfo
+bandit-report.json
+
+# Security scan artifacts
+local-safety-report.json
+**/tmp_security_*/
+**/tmp_security_*/
+coverage.json
+# Local / temporary audit scratchpads
+docs/audit/_local/**
+docs/audit/*.tmp.md
+docs/audit/*.draft.md
+.derivedData/
+ios/.derivedDataSnapshot/
+ios/.bundle/
+ios/fastlane/screenshots/
+ios/fastlane/report.xml
+ios/fastlane/Preview.html
+ios/fastlane/test_output/
+ios/vendor/bundle/

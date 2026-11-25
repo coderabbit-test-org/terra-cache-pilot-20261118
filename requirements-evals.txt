@@ -1,0 +1,8 @@
+#
+# Managed by the PulsePlate private-proxy lock workflow.
+# Profile: evals
+# Sources: requirements-evals.in
+# Regenerate with:
+#
+#    LOCK_PROFILES="evals" make requirements-locks
+#

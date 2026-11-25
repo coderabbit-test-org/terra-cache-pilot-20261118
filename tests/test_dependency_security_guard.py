@@ -1,0 +1,4478 @@
+"""Deterministic guards for dependency vulnerability floor versions (schema SSOT)."""
+
+from __future__ import annotations
+
+from copy import deepcopy
+from datetime import datetime
+import hashlib
+import json
+from fnmatch import fnmatch
+import os
+import re
+import shutil
+import subprocess
+from pathlib import Path
+from typing import Iterable, Optional
+
+import pytest
+from packaging.requirements import InvalidRequirement
+from packaging.requirements import Requirement
+from packaging.specifiers import InvalidSpecifier
+from packaging.specifiers import SpecifierSet
+from packaging.utils import canonicalize_name
+from packaging.version import InvalidVersion
+from packaging.version import Version
+
+from scripts.ci.check_python_dependency_surfaces import (
+    DEPENDENCY_SURFACES,
+    compiled_dependency_surfaces,
+    registered_dependabot_requirement_carriers,
+)
+from scripts.ci.dependabot_requirement_carriers import discover_dependabot_requirement_carriers
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SCHEMA_PATH = REPO_ROOT / "tests" / "fixtures" / "dependency_security_schema.json"
+ADMISSION_DOC_PATH = REPO_ROOT / "docs" / "security" / "CRYPTOGRAPHY_50_0_0_ADVISORY_CLUSTER.md"
+DEPENDABOT_INVENTORY_PATH = REPO_ROOT / "docs" / "security" / "DEPENDABOT_ALERT_INVENTORY.md"
+BACKLOG_LEDGER_PATH = REPO_ROOT / "docs" / "roadmap" / "BACKLOG_LEDGER.md"
+MSGPACK_ALERT_NUMBER = "225"
+MSGPACK_ALERT_LEDGER_ANCHOR = "ledger-p1-msgpack-ci-lite-alert-recheck"
+MSGPACK_ALERT_TUPLE = {
+    "alert_number": MSGPACK_ALERT_NUMBER,
+    "ecosystem": "pip",
+    "package": "msgpack",
+    "advisory": "GHSA-6v7p-g79w-8964",
+    "state": "fixed",
+    "fixed_at": "2026-06-22T22:34:21Z",
+    "dismissed_at": "null",
+    "auto_dismissed_at": "null",
+    "manifest": "requirements-ci-lite.txt",
+}
+MSGPACK_ALERT_TUPLE_FIELDS = frozenset(MSGPACK_ALERT_TUPLE)
+MSGPACK_CLOSED_SECTION_HEADING = "## Closed alert reconciliation"
+DEPENDABOT_OPEN_SECTION_HEADING = "## Authenticated open alerts"
+SNAPSHOT_START = "<!-- dependency-remediation-admission-v1-snapshot:start -->"
+SNAPSHOT_END = "<!-- dependency-remediation-admission-v1-snapshot:end -->"
+SNAPSHOT_ALLOWLIST_LINE = "<!-- pragma: allowlist nextline secret -->"
+SNAPSHOT_KIND = "dependency-remediation-admission-v1-evidence"
+SNAPSHOT_CUTOFF = "2026-08-04T10:18:11Z"
+SNAPSHOT_TARGET = "50.0.0"
+GIT_EVIDENCE_ACTIONS_MODE_FAILURE = (
+    "dependency-remediation Git evidence: GITHUB_ACTIONS must be absent locally or exactly "
+    "'true' in GitHub Actions"
+)
+GIT_EVIDENCE_GITHUB_SHA_SHAPE_FAILURE = (
+    "dependency-remediation Git evidence: GitHub Actions requires canonical lowercase full "
+    "GITHUB_SHA"
+)
+GIT_EVIDENCE_GITHUB_SHA_RESOLUTION_FAILURE = (
+    "dependency-remediation Git evidence: GITHUB_SHA must resolve exactly to a commit in the "
+    "current repository"
+)
+GIT_EVIDENCE_CHECKOUT_FAILURE = (
+    "dependency-remediation Git evidence: checked-out HEAD must resolve canonically and equal "
+    "GITHUB_SHA"
+)
+GIT_EVIDENCE_LOCAL_HEAD_FAILURE = (
+    "dependency-remediation Git evidence: local HEAD must resolve exactly to a lowercase full "
+    "commit"
+)
+GIT_EVIDENCE_BASE_ANCESTRY_FAILURE = (
+    "dependency-remediation Git evidence: remediation base must remain an ancestor of the frozen "
+    "evidence head"
+)
+
+REQUIREMENT_SURFACES = (
+    REPO_ROOT / "requirements.in",
+    REPO_ROOT / "requirements-docker-runtime.in",
+    REPO_ROOT / "requirements-ci-lite.in",
+    REPO_ROOT / "requirements-dev.in",
+    REPO_ROOT / "requirements.txt",
+    REPO_ROOT / "requirements-docker-runtime.txt",
+    REPO_ROOT / "requirements-dev.txt",
+    REPO_ROOT / "requirements-lock.txt",
+    REPO_ROOT / "requirements-ci-lite.txt",
+    REPO_ROOT / "constraints.txt",
+)
+
+CRYPTOGRAPHY_REMEDIATION_BASE = (
+    "643eb78d01476835523a3e800f1e88cb36f0aa8f"  # pragma: allowlist secret
+)
+CRYPTOGRAPHY_REMEDIATION_REPLAY_WITNESS = (
+    "5383a5bfe5c81eb5b9f07699dd67983d09118882"  # pragma: allowlist secret
+)
+CRYPTOGRAPHY_GOVERNED_SURFACE_NAMES = (
+    "requirements.in",
+    "requirements-docker-runtime.in",
+    "requirements-ci-lite.in",
+    "requirements-dev.in",
+    "constraints.txt",
+    "requirements.txt",
+    "requirements-docker-runtime.txt",
+    "requirements-ci-lite.txt",
+    "requirements-dev.txt",
+    "requirements-lock.txt",
+)
+CRYPTOGRAPHY_INTENT_SURFACES = frozenset(CRYPTOGRAPHY_GOVERNED_SURFACE_NAMES[:5])
+CRYPTOGRAPHY_COMPILED_SURFACES = frozenset(CRYPTOGRAPHY_GOVERNED_SURFACE_NAMES[5:])
+CRYPTOGRAPHY_F_CUTOFF = {
+    "GHSA-m2h6-j472-rp4c": ">=0,<49.0.0",
+    "GHSA-g6cj-pr64-35w5": ">=44.0.0,<50.0.0",
+    "GHSA-jwv3-5hgf-82ww": ">=0,<49.0.0",
+}
+
+CURRENT_ENFORCED_RUNTIME_FLOORS = {
+    "click": "8.3.3",
+    "cryptography": "50.0.2",
+    "pillow": "13.0.0",
+    "python-multipart": "0.0.31",
+    "setuptools": "84.1.0",
+    "starlette": "1.3.1",
+}
+
+REMEDIATION_FIXED_FLOORS = {
+    "mako": Version("1.4.2"),
+    "anyio": Version("4.14.2"),
+    "black": Version("26.10.1"),
+    "certifi": Version("2026.10.19"),
+    "dnspython": Version("2.9.2"),
+    "filelock": Version("4.2.1"),
+    "setuptools": Version("84.1.0"),
+    "httpcore2": Version("2.12.0"),
+    "httpx2": Version("2.12.0"),
+    "msgpack": Version("1.2.3"),
+    "opentelemetry-api": Version("1.45.2"),
+    "pillow": Version("13.0.0"),
+    "urllib3": Version("2.8.0"),
+    "virtualenv": Version("21.14.10"),
+}
+
+VIRTUALENV_F_CUTOFF = {
+    "GHSA-394h-qwmc-48pf": "<21.14.9",
+    "GHSA-3jhc-wjqf-5f2c": "<1.5",
+    "GHSA-494p-63j8-28p3": "<21.14.9",
+    "GHSA-4f8h-vr72-p32c": "<21.14.10,>=21.14.8",
+    "GHSA-597g-3phw-6986": "<20.36.1",
+    "GHSA-5vjq-rrrf-7h2q": "<=21.14.3",
+    "GHSA-6w3r-xr62-4xcp": "<21.14.9",
+    "GHSA-8rjx-v5ww-45pp": "<=21.14.1,>=20.26.6",
+    "GHSA-94p9-xgh2-xp45": "<=21.7.11",
+    "GHSA-9h9j-4vrj-gf7g": "<=21.7.10",
+    "GHSA-c947-3pg5-gm8q": "<=21.14.1",
+    "GHSA-c978-59m8-c77v": "<21.14.9",
+    "GHSA-cx28-75q4-x26q": "<21.14.9",
+    "GHSA-fc2g-4w5p-6whm": "<21.14.9",
+    "GHSA-p58f-9548-mpm2": "<=21.7.12",
+    "GHSA-qmx5-4p3x-wvqf": "<21.14.9",
+    "GHSA-rqc4-2hc7-8c8v": "<20.26.6",
+    "GHSA-vxj4-q4g9-crj7": "<=21.14.6",
+    "GHSA-x78j-v8h9-3j2q": "<=21.7.11",
+}
+
+# Reconciled primary ranges at the October 24 cutoff; no historical lock/delta binding.
+PYTHON_STABILIZATION_F_CUTOFF = {
+    "black": {"GHSA-cg8m-r9f2-5wm2": "<26.10.1"},
+    "certifi": {"GHSA-6q48-6c7w-9gw2": ">=2019.03.09,<2026.10.19"},
+    "filelock": {
+        "GHSA-567q-5qvw-pf92": "<=4.2.0,>=3.22.0",
+        "GHSA-9vhv-jxww-xfm5": "<=4.2.0,>=3.20.4",
+        "GHSA-v4x8-3wr5-3wq8": "<=4.2.0,>=3.20.4",
+    },
+    "opentelemetry-api": {"GHSA-xcq7-p3pf-p88h": "<=1.45.0"},
+    "pillow": {
+        "GHSA-22hg-r758-rrw9": ">=7.2.0,<13.0.0",
+        "GHSA-24rc-8hj2-v98c": ">=9.1.0,<13.0.0",
+        "GHSA-254f-3936-288h": ">=5.1.0,<13.0.0",
+        "GHSA-27h8-gf7j-v5hc": "<=12.3.0",
+        "GHSA-332p-7hrc-92wf": ">=2.0.0,<13.0.0",
+        "GHSA-3j72-p6qg-6xp7": "<13.0.0",
+        "GHSA-462x-pgg6-55fp": ">=8.2.0,<13.0.0",
+        "GHSA-4rm8-3hmm-39fg": "<13.0.0",
+        "GHSA-4rr5-89j8-mwwm": ">=11.3.0,<13.0.0",
+        "GHSA-58r4-6rv3-gfh8": "<=12.3.0",
+        "GHSA-5x8w-8jj5-q52h": "<=12.3.0",
+        "GHSA-5xm2-6676-qcp9": ">=8.1.0,<13.0.0",
+        "GHSA-654x-cwwv-5j9c": "<13.0.0,>=11.2.1",
+        "GHSA-65qm-jvmh-6pqg": ">=9.2.0,<13.0.0",
+        "GHSA-74r2-7ff9-mjj2": ">=5.4.0,<13.0.0",
+        "GHSA-78g4-xqwv-q3g8": ">=11.1.0,<13.0.0",
+        "GHSA-7mwm-ghpf-9vrm": "<=12.3.0",
+        "GHSA-9v9v-9qvf-h2hj": "<13.0.0",
+        "GHSA-c6hw-5grf-ff96": ">=8.1.0,<13.0.0",
+        "GHSA-cp9v-662q-vvx9": ">=12.0.0,<13.0.0",
+        "GHSA-f2g6-542v-9j58": ">=5.1.0,<13.0.0",
+        "GHSA-fc9g-5qg7-mf45": ">=9.2.0,<13.0.0",
+        "GHSA-g4qv-2jxx-769h": ">=11.0.0,<13.0.0",
+        "GHSA-g7cr-3p24-7wf7": ">=9.4.0,<13.0.0",
+        "GHSA-g842-9rc4-69pw": "<13.0.0",
+        "GHSA-gg2r-wvfm-q9rx": ">=4.1.0,<13.0.0",
+        "GHSA-j4m9-6w36-pw47": ">=10.0.0,<13.0.0",
+        "GHSA-jg86-v3jv-hrpm": ">=5.1.0,<13.0.0",
+        "GHSA-mrfp-p49p-3hf2": ">=5.1.0,<13.0.0",
+        "GHSA-p4wg-p73j-c528": ">=5.1.0,<13.0.0",
+        "GHSA-p8hx-v2p6-rp84": "<13.0.0",
+        "GHSA-pchr-8j38-3x4p": "<=12.3.0",
+        "GHSA-q45j-58j2-45rg": ">=5.3.0,<13.0.0",
+        "GHSA-v9pv-5gc8-w2m6": ">=11.0.0,<13.0.0",
+        "GHSA-vx6w-vv9f-6gvg": ">=2.3.0,<=12.3.0",
+        "GHSA-w889-685w-c8fh": ">=2.6.0,<13.0.0",
+        "GHSA-xgh8-jp6q-p5x8": "<=12.3.0",
+    },
+    "setuptools": {"GHSA-xmj3-9gf7-h52w": "<84.1.0,>=38.2.2"},
+    "virtualenv": {
+        "GHSA-394h-qwmc-48pf": "<21.14.9",
+        "GHSA-494p-63j8-28p3": "<21.14.9",
+        "GHSA-4f8h-vr72-p32c": "<21.14.10,>=21.14.8",
+        "GHSA-6w3r-xr62-4xcp": "<21.14.9",
+        "GHSA-c978-59m8-c77v": "<21.14.9",
+        "GHSA-cx28-75q4-x26q": "<21.14.9",
+        "GHSA-fc2g-4w5p-6whm": "<21.14.9",
+        "GHSA-qmx5-4p3x-wvqf": "<21.14.9",
+        "GHSA-vxj4-q4g9-crj7": "<=21.14.6",
+    },
+}
+
+# Separate late October 27 unit; the original seven-identity inventory stays intact.
+LATE_PYTHON_STABILIZATION_F_CUTOFF = {
+    "dnspython": {
+        "GHSA-3rq5-2g8h-59hc": "<2.6.1",
+        "GHSA-45c3-73f7-pv4m": "<2.9.0",
+    },
+    "msgpack": {
+        "GHSA-6v7p-g79w-8964": "<=1.2.0",
+        "GHSA-j586-36cw-2gc2": "<1.2.3",
+    },
+}
+PYTHON_STABILIZATION_GUARDED_ADVISORIES = {
+    **PYTHON_STABILIZATION_F_CUTOFF,
+    **LATE_PYTHON_STABILIZATION_F_CUTOFF,
+    "dnspython": {
+        **LATE_PYTHON_STABILIZATION_F_CUTOFF["dnspython"],
+        "GHSA-vvf4-9x63-8xvv": "<2.9.2",
+    },
+    "opentelemetry-api": {
+        **PYTHON_STABILIZATION_F_CUTOFF["opentelemetry-api"],
+        "GHSA-mf5v-w3w3-f6cg": "<=1.45.1",
+    },
+}
+
+
+CURRENT_BLOCKED_VERSION_SPECIFIERS = {
+    "anyio": f"<{REMEDIATION_FIXED_FLOORS['anyio']}",
+    "httpcore2": f"<{REMEDIATION_FIXED_FLOORS['httpcore2']}",
+    "httpx2": f"<{REMEDIATION_FIXED_FLOORS['httpx2']}",
+    "python-multipart": "<0.0.31",
+    "setuptools": "<84.1.0",
+    "urllib3": f"<{REMEDIATION_FIXED_FLOORS['urllib3']}",
+}
+
+PIP_DIRECTIVE_PREFIXES = (
+    "-i ",
+    "--index-url ",
+    "--extra-index-url ",
+    "-f ",
+    "--find-links ",
+    "-r ",
+    "--requirement ",
+    "-c ",
+    "--constraint ",
+)
+
+URL_VCS_EDITABLE_PREFIXES = (
+    "-e ",
+    "--editable ",
+    "git+",
+    "hg+",
+    "svn+",
+    "bzr+",
+)
+PIP_DIRECTIVE_SEMANTIC_CARRIER = "__pip_directive__"
+
+
+def _extract_unique_markdown_section(document: str, heading: str, *, projection: str) -> str:
+    """Extract one exact level-two section for the alert-225 parity guard."""
+
+    lines = document.splitlines()
+    matches = [index for index, line in enumerate(lines) if line == heading]
+    assert len(matches) == 1, f"{projection}: expected exactly one {heading!r} section"
+    start = matches[0] + 1
+    end = next(
+        (index for index in range(start, len(lines)) if lines[index].startswith("## ")),
+        len(lines),
+    )
+    return "\n".join(lines[start:end])
+
+
+def _extract_unique_msgpack_ledger_block(document: str) -> str:
+    """Extract the uniquely anchored msgpack alert-225 ledger block."""
+
+    marker = f'<a id="{MSGPACK_ALERT_LEDGER_ANCHOR}"></a>'
+    assert (
+        document.count(marker) == 1
+    ), f"ledger: expected exactly one {MSGPACK_ALERT_LEDGER_ANCHOR!r} anchor"
+    remainder = document.split(marker, maxsplit=1)[1]
+    next_anchor = re.search(r'^<a id="[A-Za-z0-9_-]+"></a>$', remainder, flags=re.MULTILINE)
+    return remainder[: next_anchor.start()] if next_anchor is not None else remainder
+
+
+def _parse_msgpack_alert_tuple(section: str, *, projection: str) -> dict[str, str]:
+    """Parse one complete sanitized alert-225 tuple without prose inference."""
+
+    fenced_blocks = re.findall(
+        r"^[ ]*```text\n(.*?)\n[ ]*```$",
+        section,
+        flags=re.DOTALL | re.MULTILINE,
+    )
+    candidates = [block for block in fenced_blocks if "alert_number=" in block]
+    assert len(candidates) == 1, f"{projection}: expected exactly one alert-225 tuple"
+    raw_lines = candidates[0].splitlines()
+    indentation = min(len(line) - len(line.lstrip(" ")) for line in raw_lines if line)
+    tuple_lines = [line[indentation:] for line in raw_lines]
+    parsed: dict[str, str] = {}
+    for line in tuple_lines:
+        assert line and line.strip() == line, f"{projection}: malformed tuple line"
+        key, separator, value = line.partition("=")
+        assert separator and key and value, f"{projection}: malformed tuple field"
+        assert key not in parsed, f"{projection}: duplicate tuple field {key!r}"
+        parsed[key] = value
+    assert set(parsed) == MSGPACK_ALERT_TUPLE_FIELDS, (
+        f"{projection}: tuple fields mismatch; " f"expected {sorted(MSGPACK_ALERT_TUPLE_FIELDS)!r}"
+    )
+    timestamp = parsed["fixed_at"]
+    assert re.fullmatch(
+        r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z",
+        timestamp,
+    ), f"{projection}: fixed_at must be exact UTC YYYY-MM-DDTHH:MM:SSZ"
+    try:
+        datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError as error:
+        raise AssertionError(f"{projection}: fixed_at must be a valid UTC timestamp") from error
+    return parsed
+
+
+def _assert_msgpack_alert_225_inventory_ledger_parity(
+    inventory_document: str,
+    ledger_document: str,
+) -> None:
+    """Require exact closed-provider tuple parity for historical alert 225."""
+
+    open_section = _extract_unique_markdown_section(
+        inventory_document,
+        DEPENDABOT_OPEN_SECTION_HEADING,
+        projection="inventory",
+    )
+    assert not re.search(
+        r"#225(?![0-9A-Za-z_])",
+        open_section,
+    ), "inventory: fixed alert 225 must not remain in the open-alert table"
+    closed_section = _extract_unique_markdown_section(
+        inventory_document,
+        MSGPACK_CLOSED_SECTION_HEADING,
+        projection="inventory",
+    )
+    assert (
+        f"BACKLOG_LEDGER.md#{MSGPACK_ALERT_LEDGER_ANCHOR}" in closed_section
+    ), "inventory: alert-225 tuple must point to its unique ledger anchor"
+    assert (
+        "provider-state reconciliation only" in closed_section.lower()
+    ), "inventory: provider-state-only boundary missing"
+    inventory_tuple = _parse_msgpack_alert_tuple(closed_section, projection="inventory")
+
+    ledger_block = _extract_unique_msgpack_ledger_block(ledger_document)
+    ledger_tuple = _parse_msgpack_alert_tuple(ledger_block, projection="ledger")
+    assert inventory_tuple == ledger_tuple, "ledger: alert-225 tuple differs from inventory"
+    assert inventory_tuple == MSGPACK_ALERT_TUPLE, (
+        "inventory: alert-225 tuple differs from the authenticated sanitized value; "
+        f"expected {MSGPACK_ALERT_TUPLE!r}"
+    )
+    assert re.search(
+        r"^- \[x\] P1: Recheck msgpack Dependabot alert #225",
+        ledger_block,
+        flags=re.MULTILINE,
+    ), "ledger: fixed alert 225 requires a checked parent item"
+    assert (
+        "- [x] Recheck Dependabot alert `#225`" in ledger_block
+    ), "ledger: provider-recheck DoD must be checked"
+    assert (
+        "- [x] Record authenticated closure evidence" in ledger_block
+    ), "ledger: closure-evidence DoD must be checked"
+    assert (
+        "no repo-owned vulnerable dependency path was reproduced" in ledger_block
+    ), "ledger: historical no-reproduced-path boundary missing"
+    lowered = ledger_block.lower()
+    for forbidden in ("live dependabot alert", "pending recheck", "status: planned"):
+        assert forbidden not in lowered, f"ledger: active-state carrier remains: {forbidden!r}"
+
+
+def _msgpack_alert_tuple_text(fields: dict[str, str] | None = None) -> str:
+    """Render the closed synthetic tuple used by deterministic negative controls."""
+
+    values = fields or MSGPACK_ALERT_TUPLE
+    return "\n".join(f"{key}={value}" for key, value in values.items())
+
+
+def _msgpack_inventory_fixture(*, fields: dict[str, str] | None = None) -> str:
+    """Return a minimal inventory with disjoint open and closed alert sections."""
+
+    return (
+        "# Inventory\n\n"
+        f"{DEPENDABOT_OPEN_SECTION_HEADING}\n\n"
+        "| Alert | Package |\n| --- | --- |\n| `#999` | `other` |\n\n"
+        f"{MSGPACK_CLOSED_SECTION_HEADING}\n\n"
+        "```text\n"
+        f"{_msgpack_alert_tuple_text(fields)}\n"
+        "```\n\n"
+        f"`docs/roadmap/BACKLOG_LEDGER.md#{MSGPACK_ALERT_LEDGER_ANCHOR}`\n\n"
+        "Provider-state reconciliation only; no new pip dependency material remediation.\n\n"
+        "## Next section\n"
+    )
+
+
+def _msgpack_ledger_fixture(*, fields: dict[str, str] | None = None) -> str:
+    """Return a minimal completed ledger block for the alert-225 invariant."""
+
+    return (
+        f'<a id="{MSGPACK_ALERT_LEDGER_ANCHOR}"></a>\n'
+        "- [x] P1: Recheck msgpack Dependabot alert #225 after remediation\n"
+        "  - Status: Completed.\n"
+        "  - Authenticated provider-state tuple:\n\n"
+        "    ```text\n"
+        + "\n".join(f"    {line}" for line in _msgpack_alert_tuple_text(fields).splitlines())
+        + "\n    ```\n"
+        "  - Reason: Historical provider alert; no new pip material.\n"
+        "  - DoD:\n"
+        "    - [x] Recheck Dependabot alert `#225` after provider refresh.\n"
+        "    - [x] Record authenticated closure evidence.\n"
+        "    - [x] Preserve requirements unchanged because no repo-owned vulnerable "
+        "dependency path was reproduced.\n\n"
+        '<a id="next-ledger-item"></a>\n'
+    )
+
+
+def test_msgpack_alert_225_live_inventory_and_ledger_are_exactly_reconciled() -> None:
+    """Current docs must agree on the exact authenticated terminal provider tuple."""
+
+    _assert_msgpack_alert_225_inventory_ledger_parity(
+        DEPENDABOT_INVENTORY_PATH.read_text(encoding="utf-8"),
+        BACKLOG_LEDGER_PATH.read_text(encoding="utf-8"),
+    )
+
+
+def test_msgpack_alert_225_parity_allows_field_order_and_unrelated_text() -> None:
+    """Named fields remain semantic while unrelated regions stay outside the owner."""
+
+    reordered = dict(reversed(tuple(MSGPACK_ALERT_TUPLE.items())))
+    inventory = "unrelated prefix\n" + _msgpack_inventory_fixture(fields=reordered).replace(
+        "| `#999` | `other` |",
+        "| `#224` | `other` |\n| `#2250` | `other` |\n| `#1225` | `other` |",
+    )
+    ledger = "unrelated ledger prefix\n" + _msgpack_ledger_fixture(fields=reordered)
+
+    _assert_msgpack_alert_225_inventory_ledger_parity(inventory, ledger)
+    assert "{" not in inventory, "sanitized fixture must not require raw provider JSON"
+    assert "https://" not in ledger, "sanitized fixture must not require provider URLs"
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "missing_closed_section",
+        "duplicate_closed_section",
+        "duplicate_closed_tuple",
+        "missing_ledger_anchor",
+        "duplicate_ledger_anchor",
+        "fixed_alert_in_open_table",
+        "fixed_alert_open_unformatted",
+        "fixed_alert_open_linked",
+        "fixed_alert_open_embedded_cell",
+        "fixed_alert_open_prose",
+        "inventory_state_open",
+        "inventory_state_dismissed",
+        "inventory_state_unknown",
+        "ledger_state_mismatch",
+        "fixed_at_one_second_drift",
+        "fixed_at_missing",
+        "fixed_at_malformed",
+        "fixed_at_invalid_calendar",
+        "dismissed_at_mismatch",
+        "dismissed_at_missing",
+        "auto_dismissed_at_mismatch",
+        "auto_dismissed_at_missing",
+        "manifest_mismatch",
+        "package_mismatch",
+        "advisory_mismatch",
+        "alert_number_mismatch",
+        "ecosystem_mismatch",
+        "parent_unchecked",
+        "provider_recheck_unchecked",
+        "closure_evidence_unchecked",
+        "active_state_wording",
+        "partial_tuple",
+        "duplicate_tuple_field",
+        "unrelated_alert_substitution",
+        "missing_ledger_link",
+        "missing_provider_state_boundary",
+    ),
+)
+def test_msgpack_alert_225_parity_fails_closed(case: str) -> None:
+    """Every missing, duplicate, contradictory, or malformed projection must fail."""
+
+    inventory_fields = dict(MSGPACK_ALERT_TUPLE)
+    ledger_fields = dict(MSGPACK_ALERT_TUPLE)
+    inventory = _msgpack_inventory_fixture(fields=inventory_fields)
+    ledger = _msgpack_ledger_fixture(fields=ledger_fields)
+
+    if case == "missing_closed_section":
+        inventory = inventory.replace(MSGPACK_CLOSED_SECTION_HEADING, "## Removed section")
+    elif case == "duplicate_closed_section":
+        inventory += f"\n{MSGPACK_CLOSED_SECTION_HEADING}\n"
+    elif case == "duplicate_closed_tuple":
+        inventory = inventory.replace(
+            "## Next section",
+            f"```text\n{_msgpack_alert_tuple_text()}\n```\n\n## Next section",
+        )
+    elif case == "missing_ledger_anchor":
+        ledger = ledger.replace(MSGPACK_ALERT_LEDGER_ANCHOR, "missing-ledger-anchor")
+    elif case == "duplicate_ledger_anchor":
+        marker = f'<a id="{MSGPACK_ALERT_LEDGER_ANCHOR}"></a>'
+        ledger = f"{marker}\n{ledger}"
+    elif case == "fixed_alert_in_open_table":
+        inventory = inventory.replace(
+            "| `#999` | `other` |",
+            "| `#225` | `msgpack` |",
+        )
+    elif case == "fixed_alert_open_unformatted":
+        inventory = inventory.replace("| `#999` | `other` |", "| #225 | msgpack |")
+    elif case == "fixed_alert_open_linked":
+        inventory = inventory.replace(
+            "| `#999` | `other` |",
+            "| [#225](dependabot/alerts/225) | msgpack |",
+        )
+    elif case == "fixed_alert_open_embedded_cell":
+        inventory = inventory.replace(
+            "| `#999` | `other` |",
+            "| Active alert `#225` | msgpack |",
+        )
+    elif case == "fixed_alert_open_prose":
+        inventory = inventory.replace(
+            "| `#999` | `other` |",
+            "| `#999` | `other` |\n\nAlert #225 remains open.",
+        )
+    elif case in {"inventory_state_open", "inventory_state_dismissed", "inventory_state_unknown"}:
+        state = case.removeprefix("inventory_state_")
+        inventory_fields["state"] = state
+        inventory = _msgpack_inventory_fixture(fields=inventory_fields)
+    elif case == "ledger_state_mismatch":
+        ledger_fields["state"] = "open"
+        ledger = _msgpack_ledger_fixture(fields=ledger_fields)
+    elif case == "fixed_at_one_second_drift":
+        ledger_fields["fixed_at"] = "2026-06-22T22:34:22Z"
+        ledger = _msgpack_ledger_fixture(fields=ledger_fields)
+    elif case == "fixed_at_missing":
+        inventory_fields.pop("fixed_at")
+        inventory = _msgpack_inventory_fixture(fields=inventory_fields)
+    elif case == "fixed_at_malformed":
+        inventory_fields["fixed_at"] = "2026-06-22 22:34:21"
+        inventory = _msgpack_inventory_fixture(fields=inventory_fields)
+    elif case == "fixed_at_invalid_calendar":
+        inventory_fields["fixed_at"] = "2026-02-30T22:34:21Z"
+        inventory = _msgpack_inventory_fixture(fields=inventory_fields)
+    elif case == "dismissed_at_mismatch":
+        ledger_fields["dismissed_at"] = "2026-06-22T22:34:21Z"
+        ledger = _msgpack_ledger_fixture(fields=ledger_fields)
+    elif case == "dismissed_at_missing":
+        ledger_fields.pop("dismissed_at")
+        ledger = _msgpack_ledger_fixture(fields=ledger_fields)
+    elif case == "auto_dismissed_at_mismatch":
+        ledger_fields["auto_dismissed_at"] = "2026-06-22T22:34:21Z"
+        ledger = _msgpack_ledger_fixture(fields=ledger_fields)
+    elif case == "auto_dismissed_at_missing":
+        ledger_fields.pop("auto_dismissed_at")
+        ledger = _msgpack_ledger_fixture(fields=ledger_fields)
+    elif case in {
+        "manifest_mismatch",
+        "package_mismatch",
+        "advisory_mismatch",
+        "alert_number_mismatch",
+        "ecosystem_mismatch",
+    }:
+        field = case.removesuffix("_mismatch")
+        ledger_fields[field] = "other"
+        ledger = _msgpack_ledger_fixture(fields=ledger_fields)
+    elif case == "parent_unchecked":
+        ledger = ledger.replace("- [x] P1: Recheck", "- [ ] P1: Recheck")
+    elif case == "provider_recheck_unchecked":
+        ledger = ledger.replace(
+            "- [x] Recheck Dependabot alert `#225`",
+            "- [ ] Recheck Dependabot alert `#225`",
+        )
+    elif case == "closure_evidence_unchecked":
+        ledger = ledger.replace(
+            "- [x] Record authenticated closure evidence",
+            "- [ ] Record authenticated closure evidence",
+        )
+    elif case == "active_state_wording":
+        ledger = ledger.replace("Historical provider alert", "Live Dependabot alert")
+    elif case == "partial_tuple":
+        inventory_fields.pop("manifest")
+        inventory = _msgpack_inventory_fixture(fields=inventory_fields)
+    elif case == "duplicate_tuple_field":
+        inventory = inventory.replace("state=fixed", "state=fixed\nstate=fixed", 1)
+    elif case == "unrelated_alert_substitution":
+        inventory_fields["alert_number"] = "999"
+        inventory = _msgpack_inventory_fixture(fields=inventory_fields)
+    elif case == "missing_ledger_link":
+        inventory = inventory.replace(MSGPACK_ALERT_LEDGER_ANCHOR, "other-anchor")
+    elif case == "missing_provider_state_boundary":
+        inventory = inventory.replace(
+            "Provider-state reconciliation only",
+            "Historical record",
+        )
+    else:
+        raise AssertionError(f"unhandled alert-225 parity case: {case}")
+
+    with pytest.raises(AssertionError):
+        _assert_msgpack_alert_225_inventory_ledger_parity(inventory, ledger)
+
+
+def _is_constraint_style(path: Path) -> bool:
+    """Constraint-style (>=) by filename for source/constraint requirement surfaces."""
+    return path.name in {
+        "requirements.in",
+        "requirements-ci-lite.in",
+        "requirements-docker-runtime.in",
+        "requirements-dev.in",
+    } or path.name.startswith("constraints")
+
+
+def _normalized_package_name(package_name: str) -> str:
+    """PEP 503-style canonical package names keep guard comparisons stable."""
+    return canonicalize_name(package_name)
+
+
+def _is_pip_directive_line(line: str) -> bool:
+    """Return True for pip option lines that are not package requirements."""
+    return line.startswith(PIP_DIRECTIVE_PREFIXES)
+
+
+def _is_url_vcs_editable_requirement(line: str) -> bool:
+    """Return True for direct URL, VCS, or editable requirement entries."""
+    return "://" in line or line.startswith(URL_VCS_EDITABLE_PREFIXES)
+
+
+def _load_schema(path: Path) -> dict:
+    if not path.exists():
+        pytest.fail(f"Missing dependency security schema file: {path}")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        pytest.fail(f"Invalid JSON in dependency security schema {path}: {e}")
+    if not isinstance(data, dict):
+        pytest.fail("Schema root must be a JSON object.")
+    min_versions = data.get("min_versions")
+    if not isinstance(min_versions, dict) or not min_versions:
+        pytest.fail("Schema must contain non-empty object: { 'min_versions': { ... } }")
+    for pkg, v_str in min_versions.items():
+        if not isinstance(v_str, str) or not v_str.strip():
+            pytest.fail(f"Schema: {pkg!r} has invalid version string: {v_str!r}")
+        try:
+            Version(v_str)
+        except InvalidVersion as e:
+            pytest.fail(f"Schema: {pkg!r} has unparseable version {v_str!r}: {e}")
+    # Validate optional blocked_packages field
+    _validate_blocked_packages(data)
+    # Validate optional blocked_versions field
+    _validate_blocked_versions(data)
+    return data
+
+
+def _validate_blocked_packages(data: dict) -> None:
+    """Validate blocked_packages is list[str] if present."""
+    blocked_packages = data.get("blocked_packages")
+    if blocked_packages is None:
+        return
+    if not isinstance(blocked_packages, list):
+        pytest.fail("Schema: 'blocked_packages' must be a list.")
+    for i, pkg in enumerate(blocked_packages):
+        if not isinstance(pkg, str) or not pkg.strip():
+            pytest.fail(f"Schema: blocked_packages[{i}] must be a non-empty string.")
+
+
+def _validate_blocked_versions(data: dict) -> None:
+    """Validate blocked_versions is dict[str, list[str]] with parseable specifiers."""
+    blocked_versions = data.get("blocked_versions")
+    if blocked_versions is None:
+        return
+    if not isinstance(blocked_versions, dict):
+        pytest.fail("Schema: 'blocked_versions' must be a dict.")
+    for pkg, specifiers in blocked_versions.items():
+        if not isinstance(pkg, str) or not pkg.strip():
+            pytest.fail(f"Schema: blocked_versions key must be a non-empty string: {pkg!r}")
+        if not isinstance(specifiers, list):
+            pytest.fail(f"Schema: blocked_versions[{pkg!r}] must be a list of specifiers.")
+        for i, spec_str in enumerate(specifiers):
+            if not isinstance(spec_str, str) or not spec_str.strip():
+                pytest.fail(f"Schema: blocked_versions[{pkg!r}][{i}] must be a non-empty string.")
+            try:
+                SpecifierSet(spec_str)
+            except InvalidSpecifier as e:
+                pytest.fail(
+                    f"Schema: blocked_versions[{pkg!r}][{i}] has unparseable specifier "
+                    f"{spec_str!r}: {e}"
+                )
+
+
+def _iter_requirement_lines(path: Path) -> Iterable[str]:
+    if not path.exists():
+        pytest.fail(f"Missing requirement surface file: {path}")
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        # Keep trailing-comment requirements valid: `pkg>=1.2.3  # note`
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if _is_pip_directive_line(line):
+            continue
+        yield line
+
+
+def _parse_requirement(line: str, path: Optional[Path] = None) -> Optional[Requirement]:
+    """
+    Return parsed Requirement, or None for non-requirement lines.
+    If path is given and line looks like a requirement but fails to parse, fail-fast.
+    Inline comments are stripped in _iter_requirement_lines before lines are yielded.
+    """
+    s = line.strip()
+    if not s or s.startswith("#"):
+        return None
+    if _is_pip_directive_line(s):
+        return None
+    if _is_url_vcs_editable_requirement(s):
+        if path is not None:
+            pytest.fail(
+                f"{path.name}: URL/VCS/editable requirement entries are not allowed in "
+                "dependency guard surfaces. Use pinned/constraint package specifiers instead."
+            )
+        return None
+    try:
+        return Requirement(s)
+    except (InvalidRequirement, InvalidSpecifier) as e:
+        if path is not None:
+            pytest.fail(f"{path.name}: Invalid requirement syntax: {line!r}\nError: {e}")
+        return None
+
+
+def _min_version_for_pkg(req: Requirement, pkg: str, *, pinned: bool) -> Optional[str]:
+    if _normalized_package_name(req.name) != _normalized_package_name(pkg):
+        return None
+    if pinned:
+        equals = [sp.version for sp in req.specifier if sp.operator == "=="]
+        return min(equals, key=lambda v: Version(v)) if equals else None
+    floors = [sp.version for sp in req.specifier if sp.operator in (">=", "==", "~=")]
+    if not floors:
+        return None
+    return max(floors, key=lambda v: Version(v))
+
+
+def _effective_min_version_in_file(path: Path, package: str) -> Optional[Version]:
+    """
+    Return the effective minimum version for `package` in this file.
+    Pinned surfaces: min of == pins. Constraints: strongest supported floor per carrier.
+    """
+    pinned = not _is_constraint_style(path)
+    versions: list[Version] = []
+    for line in _iter_requirement_lines(path):
+        req = _parse_requirement(line, path)
+        if req is None:
+            continue
+        v_str = _min_version_for_pkg(req, package, pinned=pinned)
+        if v_str is not None:
+            versions.append(Version(v_str))
+    return min(versions) if versions else None
+
+
+def _requirement_evidence_per_package(
+    path: Path,
+) -> tuple[dict[str, Version], dict[str, tuple[Requirement, ...]]]:
+    """Parse once; return effective minima and every complete requirement carrier."""
+    pinned = not _is_constraint_style(path)
+    by_pkg: dict[str, list[Version]] = {}
+    carriers: dict[str, list[Requirement]] = {}
+    for line in _iter_requirement_lines(path):
+        req = _parse_requirement(line, path)
+        if req is None:
+            continue
+        normalized_name = _normalized_package_name(req.name)
+        carriers.setdefault(normalized_name, []).append(req)
+        v_str = _min_version_for_pkg(req, req.name, pinned=pinned)
+        if v_str is not None:
+            by_pkg.setdefault(normalized_name, []).append(Version(v_str))
+    minima = {pkg: min(versions) for pkg, versions in by_pkg.items()}
+    return minima, {pkg: tuple(requirements) for pkg, requirements in carriers.items()}
+
+
+def _effective_min_versions_per_package(path: Path) -> dict[str, Version]:
+    """Return normalized package name -> effective min version."""
+    minima, _carriers = _requirement_evidence_per_package(path)
+    return minima
+
+
+def _pinned_versions_per_package(path: Path) -> dict[str, set[Version]]:
+    """Parse file once; return every pinned version by normalized package name."""
+    by_pkg: dict[str, set[Version]] = {}
+    for line in _iter_requirement_lines(path):
+        req = _parse_requirement(line, path)
+        if req is None:
+            continue
+        pins = {Version(sp.version) for sp in req.specifier if sp.operator == "=="}
+        if pins:
+            by_pkg.setdefault(_normalized_package_name(req.name), set()).update(pins)
+    return by_pkg
+
+
+def _packages_present_in_file(path: Path) -> set[str]:
+    """Parse file once; return normalized package names present in this surface."""
+    packages: set[str] = set()
+    for line in _iter_requirement_lines(path):
+        req = _parse_requirement(line, path)
+        if req is None:
+            continue
+        packages.add(_normalized_package_name(req.name))
+    return packages
+
+
+def _git_subprocess_environment() -> dict[str, str]:
+    """Return an isolated Git environment without mutating the process environment."""
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    environment.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_NO_REPLACE_OBJECTS": "1",
+        }
+    )
+    return environment
+
+
+def _git_command(arguments: list[str], *, failure_message: str | None = None) -> str:
+    """Run git through its resolved absolute executable for finite admission evidence."""
+    git = shutil.which("git")
+    if git is None:
+        if failure_message is not None:
+            pytest.fail(failure_message)
+        pytest.fail("dependency-remediation Git evidence requires an available git executable")
+    result = subprocess.run(
+        [git, *arguments],
+        cwd=REPO_ROOT,
+        env=_git_subprocess_environment(),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode:
+        if failure_message is not None:
+            pytest.fail(failure_message)
+        pytest.fail(
+            f"dependency-remediation Git evidence command failed: {' '.join(arguments)}: "
+            f"{result.stderr.strip()}"
+        )
+    return result.stdout
+
+
+def _is_lowercase_full_git_sha(value: object) -> bool:
+    """Return whether value is the canonical full commit spelling accepted here."""
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value) is not None
+
+
+def _resolve_dependency_evidence_head() -> str:
+    """Resolve one immutable full commit for every head-dependent Git witness query."""
+    if "GITHUB_ACTIONS" not in os.environ:
+        resolved_head_output = _git_command(
+            ["rev-parse", "--verify", "HEAD^{commit}"],
+            failure_message=GIT_EVIDENCE_LOCAL_HEAD_FAILURE,
+        )
+        resolved_head = resolved_head_output.removesuffix("\n")
+        if resolved_head_output != f"{resolved_head}\n":
+            pytest.fail(GIT_EVIDENCE_LOCAL_HEAD_FAILURE)
+        if not _is_lowercase_full_git_sha(resolved_head):
+            pytest.fail(GIT_EVIDENCE_LOCAL_HEAD_FAILURE)
+        return resolved_head
+
+    if os.environ["GITHUB_ACTIONS"] != "true":
+        pytest.fail(GIT_EVIDENCE_ACTIONS_MODE_FAILURE)
+    if "GITHUB_SHA" not in os.environ:
+        pytest.fail(GIT_EVIDENCE_GITHUB_SHA_SHAPE_FAILURE)
+
+    github_sha = os.environ["GITHUB_SHA"]
+    if not _is_lowercase_full_git_sha(github_sha):
+        pytest.fail(GIT_EVIDENCE_GITHUB_SHA_SHAPE_FAILURE)
+    resolved_github_sha_output = _git_command(
+        ["rev-parse", "--verify", f"{github_sha}^{{commit}}"],
+        failure_message=GIT_EVIDENCE_GITHUB_SHA_RESOLUTION_FAILURE,
+    )
+    if resolved_github_sha_output != f"{github_sha}\n":
+        pytest.fail(GIT_EVIDENCE_GITHUB_SHA_RESOLUTION_FAILURE)
+
+    resolved_head_output = _git_command(
+        ["rev-parse", "--verify", "HEAD^{commit}"],
+        failure_message=GIT_EVIDENCE_CHECKOUT_FAILURE,
+    )
+    resolved_head = resolved_head_output.removesuffix("\n")
+    if resolved_head_output != f"{resolved_head}\n":
+        pytest.fail(GIT_EVIDENCE_CHECKOUT_FAILURE)
+    if not _is_lowercase_full_git_sha(resolved_head):
+        pytest.fail(GIT_EVIDENCE_CHECKOUT_FAILURE)
+    if resolved_head != github_sha:
+        pytest.fail(GIT_EVIDENCE_CHECKOUT_FAILURE)
+    return github_sha
+
+
+def _assert_remediation_base_is_ancestor(evidence_head: str) -> None:
+    """Require the immutable remediation base to remain below the frozen evidence head."""
+    _git_command(
+        [
+            "merge-base",
+            "--is-ancestor",
+            CRYPTOGRAPHY_REMEDIATION_BASE,
+            evidence_head,
+        ],
+        failure_message=GIT_EVIDENCE_BASE_ANCESTRY_FAILURE,
+    )
+
+
+def _snapshot_introduction_revision(evidence_head: str) -> str:
+    """Locate the unique reachable commit that introduced the owner snapshot marker."""
+    owner_path = ADMISSION_DOC_PATH.relative_to(REPO_ROOT).as_posix()
+    revisions = [
+        line
+        for line in _git_command(
+            [
+                "log",
+                f"-S{SNAPSHOT_START}",
+                "--format=%H",
+                f"{CRYPTOGRAPHY_REMEDIATION_BASE}..{evidence_head}",
+                "--",
+                owner_path,
+            ]
+        ).splitlines()
+        if line
+    ]
+    assert (
+        len(revisions) == 1
+    ), "snapshot marker must have exactly one reachable introduction revision"
+    revision = revisions[0]
+    assert len(revision) == 40 and all(
+        character in "0123456789abcdef" for character in revision
+    ), "snapshot introduction revision must be a lowercase 40-hex Git object"
+    return revision
+
+
+def _discover_cryptography_surfaces(revision: str) -> dict[str, str]:
+    """Mechanically discover every top-level tracked requirement surface with cryptography."""
+    candidates = _git_command(["ls-tree", "-r", "--name-only", revision]).splitlines()
+    discovered: dict[str, str] = {}
+    for name in candidates:
+        if Path(name).parent != Path(".") or not (
+            fnmatch(name, "requirements*.in")
+            or fnmatch(name, "requirements*.txt")
+            or name == "constraints.txt"
+        ):
+            continue
+        text = _git_command(["show", f"{revision}:{name}"])
+        occurrences = _cryptography_versions_from_text(name, text)
+        if not occurrences:
+            continue
+        assert len(occurrences) == 1, f"{name}: duplicate cryptography occurrences are forbidden"
+        discovered[name] = text
+    assert discovered, f"{revision}: no tracked cryptography requirement surfaces discovered"
+    return discovered
+
+
+def _cryptography_versions_from_text(surface_name: str, text: str) -> list[Version]:
+    """Return every cryptography floor/pin so absence and duplication stay distinct."""
+    path = REPO_ROOT / surface_name
+    versions: list[Version] = []
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line or _is_pip_directive_line(line):
+            continue
+        req = _parse_requirement(line, path)
+        if req is None or _normalized_package_name(req.name) != "cryptography":
+            continue
+        version = _min_version_for_pkg(req, "cryptography", pinned=not _is_constraint_style(path))
+        assert (
+            version is not None
+        ), f"{surface_name}: cryptography occurrence must declare a comparable >= or == version"
+        versions.append(Version(version))
+    return versions
+
+
+def _cryptography_version_from_text(surface_name: str, text: str) -> Version:
+    """Return the one governed cryptography floor/pin for a surface snapshot."""
+    versions = _cryptography_versions_from_text(surface_name, text)
+    assert len(versions) == 1, f"{surface_name}: expected exactly one cryptography occurrence"
+    return versions[0]
+
+
+def _semantic_requirements(text: str, path: Path) -> dict[str, tuple[str, ...]]:
+    """Compare requirement/directive meaning, ignoring comments and lockfile relocation."""
+    parsed: dict[str, list[str]] = {}
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if _is_pip_directive_line(line):
+            parsed.setdefault(PIP_DIRECTIVE_SEMANTIC_CARRIER, []).append(line)
+            continue
+        req = _parse_requirement(line, path)
+        if req is not None:
+            extras = ",".join(sorted(canonicalize_name(extra) for extra in req.extras))
+            marker = str(req.marker) if req.marker is not None else ""
+            parsed.setdefault(_normalized_package_name(req.name), []).append(
+                "|".join((extras, str(req.specifier), marker, req.url or ""))
+            )
+    return {name: tuple(sorted(specifiers)) for name, specifiers in parsed.items()}
+
+
+def _semantic_sha256(text: str, path: Path) -> str:
+    """Hash normalized requirement meaning, independent of line relocation."""
+    canonical = json.dumps(
+        _semantic_requirements(text, path),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _validate_selected_target(
+    surface_name: str,
+    surface_class: str,
+    requirement_text: str,
+    target_text: str,
+) -> Version:
+    """Validate the package, full target membership, and compiled exact pin."""
+    requirement = Requirement(requirement_text)
+    assert (
+        _normalized_package_name(requirement.name) == "cryptography"
+    ), f"{surface_name}: snapshot requirement must name cryptography"
+    assert not requirement.extras, f"{surface_name}: snapshot requirement must not declare extras"
+    assert requirement.marker is None, f"{surface_name}: snapshot requirement must not use a marker"
+    assert (
+        requirement.url is None
+    ), f"{surface_name}: snapshot requirement must not use a direct URL"
+    target = Version(target_text)
+    assert (
+        target in requirement.specifier
+    ), f"{surface_name}: selected target {target} must be contained by recorded requirement"
+    specifiers = tuple(requirement.specifier)
+    if surface_class == "I_R":
+        expected_operators = {">="} if surface_name == "constraints.txt" else {">=", "<"}
+        assert (
+            len(specifiers) == len(expected_operators)
+            and {specifier.operator for specifier in specifiers} == expected_operators
+        ), f"{surface_name}: intent snapshot must preserve the canonical range operation kind"
+    elif surface_class == "C_R":
+        assert (
+            len(specifiers) == 1
+            and specifiers[0].operator == "=="
+            and specifiers[0].version == target_text
+        ), f"{surface_name}: compiled snapshot must contain exactly one =={target} pin"
+    return target
+
+
+def _is_lowercase_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _load_admission_snapshot(document: str) -> dict:
+    assert document.count(SNAPSHOT_START) == 1, "snapshot must have exactly one start marker"
+    assert document.count(SNAPSHOT_END) == 1, "snapshot must have exactly one end marker"
+    start = document.index(SNAPSHOT_START)
+    end = document.index(SNAPSHOT_END)
+    assert start < end, "snapshot markers must appear in start/end order"
+    payload_lines = document[start + len(SNAPSHOT_START) : end].strip().splitlines()
+    assert (
+        len(payload_lines) == 2 and payload_lines[0] == SNAPSHOT_ALLOWLIST_LINE
+    ), "snapshot markers must contain exactly one allowlist line and one JSON object line"
+    try:
+        snapshot = json.loads(payload_lines[1])
+    except json.JSONDecodeError as exc:
+        pytest.fail(f"invalid dependency-remediation admission snapshot: {exc}")
+    assert isinstance(snapshot, dict), "snapshot JSON root must be an object"
+    assert set(snapshot) == {
+        "advisories",
+        "base",
+        "cutoff",
+        "snapshot_kind",
+        "surfaces",
+        "target",
+    }, "snapshot top-level keys must match the v1 contract exactly"
+    assert snapshot["snapshot_kind"] == SNAPSHOT_KIND
+    assert snapshot["base"] == CRYPTOGRAPHY_REMEDIATION_BASE
+    assert snapshot["cutoff"] == SNAPSHOT_CUTOFF
+    assert snapshot["target"] == SNAPSHOT_TARGET
+    assert snapshot["advisories"] == CRYPTOGRAPHY_F_CUTOFF
+    surfaces = snapshot["surfaces"]
+    assert isinstance(surfaces, dict), "snapshot surfaces must be an object"
+    assert set(surfaces) == set(
+        CRYPTOGRAPHY_GOVERNED_SURFACE_NAMES
+    ), "snapshot must contain exactly the ten governed surfaces"
+    for name in CRYPTOGRAPHY_GOVERNED_SURFACE_NAMES:
+        record = surfaces[name]
+        assert isinstance(record, dict), f"{name}: snapshot record must be an object"
+        expected_record_keys = {
+            "class",
+            "requirement",
+            "semantic_sha256",
+        }
+        expected_class = "I_R" if name in CRYPTOGRAPHY_INTENT_SURFACES else "C_R"
+        if expected_class == "C_R":
+            expected_record_keys.add("file_sha256")
+        assert (
+            set(record) == expected_record_keys
+        ), f"{name}: snapshot record keys must match its v1 class exactly"
+        assert record["class"] == expected_class, f"{name}: snapshot class mismatch"
+        assert (
+            isinstance(record["requirement"], str) and record["requirement"].strip()
+        ), f"{name}: snapshot requirement must be non-empty"
+        _validate_selected_target(
+            name,
+            expected_class,
+            record["requirement"],
+            snapshot["target"],
+        )
+        assert _is_lowercase_sha256(
+            record["semantic_sha256"]
+        ), f"{name}: semantic_sha256 must be a lowercase 64-hex digest"
+        if expected_class == "C_R":
+            assert _is_lowercase_sha256(
+                record["file_sha256"]
+            ), f"{name}: file_sha256 must be a lowercase 64-hex digest"
+    return snapshot
+
+
+def _historical_snapshot_evidence(
+    evidence_head: str,
+) -> tuple[dict, dict[str, str], dict[str, str]]:
+    snapshot_revision = _snapshot_introduction_revision(evidence_head)
+    owner_path = ADMISSION_DOC_PATH.relative_to(REPO_ROOT).as_posix()
+    snapshot_document = _git_command(["show", f"{snapshot_revision}:{owner_path}"])
+    snapshot = _load_admission_snapshot(snapshot_document)
+    base_texts = _discover_cryptography_surfaces(CRYPTOGRAPHY_REMEDIATION_BASE)
+    head_texts = _discover_cryptography_surfaces(snapshot_revision)
+    return snapshot, base_texts, head_texts
+
+
+def _immutable_replay_witness_evidence(evidence_head: str) -> tuple[str, str, dict[str, str]]:
+    """Open the immutable replay commit and its current-head reachability proof."""
+    parent_record = _git_command(
+        ["rev-list", "--parents", "-n", "1", CRYPTOGRAPHY_REMEDIATION_REPLAY_WITNESS]
+    ).strip()
+    merge_base = _git_command(
+        ["merge-base", CRYPTOGRAPHY_REMEDIATION_REPLAY_WITNESS, evidence_head]
+    ).strip()
+    replay_texts = _discover_cryptography_surfaces(CRYPTOGRAPHY_REMEDIATION_REPLAY_WITNESS)
+    return parent_record, merge_base, replay_texts
+
+
+def _derive_material_transitions(
+    base_texts: dict[str, str], head_texts: dict[str, str]
+) -> dict[str, str]:
+    """Classify actual semantic transitions; only the floor may change."""
+    assert set(base_texts) == set(head_texts), "base/head surface union must reconcile exactly"
+    transitions: dict[str, str] = {}
+    for name in sorted(base_texts):
+        base_semantics = _semantic_requirements(base_texts[name], REPO_ROOT / name)
+        head_semantics = _semantic_requirements(head_texts[name], REPO_ROOT / name)
+        changed = {
+            package
+            for package in set(base_semantics) | set(head_semantics)
+            if base_semantics.get(package) != head_semantics.get(package)
+        }
+        assert changed == {"cryptography"}, f"{name}: unrelated semantic transition: {changed}"
+        transitions[name] = "I_R" if name in CRYPTOGRAPHY_INTENT_SURFACES else "C_R"
+    return transitions
+
+
+def _assert_immutable_replay_witness(
+    *,
+    parent_record: str,
+    merge_base: str,
+    base_texts: dict[str, str],
+    replay_texts: dict[str, str],
+    frozen_head_texts: dict[str, str],
+) -> None:
+    """Fail closed unless replay proves the exact I_R/C_R remediation transition."""
+    assert parent_record.split() == [
+        CRYPTOGRAPHY_REMEDIATION_REPLAY_WITNESS,
+        CRYPTOGRAPHY_REMEDIATION_BASE,
+    ], "immutable replay witness must have the exact remediation base as its sole parent"
+    assert (
+        merge_base == CRYPTOGRAPHY_REMEDIATION_REPLAY_WITNESS
+    ), "immutable replay witness must remain an ancestor of HEAD"
+
+    expected_classes = {
+        **{name: "I_R" for name in CRYPTOGRAPHY_INTENT_SURFACES},
+        **{name: "C_R" for name in CRYPTOGRAPHY_COMPILED_SURFACES},
+    }
+    assert CRYPTOGRAPHY_INTENT_SURFACES.isdisjoint(
+        CRYPTOGRAPHY_COMPILED_SURFACES
+    ), "I_R and C_R must remain a disjoint partition"
+    assert set(expected_classes) == set(
+        CRYPTOGRAPHY_GOVERNED_SURFACE_NAMES
+    ), "I_R/C_R partition must equal the ten governed surfaces"
+    for evidence_class, surface_texts in (
+        ("S_base", base_texts),
+        ("S_replay", replay_texts),
+        ("S_head", frozen_head_texts),
+    ):
+        assert set(surface_texts) == set(
+            expected_classes
+        ), f"{evidence_class} must mechanically enumerate all ten governed surfaces"
+
+    transitions = _derive_material_transitions(base_texts, replay_texts)
+    assert (
+        transitions == expected_classes
+    ), "base/replay transitions must preserve the exact I_R/C_R partition"
+
+    for name in sorted(CRYPTOGRAPHY_INTENT_SURFACES):
+        replay_carrier = _semantic_requirements(replay_texts[name], REPO_ROOT / name).get(
+            "cryptography"
+        )
+        frozen_head_carrier = _semantic_requirements(frozen_head_texts[name], REPO_ROOT / name).get(
+            "cryptography"
+        )
+        assert replay_carrier is not None, f"{name}: replay cryptography carrier is missing"
+        assert (
+            replay_carrier == frozen_head_carrier
+        ), f"{name}: replay I_R carrier differs from frozen S_head"
+
+    for name in sorted(CRYPTOGRAPHY_COMPILED_SURFACES):
+        replay_bytes = replay_texts[name].encode("utf-8")
+        frozen_head_bytes = frozen_head_texts[name].encode("utf-8")
+        assert (
+            replay_bytes == frozen_head_bytes
+        ), f"{name}: replay C_R lock bytes differ from frozen S_head"
+
+
+def _assert_snapshot_receipts(snapshot: dict, head_texts: dict[str, str]) -> None:
+    """Bind independent S_head inventory, meaning, and C_R bytes to its snapshot."""
+    declared_surfaces = CRYPTOGRAPHY_INTENT_SURFACES | CRYPTOGRAPHY_COMPILED_SURFACES
+    assert CRYPTOGRAPHY_INTENT_SURFACES.isdisjoint(
+        CRYPTOGRAPHY_COMPILED_SURFACES
+    ), "I_R and C_R must remain a disjoint partition"
+    snapshot_surfaces = set(snapshot["surfaces"])
+    assert (
+        snapshot_surfaces == declared_surfaces
+    ), "snapshot inventory must equal the declared I_R/C_R partition"
+    assert (
+        set(head_texts) == snapshot_surfaces
+    ), "independently discovered S_head inventory must equal the owner snapshot"
+    for name in sorted(snapshot_surfaces):
+        text = head_texts[name]
+        record = snapshot["surfaces"][name]
+        surface_path = REPO_ROOT / name
+        actual_carrier = _semantic_requirements(text, surface_path).get("cryptography")
+        recorded_carrier = _semantic_requirements(record["requirement"], surface_path).get(
+            "cryptography"
+        )
+        assert (
+            actual_carrier == recorded_carrier
+        ), f"{name}: cryptography carrier semantics mismatch"
+        semantic_hash = _semantic_sha256(text, surface_path)
+        assert (
+            semantic_hash == record["semantic_sha256"]
+        ), f"{name}: snapshot semantic receipt mismatch"
+        if record["class"] == "C_R":
+            file_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            assert file_hash == record["file_sha256"], f"{name}: compiled replay receipt mismatch"
+
+
+def _historical_admission_inputs(evidence_head: str) -> tuple[
+    dict,
+    dict[str, Version],
+    dict[str, Version],
+    dict[str, str],
+]:
+    """Build immutable admission inputs without reading live requirement surfaces."""
+    historical_snapshot, base_texts, head_texts = _historical_snapshot_evidence(evidence_head)
+    snapshot = _load_admission_snapshot(ADMISSION_DOC_PATH.read_text(encoding="utf-8"))
+    assert (
+        snapshot == historical_snapshot
+    ), "current owner snapshot must equal its immutable introduction evidence"
+    declared_surfaces = CRYPTOGRAPHY_INTENT_SURFACES | CRYPTOGRAPHY_COMPILED_SURFACES
+    base_surfaces = set(base_texts)
+    head_surfaces = set(head_texts)
+    assert base_surfaces | head_surfaces == declared_surfaces, "S_base/S_head union drifted"
+    assert not base_surfaces ^ head_surfaces, "S_base/S_head topology deltas are forbidden"
+    _assert_snapshot_receipts(snapshot, head_texts)
+    parent_record, merge_base, replay_texts = _immutable_replay_witness_evidence(evidence_head)
+    _assert_immutable_replay_witness(
+        parent_record=parent_record,
+        merge_base=merge_base,
+        base_texts=base_texts,
+        replay_texts=replay_texts,
+        frozen_head_texts=head_texts,
+    )
+    base_occurrences = {
+        name: _cryptography_version_from_text(name, text) for name, text in base_texts.items()
+    }
+    head_occurrences = {
+        name: _cryptography_version_from_text(name, text) for name, text in head_texts.items()
+    }
+    transitions = _derive_material_transitions(base_texts, head_texts)
+    return snapshot, base_occurrences, head_occurrences, transitions
+
+
+def _assert_cryptography_remediation_admission(
+    *,
+    base_occurrences: dict[str, Version],
+    head_occurrences: dict[str, Version],
+    advisories: dict[str, str],
+    material_transitions: dict[str, str],
+) -> None:
+    """Fail closed unless the finite remediation evidence has an exact partition."""
+    expected_surfaces = set(CRYPTOGRAPHY_GOVERNED_SURFACE_NAMES)
+    assert (
+        set(base_occurrences) == expected_surfaces
+    ), "S_base must enumerate every governed surface"
+    assert (
+        set(head_occurrences) == expected_surfaces
+    ), "S_head must enumerate every governed surface"
+    assert set(advisories) == set(
+        CRYPTOGRAPHY_F_CUTOFF
+    ), "F_cutoff advisory set drifted or is incomplete"
+    assert all(
+        version == Version("48.0.1") for version in base_occurrences.values()
+    ), "S_base witnesses must all report the pre-remediation 48.0.1 version"
+    affected = {
+        advisory
+        for advisory, affected_range in advisories.items()
+        if any(
+            str(version) in SpecifierSet(affected_range) for version in base_occurrences.values()
+        )
+    }
+    assert affected == set(
+        CRYPTOGRAPHY_F_CUTOFF
+    ), "A must contain every advisory with an affected OSV/pip-audit base witness"
+    assert all(
+        version >= Version("50.0.0") for version in head_occurrences.values()
+    ), "P requires every head witness to meet the 50.0.0 floor"
+    assert all(
+        str(version) not in SpecifierSet(affected_range)
+        for version in head_occurrences.values()
+        for affected_range in advisories.values()
+    ), "P requires every head witness to clear every frozen advisory"
+    expected_transitions = {
+        **{name: "I_R" for name in CRYPTOGRAPHY_INTENT_SURFACES},
+        **{name: "C_R" for name in CRYPTOGRAPHY_COMPILED_SURFACES},
+    }
+    assert (
+        material_transitions == expected_transitions
+    ), "material transitions must partition into I_R or C_R"
+
+
+def _validate_live_cryptography_intent_carrier(
+    surface: Path,
+    carriers: tuple[Requirement, ...],
+    required_min: Version,
+) -> None:
+    """Keep live I_R in one schema-derived operation class."""
+    if len(carriers) != 1:
+        pytest.fail(f"{surface.name}: cryptography I_R must contain exactly one carrier")
+    requirement = carriers[0]
+    if requirement.extras:
+        pytest.fail(f"{surface.name}: cryptography I_R must not declare extras")
+    if requirement.url is not None:
+        pytest.fail(f"{surface.name}: cryptography I_R must not use a direct URL")
+    if requirement.marker is not None:
+        pytest.fail(f"{surface.name}: cryptography I_R must not use a marker")
+
+    declared = _min_version_for_pkg(requirement, "cryptography", pinned=False)
+    if declared is None or Version(declared) < required_min:
+        pytest.fail(f"{surface.name}: cryptography I_R must declare at least the schema minimum")
+    declared_min = Version(declared)
+    if not requirement.specifier.contains(str(declared_min), prereleases=True):
+        pytest.fail(f"{surface.name}: cryptography I_R excludes its declared minimum")
+    expected_specifiers = {(">=", declared_min)}
+    if surface.name != "constraints.txt":
+        expected_specifiers.add(("<", Version(f"{required_min.major + 1}.0.0")))
+    specifiers = tuple(requirement.specifier)
+    actual_specifiers = {
+        (specifier.operator, Version(specifier.version)) for specifier in specifiers
+    }
+    if len(specifiers) != len(expected_specifiers) or actual_specifiers != expected_specifiers:
+        pytest.fail(
+            f"{surface.name}: cryptography I_R must preserve the canonical " "schema-driven range"
+        )
+
+
+@pytest.mark.parametrize("surface", REQUIREMENT_SURFACES)
+def test_dependency_security_guard_enforces_min_versions(surface: Path) -> None:
+    """
+    Guard: Every requirement surface must pin/constrain each package in schema
+    to a version >= the schema minimum. Parses each file once (O(1) reads).
+    """
+    schema = _load_schema(SCHEMA_PATH)
+    min_versions = schema["min_versions"]
+    pinned = not _is_constraint_style(surface)
+    all_reqs, carriers = _requirement_evidence_per_package(surface)
+
+    for pkg, min_v_str in min_versions.items():
+        required_min = Version(str(min_v_str))
+        normalized_name = _normalized_package_name(pkg)
+        effective = all_reqs.get(normalized_name)
+        if effective is None:
+            pytest.fail(
+                f"{surface.name}: expected {pkg} to be pinned (==) or constrained (>=) "
+                f"(required min {required_min}), but no version was found."
+            )
+        if effective < required_min:
+            pytest.fail(
+                f"{surface.name}: {pkg} has {effective}, but minimum safe version is {required_min}. "
+                f"Update this surface to at least {required_min}."
+            )
+        if normalized_name not in CURRENT_ENFORCED_RUNTIME_FLOORS:
+            continue
+        package_carriers = carriers[normalized_name]
+        if pinned and len(package_carriers) != 1:
+            pytest.fail(
+                f"{surface.name}: {pkg} security-floor lock must contain exactly one carrier."
+            )
+        for requirement in package_carriers:
+            if requirement.marker is not None:
+                pytest.fail(
+                    f"{surface.name}: {pkg} security-floor requirement must be unconditional; "
+                    f"marker {requirement.marker!s} is not allowed."
+                )
+            declared = _min_version_for_pkg(requirement, pkg, pinned=False)
+            if declared is None:
+                pytest.fail(f"{surface.name}: {pkg} source carrier has no declared safe floor.")
+            version_to_check = Version(declared)
+            version_label = "declared safe floor"
+            if pinned:
+                specifiers = tuple(requirement.specifier)
+                if len(specifiers) != 1 or specifiers[0].operator != "==":
+                    pytest.fail(
+                        f"{surface.name}: {pkg} security-floor lock carrier must contain "
+                        "exactly one == pin."
+                    )
+                version_to_check = Version(specifiers[0].version)
+                version_label = "pinned version"
+            if not requirement.specifier.contains(str(version_to_check), prereleases=True):
+                pytest.fail(
+                    f"{surface.name}: {pkg} requirement {requirement.specifier!s} excludes "
+                    f"{version_label} {version_to_check}."
+                )
+
+    if surface.name in CRYPTOGRAPHY_INTENT_SURFACES:
+        _validate_live_cryptography_intent_carrier(
+            surface,
+            carriers.get("cryptography", ()),
+            Version(str(min_versions["cryptography"])),
+        )
+
+
+def test_live_source_floor_accepts_a_stronger_canonical_minimum(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    schema = _load_schema(SCHEMA_PATH)
+    schema["min_versions"] = {**schema["min_versions"], "cryptography": "50.0.0"}
+    monkeypatch.setattr(f"{__name__}._load_schema", lambda path: schema)
+    surface = tmp_path / "requirements.in"
+    rows = []
+    for package, version in schema["min_versions"].items():
+        if package == "cryptography":
+            rows.append("cryptography>=50.0.2,<51.0.0")
+        else:
+            rows.append(f"{package}>={version}")
+    surface.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    test_dependency_security_guard_enforces_min_versions(surface)
+    _validate_live_cryptography_intent_carrier(
+        tmp_path / "constraints.txt", (Requirement("cryptography>=50.0.2"),), Version("50.0.0")
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "cryptography>=49.0.0,<51.0.0",
+        "cryptography>=50.0.2,<50.0.2",
+        "cryptography>=51.0.0,<51.0.0",
+        "cryptography>=50.0.2,!=50.0.2,<51.0.0",
+        "cryptography>=50.0.2,>=50.0.3,<51.0.0",
+        "cryptography==50.0.2",
+        "cryptography[extra]>=50.0.2,<51.0.0",
+        'cryptography>=50.0.2,<51.0.0; python_version>"3.10"',
+    ),
+)
+def test_live_source_floor_rejects_weaker_excluded_or_noncanonical_ranges(text: str) -> None:
+    with pytest.raises(pytest.fail.Exception):
+        _validate_live_cryptography_intent_carrier(
+            Path("requirements.in"), (Requirement(text),), Version("50.0.0")
+        )
+
+
+def test_constraint_surface_effective_min_includes_pins(tmp_path: Path) -> None:
+    """
+    Regression: constraint-style surface effective min must include both >= and ==.
+    A file with both cryptography>=50.0.0 and cryptography==3.4.8 must yield
+    effective min 3.4.8 so the guard fails (low pin cannot bypass).
+    """
+    fake_constraints = tmp_path / "constraints.txt"
+    fake_constraints.write_text(
+        "cryptography>=50.0.0\ncryptography==3.4.8\n",
+        encoding="utf-8",
+    )
+    effective = _effective_min_version_in_file(fake_constraints, "cryptography")
+    assert effective is not None
+    assert effective == Version(
+        "3.4.8"
+    ), "Constraint surface must take min over all lines; lower == must not be ignored."
+    required_min = Version("50.0.0")
+    assert effective < required_min, "Guard should fail when a lower pin exists."
+
+
+def test_dependency_security_guard_rejects_former_cryptography_floor(
+    tmp_path: Path,
+) -> None:
+    """The actual all-min guard rejects a complete surface still pinned to 48.0.1."""
+
+    schema = _load_schema(SCHEMA_PATH)
+    former_surface = tmp_path / "requirements.txt"
+    former_surface.write_text(
+        "\n".join(
+            f"{package}=={'48.0.1' if package == 'cryptography' else version}"
+            for package, version in schema["min_versions"].items()
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        pytest.fail.Exception,
+        match=(
+            r"requirements\.txt: cryptography has 48\.0\.1, but minimum safe "
+            rf"version is {re.escape(str(schema['min_versions']['cryptography']))}"
+        ),
+    ):
+        test_dependency_security_guard_enforces_min_versions(former_surface)
+
+
+@pytest.mark.parametrize(
+    ("cryptography_carriers", "expected_error"),
+    [
+        (
+            ("cryptography>=50.0.0,!=50.0.0,<51.0.0",),
+            r"cryptography requirement .* excludes declared safe floor 50\.0\.0",
+        ),
+        (
+            ('cryptography>=50.0.0; python_version < "0"',),
+            r"cryptography security-floor requirement must be unconditional",
+        ),
+        (
+            ("cryptography==50.0.0",),
+            r"cryptography I_R must preserve the canonical schema-driven range",
+        ),
+        (
+            ("cryptography[ssh]>=50.0.0,<51.0.0",),
+            r"cryptography I_R must not declare extras",
+        ),
+        (
+            (
+                "cryptography>=50.0.0,<51.0.0",
+                "cryptography>=50.0.0,<51.0.0",
+            ),
+            r"cryptography I_R must contain exactly one carrier",
+        ),
+        (
+            ("cryptography>=50.0.0,<52.0.0",),
+            r"cryptography I_R must preserve the canonical schema-driven range",
+        ),
+    ],
+    ids=[
+        "selected-floor-excluded",
+        "inactive-marker",
+        "exact-pin-is-not-source-intent",
+        "extra-is-not-source-intent",
+        "duplicate-canonical-carriers",
+        "non-next-major-upper-bound",
+    ],
+)
+def test_dependency_security_guard_rejects_noncanonical_live_floor_carrier(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cryptography_carriers: tuple[str, ...],
+    expected_error: str,
+) -> None:
+    """The live all-surfaces path validates the complete floor carrier."""
+
+    schema = _load_schema(SCHEMA_PATH)
+    schema["min_versions"] = {**schema["min_versions"], "cryptography": "50.0.0"}
+    monkeypatch.setattr(f"{__name__}._load_schema", lambda path: schema)
+    source_surface = tmp_path / "requirements.in"
+    source_surface.write_text(
+        "\n".join(
+            [
+                f"{package}>={version}"
+                for package, version in schema["min_versions"].items()
+                if package != "cryptography"
+            ]
+            + list(cryptography_carriers)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(pytest.fail.Exception, match=expected_error):
+        test_dependency_security_guard_enforces_min_versions(source_surface)
+
+
+def test_dependency_git_command_isolates_git_environment_and_uses_absolute_binary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sole subprocess boundary removes ambient Git controls without global mutation."""
+    hostile_git_environment = {
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES": "/tmp/hostile-alternates",
+        "GIT_CONFIG_GLOBAL": "/tmp/hostile-global-config",
+        "GIT_CONFIG_NOSYSTEM": "0",
+        "GIT_DIR": "/tmp/hostile-git-dir",
+        "GIT_NO_REPLACE_OBJECTS": "0",
+        "GIT_OBJECT_DIRECTORY": "/tmp/hostile-objects",
+        "GIT_REPLACE_REF_BASE": "refs/replace/hostile",
+        "GIT_SYNTHETIC_CONTROL": "hostile",
+    }
+    for key, value in hostile_git_environment.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("git_lowercase_control", "preserved")
+    process_environment = dict(os.environ)
+    observed: dict[str, object] = {}
+
+    def fake_which(command: str) -> str:
+        observed["which"] = command
+        return "/usr/bin/git"
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        observed["command"] = command
+        observed["kwargs"] = kwargs
+        return subprocess.CompletedProcess(command, 0, stdout="evidence\n", stderr="")
+
+    monkeypatch.setattr(shutil, "which", fake_which)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert _git_command(["status", "--short"]) == "evidence\n"
+
+    expected_environment = {
+        key: value for key, value in process_environment.items() if not key.startswith("GIT_")
+    }
+    expected_environment.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_NO_REPLACE_OBJECTS": "1",
+        }
+    )
+    assert observed["which"] == "git"
+    assert observed["command"] == ["/usr/bin/git", "status", "--short"]
+    assert observed["kwargs"] == {
+        "cwd": REPO_ROOT,
+        "env": expected_environment,
+        "text": True,
+        "capture_output": True,
+        "check": False,
+    }
+    assert all(
+        key not in expected_environment
+        for key in hostile_git_environment
+        if key
+        not in {
+            "GIT_CONFIG_NOSYSTEM",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_NO_REPLACE_OBJECTS",
+        }
+    )
+    assert expected_environment["git_lowercase_control"] == "preserved"
+    assert dict(os.environ) == process_environment
+
+
+def test_dependency_git_authority_diagnostics_are_distinct_and_fixed() -> None:
+    assert (
+        GIT_EVIDENCE_ACTIONS_MODE_FAILURE,
+        GIT_EVIDENCE_GITHUB_SHA_SHAPE_FAILURE,
+        GIT_EVIDENCE_GITHUB_SHA_RESOLUTION_FAILURE,
+        GIT_EVIDENCE_CHECKOUT_FAILURE,
+        GIT_EVIDENCE_LOCAL_HEAD_FAILURE,
+        GIT_EVIDENCE_BASE_ANCESTRY_FAILURE,
+    ) == (
+        "dependency-remediation Git evidence: GITHUB_ACTIONS must be absent locally or exactly "
+        "'true' in GitHub Actions",
+        "dependency-remediation Git evidence: GitHub Actions requires canonical lowercase full "
+        "GITHUB_SHA",
+        "dependency-remediation Git evidence: GITHUB_SHA must resolve exactly to a commit in the "
+        "current repository",
+        "dependency-remediation Git evidence: checked-out HEAD must resolve canonically and equal "
+        "GITHUB_SHA",
+        "dependency-remediation Git evidence: local HEAD must resolve exactly to a lowercase full "
+        "commit",
+        "dependency-remediation Git evidence: remediation base must remain an ancestor of the "
+        "frozen evidence head",
+    )
+    assert (
+        len(
+            {
+                GIT_EVIDENCE_ACTIONS_MODE_FAILURE,
+                GIT_EVIDENCE_GITHUB_SHA_SHAPE_FAILURE,
+                GIT_EVIDENCE_GITHUB_SHA_RESOLUTION_FAILURE,
+                GIT_EVIDENCE_CHECKOUT_FAILURE,
+                GIT_EVIDENCE_LOCAL_HEAD_FAILURE,
+                GIT_EVIDENCE_BASE_ANCESTRY_FAILURE,
+            }
+        )
+        == 6
+    )
+
+
+@pytest.mark.parametrize(
+    "github_actions",
+    ("", "TRUE", "True", "1", " true", "true ", "true\n"),
+    ids=("empty", "upper", "title", "one", "leading-space", "trailing-space", "newline"),
+)
+def test_dependency_evidence_head_rejects_noncanonical_github_actions(
+    monkeypatch: pytest.MonkeyPatch,
+    github_actions: str,
+) -> None:
+    """Presence selects CI mode, where only the byte-exact value true is accepted."""
+    monkeypatch.setenv("GITHUB_ACTIONS", github_actions)
+    monkeypatch.setenv("GITHUB_SHA", "a" * 40)
+
+    def unexpected_git(arguments: list[str], *, failure_message: str | None = None) -> str:
+        raise AssertionError(f"unexpected Git call: {arguments!r}, {failure_message!r}")
+
+    monkeypatch.setitem(
+        _resolve_dependency_evidence_head.__globals__, "_git_command", unexpected_git
+    )
+
+    with pytest.raises(pytest.fail.Exception) as exc_info:
+        _resolve_dependency_evidence_head()
+    message = str(exc_info.value)
+    assert message == GIT_EVIDENCE_ACTIONS_MODE_FAILURE
+    assert repr(github_actions) not in message
+
+
+@pytest.mark.parametrize(
+    "github_sha",
+    (
+        None,
+        "a" * 39,
+        "A" * 40,
+        f" {'a' * 40}",
+        f"{'a' * 40} ",
+        f"{'a' * 40}\n",
+        f"{'a' * 40}\n{'b' * 40}",
+    ),
+    ids=(
+        "missing",
+        "short",
+        "uppercase",
+        "leading-whitespace",
+        "trailing-whitespace",
+        "newline",
+        "multiline",
+    ),
+)
+def test_dependency_evidence_head_rejects_noncanonical_github_sha_without_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    github_sha: str | None,
+) -> None:
+    """CI evidence never trims, case-folds, echoes, or falls back from an invalid SHA."""
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    if github_sha is None:
+        monkeypatch.delenv("GITHUB_SHA", raising=False)
+    else:
+        monkeypatch.setenv("GITHUB_SHA", github_sha)
+
+    def unexpected_git(arguments: list[str], *, failure_message: str | None = None) -> str:
+        raise AssertionError(f"unexpected Git call: {arguments!r}, {failure_message!r}")
+
+    monkeypatch.setitem(
+        _resolve_dependency_evidence_head.__globals__, "_git_command", unexpected_git
+    )
+
+    with pytest.raises(pytest.fail.Exception) as exc_info:
+        _resolve_dependency_evidence_head()
+    message = str(exc_info.value)
+    assert message == GIT_EVIDENCE_GITHUB_SHA_SHAPE_FAILURE
+    assert repr(github_sha) not in message
+
+
+@pytest.mark.parametrize(
+    "resolved_output",
+    (
+        "",
+        "a" * 40,
+        f"{'A' * 40}\n",
+        f"{'a' * 40} \n",
+        f"{'a' * 40}\n{'b' * 40}\n",
+    ),
+    ids=("empty", "missing-newline", "uppercase", "whitespace", "multiline"),
+)
+def test_dependency_evidence_head_rejects_noncanonical_local_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+    resolved_output: str,
+) -> None:
+    """Local resolution accepts only one canonical lowercase full SHA line."""
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    calls: list[tuple[str, ...]] = []
+
+    def fake_git(arguments: list[str], *, failure_message: str | None = None) -> str:
+        calls.append(tuple(arguments))
+        assert failure_message == GIT_EVIDENCE_LOCAL_HEAD_FAILURE
+        return resolved_output
+
+    monkeypatch.setitem(_resolve_dependency_evidence_head.__globals__, "_git_command", fake_git)
+
+    with pytest.raises(pytest.fail.Exception) as exc_info:
+        _resolve_dependency_evidence_head()
+    message = str(exc_info.value)
+    assert message == GIT_EVIDENCE_LOCAL_HEAD_FAILURE
+    assert repr(resolved_output) not in message
+    assert calls == [("rev-parse", "--verify", "HEAD^{commit}")]
+
+
+@pytest.mark.parametrize(
+    "git_path",
+    (None, "/usr/bin/git"),
+    ids=("missing-git-binary", "rev-parse-failure"),
+)
+def test_dependency_evidence_head_rejects_unresolvable_local_head_without_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    git_path: str | None,
+) -> None:
+    """A local Git failure stays within the local-HEAD diagnostic boundary."""
+    orphan_sha = f"hostile-orphan\n{'b' * 40}"
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    monkeypatch.setenv("GITHUB_SHA", orphan_sha)
+    monkeypatch.setattr(shutil, "which", lambda _command: git_path)
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        if git_path is None:
+            raise AssertionError(f"unexpected subprocess call: {command!r}")
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 128, stdout="", stderr="hostile-local-error")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(pytest.fail.Exception) as exc_info:
+        _resolve_dependency_evidence_head()
+    message = str(exc_info.value)
+    assert message == GIT_EVIDENCE_LOCAL_HEAD_FAILURE
+    assert orphan_sha not in message
+    assert "hostile-local-error" not in message
+    expected_commands = (
+        [] if git_path is None else [[git_path, "rev-parse", "--verify", "HEAD^{commit}"]]
+    )
+    assert commands == expected_commands
+
+
+def test_dependency_evidence_head_local_mode_ignores_orphan_github_sha_and_resolves_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An orphan GITHUB_SHA has no authority when GITHUB_ACTIONS is absent."""
+    frozen_head = "a" * 40
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    monkeypatch.setenv("GITHUB_SHA", f"orphan\n{'b' * 40}")
+    calls: list[tuple[str, ...]] = []
+
+    def fake_git(arguments: list[str], *, failure_message: str | None = None) -> str:
+        calls.append(tuple(arguments))
+        assert failure_message == GIT_EVIDENCE_LOCAL_HEAD_FAILURE
+        return f"{frozen_head}\n"
+
+    monkeypatch.setitem(_resolve_dependency_evidence_head.__globals__, "_git_command", fake_git)
+
+    assert _resolve_dependency_evidence_head() == frozen_head
+    assert calls == [("rev-parse", "--verify", "HEAD^{commit}")]
+
+
+def test_dependency_evidence_head_rejects_unresolvable_ci_sha_without_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unresolved canonical CI SHA fails at its first and only attempted resolution."""
+    github_sha = "a" * 40
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_SHA", github_sha)
+    monkeypatch.setattr(shutil, "which", lambda _command: "/usr/bin/git")
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 128, stdout="", stderr="unresolvable")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(pytest.fail.Exception) as exc_info:
+        _resolve_dependency_evidence_head()
+    message = str(exc_info.value)
+    assert message == GIT_EVIDENCE_GITHUB_SHA_RESOLUTION_FAILURE
+    assert github_sha not in message
+    assert "unresolvable" not in message
+    assert commands == [["/usr/bin/git", "rev-parse", "--verify", f"{github_sha}^{{commit}}"]]
+
+
+def test_dependency_evidence_head_rejects_ci_sha_resolution_mismatch_without_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A canonical input resolving to another commit never falls back to checkout HEAD."""
+    github_sha = "a" * 40
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_SHA", github_sha)
+    calls: list[tuple[str, ...]] = []
+
+    def fake_git(arguments: list[str], *, failure_message: str | None = None) -> str:
+        calls.append(tuple(arguments))
+        assert failure_message == GIT_EVIDENCE_GITHUB_SHA_RESOLUTION_FAILURE
+        return f"{'b' * 40}\n"
+
+    monkeypatch.setitem(_resolve_dependency_evidence_head.__globals__, "_git_command", fake_git)
+
+    with pytest.raises(pytest.fail.Exception) as exc_info:
+        _resolve_dependency_evidence_head()
+    message = str(exc_info.value)
+    assert message == GIT_EVIDENCE_GITHUB_SHA_RESOLUTION_FAILURE
+    assert github_sha not in message
+    assert "b" * 40 not in message
+    assert calls == [("rev-parse", "--verify", f"{github_sha}^{{commit}}")]
+
+
+@pytest.mark.parametrize(
+    "checkout_output",
+    (
+        None,
+        f"{'A' * 40}\n",
+        f"{'a' * 40}\n{'b' * 40}\n",
+        f"{'b' * 40}\n",
+    ),
+    ids=("command-failure", "uppercase-output", "multiline-output", "commit-mismatch"),
+)
+def test_dependency_evidence_head_rejects_checkout_mismatch_without_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    checkout_output: str | None,
+) -> None:
+    """CI evidence binds both the event SHA object and the independently resolved checkout."""
+    github_sha = "a" * 40
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_SHA", github_sha)
+    calls: list[tuple[str, ...]] = []
+
+    def fake_git(arguments: list[str], *, failure_message: str | None = None) -> str:
+        calls.append(tuple(arguments))
+        expected_failure = (
+            GIT_EVIDENCE_GITHUB_SHA_RESOLUTION_FAILURE
+            if arguments[-1] == f"{github_sha}^{{commit}}"
+            else GIT_EVIDENCE_CHECKOUT_FAILURE
+        )
+        assert failure_message == expected_failure
+        if arguments[-1] == f"{github_sha}^{{commit}}":
+            return f"{github_sha}\n"
+        if checkout_output is None:
+            pytest.fail(failure_message)
+        return checkout_output
+
+    monkeypatch.setitem(_resolve_dependency_evidence_head.__globals__, "_git_command", fake_git)
+
+    with pytest.raises(pytest.fail.Exception) as exc_info:
+        _resolve_dependency_evidence_head()
+    message = str(exc_info.value)
+    assert message == GIT_EVIDENCE_CHECKOUT_FAILURE
+    assert github_sha not in message
+    assert repr(checkout_output) not in message
+    assert calls == [
+        ("rev-parse", "--verify", f"{github_sha}^{{commit}}"),
+        ("rev-parse", "--verify", "HEAD^{commit}"),
+    ]
+
+
+def test_dependency_evidence_base_ancestry_failure_is_fixed_and_non_echoing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed base relation does not expose the selected graph objects."""
+    frozen_head = "a" * 40
+    calls: list[tuple[str, ...]] = []
+
+    def fake_git(arguments: list[str], *, failure_message: str | None = None) -> str:
+        calls.append(tuple(arguments))
+        assert failure_message == GIT_EVIDENCE_BASE_ANCESTRY_FAILURE
+        pytest.fail(failure_message)
+
+    monkeypatch.setitem(_assert_remediation_base_is_ancestor.__globals__, "_git_command", fake_git)
+
+    with pytest.raises(pytest.fail.Exception) as exc_info:
+        _assert_remediation_base_is_ancestor(frozen_head)
+    message = str(exc_info.value)
+    assert message == GIT_EVIDENCE_BASE_ANCESTRY_FAILURE
+    assert frozen_head not in message
+    assert CRYPTOGRAPHY_REMEDIATION_BASE not in message
+    assert calls == [("merge-base", "--is-ancestor", CRYPTOGRAPHY_REMEDIATION_BASE, frozen_head)]
+
+
+def test_dependency_evidence_head_accepts_exact_ci_sha_and_checkout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A canonical event SHA is frozen only after both independent resolutions agree."""
+    github_sha = "a" * 40
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_SHA", github_sha)
+    calls: list[tuple[str, ...]] = []
+
+    def fake_git(arguments: list[str], *, failure_message: str | None = None) -> str:
+        calls.append(tuple(arguments))
+        expected_failure = (
+            GIT_EVIDENCE_GITHUB_SHA_RESOLUTION_FAILURE
+            if arguments[-1] == f"{github_sha}^{{commit}}"
+            else GIT_EVIDENCE_CHECKOUT_FAILURE
+        )
+        assert failure_message == expected_failure
+        return f"{github_sha}\n"
+
+    monkeypatch.setitem(_resolve_dependency_evidence_head.__globals__, "_git_command", fake_git)
+
+    assert _resolve_dependency_evidence_head() == github_sha
+    assert calls == [
+        ("rev-parse", "--verify", f"{github_sha}^{{commit}}"),
+        ("rev-parse", "--verify", "HEAD^{commit}"),
+    ]
+
+
+def test_dependency_git_witness_threads_one_frozen_head_after_checkout_moves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every head-dependent graph query consumes the one local resolution."""
+    frozen_head = "a" * 40
+    moved_head = "b" * 40
+    snapshot_revision = "c" * 40
+    current_head = [frozen_head]
+    calls: list[tuple[str, ...]] = []
+    discovered_revisions: list[str] = []
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+
+    def fake_git(arguments: list[str], *, failure_message: str | None = None) -> str:
+        calls.append(tuple(arguments))
+        if arguments == ["rev-parse", "--verify", "HEAD^{commit}"]:
+            assert failure_message == GIT_EVIDENCE_LOCAL_HEAD_FAILURE
+            return f"{current_head[0]}\n"
+        if arguments[:2] == ["log", f"-S{SNAPSHOT_START}"]:
+            return f"{snapshot_revision}\n"
+        if arguments[:3] == ["merge-base", "--is-ancestor", CRYPTOGRAPHY_REMEDIATION_BASE]:
+            assert failure_message == GIT_EVIDENCE_BASE_ANCESTRY_FAILURE
+            return ""
+        if arguments[:4] == [
+            "rev-list",
+            "--parents",
+            "-n",
+            "1",
+        ]:
+            return (
+                f"{CRYPTOGRAPHY_REMEDIATION_REPLAY_WITNESS} " f"{CRYPTOGRAPHY_REMEDIATION_BASE}\n"
+            )
+        if arguments[:2] == ["merge-base", CRYPTOGRAPHY_REMEDIATION_REPLAY_WITNESS]:
+            return f"{CRYPTOGRAPHY_REMEDIATION_REPLAY_WITNESS}\n"
+        if arguments[0] == "show" and arguments[1].startswith(f"{snapshot_revision}:"):
+            return "snapshot-document"
+        raise AssertionError(f"unexpected Git call: {arguments!r}")
+
+    def fake_discover(revision: str) -> dict[str, str]:
+        discovered_revisions.append(revision)
+        return {}
+
+    monkeypatch.setitem(_resolve_dependency_evidence_head.__globals__, "_git_command", fake_git)
+    monkeypatch.setitem(
+        _historical_snapshot_evidence.__globals__,
+        "_load_admission_snapshot",
+        lambda _document: {"snapshot": True},
+    )
+    monkeypatch.setitem(
+        _historical_snapshot_evidence.__globals__,
+        "_discover_cryptography_surfaces",
+        fake_discover,
+    )
+
+    evidence_head = _resolve_dependency_evidence_head()
+    current_head[0] = moved_head
+    _assert_remediation_base_is_ancestor(evidence_head)
+    snapshot, _, _ = _historical_snapshot_evidence(evidence_head)
+    _immutable_replay_witness_evidence(evidence_head)
+
+    assert snapshot == {"snapshot": True}
+    assert discovered_revisions == [
+        CRYPTOGRAPHY_REMEDIATION_BASE,
+        snapshot_revision,
+        CRYPTOGRAPHY_REMEDIATION_REPLAY_WITNESS,
+    ]
+    graph_calls = calls[1:]
+    owner_path = ADMISSION_DOC_PATH.relative_to(REPO_ROOT).as_posix()
+    assert (
+        "log",
+        f"-S{SNAPSHOT_START}",
+        "--format=%H",
+        f"{CRYPTOGRAPHY_REMEDIATION_BASE}..{frozen_head}",
+        "--",
+        owner_path,
+    ) in graph_calls
+    assert (
+        "merge-base",
+        "--is-ancestor",
+        CRYPTOGRAPHY_REMEDIATION_BASE,
+        frozen_head,
+    ) in graph_calls
+    assert (
+        "merge-base",
+        CRYPTOGRAPHY_REMEDIATION_REPLAY_WITNESS,
+        frozen_head,
+    ) in graph_calls
+    assert all("HEAD" not in argument for command in graph_calls for argument in command)
+    assert all(moved_head not in command for command in graph_calls)
+
+
+def test_dependency_security_guard_allows_schema_driven_live_floor_rotation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Live carrier truth may rotate without rewriting historical admission evidence."""
+    schema = _load_schema(SCHEMA_PATH)
+    schema["min_versions"]["cryptography"] = "50.0.1"
+    rotated_schema = tmp_path / "dependency_security_schema.json"
+    rotated_schema.write_text(json.dumps(schema), encoding="utf-8")
+    monkeypatch.setitem(globals(), "SCHEMA_PATH", rotated_schema)
+
+    other_requirements = "\n".join(
+        f"{package}>={version}"
+        for package, version in schema["min_versions"].items()
+        if package != "cryptography"
+    )
+    for surface_name, cryptography_carrier in (
+        ("requirements.in", "cryptography>=50.0.1,<51.0.0"),
+        ("constraints.txt", "cryptography>=50.0.1"),
+    ):
+        surface = tmp_path / surface_name
+        surface.write_text(
+            f"{other_requirements}\n{cryptography_carrier}\n",
+            encoding="utf-8",
+        )
+        test_dependency_security_guard_enforces_min_versions(surface)
+
+    evidence_head = _resolve_dependency_evidence_head()
+    snapshot, base_occurrences, head_occurrences, transitions = _historical_admission_inputs(
+        evidence_head
+    )
+    assert snapshot["target"] == "50.0.0"
+    _assert_cryptography_remediation_admission(
+        base_occurrences=base_occurrences,
+        head_occurrences=head_occurrences,
+        advisories=snapshot["advisories"],
+        material_transitions=transitions,
+    )
+
+
+@pytest.mark.parametrize(
+    ("cryptography_carriers", "expected_error"),
+    [
+        (("cryptography=={higher}",), None),
+        (
+            ("cryptography>={floor},=={higher}",),
+            r"cryptography security-floor lock carrier must contain exactly one == pin",
+        ),
+        (
+            ("cryptography=={higher}", "cryptography=={next_patch}"),
+            r"cryptography security-floor lock must contain exactly one carrier",
+        ),
+    ],
+    ids=["above-floor-pin", "hybrid-carrier", "conflicting-duplicate-pins"],
+)
+def test_dependency_security_guard_enforces_live_lock_carrier_class(
+    tmp_path: Path,
+    cryptography_carriers: tuple[str, ...],
+    expected_error: str | None,
+) -> None:
+    """Live C_R permits a higher pin but rejects hybrid or conflicting carriers."""
+    schema = _load_schema(SCHEMA_PATH)
+    minimum = Version(schema["min_versions"]["cryptography"])
+    substitutions = {
+        "floor": str(minimum),
+        "higher": f"{minimum.major}.{minimum.minor}.{minimum.micro + 1}",
+        "next_patch": f"{minimum.major}.{minimum.minor}.{minimum.micro + 2}",
+    }
+    lock_surface = tmp_path / "requirements.txt"
+    lock_surface.write_text(
+        "\n".join(
+            [
+                f"{package}=={version}"
+                for package, version in schema["min_versions"].items()
+                if package != "cryptography"
+            ]
+            + [carrier.format(**substitutions) for carrier in cryptography_carriers]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    if expected_error is None:
+        test_dependency_security_guard_enforces_min_versions(lock_surface)
+    else:
+        with pytest.raises(pytest.fail.Exception, match=expected_error):
+            test_dependency_security_guard_enforces_min_versions(lock_surface)
+
+
+def test_cryptography_50_dependency_remediation_admission_is_exact_and_replayable() -> None:
+    """Admission v1 closes the base/head/advisory transition proof over ten surfaces."""
+    evidence_head = _resolve_dependency_evidence_head()
+    _assert_remediation_base_is_ancestor(evidence_head)
+    snapshot, base_occurrences, head_occurrences, transitions = _historical_admission_inputs(
+        evidence_head
+    )
+    _assert_cryptography_remediation_admission(
+        base_occurrences=base_occurrences,
+        head_occurrences=head_occurrences,
+        advisories=snapshot["advisories"],
+        material_transitions=transitions,
+    )
+
+    assert base_occurrences == {
+        name: Version("48.0.1") for name in CRYPTOGRAPHY_GOVERNED_SURFACE_NAMES
+    }
+    assert head_occurrences == {
+        name: Version("50.0.0") for name in CRYPTOGRAPHY_GOVERNED_SURFACE_NAMES
+    }
+    owner_document = ADMISSION_DOC_PATH.read_text(encoding="utf-8")
+    for receipt in (
+        CRYPTOGRAPHY_REMEDIATION_BASE,
+        SNAPSHOT_CUTOFF,
+        "5383a5bfe5c81eb5b9f07699dd67983d09118882",  # pragma: allowlist secret
+        "GHSA-m2h6-j472-rp4c",
+        "GHSA-g6cj-pr64-35w5",
+        "GHSA-jwv3-5hgf-82ww",
+        ">=0,<49.0.0",
+        ">=44.0.0,<50.0.0",
+        "I_R={requirements.in",
+        "C_R={requirements.txt",
+    ):
+        assert receipt in owner_document, f"owner evidence receipt missing: {receipt}"
+
+
+def test_cryptography_50_admission_rejects_duplicate_surface_occurrence() -> None:
+    with pytest.raises(AssertionError, match="expected exactly one cryptography occurrence"):
+        _cryptography_version_from_text(
+            "requirements.txt", "cryptography==50.0.0\ncryptography==50.0.0\n"
+        )
+
+
+def test_cryptography_50_admission_rejects_unversioned_surface_occurrence() -> None:
+    with pytest.raises(AssertionError, match="must declare a comparable"):
+        _cryptography_versions_from_text("requirements.in", "cryptography\n")
+
+
+def test_cryptography_50_admission_rejects_unrelated_semantic_transition() -> None:
+    evidence_head = _resolve_dependency_evidence_head()
+    _, base_texts, head_texts = _historical_snapshot_evidence(evidence_head)
+    head_texts["requirements.txt"] = head_texts["requirements.txt"].replace(
+        "click==8.3.3", "click==8.3.4", 1
+    )
+    with pytest.raises(AssertionError, match="unrelated semantic transition"):
+        _derive_material_transitions(base_texts, head_texts)
+
+
+@pytest.mark.parametrize(
+    "directive",
+    (
+        "--extra-index-url https://pypi.org/simple",
+        "--find-links https://example.invalid/wheels",
+    ),
+)
+def test_cryptography_50_admission_rejects_changed_pip_directive(directive: str) -> None:
+    evidence_head = _resolve_dependency_evidence_head()
+    _, base_texts, head_texts = _historical_snapshot_evidence(evidence_head)
+    head_texts["requirements.in"] = f"{head_texts['requirements.in']}\n{directive}\n"
+    with pytest.raises(AssertionError, match="unrelated semantic transition"):
+        _derive_material_transitions(base_texts, head_texts)
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    (
+        ("psycopg[binary]>=3.2.3", "psycopg>=3.2.3"),
+        ('click>=8.3.3; python_version >= "3.12"', 'click>=8.3.3; python_version < "3.12"'),
+    ),
+)
+def test_cryptography_50_admission_rejects_changed_requirement_semantics(
+    before: str, after: str
+) -> None:
+    evidence_head = _resolve_dependency_evidence_head()
+    _, base_texts, head_texts = _historical_snapshot_evidence(evidence_head)
+    head_texts["requirements.in"] = f"{head_texts['requirements.in']}\n{after}\n"
+    base_texts["requirements.in"] = f"{base_texts['requirements.in']}\n{before}\n"
+    with pytest.raises(AssertionError, match="unrelated semantic transition"):
+        _derive_material_transitions(base_texts, head_texts)
+
+
+def test_cryptography_50_admission_rejects_unreplayable_compiled_lock() -> None:
+    evidence_head = _resolve_dependency_evidence_head()
+    loaded_snapshot, _, head_texts = _historical_snapshot_evidence(evidence_head)
+    snapshot = deepcopy(loaded_snapshot)
+    snapshot["surfaces"]["requirements.txt"]["file_sha256"] = "0" * 64
+    with pytest.raises(AssertionError, match="compiled replay receipt mismatch"):
+        _assert_snapshot_receipts(snapshot, head_texts)
+
+
+def test_cryptography_50_admission_rejects_current_owner_snapshot_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evidence_head = _resolve_dependency_evidence_head()
+    historical_snapshot, base_texts, head_texts = _historical_snapshot_evidence(evidence_head)
+    owner_document = ADMISSION_DOC_PATH.read_text(encoding="utf-8")
+    recorded_hash = historical_snapshot["surfaces"]["requirements.txt"]["file_sha256"]
+    drifted_owner = tmp_path / ADMISSION_DOC_PATH.name
+    drifted_owner.write_text(owner_document.replace(recorded_hash, "0" * 64, 1), encoding="utf-8")
+    monkeypatch.setitem(
+        _historical_admission_inputs.__globals__,
+        "_historical_snapshot_evidence",
+        lambda _evidence_head: (historical_snapshot, base_texts, head_texts),
+    )
+    monkeypatch.setitem(
+        _historical_admission_inputs.__globals__,
+        "ADMISSION_DOC_PATH",
+        drifted_owner,
+    )
+
+    with pytest.raises(AssertionError, match="current owner snapshot must equal"):
+        _historical_admission_inputs(evidence_head)
+
+
+def test_cryptography_50_admission_rejects_snapshot_head_inventory_drift() -> None:
+    evidence_head = _resolve_dependency_evidence_head()
+    snapshot, _, head_texts = _historical_snapshot_evidence(evidence_head)
+    renamed_head_texts = dict(head_texts)
+    renamed_head_texts["renamed-requirements.txt"] = renamed_head_texts.pop("requirements.txt")
+    with pytest.raises(AssertionError, match="independently discovered S_head inventory"):
+        _assert_snapshot_receipts(snapshot, renamed_head_texts)
+
+
+@pytest.mark.parametrize(
+    ("surface_name", "surface_class", "replacement"),
+    (
+        (
+            "requirements.in",
+            "I_R",
+            'cryptography>=50.0.0,<51.0.0; python_version >= "0"',
+        ),
+        (
+            "requirements.txt",
+            "C_R",
+            "cryptography[ssh]==50.0.0",
+        ),
+    ),
+)
+def test_cryptography_50_admission_rejects_carrier_semantics_mismatch(
+    surface_name: str,
+    surface_class: str,
+    replacement: str,
+) -> None:
+    evidence_head = _resolve_dependency_evidence_head()
+    loaded_snapshot, _, loaded_head_texts = _historical_snapshot_evidence(evidence_head)
+    snapshot = deepcopy(loaded_snapshot)
+    head_texts = dict(loaded_head_texts)
+    record = snapshot["surfaces"][surface_name]
+    assert record["class"] == surface_class
+    assert head_texts[surface_name].count(record["requirement"]) == 1
+    head_texts[surface_name] = head_texts[surface_name].replace(
+        record["requirement"], replacement, 1
+    )
+    record["semantic_sha256"] = _semantic_sha256(head_texts[surface_name], REPO_ROOT / surface_name)
+    if surface_class == "C_R":
+        record["file_sha256"] = hashlib.sha256(head_texts[surface_name].encode("utf-8")).hexdigest()
+    with pytest.raises(AssertionError, match="cryptography carrier semantics mismatch"):
+        _assert_snapshot_receipts(snapshot, head_texts)
+
+
+@pytest.mark.parametrize(
+    ("failure_mode", "expected_message"),
+    (
+        ("parent", "exact remediation base as its sole parent"),
+        ("reachability", "must remain an ancestor of HEAD"),
+        ("transition", "unrelated semantic transition"),
+        ("lock_bytes", "replay C_R lock bytes differ from frozen S_head"),
+    ),
+)
+def test_cryptography_50_immutable_replay_witness_fails_closed(
+    failure_mode: str,
+    expected_message: str,
+) -> None:
+    evidence_head = _resolve_dependency_evidence_head()
+    _, base_texts, frozen_head_texts = _historical_snapshot_evidence(evidence_head)
+    parent_record, merge_base, loaded_replay_texts = _immutable_replay_witness_evidence(
+        evidence_head
+    )
+    replay_texts = dict(loaded_replay_texts)
+
+    if failure_mode == "parent":
+        parent_record = f"{parent_record} {'0' * 40}"
+    elif failure_mode == "reachability":
+        merge_base = CRYPTOGRAPHY_REMEDIATION_BASE
+    elif failure_mode == "transition":
+        replay_texts["requirements.in"] = replay_texts["requirements.in"].replace(
+            "click>=8.3.3,<9.0.0", "click>=8.3.4,<9.0.0", 1
+        )
+    elif failure_mode == "lock_bytes":
+        replay_texts["requirements.txt"] += "# replay-byte-drift\n"
+    else:
+        raise AssertionError(f"unsupported replay-witness failure mode: {failure_mode}")
+
+    with pytest.raises(AssertionError, match=expected_message):
+        _assert_immutable_replay_witness(
+            parent_record=parent_record,
+            merge_base=merge_base,
+            base_texts=base_texts,
+            replay_texts=replay_texts,
+            frozen_head_texts=frozen_head_texts,
+        )
+
+
+def test_cryptography_50_admission_reports_noncanonical_base_witness() -> None:
+    base_occurrences = {name: Version("48.0.1") for name in CRYPTOGRAPHY_GOVERNED_SURFACE_NAMES}
+    base_occurrences["requirements.txt"] = Version("48.0.0")
+    head_occurrences = {name: Version("50.0.0") for name in CRYPTOGRAPHY_GOVERNED_SURFACE_NAMES}
+    transitions = {
+        **{name: "I_R" for name in CRYPTOGRAPHY_INTENT_SURFACES},
+        **{name: "C_R" for name in CRYPTOGRAPHY_COMPILED_SURFACES},
+    }
+    with pytest.raises(
+        AssertionError,
+        match="S_base witnesses must all report the pre-remediation 48.0.1 version",
+    ):
+        _assert_cryptography_remediation_admission(
+            base_occurrences=base_occurrences,
+            head_occurrences=head_occurrences,
+            advisories=CRYPTOGRAPHY_F_CUTOFF,
+            material_transitions=transitions,
+        )
+
+
+@pytest.mark.parametrize(
+    "requirement_text",
+    (
+        "cryptography>=50.0.0,<50.0.0",
+        "cryptography>=50.0.0,!=50.0.0,<51.0.0",
+    ),
+)
+def test_cryptography_50_admission_rejects_selected_target_exclusion(
+    requirement_text: str,
+) -> None:
+    with pytest.raises(
+        AssertionError,
+        match="selected target 50.0.0 must be contained by recorded requirement",
+    ):
+        _validate_selected_target(
+            "requirements.in",
+            "I_R",
+            requirement_text,
+            "50.0.0",
+        )
+
+
+def test_cryptography_50_admission_rejects_pinned_intent_operation() -> None:
+    with pytest.raises(AssertionError, match="canonical range operation kind"):
+        _validate_selected_target(
+            "requirements.in",
+            "I_R",
+            "cryptography==50.0.0",
+            "50.0.0",
+        )
+
+
+def test_cryptography_50_admission_rejects_nonexact_compiled_target_pin() -> None:
+    with pytest.raises(AssertionError, match="must contain exactly one ==50.0.0 pin"):
+        _validate_selected_target(
+            "requirements.txt",
+            "C_R",
+            "cryptography>=50.0.0,<51.0.0",
+            "50.0.0",
+        )
+
+
+@pytest.mark.parametrize(
+    ("surface_class", "requirement_text", "message"),
+    (
+        (
+            "I_R",
+            'cryptography>=50.0.0,<51.0.0; python_version < "0"',
+            "must not use a marker",
+        ),
+        (
+            "C_R",
+            'cryptography==50.0.0; python_version < "0"',
+            "must not use a marker",
+        ),
+        (
+            "I_R",
+            "cryptography @ https://example.invalid/cryptography-50.0.0.whl",
+            "must not use a direct URL",
+        ),
+        (
+            "I_R",
+            "cryptography[ssh]>=50.0.0,<51.0.0",
+            "must not declare extras",
+        ),
+    ),
+)
+def test_cryptography_50_admission_rejects_noncanonical_requirement_carrier(
+    surface_class: str,
+    requirement_text: str,
+    message: str,
+) -> None:
+    with pytest.raises(AssertionError, match=message):
+        _validate_selected_target(
+            "requirements.in",
+            surface_class,
+            requirement_text,
+            "50.0.0",
+        )
+
+
+def test_cryptography_50_historical_snapshot_is_independent_of_future_live_rotation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(CURRENT_ENFORCED_RUNTIME_FLOORS, "cryptography", "50.0.1")
+    assert CURRENT_ENFORCED_RUNTIME_FLOORS["cryptography"] == "50.0.1"
+    evidence_head = _resolve_dependency_evidence_head()
+    snapshot, base_occurrences, head_occurrences, transitions = _historical_admission_inputs(
+        evidence_head
+    )
+    assert snapshot["target"] == "50.0.0"
+    assert all(version == Version("50.0.0") for version in head_occurrences.values())
+    assert all(
+        version < Version(CURRENT_ENFORCED_RUNTIME_FLOORS["cryptography"])
+        for version in head_occurrences.values()
+    )
+    assert transitions == {
+        **{name: "I_R" for name in CRYPTOGRAPHY_INTENT_SURFACES},
+        **{name: "C_R" for name in CRYPTOGRAPHY_COMPILED_SURFACES},
+    }
+    _assert_cryptography_remediation_admission(
+        base_occurrences=base_occurrences,
+        head_occurrences=head_occurrences,
+        advisories=snapshot["advisories"],
+        material_transitions=transitions,
+    )
+
+
+@pytest.mark.parametrize(
+    ("base_occurrences", "head_occurrences", "advisories", "transitions", "message"),
+    [
+        (
+            {name: Version("48.0.1") for name in CRYPTOGRAPHY_GOVERNED_SURFACE_NAMES[1:]},
+            {name: Version("50.0.0") for name in CRYPTOGRAPHY_GOVERNED_SURFACE_NAMES},
+            CRYPTOGRAPHY_F_CUTOFF,
+            {
+                **{name: "I_R" for name in CRYPTOGRAPHY_INTENT_SURFACES},
+                **{name: "C_R" for name in CRYPTOGRAPHY_COMPILED_SURFACES},
+            },
+            "S_base",
+        ),
+        (
+            {name: Version("48.0.1") for name in CRYPTOGRAPHY_GOVERNED_SURFACE_NAMES},
+            {name: Version("50.0.0") for name in CRYPTOGRAPHY_GOVERNED_SURFACE_NAMES},
+            {"GHSA-g6cj-pr64-35w5": ">=44.0.0,<50.0.0"},
+            {
+                **{name: "I_R" for name in CRYPTOGRAPHY_INTENT_SURFACES},
+                **{name: "C_R" for name in CRYPTOGRAPHY_COMPILED_SURFACES},
+            },
+            "F_cutoff",
+        ),
+        (
+            {name: Version("48.0.1") for name in CRYPTOGRAPHY_GOVERNED_SURFACE_NAMES},
+            {name: Version("48.0.1") for name in CRYPTOGRAPHY_GOVERNED_SURFACE_NAMES},
+            CRYPTOGRAPHY_F_CUTOFF,
+            {
+                **{name: "I_R" for name in CRYPTOGRAPHY_INTENT_SURFACES},
+                **{name: "C_R" for name in CRYPTOGRAPHY_COMPILED_SURFACES},
+            },
+            "P requires",
+        ),
+        (
+            {name: Version("48.0.1") for name in CRYPTOGRAPHY_GOVERNED_SURFACE_NAMES},
+            {name: Version("50.0.0") for name in CRYPTOGRAPHY_GOVERNED_SURFACE_NAMES},
+            CRYPTOGRAPHY_F_CUTOFF,
+            {
+                **{name: "I_R" for name in CRYPTOGRAPHY_INTENT_SURFACES},
+                **{name: "C_R" for name in CRYPTOGRAPHY_COMPILED_SURFACES},
+                "manual.txt": "manual",
+            },
+            "partition",
+        ),
+    ],
+)
+def test_cryptography_50_admission_rejects_incomplete_or_unsafe_evidence(
+    base_occurrences: dict[str, Version],
+    head_occurrences: dict[str, Version],
+    advisories: dict[str, str],
+    transitions: dict[str, str],
+    message: str,
+) -> None:
+    with pytest.raises(AssertionError, match=message):
+        _assert_cryptography_remediation_admission(
+            base_occurrences=base_occurrences,
+            head_occurrences=head_occurrences,
+            advisories=advisories,
+            material_transitions=transitions,
+        )
+
+
+def test_load_schema_fails_on_invalid_version(tmp_path: Path) -> None:
+    """Schema loader must fail if a version string is unparseable."""
+    bad_schema = tmp_path / "schema.json"
+    bad_schema.write_text(
+        '{"min_versions": {"cryptography": "46..0.5"}}',
+        encoding="utf-8",
+    )
+    with pytest.raises(BaseException, match="unparseable version"):
+        _load_schema(bad_schema)
+
+
+def test_parse_requirement_fails_on_invalid_syntax(tmp_path: Path) -> None:
+    """Guard must fail-fast if a requirements file has invalid requirement syntax."""
+    bad_req = tmp_path / "requirements.txt"
+    bad_req.write_text("cryptography==46..0.5\n", encoding="utf-8")
+    with pytest.raises(BaseException, match="Invalid requirement syntax"):
+        _effective_min_versions_per_package(bad_req)
+
+
+@pytest.mark.parametrize(
+    "requirement_line",
+    [
+        "cryptography @ https://example.com/cryptography-3.4.8-py3-none-any.whl",
+        "git+https://example.com/acme/cryptography.git",
+        "-e git+https://example.com/acme/cryptography.git#egg=cryptography",
+        "--editable git+https://example.com/acme/cryptography.git#egg=cryptography",
+    ],
+)
+def test_parse_requirement_fails_on_url_vcs_or_editable_requirement(
+    tmp_path: Path, requirement_line: str
+) -> None:
+    """Guard must fail-fast if a requirements file contains URL/VCS/editable entry."""
+    bad_req = tmp_path / "requirements.txt"
+    bad_req.write_text(
+        f"{requirement_line}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        pytest.fail.Exception,
+        match=r"requirements\.txt: URL/VCS/editable requirement entries are not allowed",
+    ):
+        _effective_min_versions_per_package(bad_req)
+
+
+def test_dependency_security_schema_is_stable_and_sorted() -> None:
+    """Schema must be stable (string keys/values) and keys sorted (diff hygiene)."""
+    schema = _load_schema(SCHEMA_PATH)
+    min_versions = schema["min_versions"]
+    if not all(isinstance(k, str) and k.strip() for k in min_versions.keys()):
+        pytest.fail("Schema min_versions keys must be non-empty strings.")
+    if not all(isinstance(v, str) and v.strip() for v in min_versions.values()):
+        pytest.fail("Schema min_versions values must be non-empty strings.")
+    keys = list(min_versions.keys())
+    if keys != sorted(keys, key=lambda s: s.lower()):
+        pytest.fail(
+            "Schema min_versions keys must be sorted (case-insensitive) to keep diffs clean."
+        )
+    # Validate blocked_packages is sorted (if present)
+    blocked_packages = schema.get("blocked_packages", [])
+    if blocked_packages:
+        if blocked_packages != sorted(blocked_packages, key=lambda s: s.lower()):
+            pytest.fail(
+                "Schema blocked_packages must be sorted (case-insensitive) to keep diffs clean."
+            )
+    # Validate blocked_versions keys are sorted (if present)
+    blocked_versions = schema.get("blocked_versions", {})
+    if blocked_versions:
+        bv_keys = list(blocked_versions.keys())
+        if bv_keys != sorted(bv_keys, key=lambda s: s.lower()):
+            pytest.fail(
+                "Schema blocked_versions keys must be sorted (case-insensitive) "
+                "to keep diffs clean."
+            )
+        # Validate each blocked_versions value list is sorted
+        for pkg, specifiers in blocked_versions.items():
+            if specifiers != sorted(specifiers):
+                pytest.fail(
+                    f"Schema blocked_versions[{pkg!r}] specifiers must be sorted "
+                    "to keep diffs clean."
+                )
+
+
+def test_dependency_security_schema_tracks_current_enforced_runtime_floors() -> None:
+    """Guard current security-floor rotations in one intentionally updated map."""
+    schema = _load_schema(SCHEMA_PATH)
+
+    for package, floor in CURRENT_ENFORCED_RUNTIME_FLOORS.items():
+        assert schema["min_versions"][package] == floor
+    for package, specifier in CURRENT_BLOCKED_VERSION_SPECIFIERS.items():
+        assert specifier in schema["blocked_versions"][package]
+
+
+@pytest.mark.parametrize("surface", REQUIREMENT_SURFACES)
+def test_dependency_security_guard_enforces_blocked_packages(surface: Path) -> None:
+    """
+    Guard: No requirement surface may contain packages listed in
+    schema["blocked_packages"]. Entirely forbidden dependencies.
+    """
+    schema = _load_schema(SCHEMA_PATH)
+    blocked_packages = schema.get("blocked_packages", [])
+    if not blocked_packages:
+        pytest.skip("No blocked packages defined in schema.")
+    all_reqs = _packages_present_in_file(surface)
+    for pkg in blocked_packages:
+        if _normalized_package_name(pkg) in all_reqs:
+            pytest.fail(
+                f"{surface.name}: package {pkg!r} is blocked by security policy. "
+                f"Remove it from this surface."
+            )
+
+
+def test_blocked_packages_cover_the_complete_current_carrier_inventory() -> None:
+    """Retired leaves stay absent in optional and noncompiled carriers too."""
+    registered = registered_dependabot_requirement_carriers()
+    discovered = discover_dependabot_requirement_carriers(REPO_ROOT)
+    assert discovered == registered, "blocked-package carrier inventory differs from registry"
+    blocked = {
+        _normalized_package_name(package)
+        for package in _load_schema(SCHEMA_PATH).get("blocked_packages", ())
+    }
+    for name in sorted(discovered):
+        present = _packages_present_in_file(REPO_ROOT / name)
+        assert not (present & blocked), (
+            f"{name}: blocked packages remain in the current governed carrier: "
+            f"{sorted(present & blocked)}"
+        )
+
+
+def test_psycopg_binary_retirement_remains_in_the_security_schema() -> None:
+    """A future lock refresh must not silently reintroduce bundled libpq/OpenSSL."""
+    schema = _load_schema(SCHEMA_PATH)
+    assert "psycopg-binary" in schema["blocked_packages"]
+
+
+@pytest.fixture
+def blocked_dependency_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Exercise real Git-based carrier discovery with synthetic package rows."""
+    for name in registered_dependabot_requirement_carriers():
+        destination = tmp_path / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text("# synthetic empty carrier\n", encoding="utf-8")
+    monkeypatch.setattr(f"{__name__}.REPO_ROOT", tmp_path)
+    _git_command(["init", "--quiet"])
+    _git_command(["add", "."])
+    return tmp_path
+
+
+@pytest.mark.parametrize("carrier", ("requirements-evals.txt", "requirements-all.txt"))
+@pytest.mark.parametrize(
+    "text",
+    (
+        "psycopg-binary\n",
+        "Psycopg_Binary==3.3.4\n",
+        "psycopg.binary>=3.3.4\n",
+        'psycopg-binary==3.3.4; python_version < "0"\n',
+    ),
+)
+def test_retired_psycopg_binary_is_rejected_in_optional_carriers(
+    blocked_dependency_repo: Path, carrier: str, text: str
+) -> None:
+    """Normalization and inactive markers cannot hide the removed identity."""
+    (blocked_dependency_repo / carrier).write_text(text, encoding="utf-8")
+    with pytest.raises(AssertionError, match="blocked packages remain"):
+        test_blocked_packages_cover_the_complete_current_carrier_inventory()
+
+
+def test_blocked_package_guard_rejects_carrier_inventory_drift(
+    blocked_dependency_repo: Path,
+) -> None:
+    """An unregistered tracked source cannot fall outside the absence proof."""
+    extra = blocked_dependency_repo / "requirements-extra.txt"
+    extra.write_text("# synthetic extra carrier\n", encoding="utf-8")
+    _git_command(["add", str(extra)])
+    with pytest.raises(AssertionError, match="carrier inventory differs"):
+        test_blocked_packages_cover_the_complete_current_carrier_inventory()
+
+
+def test_blocked_packages_detects_unpinned_requirements(tmp_path: Path) -> None:
+    """Blocked package detection must include bare package names without specifiers."""
+    req = tmp_path / "requirements.txt"
+    req.write_text("unsafe-pkg\n", encoding="utf-8")
+    assert "unsafe-pkg" in _packages_present_in_file(req)
+
+
+def test_blocked_packages_detects_pinned_requirements(tmp_path: Path) -> None:
+    """Blocked package detection must still catch pinned package requirements."""
+    req = tmp_path / "requirements.txt"
+    req.write_text("unsafe-pkg==1.2.3\n", encoding="utf-8")
+    assert "unsafe-pkg" in _packages_present_in_file(req)
+
+
+def test_blocked_packages_canonicalize_equivalent_package_names(tmp_path: Path) -> None:
+    """Equivalent _, ., and - package spellings must match the same blocked package."""
+    req = tmp_path / "requirements.txt"
+    req.write_text("unsafe_pkg==1.2.3\nunsafe.pkg\n", encoding="utf-8")
+    all_reqs = _packages_present_in_file(req)
+    assert "unsafe-pkg" in all_reqs
+    assert _normalized_package_name("unsafe_pkg") in all_reqs
+    assert _normalized_package_name("unsafe.pkg") in all_reqs
+
+
+def test_min_versions_lookup_uses_canonical_package_names(tmp_path: Path) -> None:
+    """Schema names using - must match requirement names using _ or . spellings."""
+    req = tmp_path / "requirements.txt"
+    req.write_text("unsafe_pkg==1.2.3\n", encoding="utf-8")
+
+    all_reqs = _effective_min_versions_per_package(req)
+    effective = all_reqs.get(_normalized_package_name("unsafe-pkg"))
+
+    assert effective == Version("1.2.3")
+
+
+def test_parse_requirement_skips_short_form_pip_flags(tmp_path: Path) -> None:
+    """Short-form pip directives must not be parsed as package requirements."""
+    req = tmp_path / "requirements.txt"
+    req.write_text(
+        "-i https://example.com/simple\n"
+        "--index-url https://example.com/simple\n"
+        "--extra-index-url https://example.com/extra\n"
+        "-f https://example.com/wheels\n"
+        "--find-links https://example.com/wheels\n"
+        "-r base-requirements.txt\n"
+        "--requirement base-requirements.txt\n"
+        "-c constraints.txt\n"
+        "--constraint constraints.txt\n",
+        encoding="utf-8",
+    )
+    assert _packages_present_in_file(req) == set()
+
+
+@pytest.mark.parametrize("surface", REQUIREMENT_SURFACES)
+def test_dependency_security_guard_enforces_blocked_versions(surface: Path) -> None:
+    """
+    Guard: Packages with blocked version ranges must not match any
+    blocked specifier in schema["blocked_versions"].
+    Only checks pinned (==) versions; constraint-style ranges are not failed.
+    """
+    schema = _load_schema(SCHEMA_PATH)
+    blocked_versions = schema.get("blocked_versions", {})
+    if not blocked_versions:
+        pytest.skip("No blocked versions defined in schema.")
+    # Only check pinned surfaces (==) to avoid false positives on ranges
+    if _is_constraint_style(surface):
+        pytest.skip(
+            f"{surface.name} is constraint-style; blocked versions check skipped "
+            "(only pinned surfaces checked)."
+        )
+    pinned_versions = _pinned_versions_per_package(surface)
+    for pkg, specifiers in blocked_versions.items():
+        versions = pinned_versions.get(_normalized_package_name(pkg))
+        if not versions:
+            continue  # Package not in this surface
+        for spec_str in specifiers:
+            spec = SpecifierSet(spec_str)
+            for effective in sorted(versions):
+                if str(effective) in spec:
+                    pytest.fail(
+                        f"{surface.name}: {pkg}=={effective} matches blocked specifier "
+                        f"{spec_str!r}. Update to a safe version."
+                    )
+
+
+def test_blocked_versions_lookup_uses_canonical_package_names(tmp_path: Path) -> None:
+    """Blocked version schema names must match equivalent requirement spellings."""
+    req = tmp_path / "requirements.txt"
+    req.write_text("unsafe_pkg==2.0.3\n", encoding="utf-8")
+
+    pinned_versions = _pinned_versions_per_package(req)
+    versions = pinned_versions.get(_normalized_package_name("unsafe-pkg"))
+
+    assert versions == {Version("2.0.3")}
+    assert any(str(version) in SpecifierSet(">=2.0.0,<2.1.0") for version in versions)
+
+
+def test_blocked_versions_check_all_pinned_versions(tmp_path: Path) -> None:
+    """Blocked-version guard must not collapse marker-split pins to one version."""
+    req = tmp_path / "requirements.txt"
+    req.write_text(
+        'some-pkg==2.0.3; python_version < "3.13"\n' 'some_pkg==3.0.0; python_version >= "3.13"\n',
+        encoding="utf-8",
+    )
+
+    versions = _pinned_versions_per_package(req).get(_normalized_package_name("some-pkg"))
+
+    assert versions == {Version("2.0.3"), Version("3.0.0")}
+    assert any(str(version) in SpecifierSet(">=2.0.0,<2.1.0") for version in versions)
+
+
+def test_validate_blocked_packages_fails_on_invalid_type(tmp_path: Path) -> None:
+    """blocked_packages must be a list."""
+    bad_schema = tmp_path / "schema.json"
+    bad_schema.write_text(
+        '{"min_versions": {"cryptography": "46.0.5"}, "blocked_packages": "not-a-list"}',
+        encoding="utf-8",
+    )
+    with pytest.raises(BaseException, match="must be a list"):
+        _load_schema(bad_schema)
+
+
+def test_validate_blocked_packages_fails_on_invalid_entry(tmp_path: Path) -> None:
+    """blocked_packages entries must be non-empty strings."""
+    bad_schema = tmp_path / "schema.json"
+    bad_schema.write_text(
+        '{"min_versions": {"cryptography": "46.0.5"}, "blocked_packages": [""]}',
+        encoding="utf-8",
+    )
+    with pytest.raises(BaseException, match="must be a non-empty string"):
+        _load_schema(bad_schema)
+
+
+def test_validate_blocked_versions_fails_on_invalid_type(tmp_path: Path) -> None:
+    """blocked_versions must be a dict."""
+    bad_schema = tmp_path / "schema.json"
+    bad_schema.write_text(
+        '{"min_versions": {"cryptography": "46.0.5"}, "blocked_versions": "not-a-dict"}',
+        encoding="utf-8",
+    )
+    with pytest.raises(BaseException, match="must be a dict"):
+        _load_schema(bad_schema)
+
+
+def test_validate_blocked_versions_fails_on_invalid_specifier(tmp_path: Path) -> None:
+    """blocked_versions specifiers must be parseable."""
+    bad_schema = tmp_path / "schema.json"
+    bad_schema.write_text(
+        '{"min_versions": {"cryptography": "46.0.5"}, '
+        '"blocked_versions": {"pkg": [">=1.0.0,<=invalid"]}}',
+        encoding="utf-8",
+    )
+    with pytest.raises(BaseException, match="unparseable specifier"):
+        _load_schema(bad_schema)
+
+
+def test_blocked_package_enforcement_with_fake_surface(tmp_path: Path) -> None:
+    """Regression: blocked package in surface should be detected."""
+    fake_req = tmp_path / "requirements.txt"
+    fake_req.write_text("unsafe-pkg==1.0.0\nsome-other==2.0.0\n", encoding="utf-8")
+    all_reqs = _packages_present_in_file(fake_req)
+    blocked_packages = ["unsafe-pkg"]
+    # Simulate the guard check
+    violations = [pkg for pkg in blocked_packages if _normalized_package_name(pkg) in all_reqs]
+    assert violations == ["unsafe-pkg"], "Blocked package should be detected."
+
+
+def test_blocked_version_enforcement_with_fake_surface(tmp_path: Path) -> None:
+    """Regression: blocked version match in surface should be detected."""
+    fake_req = tmp_path / "requirements.txt"
+    fake_req.write_text("some-pkg==2.0.3\n", encoding="utf-8")
+    pinned_versions = _pinned_versions_per_package(fake_req)
+    blocked_versions = {"some-pkg": [">=2.0.0,<2.1.0"]}
+    # Simulate the guard check
+    violations = []
+    for pkg, specifiers in blocked_versions.items():
+        versions = pinned_versions.get(_normalized_package_name(pkg))
+        if not versions:
+            continue
+        for spec_str in specifiers:
+            spec = SpecifierSet(spec_str)
+            for effective in sorted(versions):
+                if str(effective) in spec:
+                    violations.append((pkg, str(effective), spec_str))
+    assert violations == [
+        ("some-pkg", "2.0.3", ">=2.0.0,<2.1.0")
+    ], "Blocked version match should be detected."
+
+
+def test_repo_managed_lock_surfaces_do_not_pin_pip() -> None:
+    """Guard: repo-managed lock surfaces must not pin pip as an unsafe package.
+
+    pip-compile --allow-unsafe may reintroduce pip==... entries; the repo
+    security policy (GHSA-58qw-9mgm-455v-pip.md) requires these entries to
+    be absent.  This guard prevents future drift regardless of the specific
+    pip version.
+    """
+    pinned_surfaces = [
+        surface for surface in REQUIREMENT_SURFACES if not _is_constraint_style(surface)
+    ]
+
+    offenders: list[str] = []
+    for surface in pinned_surfaces:
+        if not surface.exists():
+            continue
+        pins = _pinned_versions_per_package(surface).get(
+            _normalized_package_name("pip"),
+        )
+        if pins:
+            versions = ", ".join(str(v) for v in sorted(pins))
+            offenders.append(f"{surface.name}: pip=={versions}")
+
+    assert not offenders, (
+        "Repo-managed lock surfaces must not pin pip as an unsafe package. "
+        "Remove pip==... entries instead of repinning pip. "
+        "See docs/security/GHSA-58qw-9mgm-455v-pip.md. Offenders: " + "; ".join(offenders)
+    )
+
+
+# These current runtime-consuming profiles require AnyIO; optional data/evals
+# profiles are inspected for occurrences without acquiring a new dependency.
+ANYIO_REQUIRED_COMPILE_PROFILES = frozenset(
+    {
+        "runtime",
+        "docker-runtime",
+        "ci-lite",
+        "test",
+        "dev",
+        "rag-vector",
+        "rag-vector-cpu",
+        "aggregate",
+    }
+)
+
+
+def _assert_remediated_dependency_surface(
+    path: Path, *, required: bool, pinned: bool, package: str = "anyio", forbidden: bool = False
+) -> None:
+    """Enforce finite admitted package floors using the existing parser."""
+    floor = REMEDIATION_FIXED_FLOORS[package]
+    label = "AnyIO" if package == "anyio" else package
+    if package in PYTHON_STABILIZATION_GUARDED_ADVISORIES and (path.exists() or path.is_symlink()):
+        assert (
+            not path.is_symlink() and path.is_file()
+        ), f"{path.name}: {label} carrier must be a regular non-symlink file"
+    _minima, carriers = _requirement_evidence_per_package(path)
+    occurrences = carriers.get(package, ())
+    if package == "virtualenv":
+        assert "virtual-env" not in carriers, f"{path.name}: virtualenv alias is not canonical"
+    if forbidden:
+        assert not occurrences, f"{path.name}: {label} is outside its owned profiles"
+        return
+    if not required and not occurrences:
+        return
+    assert len(occurrences) == 1, f"{path.name}: expected exactly one {label} carrier"
+    requirement = occurrences[0]
+    assert requirement.marker is None, f"{path.name}: {label} carrier must be unconditional"
+    assert not requirement.extras, f"{path.name}: {label} carrier must not declare extras"
+    specifiers = tuple(requirement.specifier)
+    if pinned:
+        assert (
+            len(specifiers) == 1 and specifiers[0].operator == "=="
+        ), f"{path.name}: {label} lock requires exactly one == pin"
+    if package in PYTHON_STABILIZATION_GUARDED_ADVISORIES:
+        assert all(
+            spec.operator != "===" for spec in specifiers
+        ), f"{path.name}: arbitrary equality cannot establish {package} range evidence"
+    candidate = _min_version_for_pkg(requirement, package, pinned=pinned)
+    assert candidate is not None, f"{path.name}: {label} requires a comparable floor or pin"
+    version = Version(candidate)
+    assert requirement.specifier.contains(
+        version, prereleases=True
+    ), f"{path.name}: {label} carrier excludes its comparable floor or pin"
+    for blocked in _load_schema(SCHEMA_PATH)["blocked_versions"][package]:
+        assert not SpecifierSet(blocked).contains(
+            version, prereleases=True
+        ), f"{path.name}: {label} {version} matches blocked range {blocked}"
+    # PEP 440's exclusive < range excludes prereleases of its boundary version.
+    assert version >= floor, f"{path.name}: version is below fixed {label} floor"
+
+
+def test_anyio_current_governed_surfaces_are_safe() -> None:
+    """Discover current carriers; do not freeze historical base or resolver state."""
+    registered = registered_dependabot_requirement_carriers()
+    discovered = discover_dependabot_requirement_carriers(REPO_ROOT)
+    assert discovered == registered, "AnyIO requirement carrier inventory differs from registry"
+    compiled = compiled_dependency_surfaces()
+    assert ANYIO_REQUIRED_COMPILE_PROFILES <= {
+        surface.compile_profile for surface in compiled
+    }, "AnyIO required compile profile is missing from registry"
+    locks = {surface.lockfile for surface in compiled}
+    required = {"requirements.in"} | {
+        surface.lockfile
+        for surface in compiled
+        if surface.compile_profile in ANYIO_REQUIRED_COMPILE_PROFILES
+    }
+    assert required <= discovered, "AnyIO required carrier is missing from inventory"
+    for name in sorted(discovered):
+        _assert_remediated_dependency_surface(
+            REPO_ROOT / name, required=name in required, pinned=name in locks
+        )
+
+
+@pytest.mark.parametrize(
+    ("name", "text", "error"),
+    [
+        ("requirements.txt", "httpx==0.28.1\n", "exactly one AnyIO"),
+        ("requirements.txt", "anyio==4.14.2\nAnyIO==4.14.2\n", "exactly one AnyIO"),
+        ("requirements.txt", "AnyIO==4.12.0\n", "matches blocked range"),
+        ("requirements.txt", "anyio==4.14.0\n", "matches blocked range"),
+        ("requirements.txt", "anyio==4.14.1\n", "matches blocked range"),
+        ("requirements.txt", "anyio==4.14.2rc1\n", "below fixed AnyIO floor"),
+        ("requirements.txt", "anyio==4.14.2.dev1\n", "below fixed AnyIO floor"),
+        ("requirements.txt", "anyio>=4.14.2\n", "exactly one == pin"),
+        ("requirements.txt", 'anyio==4.14.2; python_version < "0"\n', "unconditional"),
+        ("requirements.txt", "anyio[trio]==4.14.2\n", "must not declare extras"),
+        ("requirements.in", "anyio\n", "comparable floor or pin"),
+        ("requirements.in", "anyio>=4.12.0,<5\n", "matches blocked range"),
+        ("requirements.in", "anyio>=4.14.2,!=4.14.2,<5\n", "excludes its comparable"),
+    ],
+)
+def test_anyio_surface_rejects_missing_duplicate_or_unsafe_carriers(
+    tmp_path: Path, name: str, text: str, error: str
+) -> None:
+    surface = tmp_path / name
+    surface.write_text(text, encoding="utf-8")
+    with pytest.raises(AssertionError, match=error):
+        _assert_remediated_dependency_surface(surface, required=True, pinned=name.endswith(".txt"))
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["anyio==4..14.2\n", "anyio @ https://example.invalid/anyio.whl\n"],
+)
+def test_anyio_surface_rejects_malformed_or_url_carriers(tmp_path: Path, text: str) -> None:
+    surface = tmp_path / "requirements.txt"
+    surface.write_text(text, encoding="utf-8")
+    with pytest.raises(pytest.fail.Exception):
+        _assert_remediated_dependency_surface(surface, required=True, pinned=True)
+
+
+def test_anyio_surface_rejects_missing_file(tmp_path: Path) -> None:
+    with pytest.raises(pytest.fail.Exception, match="Missing requirement surface"):
+        _assert_remediated_dependency_surface(
+            tmp_path / "requirements.txt", required=True, pinned=True
+        )
+
+
+@pytest.mark.parametrize(
+    ("name", "text", "required", "pinned"),
+    [
+        ("requirements.txt", "AnyIO==4.15.0\n", True, True),
+        ("requirements.in", "anyio>=4.14.2,<5.0.0\n", True, False),
+        ("requirements-evals.txt", "# No optional dependencies\n", False, True),
+    ],
+)
+def test_anyio_surface_allows_safe_future_pins_and_optional_absence(
+    tmp_path: Path, name: str, text: str, required: bool, pinned: bool
+) -> None:
+    surface = tmp_path / name
+    surface.write_text(text, encoding="utf-8")
+    _assert_remediated_dependency_surface(surface, required=required, pinned=pinned)
+
+
+def test_anyio_inventory_rejects_unregistered_alias(monkeypatch: pytest.MonkeyPatch) -> None:
+    discovered = registered_dependabot_requirement_carriers() | {"config/requirements-alias.txt"}
+    monkeypatch.setattr(
+        f"{__name__}.discover_dependabot_requirement_carriers", lambda _root: discovered
+    )
+    with pytest.raises(AssertionError, match="inventory differs from registry"):
+        test_anyio_current_governed_surfaces_are_safe()
+
+
+def test_anyio_inventory_rejects_removed_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    compiled = tuple(
+        surface for surface in compiled_dependency_surfaces() if surface.compile_profile != "test"
+    )
+    monkeypatch.setattr(f"{__name__}.compiled_dependency_surfaces", lambda: compiled)
+    with pytest.raises(AssertionError, match="required compile profile is missing"):
+        test_anyio_current_governed_surfaces_are_safe()
+
+
+def test_anyio_inventory_rejects_missing_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    missing_source = registered_dependabot_requirement_carriers() - {"requirements.in"}
+    monkeypatch.setattr(
+        f"{__name__}.registered_dependabot_requirement_carriers", lambda: missing_source
+    )
+    monkeypatch.setattr(
+        f"{__name__}.discover_dependabot_requirement_carriers", lambda _root: missing_source
+    )
+    with pytest.raises(AssertionError, match="required carrier is missing"):
+        test_anyio_current_governed_surfaces_are_safe()
+
+
+HTTP_CLIENT_REQUIRED_COMPILE_PROFILES = frozenset({"dev", "test", "aggregate"})
+HTTP_CLIENT_SOURCE_NAMES = frozenset({"requirements-dev.in", "requirements-test.in"})
+
+
+def test_http_client_current_governed_surfaces_are_safe() -> None:
+    """Keep the admitted pair safe and confined to its existing test/dev owners."""
+    registered = registered_dependabot_requirement_carriers()
+    discovered = discover_dependabot_requirement_carriers(REPO_ROOT)
+    assert discovered == registered, "HTTP-client carrier inventory differs from registry"
+    compiled = compiled_dependency_surfaces()
+    assert HTTP_CLIENT_REQUIRED_COMPILE_PROFILES <= {
+        s.compile_profile for s in compiled
+    }, "HTTP-client required compile profile is missing from registry"
+    locks = {s.lockfile for s in compiled}
+    required = HTTP_CLIENT_SOURCE_NAMES | {
+        s.lockfile for s in compiled if s.compile_profile in HTTP_CLIENT_REQUIRED_COMPILE_PROFILES
+    }
+    assert required <= discovered, "HTTP-client required carrier is missing from inventory"
+    for name in sorted(discovered):
+        for package in ("httpx2", "httpcore2"):
+            _assert_remediated_dependency_surface(
+                REPO_ROOT / name,
+                package=package,
+                required=name in required,
+                forbidden=name not in required,
+                pinned=name in locks,
+            )
+
+
+def test_http_client_idna_runtime_constraints_are_compatible() -> None:
+    """Inspect every registry lockfile field using its compiled or flexible contract."""
+    registered = registered_dependabot_requirement_carriers()
+    discovered = discover_dependabot_requirement_carriers(REPO_ROOT)
+    assert registered == discovered, "idna carrier inventory differs from registry"
+    lockfiles = {surface.lockfile for surface in DEPENDENCY_SURFACES}
+    assert lockfiles and lockfiles <= registered, "idna registry lockfile inventory is incomplete"
+    assert ANYIO_REQUIRED_COMPILE_PROFILES <= {s.compile_profile for s in DEPENDENCY_SURFACES}
+    for surface in DEPENDENCY_SURFACES:
+        _assert_http_client_idna_compatible(
+            REPO_ROOT / surface.lockfile,
+            required=surface.compile_profile in ANYIO_REQUIRED_COMPILE_PROFILES,
+            pinned=surface.compile_profile is not None,
+        )
+
+
+def _assert_http_client_idna_compatible(
+    path: Path, *, required: bool = True, pinned: bool = True
+) -> None:
+    """Validate idna under the registry's exact-pin or flexible exclusion contract."""
+    occurrences: list[Requirement] = []
+    for line in _iter_requirement_lines(path):
+        requirement = _parse_requirement(line, path)
+        if requirement is not None and _normalized_package_name(requirement.name) == "idna":
+            occurrences.append(requirement)
+    if not occurrences:
+        assert not required, f"{path.name}: expected exactly one idna carrier"
+        return
+    if not pinned:
+        for requirement in occurrences:
+            assert all(
+                spec.operator != "===" for spec in requirement.specifier
+            ), f"{path.name}: arbitrary equality cannot establish comparable idna exclusion"
+            assert not requirement.specifier.contains(
+                Version("3.11"), prereleases=True
+            ), f"{path.name}: flexible requirement admits retained excluded idna version 3.11"
+        return
+    assert len(occurrences) == 1, f"{path.name}: expected exactly one idna carrier"
+    requirement = occurrences[0]
+    assert requirement.marker is None and not requirement.extras
+    specifiers = tuple(requirement.specifier)
+    assert len(specifiers) == 1 and specifiers[0].operator == "=="
+    version = Version(specifiers[0].version)
+    assert version != Version("3.11"), f"{path.name}: retained excluded idna version 3.11"
+    if required:
+        assert version >= Version(
+            "3.18"
+        ), f"{path.name}: idna must satisfy HTTPX2 metadata floor 3.18"
+
+
+@pytest.mark.parametrize("package", ("httpx2", "httpcore2"))
+@pytest.mark.parametrize("version", ("2.3.0", "2.12.0rc1", "2.12.0.dev1"))
+def test_http_client_surface_rejects_affected_and_prefixed_versions(
+    tmp_path: Path, package: str, version: str
+) -> None:
+    path = tmp_path / "requirements-test.txt"
+    path.write_text(f"{package}=={version}\n", encoding="utf-8")
+    with pytest.raises(AssertionError, match="blocked range|below fixed"):
+        _assert_remediated_dependency_surface(path, package=package, required=True, pinned=True)
+
+
+@pytest.mark.parametrize("package", ("httpx2", "httpcore2"))
+def test_http_client_surface_rejects_runtime_exposure(tmp_path: Path, package: str) -> None:
+    path = tmp_path / "requirements.txt"
+    path.write_text(f"{package}==2.12.0\n", encoding="utf-8")
+    with pytest.raises(AssertionError, match="outside its owned profiles"):
+        _assert_remediated_dependency_surface(
+            path, package=package, required=False, forbidden=True, pinned=True
+        )
+
+
+@pytest.mark.parametrize("package", ("httpx2", "httpcore2"))
+@pytest.mark.parametrize("carrier", ("{package}==2.13.0", "{package}>=2.12.0,<3.0.0"))
+def test_http_client_surface_allows_later_stable_pins_and_source_floors(
+    tmp_path: Path, package: str, carrier: str
+) -> None:
+    pinned = "==" in carrier
+    path = tmp_path / ("requirements-test.txt" if pinned else "requirements-test.in")
+    path.write_text(carrier.format(package=package) + "\n", encoding="utf-8")
+    _assert_remediated_dependency_surface(path, package=package, required=True, pinned=pinned)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "idna==3.15\n",
+        "idna==3.18rc1\n",
+        "idna==3.18.dev1\n",
+        "# missing\n",
+        "idna==3.18\nidna==3.18\n",
+    ],
+)
+def test_http_client_idna_rejects_incompatible_or_missing_pins(tmp_path: Path, text: str) -> None:
+    path = tmp_path / "requirements.txt"
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises(AssertionError):
+        _assert_http_client_idna_compatible(path)
+
+
+def test_http_client_idna_accepts_later_compatible_pin(tmp_path: Path) -> None:
+    path = tmp_path / "requirements.txt"
+    path.write_text("idna==3.19\n", encoding="utf-8")
+    _assert_http_client_idna_compatible(path)
+
+
+@pytest.fixture
+def idna_consumer_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Track copied canonical carriers so real registry discovery governs each test."""
+    for name in registered_dependabot_requirement_carriers():
+        destination = tmp_path / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(REPO_ROOT / name, destination)
+    monkeypatch.setattr(f"{__name__}.REPO_ROOT", tmp_path)
+    _git_command(["init", "--quiet"])
+    _git_command(["add", "."])
+    return tmp_path
+
+
+@pytest.mark.parametrize("lockfile", ("requirements-data.txt", "requirements-evals.txt"))
+@pytest.mark.parametrize("version", ("3.11", "3.11.0"))
+def test_idna_consumer_rejects_known_excluded_optional_pins(
+    idna_consumer_repo: Path, lockfile: str, version: str
+) -> None:
+    """Reject excluded idna versions through each optional lock consumer."""
+    (idna_consumer_repo / lockfile).write_text(f"idna=={version}\n", encoding="utf-8")
+    with pytest.raises(AssertionError, match="retained excluded idna version"):
+        test_http_client_idna_runtime_constraints_are_compatible()
+
+
+@pytest.mark.parametrize("lockfile", ("requirements-data.txt", "requirements-evals.txt"))
+@pytest.mark.parametrize("text", ("# optional absence\n", "idna==3.15\n", "idna==3.19\n"))
+def test_idna_consumer_allows_optional_absence_and_other_exact_versions(
+    idna_consumer_repo: Path, lockfile: str, text: str
+) -> None:
+    """Permit optional absence and pins without imposing the required-profile floor."""
+    (idna_consumer_repo / lockfile).write_text(text, encoding="utf-8")
+    test_http_client_idna_runtime_constraints_are_compatible()
+
+
+@pytest.mark.parametrize("lockfile", ("requirements-data.txt", "requirements-evals.txt"))
+@pytest.mark.parametrize(
+    ("text", "error_type"),
+    [
+        ("idna==3.15\nidna==3.19\n", AssertionError),
+        ('idna==3.19; python_version >= "3.10"\n', AssertionError),
+        ("idna[extra]==3.19\n", AssertionError),
+        ("idna>=3.19\n", AssertionError),
+        ("idna==3..19\n", pytest.fail.Exception),
+        ("idna @ https://example.invalid/idna.whl\n", pytest.fail.Exception),
+    ],
+)
+def test_idna_consumer_rejects_noncanonical_present_optional_carriers(
+    idna_consumer_repo: Path, lockfile: str, text: str, error_type: type[BaseException]
+) -> None:
+    """Reject malformed or noncanonical idna carriers in each optional profile."""
+    (idna_consumer_repo / lockfile).write_text(text, encoding="utf-8")
+    with pytest.raises(error_type):
+        test_http_client_idna_runtime_constraints_are_compatible()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "idna==3.11\n",
+        "idna==3.11.0\n",
+        "idna>=3.0\n",
+        "idna==3.*\n",
+        "idna\n",
+        "idna===3.19\n",
+        "idna===opaque\n",
+        'idna==3.11; python_version < "0"\n',
+        "idna[extra]==3.11\n",
+        "idna>=3.15\nidna==3.11\n",
+    ],
+)
+def test_idna_consumer_rejects_flexible_known_bad_or_incomparable_sets(
+    idna_consumer_repo: Path, text: str
+) -> None:
+    """Exercise the registered noncompiled carrier so compiled-only iteration fails."""
+    (idna_consumer_repo / "requirements-all.txt").write_text(text, encoding="utf-8")
+    with pytest.raises(AssertionError, match="retained excluded idna version|arbitrary equality"):
+        test_http_client_idna_runtime_constraints_are_compatible()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "-r requirements.txt\n",
+        "idna>=3.15\n",
+        "idna>=3.19\n",
+        "idna>=3.0,!=3.11\n",
+        "idna==3.15.*\n",
+        "idna>=3.15\nidna>=3.19\n",
+        'idna>=3.15; python_version >= "3.10"\n',
+        "idna[extra]>=3.15\n",
+    ],
+)
+def test_idna_consumer_accepts_flexible_absence_and_excluding_sets(
+    idna_consumer_repo: Path, text: str
+) -> None:
+    """Accept valid flexible sets without imposing a compiled pin or metadata floor."""
+    (idna_consumer_repo / "requirements-all.txt").write_text(text, encoding="utf-8")
+    test_http_client_idna_runtime_constraints_are_compatible()
+
+
+@pytest.mark.parametrize(
+    ("text", "error_type"),
+    [
+        ("idna==3..15\n", pytest.fail.Exception),
+        ("idna @ https://example.invalid/idna.whl\n", pytest.fail.Exception),
+    ],
+)
+def test_idna_consumer_rejects_noncanonical_flexible_carriers(
+    idna_consumer_repo: Path, text: str, error_type: type[BaseException]
+) -> None:
+    """Reject malformed or URL-based flexible declarations through the owning parser."""
+    (idna_consumer_repo / "requirements-all.txt").write_text(text, encoding="utf-8")
+    with pytest.raises(error_type):
+        test_http_client_idna_runtime_constraints_are_compatible()
+
+
+@pytest.mark.parametrize("mutation", ("omit-registered", "add-unregistered"))
+def test_idna_consumer_requires_real_registry_discovery_parity(
+    idna_consumer_repo: Path, mutation: str
+) -> None:
+    """Reject omitted or unregistered indexed carriers through canonical discovery."""
+    if mutation == "omit-registered":
+        _git_command(["rm", "--cached", "requirements-all.txt"])
+    else:
+        (idna_consumer_repo / "requirements-extra.txt").write_text("idna==3.11\n", encoding="utf-8")
+        _git_command(["add", "requirements-extra.txt"])
+    with pytest.raises(AssertionError, match="idna carrier inventory differs from registry"):
+        test_http_client_idna_runtime_constraints_are_compatible()
+
+
+# Frozen advisory data, not an incident lock graph. Evidence owner:
+# docs/security/PR_2447_URLLIB3_REMEDIATION.md
+URLLIB3_F_CUTOFF = {
+    "GHSA-2xpw-w6gg-jr37": ("<2.6.0,>=1.0",),
+    "GHSA-34jh-p97f-mpxf": ("<=1.26.18", "<=2.2.1"),
+    "GHSA-38jv-5279-wg99": ("<2.6.3,>=1.22",),
+    "GHSA-48p4-8xcf-vxj5": ("<2.5.0,>=2.2.0",),
+    "GHSA-5phf-pp7p-vc2r": ("<=1.26.3,>=1.26.0",),
+    "GHSA-8988-9cw3-xx77": ("<2.8.0,>=1.26.0",),
+    "GHSA-g4mx-q9vg-27p4": ("<=2.0.6,>=2", "<=1.26.17"),
+    "GHSA-gh4c-6fx4-qh6g": ("<2.8.0,>=2.6.2",),
+    "GHSA-gm62-xv2j-4w53": ("<2.6.0,>=1.24",),
+    "GHSA-mf9v-mfxr-j63j": ("<2.7.0,>=2.6.0",),
+    "GHSA-pq67-6m6q-mj2v": ("<2.5.0",),
+    "GHSA-q2q7-5pp4-w6pg": ("<1.26.5",),
+    "GHSA-qccp-gfcp-xxvc": ("<2.7.0,>=1.23",),
+    "GHSA-v845-jxx5-vc9f": ("<=2.0.5,>2", "<=1.26.16"),
+    "GHSA-vxq7-64xx-v4gw": ("<2.8.0,>=1.10.3",),
+}
+
+URLLIB3_REQUIRED_COMPILE_PROFILES = frozenset(
+    {"runtime", "docker-runtime", "ci-lite", "dev", "aggregate", "rag-vector", "rag-vector-cpu"}
+)
+
+
+def _assert_urllib3_surface(path: Path, *, required: bool, pinned: bool) -> None:
+    """Reuse canonical carriers and check every retained advisory interval."""
+    if path.exists() or path.is_symlink():
+        assert (
+            not path.is_symlink() and path.is_file()
+        ), f"{path.name}: urllib3 carrier must be a regular non-symlink file"
+    _assert_remediated_dependency_surface(path, package="urllib3", required=required, pinned=pinned)
+    minima, carriers = _requirement_evidence_per_package(path)
+    occurrences = carriers.get("urllib3", ())
+    if not occurrences:
+        return
+    requirement = occurrences[0]
+    assert all(
+        spec.operator != "===" for spec in requirement.specifier
+    ), f"{path.name}: arbitrary equality cannot establish urllib3 range evidence"
+    version = minima["urllib3"]
+    for advisory, ranges in URLLIB3_F_CUTOFF.items():
+        for affected in ranges:
+            assert not SpecifierSet(affected).contains(
+                version, prereleases=True
+            ), f"{path.name}: urllib3 {version} matches {advisory} range {affected}"
+
+
+def test_urllib3_current_governed_surfaces_are_safe() -> None:
+    """Discover current owners and preserve optional-present validation."""
+    registered = registered_dependabot_requirement_carriers()
+    discovered = discover_dependabot_requirement_carriers(REPO_ROOT)
+    assert discovered == registered, "urllib3 carrier inventory differs from registry"
+    compiled = compiled_dependency_surfaces()
+    assert URLLIB3_REQUIRED_COMPILE_PROFILES <= {
+        surface.compile_profile for surface in compiled
+    }, "urllib3 required compile profile is missing from registry"
+    locks = {surface.lockfile for surface in compiled}
+    required = {"requirements.in"} | {
+        surface.lockfile
+        for surface in compiled
+        if surface.compile_profile in URLLIB3_REQUIRED_COMPILE_PROFILES
+    }
+    assert required <= discovered, "urllib3 required carrier is missing from inventory"
+    for name in sorted(discovered):
+        _assert_urllib3_surface(REPO_ROOT / name, required=name in required, pinned=name in locks)
+
+
+@pytest.mark.parametrize(
+    ("name", "text"),
+    [
+        ("requirements.txt", "# missing\n"),
+        ("requirements.txt", "urllib3==2.7.0\n"),
+        ("requirements.txt", "urllib3==1.26.3\n"),
+        ("requirements.txt", "urllib3==2.8.0rc1\n"),
+        ("requirements.txt", "urllib3==2.8.0.dev1\n"),
+        ("requirements.txt", "urllib3==2.8.0\nURLLIB3==2.8.0\n"),
+        ("requirements.txt", "urllib3==2.*\n"),
+        ("requirements.txt", "urllib3>=2.8.0\n"),
+        ("requirements.txt", "urllib3===2.8.0\n"),
+        ("requirements.txt", 'urllib3==2.8.0; python_version < "0"\n'),
+        ("requirements.txt", "urllib3[extra]==2.8.0\n"),
+        ("requirements.in", "urllib3\n"),
+        ("requirements.in", "urllib3>=2.7.0,<3\n"),
+        ("requirements.in", "urllib3>=2.8.0,!=2.8.0,<3\n"),
+        ("requirements.in", "urllib3>=2.8.0,===2.8.0\n"),
+    ],
+)
+def test_urllib3_surface_rejects_unsafe_or_noncanonical_carriers(
+    tmp_path: Path, name: str, text: str
+) -> None:
+    """Challenge complete carriers, including the exclusive-boundary prerelease gap."""
+    path = tmp_path / name
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises((AssertionError, InvalidVersion)):
+        _assert_urllib3_surface(path, required=True, pinned=name.endswith(".txt"))
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "urllib3==2..8.0\n",
+        "urllib3 @ https://example.invalid/urllib3.whl\n",
+        "-e git+https://example.invalid/urllib3.git\n",
+    ],
+)
+def test_urllib3_surface_rejects_malformed_url_or_editable_carriers(
+    tmp_path: Path, text: str
+) -> None:
+    """Use the existing fail-closed requirement parser for invalid sources."""
+    path = tmp_path / "requirements.txt"
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises(pytest.fail.Exception):
+        _assert_urllib3_surface(path, required=True, pinned=True)
+
+
+@pytest.mark.parametrize(
+    ("name", "text", "required", "pinned"),
+    [
+        ("requirements.txt", "urllib3==2.8.1\n", True, True),
+        ("requirements.txt", "urllib3==2.9.0\n", True, True),
+        ("requirements.in", "urllib3>=2.8.0,<3.0.0\n", True, False),
+        ("requirements.in", "urllib3>=2.9.0,<3.0.0\n", True, False),
+        ("requirements-evals.txt", "# optional absence\n", False, True),
+        ("requirements-data.txt", "urllib3==2.8.1\n", False, True),
+    ],
+)
+def test_urllib3_surface_allows_future_versions_and_optional_absence(
+    tmp_path: Path, name: str, text: str, required: bool, pinned: bool
+) -> None:
+    """Permit later authorized safe versions without freezing the incident pin."""
+    path = tmp_path / name
+    path.write_text(text, encoding="utf-8")
+    _assert_urllib3_surface(path, required=required, pinned=pinned)
+
+
+@pytest.mark.parametrize(
+    "lockfile", ("requirements-test.txt", "requirements-data.txt", "requirements-evals.txt")
+)
+@pytest.mark.parametrize(
+    "text",
+    (
+        "urllib3==2.7.0\n",
+        "urllib3==2.8.0rc1\n",
+        "urllib3==2.8.0\nURLLIB3==2.8.0\n",
+        "urllib3==2..8.0\n",
+        "urllib3 @ https://example.invalid/urllib3.whl\n",
+    ),
+)
+def test_urllib3_consumer_rejects_unsafe_or_malformed_present_optional_carriers(
+    idna_consumer_repo: Path, lockfile: str, text: str
+) -> None:
+    """Reuse the existing tracked carrier fixture to exercise the actual consumer."""
+    (idna_consumer_repo / lockfile).write_text(text, encoding="utf-8")
+    with pytest.raises((AssertionError, pytest.fail.Exception)):
+        test_urllib3_current_governed_surfaces_are_safe()
+
+
+@pytest.mark.parametrize(
+    "lockfile", ("requirements-test.txt", "requirements-data.txt", "requirements-evals.txt")
+)
+@pytest.mark.parametrize("text", ("# optional absence\n", "urllib3==2.9.0\n"))
+def test_urllib3_consumer_allows_optional_absence_and_future_safe_pins(
+    idna_consumer_repo: Path, lockfile: str, text: str
+) -> None:
+    """Prove optional absence does not exempt a future present safe carrier."""
+    (idna_consumer_repo / lockfile).write_text(text, encoding="utf-8")
+    test_urllib3_current_governed_surfaces_are_safe()
+
+
+@pytest.mark.parametrize("mutation", ("omit-registered", "add-unregistered"))
+def test_urllib3_consumer_requires_registry_discovery_parity(
+    idna_consumer_repo: Path, mutation: str
+) -> None:
+    """Exercise real indexed inventory changes in the existing temporary fixture."""
+    if mutation == "omit-registered":
+        _git_command(["rm", "--cached", "requirements-all.txt"])
+    else:
+        (idna_consumer_repo / "requirements-extra.txt").write_text(
+            "urllib3==2.8.0\n", encoding="utf-8"
+        )
+        _git_command(["add", "requirements-extra.txt"])
+    with pytest.raises(AssertionError, match="urllib3 carrier inventory differs from registry"):
+        test_urllib3_current_governed_surfaces_are_safe()
+
+
+def test_urllib3_inventory_rejects_removed_required_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Missing one formerly owned profile cannot collapse the universal postcondition."""
+    compiled = tuple(
+        surface
+        for surface in compiled_dependency_surfaces()
+        if surface.compile_profile != "rag-vector-cpu"
+    )
+    monkeypatch.setattr(f"{__name__}.compiled_dependency_surfaces", lambda: compiled)
+    with pytest.raises(AssertionError, match="urllib3 required compile profile is missing"):
+        test_urllib3_current_governed_surfaces_are_safe()
+
+
+def test_urllib3_surface_rejects_missing_file(tmp_path: Path) -> None:
+    """A missing carrier is failure rather than optional absence."""
+    with pytest.raises(pytest.fail.Exception, match="Missing requirement surface"):
+        _assert_urllib3_surface(tmp_path / "requirements.txt", required=False, pinned=True)
+
+
+@pytest.mark.parametrize("kind", ("symlink", "directory"))
+def test_urllib3_consumer_rejects_nonregular_indexed_carriers(
+    idna_consumer_repo: Path, kind: str
+) -> None:
+    """Canonical descriptor discovery rejects nonregular optional carrier paths."""
+    path = idna_consumer_repo / "requirements-data.txt"
+    path.unlink()
+    if kind == "symlink":
+        path.symlink_to(idna_consumer_repo / "requirements.txt")
+    else:
+        path.mkdir()
+    with pytest.raises(AssertionError, match="regular non-symlink"):
+        test_urllib3_current_governed_surfaces_are_safe()
+
+
+def test_urllib3_inventory_rejects_missing_required_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Registry parity cannot hide removal of the required authored source."""
+    missing_source = registered_dependabot_requirement_carriers() - {"requirements.in"}
+    monkeypatch.setattr(
+        f"{__name__}.registered_dependabot_requirement_carriers", lambda: missing_source
+    )
+    monkeypatch.setattr(
+        f"{__name__}.discover_dependabot_requirement_carriers", lambda _root: missing_source
+    )
+    with pytest.raises(AssertionError, match="urllib3 required carrier is missing"):
+        test_urllib3_current_governed_surfaces_are_safe()
+
+
+# Only tooling owners require this identity. Other current registered carriers
+# are checked whenever present, without adding a runtime dependency.
+VIRTUALENV_REQUIRED_COMPILE_PROFILES = frozenset({"ci-lite", "dev", "aggregate"})
+
+
+def test_virtualenv_current_governed_surfaces_are_safe() -> None:
+    """Check the current complete carrier universe against every frozen advisory."""
+    registered = registered_dependabot_requirement_carriers()
+    discovered = discover_dependabot_requirement_carriers(REPO_ROOT)
+    assert discovered == registered, "virtualenv carrier inventory differs from registry"
+    compiled = compiled_dependency_surfaces()
+    assert VIRTUALENV_REQUIRED_COMPILE_PROFILES <= {
+        surface.compile_profile for surface in compiled
+    }, "virtualenv required compile profile is missing from registry"
+    required = {"requirements-ci-lite.in", "requirements-dev.in"} | {
+        surface.lockfile
+        for surface in compiled
+        if surface.compile_profile in VIRTUALENV_REQUIRED_COMPILE_PROFILES
+    }
+    assert required <= discovered, "virtualenv required carrier is missing from inventory"
+    schema = _load_schema(SCHEMA_PATH)
+    assert "virtualenv" not in schema["min_versions"], "virtualenv must not force runtime presence"
+    assert schema["blocked_versions"]["virtualenv"] == sorted(
+        VIRTUALENV_F_CUTOFF.values()
+    ), "virtualenv schema must retain every advisory range member"
+    locks = {surface.lockfile for surface in compiled}
+    for name in sorted(discovered):
+        _assert_remediated_dependency_surface(
+            REPO_ROOT / name, package="virtualenv", required=name in required, pinned=name in locks
+        )
+
+
+@pytest.mark.parametrize(
+    "advisory,affected",
+    (
+        ("GHSA-3jhc-wjqf-5f2c", "1.4.9"),
+        ("GHSA-597g-3phw-6986", "20.36.0"),
+        ("GHSA-5vjq-rrrf-7h2q", "21.14.3"),
+        ("GHSA-8rjx-v5ww-45pp", "20.26.6"),
+        ("GHSA-94p9-xgh2-xp45", "21.7.11"),
+        ("GHSA-9h9j-4vrj-gf7g", "21.7.10"),
+        ("GHSA-c947-3pg5-gm8q", "21.14.1"),
+        ("GHSA-p58f-9548-mpm2", "21.7.12"),
+        ("GHSA-rqc4-2hc7-8c8v", "20.26.5"),
+        ("GHSA-x78j-v8h9-3j2q", "21.7.11"),
+    ),
+)
+def test_virtualenv_each_cutoff_advisory_rejects_affected_occurrence(
+    tmp_path: Path, advisory: str, affected: str
+) -> None:
+    """Historical cutoff members remain enforced after the October floor rotation."""
+    assert SpecifierSet(VIRTUALENV_F_CUTOFF[advisory]).contains(affected, prereleases=True)
+    path = tmp_path / "requirements.txt"
+    path.write_text(f"virtualenv=={affected}\n", encoding="utf-8")
+    with pytest.raises(AssertionError, match="matches blocked range"):
+        _assert_remediated_dependency_surface(
+            path, package="virtualenv", required=True, pinned=True
+        )
+
+
+@pytest.mark.parametrize(
+    "name,text",
+    (
+        ("requirements.txt", "# missing required identity\n"),
+        ("requirements.txt", "virtualenv==21.7.13\n"),
+        ("requirements.txt", "virtualenv==21.14.4rc1\n"),
+        ("requirements.txt", "virtualenv==21.14.4.dev1\n"),
+        ("requirements.txt", "virtualenv==21.14.5\nVirtualEnv==21.14.5\n"),
+        ("requirements.txt", "virtualenv==21.*\n"),
+        ("requirements.txt", "virtualenv>=21.14.5\n"),
+        ("requirements.txt", "virtualenv===21.14.5\n"),
+        ("requirements.txt", 'virtualenv==21.14.5; python_version < "0"\n'),
+        ("requirements.txt", "virtualenv[extra]==21.14.5\n"),
+        ("requirements.in", "virtualenv\n"),
+        ("requirements.in", "virtualenv>=21.14.3\n"),
+        ("requirements.in", "virtualenv>=21.14.4,!=21.14.4\n"),
+        ("requirements.in", "virtualenv>=21.14.4,===21.14.4\n"),
+        ("requirements-evals.txt", "virtual_env==21.14.5\n"),
+        ("requirements-evals.txt", "virtual.env==21.14.5\n"),
+        ("requirements-evals.txt", "virtual-env==21.14.5\n"),
+    ),
+)
+def test_virtualenv_surface_rejects_unsafe_or_noncanonical_carriers(
+    tmp_path: Path, name: str, text: str
+) -> None:
+    """Exercise complete carrier and native prerelease/version semantics."""
+    path = tmp_path / name
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises((AssertionError, InvalidVersion)):
+        _assert_remediated_dependency_surface(
+            path,
+            package="virtualenv",
+            required=name != "requirements-evals.txt",
+            pinned=name.endswith(".txt"),
+        )
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "virtualenv==21..14.5\n",
+        "virtualenv @ https://example.invalid/virtualenv.whl\n",
+        "-e git+https://example.invalid/virtualenv.git\n",
+    ),
+)
+def test_virtualenv_surface_rejects_malformed_url_or_editable_carriers(
+    tmp_path: Path, text: str
+) -> None:
+    path = tmp_path / "requirements.txt"
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises(pytest.fail.Exception):
+        _assert_remediated_dependency_surface(
+            path, package="virtualenv", required=True, pinned=True
+        )
+
+
+@pytest.mark.parametrize(
+    "name,text,required,pinned",
+    (
+        ("requirements.txt", "virtualenv==21.14.11\n", True, True),
+        ("requirements.txt", "virtualenv==21.14.10\n", True, True),
+        ("requirements.txt", "virtualenv==22.0.0\n", True, True),
+        ("requirements.in", "virtualenv>=21.14.10,<23\n", True, False),
+        ("requirements-evals.txt", "# optional absence\n", False, True),
+        ("requirements-all.txt", "virtualenv>=22.0.0\n", False, False),
+    ),
+)
+def test_virtualenv_surface_accepts_safe_future_versions_and_optional_absence(
+    tmp_path: Path, name: str, text: str, required: bool, pinned: bool
+) -> None:
+    """The head guard does not freeze the incident's exact chosen version."""
+    path = tmp_path / name
+    path.write_text(text, encoding="utf-8")
+    _assert_remediated_dependency_surface(
+        path, package="virtualenv", required=required, pinned=pinned
+    )
+
+
+@pytest.mark.parametrize(
+    "lockfile",
+    (
+        "requirements-test.txt",
+        "requirements-data.txt",
+        "requirements-evals.txt",
+        "requirements-all.txt",
+    ),
+)
+@pytest.mark.parametrize(
+    "text",
+    (
+        "virtualenv==21.14.3\n",
+        "virtualenv==21.14.4rc1\n",
+        "virtualenv==21..14.5\n",
+        "virtual_env==22.0.0\n",
+        "virtualenv @ https://example.invalid/virtualenv.whl\n",
+    ),
+)
+def test_virtualenv_consumer_rejects_unsafe_or_malformed_present_optional_carriers(
+    idna_consumer_repo: Path, lockfile: str, text: str
+) -> None:
+    """Drive the actual whole-universe consumer through existing indexed fixtures."""
+    (idna_consumer_repo / lockfile).write_text(text, encoding="utf-8")
+    with pytest.raises((AssertionError, pytest.fail.Exception)):
+        test_virtualenv_current_governed_surfaces_are_safe()
+
+
+@pytest.mark.parametrize("lockfile", ("requirements-data.txt", "requirements-evals.txt"))
+@pytest.mark.parametrize("text", ("# optional absence\n", "virtualenv==22.0.0\n"))
+def test_virtualenv_consumer_accepts_optional_absence_and_future_safe_pins(
+    idna_consumer_repo: Path, lockfile: str, text: str
+) -> None:
+    (idna_consumer_repo / lockfile).write_text(text, encoding="utf-8")
+    test_virtualenv_current_governed_surfaces_are_safe()
+
+
+@pytest.mark.parametrize("mutation", ("omit-registered", "add-unregistered"))
+def test_virtualenv_consumer_requires_registry_discovery_parity(
+    idna_consumer_repo: Path, mutation: str
+) -> None:
+    if mutation == "omit-registered":
+        _git_command(["rm", "--cached", "requirements-all.txt"])
+    else:
+        (idna_consumer_repo / "requirements-extra.txt").write_text(
+            "virtualenv==22.0.0\n", encoding="utf-8"
+        )
+        _git_command(["add", "requirements-extra.txt"])
+    with pytest.raises(AssertionError, match="virtualenv carrier inventory differs from registry"):
+        test_virtualenv_current_governed_surfaces_are_safe()
+
+
+@pytest.mark.parametrize("profile", ("ci-lite", "dev", "aggregate"))
+def test_virtualenv_inventory_rejects_missing_required_compile_profile(
+    monkeypatch: pytest.MonkeyPatch, profile: str
+) -> None:
+    compiled = tuple(
+        surface for surface in compiled_dependency_surfaces() if surface.compile_profile != profile
+    )
+    monkeypatch.setattr(f"{__name__}.compiled_dependency_surfaces", lambda: compiled)
+    with pytest.raises(AssertionError, match="virtualenv required compile profile is missing"):
+        test_virtualenv_current_governed_surfaces_are_safe()
+
+
+@pytest.mark.parametrize("source", ("requirements-ci-lite.in", "requirements-dev.in"))
+def test_virtualenv_inventory_rejects_missing_required_source(
+    monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    missing = registered_dependabot_requirement_carriers() - {source}
+    monkeypatch.setattr(f"{__name__}.registered_dependabot_requirement_carriers", lambda: missing)
+    monkeypatch.setattr(
+        f"{__name__}.discover_dependabot_requirement_carriers", lambda _root: missing
+    )
+    with pytest.raises(AssertionError, match="virtualenv required carrier is missing"):
+        test_virtualenv_current_governed_surfaces_are_safe()
+
+
+def test_virtualenv_surface_rejects_missing_file(tmp_path: Path) -> None:
+    with pytest.raises(pytest.fail.Exception, match="Missing requirement surface"):
+        _assert_remediated_dependency_surface(
+            tmp_path / "requirements-evals.txt", package="virtualenv", required=False, pinned=True
+        )
+
+
+def test_virtualenv_consumer_rejects_omitted_advisory_member(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    schema = deepcopy(_load_schema(SCHEMA_PATH))
+    schema["blocked_versions"]["virtualenv"].pop()
+    monkeypatch.setattr(f"{__name__}._load_schema", lambda _path: schema)
+    with pytest.raises(AssertionError, match="retain every advisory range member"):
+        test_virtualenv_current_governed_surfaces_are_safe()
+
+
+PILLOW_REQUIRED_RAG_LOCKS = frozenset(
+    {"requirements-rag-vector.txt", "requirements-rag-vector-cpu.txt"}
+)
+
+
+def test_python_stabilization_current_governed_surfaces_are_safe() -> None:
+    """Check every present occurrence against the complete finite advisory inventory."""
+    registered = registered_dependabot_requirement_carriers()
+    discovered = discover_dependabot_requirement_carriers(REPO_ROOT)
+    assert discovered, "Python stabilization carrier inventory must not be empty"
+    assert discovered == registered, "Python stabilization carrier inventory differs from registry"
+    locks = {surface.lockfile for surface in compiled_dependency_surfaces()}
+    assert PILLOW_REQUIRED_RAG_LOCKS <= locks & discovered, "Pillow required RAG lock is missing"
+    schema = _load_schema(SCHEMA_PATH)
+    for package, advisories in PYTHON_STABILIZATION_GUARDED_ADVISORIES.items():
+        assert set(advisories.values()) <= set(
+            schema["blocked_versions"].get(package, ())
+        ), f"{package}: schema must retain every governed advisory range"
+        for name in sorted(discovered):
+            _assert_remediated_dependency_surface(
+                REPO_ROOT / name,
+                package=package,
+                required=package == "pillow" and name in PILLOW_REQUIRED_RAG_LOCKS,
+                pinned=name in locks,
+            )
+
+
+@pytest.fixture
+def python_stabilization_repo(idna_consumer_repo: Path) -> Path:
+    """Reuse the real indexed carrier fixture with explicitly safe synthetic requirements."""
+    locks = {surface.lockfile for surface in compiled_dependency_surfaces()}
+    for name in registered_dependabot_requirement_carriers():
+        path = idna_consumer_repo / name
+        lines = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            requirement = _parse_requirement(line.split("#", 1)[0].strip(), path)
+            package = canonicalize_name(requirement.name) if requirement is not None else None
+            if package in PYTHON_STABILIZATION_GUARDED_ADVISORIES:
+                operator = "==" if name in locks else ">="
+                line = f"{package}{operator}{REMEDIATION_FIXED_FLOORS[package]}"
+            lines.append(line)
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    test_python_stabilization_current_governed_surfaces_are_safe()
+    return idna_consumer_repo
+
+
+@pytest.mark.parametrize(
+    ("package", "advisory", "affected_range"),
+    [
+        (package, advisory, affected_range)
+        for package, advisories in PYTHON_STABILIZATION_GUARDED_ADVISORIES.items()
+        for advisory, affected_range in advisories.items()
+    ],
+)
+def test_python_stabilization_enforces_each_primary_advisory_range(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    package: str,
+    advisory: str,
+    affected_range: str,
+) -> None:
+    """Each retained interval rejects its comparable regression witness on its own."""
+    affected = {
+        "black": "26.5.1",
+        "certifi": "2026.1.4",
+        "dnspython": "2.8.0",
+        "filelock": "3.24.3",
+        "setuptools": "83.0.0",
+        "msgpack": "1.2.1",
+        "opentelemetry-api": "1.44.0",
+        "pillow": "12.3.0",
+        "virtualenv": "21.14.5",
+    }[package]
+    if advisory == "GHSA-3rq5-2g8h-59hc":
+        affected = "2.6.0"
+    if advisory == "GHSA-6v7p-g79w-8964":
+        affected = "1.2.0"
+    if advisory == "GHSA-4f8h-vr72-p32c":
+        affected = "21.14.9"
+    if advisory == "GHSA-vvf4-9x63-8xvv":
+        affected = "2.9.0"
+    if advisory == "GHSA-mf5v-w3w3-f6cg":
+        affected = "1.45.1"
+    assert SpecifierSet(affected_range).contains(affected, prereleases=True), advisory
+    schema = deepcopy(_load_schema(SCHEMA_PATH))
+    schema["blocked_versions"][package] = [affected_range]
+    monkeypatch.setattr(f"{__name__}._load_schema", lambda _path: schema)
+    path = tmp_path / "requirements.txt"
+    path.write_text(f"{package}=={REMEDIATION_FIXED_FLOORS[package]}\n", encoding="utf-8")
+    _assert_remediated_dependency_surface(path, package=package, required=True, pinned=True)
+    path.write_text(f"{package}=={affected}\n", encoding="utf-8")
+    with pytest.raises(AssertionError, match="matches blocked range"):
+        _assert_remediated_dependency_surface(path, package=package, required=True, pinned=True)
+
+
+@pytest.mark.parametrize("package", tuple(PYTHON_STABILIZATION_GUARDED_ADVISORIES))
+@pytest.mark.parametrize(
+    "malformation",
+    (
+        "affected-alias",
+        "duplicate-alias",
+        "unversioned",
+        "wildcard",
+        "range",
+        "arbitrary",
+        "marker",
+        "extras",
+        "malformed",
+        "url",
+    ),
+)
+def test_python_stabilization_rejects_unsafe_optional_carriers(
+    python_stabilization_repo: Path, package: str, malformation: str
+) -> None:
+    """Canonical name equivalence and invalid carriers cannot hide optional occurrences."""
+    version = str(REMEDIATION_FIXED_FLOORS[package])
+    alias = package.upper().replace("-", "_")
+    forms = {
+        "affected-alias": f"{alias}==1.0.0",
+        "duplicate-alias": f"{package}=={version}\n{alias}=={version}",
+        "unversioned": package,
+        "wildcard": f"{package}=={version}.*",
+        "range": f"{package}>={version}",
+        "arbitrary": f"{package}==={version}",
+        "marker": f'{package}=={version}; python_version < "0"',
+        "extras": f"{package}[extra]=={version}",
+        "malformed": f"{package}==1..0",
+        "url": f"{package} @ https://example.invalid/package.whl",
+    }
+    path = python_stabilization_repo / "requirements-evals.txt"
+    path.write_text(forms[malformation] + "\n", encoding="utf-8")
+    with pytest.raises((AssertionError, InvalidVersion, pytest.fail.Exception)):
+        test_python_stabilization_current_governed_surfaces_are_safe()
+
+
+@pytest.mark.parametrize("package", tuple(PYTHON_STABILIZATION_GUARDED_ADVISORIES))
+@pytest.mark.parametrize(
+    "lockfile", tuple(surface.lockfile for surface in compiled_dependency_surfaces())
+)
+def test_python_stabilization_checks_every_registered_lock(
+    python_stabilization_repo: Path, package: str, lockfile: str
+) -> None:
+    """A safe inventory becomes invalid when any selected identity regresses in any lock."""
+    path = python_stabilization_repo / lockfile
+    retained = [
+        line
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if not line.startswith(f"{package}==")
+    ]
+    path.write_text("\n".join([*retained, f"{package}==1.0.0"]) + "\n", encoding="utf-8")
+    with pytest.raises(AssertionError):
+        test_python_stabilization_current_governed_surfaces_are_safe()
+
+
+@pytest.mark.parametrize("package", tuple(PYTHON_STABILIZATION_GUARDED_ADVISORIES))
+@pytest.mark.parametrize("kind", ("future-pin", "compatible-floor", "absence"))
+def test_python_stabilization_allows_safe_future_versions_or_absence(
+    python_stabilization_repo: Path, package: str, kind: str
+) -> None:
+    """Permanent postconditions do not freeze historical versions or dependency deltas."""
+    if kind == "absence":
+        for name in registered_dependabot_requirement_carriers():
+            if package == "pillow" and name in PILLOW_REQUIRED_RAG_LOCKS:
+                continue
+            path = python_stabilization_repo / name
+            path.write_text(
+                "\n".join(
+                    line
+                    for line in path.read_text(encoding="utf-8").splitlines()
+                    if not line.startswith(package)
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+    else:
+        name = "requirements-data.txt" if kind == "future-pin" else "requirements-all.txt"
+        operator = "==" if kind == "future-pin" else "~="
+        (python_stabilization_repo / name).write_text(
+            f"{package}{operator}9999.0.0\n", encoding="utf-8"
+        )
+    test_python_stabilization_current_governed_surfaces_are_safe()
+
+
+@pytest.mark.parametrize(
+    "mutation", ("omit-registered", "add-unregistered", "symlink", "directory")
+)
+def test_python_stabilization_rejects_incomplete_or_nonregular_inventory(
+    python_stabilization_repo: Path, mutation: str
+) -> None:
+    if mutation == "omit-registered":
+        _git_command(["rm", "--cached", "requirements-all.txt"])
+    elif mutation == "add-unregistered":
+        (python_stabilization_repo / "requirements-extra.txt").write_text(
+            "black==26.10.1\n", encoding="utf-8"
+        )
+        _git_command(["add", "requirements-extra.txt"])
+    else:
+        path = python_stabilization_repo / "requirements-data.txt"
+        path.unlink()
+        if mutation == "symlink":
+            path.symlink_to(python_stabilization_repo / "requirements.txt")
+        else:
+            path.mkdir()
+    with pytest.raises(AssertionError, match="inventory differs|regular non-symlink"):
+        test_python_stabilization_current_governed_surfaces_are_safe()
+
+
+@pytest.mark.parametrize("package", tuple(PYTHON_STABILIZATION_GUARDED_ADVISORIES))
+def test_python_stabilization_rejects_omitted_advisory_range(
+    python_stabilization_repo: Path, monkeypatch: pytest.MonkeyPatch, package: str
+) -> None:
+    schema = deepcopy(_load_schema(SCHEMA_PATH))
+    omitted = next(iter(PYTHON_STABILIZATION_GUARDED_ADVISORIES[package].values()))
+    schema["blocked_versions"][package] = [
+        value for value in schema["blocked_versions"][package] if value != omitted
+    ]
+    monkeypatch.setattr(f"{__name__}._load_schema", lambda _path: schema)
+    with pytest.raises(AssertionError, match="schema must retain every governed advisory range"):
+        test_python_stabilization_current_governed_surfaces_are_safe()
+
+
+def test_python_stabilization_rejects_empty_carrier_inventory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(f"{__name__}.registered_dependabot_requirement_carriers", frozenset)
+    monkeypatch.setattr(
+        f"{__name__}.discover_dependabot_requirement_carriers", lambda _root: frozenset()
+    )
+    with pytest.raises(AssertionError, match="carrier inventory must not be empty"):
+        test_python_stabilization_current_governed_surfaces_are_safe()
+
+
+@pytest.mark.parametrize("lockfile", sorted(PILLOW_REQUIRED_RAG_LOCKS))
+@pytest.mark.parametrize("value", (None, "pillow==12.3.0", "pillow>=13.0.0"))
+def test_python_stabilization_requires_valid_pillow_in_each_rag_lock(
+    python_stabilization_repo: Path, lockfile: str, value: str | None
+) -> None:
+    """Neither optional-profile naming nor the other RAG lock excuses missing/unsafe Pillow."""
+    path = python_stabilization_repo / lockfile
+    rows = [line for line in path.read_text().splitlines() if not line.startswith("pillow==")]
+    if value is not None:
+        rows.append(value)
+    path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    with pytest.raises(AssertionError, match="pillow|Pillow"):
+        test_python_stabilization_current_governed_surfaces_are_safe()
+
+
+@pytest.mark.parametrize("lockfile", sorted(PILLOW_REQUIRED_RAG_LOCKS))
+@pytest.mark.parametrize("kind", ("patch", "major"))
+def test_python_stabilization_rag_pillow_accepts_future_safe_pins(
+    python_stabilization_repo: Path, lockfile: str, kind: str
+) -> None:
+    floor = REMEDIATION_FIXED_FLOORS["pillow"]
+    version = (
+        f"{floor.major}.{floor.minor}.{floor.micro + 1}"
+        if kind == "patch"
+        else f"{floor.major + 1}.0.0"
+    )
+    path = python_stabilization_repo / lockfile
+    rows = [line for line in path.read_text().splitlines() if not line.startswith("pillow==")]
+    path.write_text("\n".join([*rows, f"pillow=={version}"]) + "\n", encoding="utf-8")
+    test_python_stabilization_current_governed_surfaces_are_safe()
+
+
+@pytest.mark.parametrize("package,affected", (("setuptools", "83.0.0"), ("pillow", "12.3.0")))
+def test_python_stabilization_canonical_required_floor_allows_later_patch(
+    tmp_path: Path, package: str, affected: str
+) -> None:
+    """Required-carrier and range owners accept safe evolution without consumer pin constants."""
+    schema = _load_schema(SCHEMA_PATH)
+    versions = {str(name): str(value) for name, value in schema["min_versions"].items()}
+    floor = Version(versions[package])
+    future = f"{floor.major}.{floor.minor}.{floor.micro + 1}"
+    path = tmp_path / "requirements.txt"
+    versions[package] = future
+    path.write_text("".join(f"{name}=={version}\n" for name, version in versions.items()))
+    test_dependency_security_guard_enforces_min_versions(path)
+    _assert_remediated_dependency_surface(path, package=package, required=True, pinned=True)
+    versions[package] = affected
+    path.write_text("".join(f"{name}=={version}\n" for name, version in versions.items()))
+    with pytest.raises(pytest.fail.Exception, match="minimum safe version"):
+        test_dependency_security_guard_enforces_min_versions(path)
+    with pytest.raises(AssertionError, match="blocked range"):
+        _assert_remediated_dependency_surface(path, package=package, required=True, pinned=True)
+
+
+@pytest.mark.parametrize(
+    "constraint",
+    (
+        ">={floor},~={later}",
+        "~={later},>={floor}",
+        ">={floor},>={later},<{upper}",
+        ">={later},<{upper},>={floor}",
+        "=={later},>={floor}",
+        ">={floor},=={later}",
+        "~={floor},>={later}",
+        "~={later}",
+    ),
+)
+def test_python_stabilization_source_uses_strongest_conjunctive_floor(
+    tmp_path: Path, constraint: str
+) -> None:
+    """Clause order cannot turn a permitted stronger intersection into a false rejection."""
+    floor = REMEDIATION_FIXED_FLOORS["black"]
+    later = f"{floor.major}.{floor.minor}.{floor.micro + 1}"
+    spec = constraint.format(floor=floor, later=later, upper=f"{floor.major + 1}.0.0")
+    requirement = Requirement(f"black{spec}")
+    assert _min_version_for_pkg(requirement, "black", pinned=False) == later
+    path = tmp_path / "requirements-dev.in"
+    path.write_text(str(requirement) + "\n", encoding="utf-8")
+    _assert_remediated_dependency_surface(path, package="black", required=True, pinned=False)
+
+
+@pytest.mark.parametrize(
+    "constraint",
+    (
+        ">={later},=={floor}",
+        "=={floor},>={later}",
+        ">={later},<{later}",
+        ">={later},!={later}",
+        "=={later},!={later}",
+        "~={floor},>={upper}",
+    ),
+)
+def test_python_stabilization_source_rejects_excluded_strongest_candidate(
+    tmp_path: Path, constraint: str
+) -> None:
+    """Keep full membership: do not search past exclusions or solve arbitrary intervals."""
+    floor = REMEDIATION_FIXED_FLOORS["black"]
+    later = f"{floor.major}.{floor.minor}.{floor.micro + 1}"
+    spec = constraint.format(floor=floor, later=later, upper=f"{floor.major + 1}.0.0")
+    path = tmp_path / "requirements-dev.in"
+    path.write_text(f"black{spec}\n", encoding="utf-8")
+    with pytest.raises(AssertionError, match="excludes its comparable floor or pin"):
+        _assert_remediated_dependency_surface(path, package="black", required=True, pinned=False)
+
+
+def test_python_stabilization_compound_constraint_keeps_affected_and_exact_pin_rejection(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "requirements-dev.in"
+    source.write_text("black>=26.5.0,~=26.5.1\n", encoding="utf-8")
+    with pytest.raises(AssertionError, match="blocked range"):
+        _assert_remediated_dependency_surface(source, package="black", required=True, pinned=False)
+    lock = tmp_path / "requirements-dev.txt"
+    floor = REMEDIATION_FIXED_FLOORS["black"]
+    lock.write_text(f"black=={floor},>={floor}\n", encoding="utf-8")
+    with pytest.raises(AssertionError, match="exactly one == pin"):
+        _assert_remediated_dependency_surface(lock, package="black", required=True, pinned=True)
+
+
+@pytest.mark.parametrize("package", tuple(LATE_PYTHON_STABILIZATION_F_CUTOFF))
+@pytest.mark.parametrize(
+    "kind", ("weak", "prerelease", "excluded", "arbitrary", "marker", "extras")
+)
+def test_late_python_stabilization_checks_source_floors(
+    tmp_path: Path, package: str, kind: str
+) -> None:
+    """Optional source/constraint carriers use the same finite floor recognizer as locks."""
+    floor = str(REMEDIATION_FIXED_FLOORS[package])
+    bad = {
+        "weak": (f"{package}>=1.0.0", "matches blocked range"),
+        "prerelease": (f"{package}>={floor}rc1", "below fixed"),
+        "excluded": (f"{package}>={floor},!={floor}", "excludes its comparable floor"),
+        "arbitrary": (f"{package}==={floor}", "arbitrary equality"),
+        "marker": (f'{package}>={floor}; python_version < "0"', "must be unconditional"),
+        "extras": (f"{package}[extra]>={floor}", "must not declare extras"),
+    }
+    path = tmp_path / "constraints.txt"
+    path.write_text(f"{package}>={floor}\n", encoding="utf-8")
+    _assert_remediated_dependency_surface(path, package=package, required=True, pinned=False)
+    value, diagnostic = bad[kind]
+    path.write_text(value + "\n", encoding="utf-8")
+    with pytest.raises(AssertionError, match=diagnostic):
+        _assert_remediated_dependency_surface(path, package=package, required=True, pinned=False)
+
+
+@pytest.mark.parametrize("package", tuple(LATE_PYTHON_STABILIZATION_F_CUTOFF))
+@pytest.mark.parametrize("kind", ("symlink", "directory"))
+def test_late_python_stabilization_rejects_nonregular_carriers(
+    tmp_path: Path, package: str, kind: str
+) -> None:
+    """Both late identities retain the existing regular-file boundary independently."""
+    source = tmp_path / "safe.txt"
+    source.write_text(f"{package}=={REMEDIATION_FIXED_FLOORS[package]}\n", encoding="utf-8")
+    _assert_remediated_dependency_surface(source, package=package, required=True, pinned=True)
+    path = tmp_path / "requirements.txt"
+    if kind == "symlink":
+        path.symlink_to(source)
+    else:
+        path.mkdir()
+    with pytest.raises(AssertionError, match="regular non-symlink"):
+        _assert_remediated_dependency_surface(path, package=package, required=True, pinned=True)
+
+
+@pytest.mark.parametrize("package", ["certifi"])
+def test_october_dependency_floors_cover_current_governed_surfaces(package: str) -> None:
+    """Prevent regression of certifi remediation across current governed surfaces."""
+    registered = registered_dependabot_requirement_carriers()
+    assert discover_dependabot_requirement_carriers(REPO_ROOT) == registered
+    affected_profiles = {
+        "runtime",
+        "docker-runtime",
+        "ci-lite",
+        "dev",
+        "rag-vector",
+        "rag-vector-cpu",
+        "aggregate",
+    }
+    compiled = compiled_dependency_surfaces()
+    assert affected_profiles <= {surface.compile_profile for surface in compiled}
+    required = {"requirements.in", "constraints.txt"} | {
+        surface.lockfile for surface in compiled if surface.compile_profile in affected_profiles
+    }
+    locks = {surface.lockfile for surface in compiled}
+    for name in sorted(registered):
+        _assert_remediated_dependency_surface(
+            REPO_ROOT / name,
+            required=name in required,
+            pinned=name in locks,
+            package=package,
+        )
+
+
+@pytest.mark.parametrize(
+    ("package", "requirement"),
+    [
+        ("certifi", "certifi==2026.1.4"),
+        ("certifi", "certifi==2026.10.18"),
+        ("certifi", "certifi==2026.10.19rc1"),
+        ("certifi", "certifi==2026.10.19\ncertifi==2026.10.19"),
+    ],
+)
+def test_october_dependency_floors_reject_affected_or_ambiguous_occurrences(
+    tmp_path: Path, package: str, requirement: str
+) -> None:
+    surface = tmp_path / "requirements.txt"
+    surface.write_text(requirement + "\n", encoding="utf-8")
+    with pytest.raises(AssertionError):
+        _assert_remediated_dependency_surface(surface, required=True, pinned=True, package=package)
+
+
+MAKO_F_CUTOFF = {
+    "GHSA-v92g-xgxw-vvmm": "<=1.3.10",
+    "GHSA-2h4p-vjrc-8xpq": "<=1.3.11",
+    "GHSA-5639-2j2p-m4mx": "<=1.4.1",
+    "GHSA-v973-fxgf-6xhp": "<1.2.2",
+    "GHSA-7q8x-38mc-p84f": "<0.3.4",
+}
+
+
+def test_mako_current_governed_surfaces_are_safe() -> None:
+    """Reuse the finite per-identity recognizer across the complete current registry."""
+    registered = registered_dependabot_requirement_carriers()
+    discovered = discover_dependabot_requirement_carriers(REPO_ROOT)
+    assert discovered and discovered == registered, "Mako carrier inventory differs from registry"
+    compiled = compiled_dependency_surfaces()
+    profiles = {"runtime", "docker-runtime", "ci-lite", "dev", "aggregate"}
+    assert profiles <= {surface.compile_profile for surface in compiled}
+    required = {
+        "requirements.in",
+        "requirements-docker-runtime.in",
+        "requirements-ci-lite.in",
+        "requirements-dev.in",
+        "constraints.txt",
+    } | {surface.lockfile for surface in compiled if surface.compile_profile in profiles}
+    assert required <= discovered, "Mako required carrier is missing"
+    schema = _load_schema(SCHEMA_PATH)
+    assert schema["min_versions"]["mako"] == str(REMEDIATION_FIXED_FLOORS["mako"])
+    assert set(schema["blocked_versions"]["mako"]) == set(MAKO_F_CUTOFF.values())
+    locks = {surface.lockfile for surface in compiled}
+    for name in sorted(discovered):
+        _assert_remediated_dependency_surface(
+            REPO_ROOT / name, package="mako", required=name in required, pinned=name in locks
+        )
+
+
+@pytest.mark.parametrize(
+    "advisory,affected",
+    [
+        ("GHSA-v92g-xgxw-vvmm", "1.3.10"),
+        ("GHSA-2h4p-vjrc-8xpq", "1.3.11"),
+        ("GHSA-5639-2j2p-m4mx", "1.4.1"),
+        ("GHSA-v973-fxgf-6xhp", "1.2.1"),
+        ("GHSA-7q8x-38mc-p84f", "0.3.3"),
+    ],
+)
+def test_mako_each_primary_advisory_remains_rejected(
+    tmp_path: Path, advisory: str, affected: str
+) -> None:
+    assert SpecifierSet(MAKO_F_CUTOFF[advisory]).contains(affected, prereleases=True)
+    assert not SpecifierSet(MAKO_F_CUTOFF[advisory]).contains("1.4.2", prereleases=True)
+    path = tmp_path / "requirements.txt"
+    path.write_text(f"mako=={affected}\n")
+    with pytest.raises(AssertionError, match="matches blocked range"):
+        _assert_remediated_dependency_surface(path, package="mako", required=True, pinned=True)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "mako==1.3.12\n",
+        "mako==1.4.1\n",
+        "# omitted\n",
+        "mako==1.4.2\nMako==1.4.2\n",
+        "mako>=1.4.2\n",
+        "mako===1.4.2\n",
+        "mako==1.*\n",
+        'mako==1.4.2; python_version < "0"\n',
+        "mako[extra]==1.4.2\n",
+        "mako==1.4.2rc1\n",
+    ],
+)
+def test_mako_rejects_affected_missing_ambiguous_or_unconditional_lock_drift(
+    tmp_path: Path, text: str
+) -> None:
+    path = tmp_path / "requirements.txt"
+    path.write_text(text)
+    with pytest.raises((AssertionError, InvalidVersion)):
+        _assert_remediated_dependency_surface(path, package="mako", required=True, pinned=True)
+
+
+@pytest.mark.parametrize("text", ["mako==1..4.2\n", "mako @ https://example.invalid/mako.whl\n"])
+def test_mako_rejects_malformed_or_uncomparable_carriers(tmp_path: Path, text: str) -> None:
+    path = tmp_path / "requirements.txt"
+    path.write_text(text)
+    with pytest.raises(pytest.fail.Exception):
+        _assert_remediated_dependency_surface(path, package="mako", required=True, pinned=True)
+
+
+@pytest.mark.parametrize(
+    "name,text,required,pinned",
+    [
+        ("requirements.txt", "mako==1.4.2\n", True, True),
+        ("requirements.txt", "Mako==1.5.0\n", True, True),
+        ("requirements.in", "mako>=1.4.2,<2.0.0\n", True, False),
+        ("requirements-evals.txt", "# optional absence\n", False, True),
+    ],
+)
+def test_mako_accepts_safe_current_future_and_optional_carriers(
+    tmp_path: Path, name: str, text: str, required: bool, pinned: bool
+) -> None:
+    path = tmp_path / name
+    path.write_text(text)
+    _assert_remediated_dependency_surface(path, package="mako", required=required, pinned=pinned)

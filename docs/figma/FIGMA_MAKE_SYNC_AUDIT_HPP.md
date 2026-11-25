@@ -1,0 +1,239 @@
+<!-- markdownlint-disable MD013 -->
+# Figma Make Sync Audit (H+P+Pr)
+
+**Date:** March 12, 2026
+**Scope:** Home + Plate + Progress (Web + iOS) and linked CTA flows
+**Source mode:** Make-only reference evidence for the current repo-first lane (`MrztJU3CQtxhADBbtAsWJ6`)
+**Context version:** 2026-02-18 / commit `162ad6ef`
+
+## 1) Purpose
+
+This audit reconciles current Figma Make updates with Git source-of-truth artifacts and records reference evidence for the current repo-first lane. Historical Code Connect blocker notes remain here for provenance only; they do not define the active execution path.
+
+Primary SoT references:
+
+- `docs/figma/FIGMA_IMPLEMENTATION_RUNBOOK.md`
+- `docs/figma/PULSEPLATE_FIGMA_AI_GOVERNANCE_INDEX.md`
+- `docs/design/PULSEPLATE_BUTTON_ACTION_PROMPT_MATRIX.md`
+- `docs/design/PULSEPLATE_BUTTON_VISUAL_SYSTEM_TRENDS_AND_FORECAST.md`
+- `docs/sora/PULSEPLATE_SORA_PROMPT_ENGINEERING_PLAYBOOK.md`
+- `frontend/src/config/routes.ts:23`
+- `frontend/src/pages/Home.tsx:34`
+- `ios/PulsePlate/Views/HomeView.swift:57`
+
+## 2) Baseline Snapshot (Evidence)
+
+- Figma MCP auth check remains historical activation evidence only; it is not a gate for the current repo-first lane.
+  Evidence: `docs/figma/FIGMA_CODE_CONNECT_BRIDGE_HPP.md:14`
+- Active Make file pointer exists in backlog as reference evidence for the current lane: `docs/roadmap/BACKLOG_LEDGER.md:1643`.
+- Make-only sync loop explicitly requires `get_design_context(fileKey=MrztJU3CQtxhADBbtAsWJ6, nodeId=0:1)` before reconciliation.
+  Evidence: `docs/figma/FIGMA_IMPLEMENTATION_RUNBOOK.md:139`
+- Project CTA behavior SoT remains matrix-driven: `docs/design/PULSEPLATE_BUTTON_ACTION_PROMPT_MATRIX.md:59`.
+- Production-domain baseline re-check on March 12, 2026 shows repo-backed
+  runtime still serving `pulseplate.app`, `www.pulseplate.app` returning `525`,
+  and the Figma custom-domain attempt warning about a conflicting apex `AAAA`
+  record. Evidence:
+  `docs/figma/orchestration/sessions/2026-03-12_domain_canonicalization/01_BASELINE_STATUS.md:6`
+
+## 3) Aligned
+
+1. Scope lock is consistent with H+P+Pr governance.
+Evidence: `docs/figma/PULSEPLATE_FIGMA_AI_GOVERNANCE_INDEX.md:40`, `docs/figma/FIGMA_IMPLEMENTATION_RUNBOOK.md:5`
+2. Naming contract is aligned to `PP/<Platform>/<Screen>/<Component>/<State>`.
+Evidence: `docs/figma/FIGMA_AI_HANDOFF_CHECKLIST.md:19`, `docs/figma/PULSEPLATE_FIGMA_AI_GOVERNANCE_INDEX.md:74`
+3. CTA registry list in governance matches matrix coverage expectations.
+Evidence: `docs/figma/PULSEPLATE_FIGMA_AI_GOVERNANCE_INDEX.md:139`, `docs/design/PULSEPLATE_BUTTON_ACTION_PROMPT_MATRIX.md:59`
+4. Safety framing remains wellness-first and no-diagnostic in canonical Git docs.
+Evidence: `docs/figma/FIGMA_IMPLEMENTATION_RUNBOOK.md:129`, `docs/sora/PULSEPLATE_SORA_PROMPT_ENGINEERING_PLAYBOOK.md:317`
+
+## 4) Conflicts
+
+### 4.1 Palette Governance Conflict (Gold treatment)
+
+- Make guideline snapshot includes Gold `#D4AF37` as canonical palette member.
+- Git anti-drift references treat purple/gold drift as forbidden unless explicitly constrained to contextual accents.
+Evidence: `docs/sora/PULSEPLATE_SORA_PROMPT_ENGINEERING_PLAYBOOK.md:154`, `docs/sora/PULSEPLATE_SORA_PROMPT_ENGINEERING_PLAYBOOK.md:324`, `docs/figma/PULSEPLATE_FIGMA_AI_GOVERNANCE_INDEX.md:63`
+
+Risk: visual drift between Make-driven assets and in-product style lock.
+
+### 4.2 Accessibility Target Size Conflict (Web)
+
+- Make guideline snapshot references web minimum target of 44px.
+- Project visual system lock for this stream sets web minimum to 48x48 CSS px.
+Evidence: `docs/design/PULSEPLATE_BUTTON_VISUAL_SYSTEM_TRENDS_AND_FORECAST.md:104`, `docs/design/PULSEPLATE_BUTTON_VISUAL_SYSTEM_TRENDS_AND_FORECAST.md:111`
+
+Risk: inconsistent component sizing and QA ambiguity for tap/click comfort.
+
+### 4.3 Architecture Divergence (Make shell vs runtime site)
+
+- Make `App.tsx` uses view toggles and localStorage bootstrap flow not present in canonical route/runtime architecture.
+- Production web runtime uses route registry + auth wrappers + tab bar contract.
+Evidence: `frontend/src/App.tsx:1`, `frontend/src/config/routes.ts:23`, `frontend/src/pages/Home.tsx:34`, `frontend/src/pages/Plate.tsx:37`
+
+Risk: generated components map to non-canonical entry points.
+
+### 4.4 Production Domain Ownership Conflict
+
+- The repo-backed production contract still owns `pulseplate.app` and `www.pulseplate.app`.
+- The current Figma custom-domain setup attempts to attach `pulseplate.app`
+  while warning about a conflicting apex `AAAA` record.
+- `www.pulseplate.app` currently fails TLS (`525`), which is consistent with
+  mixed or incomplete ownership between Cloudflare/app runtime and the Figma
+  custom-domain attempt.
+Evidence:
+`docs/figma/orchestration/sessions/2026-03-12_domain_canonicalization/01_BASELINE_STATUS.md:5`,
+`deploy/Caddyfile.production:1`,
+`deploy/docker-compose.production.yaml:1`
+
+Risk: production traffic can drift between incompatible ownership models and
+break TLS or redirect behavior before any design sync work even starts.
+
+## 5) Missing for Historical Code Connect Activation (Reference Only)
+
+1. No Design file URL or node IDs for node-level Code Connect.
+2. `Figma Node ID` still `TBD` across matrix rows.
+Evidence: `docs/design/PULSEPLATE_BUTTON_ACTION_PROMPT_MATRIX.md:59`
+3. Mapping registry exists for 23 CTA IDs:
+   `docs/figma/FIGMA_CODE_CONNECT_MAPPING_CANDIDATES_HPP.md`.
+4. No status lifecycle tracking (`candidate -> validated -> active`) in current handoff contract.
+
+## 6) Historical Follow-ups (Reference Only Unless a Future Packet Reopens the Lane)
+
+| Priority | Item | Owner | DoD | Target PR |
+| --- | --- | --- | --- | --- |
+| P0 | Resolve web target-size conflict (44 vs 48) by declaring one canonical value in figma docs and Make sync contracts | Coordinator + Accessibility | One value in all figma docs; conflict note closed in this audit | Follow-up docs PR |
+| P1 | Keep historical Code Connect docs archived as reference-only for the current lane | Coordinator | Active docs no longer treat bridge/node-capture/mapping docs as current prerequisites | PR #1425 |
+| P0 | Canonicalize production-domain ownership to the repo-backed runtime and move any Figma-hosted preview to a dedicated subdomain | Coordinator + FE + Deploy | `pulseplate.app` + `www` remain app-owned, TLS is healthy for both names, and Figma preview no longer competes for root ownership | Domain + Infra PR |
+| P2 | Revisit node-level mappings only if a future packet explicitly reopens that historical lane | Design + FE + iOS | Reopened packet defines fresh scope, status model, and validation path before any mapping work resumes | Separate future packet / PR |
+
+## 7) Historical Blockers (Reference Only)
+
+### Blocker B1 — Missing Design URL + node IDs
+
+- Description: if a future packet reopens the historical Code Connect lane, activation cannot proceed past candidate stage without Design file key/node IDs.
+- Tracking: add backlog dependency item in `docs/roadmap/BACKLOG_LEDGER.md`.
+- Temporary mode: current lane stays repo-first + Make reference evidence only.
+
+### Blocker B2 — Production-domain ownership drift
+
+- Description: `pulseplate.app` is the repo-canonical production host, but the
+  current Figma custom-domain attempt still competes for root-domain setup and
+  `www` TLS is currently unhealthy.
+- Tracking: keep production-domain ownership remediation separate from any historical Code Connect activation work and complete it first.
+- Temporary mode: use Figma as source/reconciliation only; if a public Figma
+  preview is needed, move it to a dedicated non-production subdomain.
+
+## 8) Decision Log
+
+- 2026-02-18: Locked source mode to Make-only until Design URL is provided.
+- 2026-02-18: Locked integration direction to Code Connect bridge (not embed).
+- 2026-02-18: Locked requirement that all 23 CTA IDs must be represented in mapping candidates.
+- 2026-03-12: Locked `pulseplate.app` and `www.pulseplate.app` to repo-canonical production ownership; Figma remains a design/source lane, not the production host.
+
+## 9) Delta — April 13, 2026 (post-PR #1407, docs-only)
+
+This section is intentionally delta-only and remains `reference_only` evidence
+support inside the existing Make sync audit. It does not reopen the authority
+model already fixed in `PR #1407`, does not promote this document into an
+authority carrier, and does not replace the clean-lane reconciliation packets.
+
+### 9.1 Authority unchanged
+
+- Web/design-system execution authority remains
+  `2JDwOByQIbcPgp93FDzHii` (`canonical_execution`).
+- The legacy `PulsePlate_v3` file `qJBtE5J6efmavcHCm6SF0O` remains
+  `reference_only`; the user-supplied `node-id=16:4` link is supplemental
+  provenance only and does not replace the historical `node-id=16:11` invalid
+  target already recorded in the clean-lane reconciliation packet.
+- The active Make/prototype file `MrztJU3CQtxhADBbtAsWJ6` also remains
+  `reference_only`; this delta does not change the Make lane classification.
+- Repo code, docs, tests, and token/component mirrors still win whenever repo
+  and Figma disagree.
+
+Evidence:
+
+- `docs/figma/FIGMA_WEB_IOS_AUTHORITY_RECONCILIATION_PACKET.md:57-73`
+- `docs/figma/PULSEPLATE_V3_DESIGN_SYSTEM_RECONCILIATION.md:36-56`
+- `docs/figma/README.md:75-77`
+- `docs/review/PR_1407_FIXED_MAPPING.md:38-41`
+- `docs/figma/orchestration/sessions/2026-04-13_phase1_delta_audit.md:12-20`
+
+### 9.2 Live canonical / aligned surfaces
+
+1. `2JDwOByQIbcPgp93FDzHii` node `174:116` (`Shell Parity Boundary Board`)
+   remains aligned and should be kept as boundary evidence, not redesigned into
+   fake web/iOS parity.
+2. The clean-file phase structure remains valid for `Foundations + Components +
+   Welcome Gate`; this audit does not change the Phase 1 page contract.
+3. Mirror-safe repo-backed lanes remain the same as the canonical mapping set:
+   `PP/Shared/Button/*`, `PP/Shared/Input/*`,
+   `PP/Shared/FormField/*`, `PP/Shared/Card/*`,
+   `PP/Shared/Dialog/*`, `PP/Shared/Toggle/*`,
+   `PP/Shared/SegmentedControl/*`, `PP/State/Empty/*`,
+   `PP/State/Skeleton/*`, `PP/Web/Navigation/TabBar/*`,
+   `PP/Branding/PulsePlateLogo/*`, `PP/Branding/FitChef/*`.
+
+Evidence:
+
+- `docs/figma/PULSEPLATE_V3_DESIGN_SYSTEM_RECONCILIATION.md:25-32`
+- `docs/figma/PULSEPLATE_V3_DESIGN_SYSTEM_RECONCILIATION.md:191-205`
+
+### 9.3 Reference-only / stale surfaces
+
+1. `qJBtE5J6efmavcHCm6SF0O` node `16:4` resolves to `03_iOS_Onboarding` and is
+   useful as provenance only; it must not become an execution target.
+2. Storybook surfaces still expose legacy node references that point at
+   reference-only/stale boards rather than the clean execution lane.
+3. Any discrepancy between `qJBtE5J6efmavcHCm6SF0O` and current repo/runtime
+   truth remains a repo-or-canonical-file issue, not a request to promote the
+   legacy file.
+
+Evidence:
+
+- `docs/figma/PULSEPLATE_V3_DESIGN_SYSTEM_RECONCILIATION.md:43-48`
+- `frontend/src/components/design-system/DesignSystemOverview.tsx:29-33`
+- `frontend/src/components/design-system/CanonBoards.tsx:234`
+- `frontend/src/components/design-system/CanonBoards.tsx:349`, `frontend/src/components/design-system/CanonBoards.tsx:427-429`
+
+### 9.4 Working matrix for Phase 1 follow-up split
+
+| Classification | Surface | Evidence | Next action |
+| --- | --- | --- | --- |
+| aligned / keep | `2JD...` node `174:116` (`Shell Parity Boundary Board`) | `docs/figma/orchestration/sessions/2026-04-13_phase1_delta_audit.md:12-18`; authority packets above | keep as canonical boundary board |
+| aligned / mirror-safe | repo-backed canonical shared/component lanes from `PP/Shared/Button/*` through `PP/Branding/FitChef/*` | `docs/figma/PULSEPLATE_V3_DESIGN_SYSTEM_RECONCILIATION.md:191-205` | update Figma only as a mirror of repo SoT |
+| reference-only | `qJBtE5J6efmavcHCm6SF0O` / supplemental `node-id=16:4` provenance | `docs/figma/orchestration/sessions/2026-04-13_phase1_delta_audit.md:12-20`; `docs/figma/PULSEPLATE_V3_DESIGN_SYSTEM_RECONCILIATION.md:38-56` | keep for provenance only; do not replace the historical `16:11` invalid-target note |
+| resolved in repo | `DesignSystemOverview` Storybook wording retargeted after PR `#1422` | `frontend/src/components/design-system/DesignSystemOverview.tsx:29-33` | keep audit evidence aligned to repo truth; no broader Figma parity claim |
+| resolved in repo | `CanonBoards` Storybook wording retargeted after PR `#1422` | `frontend/src/components/design-system/CanonBoards.tsx:234`, `frontend/src/components/design-system/CanonBoards.tsx:349`, `frontend/src/components/design-system/CanonBoards.tsx:427-429` | keep audit evidence aligned to repo truth; no broader Figma parity claim |
+| update code first | `PremiumGate` legacy CTA styling debt | `frontend/src/components/PremiumGate.tsx:48-57` | normalize to governed primitives/tokens before Figma mirror work |
+| update code first | `VipBadge` purple gradient drift | `frontend/src/components/VipBadge.tsx:20-24` | remove forbidden drift in repo before any canonical Figma sync |
+| repo-first missing primitive | `PP/Shared/Select/*`, `Textarea/*`, `Checkbox/*`, `RadioGroup/*`, `Alert/*`, `Tooltip/*` | `docs/figma/PULSEPLATE_V3_DESIGN_SYSTEM_RECONCILIATION.md:206-211` | add governed repo primitives first; Figma must not invent canon |
+| resolved in repo docs | `PP/Shared/StepRail/*` normalization | `docs/figma/PULSEPLATE_V3_DESIGN_SYSTEM_RECONCILIATION.md:215`, `docs/design/UI_COMPONENT_VOCABULARY.md:131`, `docs/design/UI_COMPONENT_VOCABULARY.md:145` | keep canonical `stepper/progress-indicator` wording; defer primitive implementation |
+
+### 9.5 Ledger / follow-up status
+
+One new backlog item is opened by this delta for the repo-first remediation
+cluster that should not stay narrative-only:
+
+- `docs/roadmap/BACKLOG_LEDGER.md#ledger-p1-pulseplate-v3-phase1-repo-drift-cleanup`
+
+Ledger mapping after this update is:
+
+- `PremiumGate` and `VipBadge` remain covered by the cited Phase 1 execution
+  ledger item as known blockers.
+- `DesignSystemOverview` and `CanonBoards` are now resolved in repo truth after
+  PR `#1422`; this audit row is retained only as evidence refresh.
+- Missing shared primitives remain tracked by the same repo-first drift
+  cleanup item. The `StepRail` naming decision is now resolved in repo docs,
+  while reusable primitive implementation remains deferred under that item.
+- `update Figma`, `reference_only`, and `aligned / keep` rows remain
+  classification/evidence outcomes rather than direct implementation claims.
+
+### 9.6 Audit guardrails for the next PRs
+
+- Do not treat placeholder, hold, reserved, or legacy-reference frames as
+  shippable authority.
+- Avoid repairing repo/runtime drift by drawing cleaner fiction in Figma.
+- Prevent missing repo primitives from becoming Figma-only component
+  inventions.
+
+<!-- markdownlint-enable MD013 -->

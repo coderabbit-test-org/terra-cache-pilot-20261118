@@ -1,0 +1,476 @@
+#!/usr/bin/env python3
+"""Canonical orchestration wrapper for merge-readiness gates."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess  # nosec B404 # B404: bounded repo gates and read-only gh metadata/auth require subprocess; owned call sites individually reviewed (remove-by: 2027-01-31, ref: PR-main-nightly-nosec-ttl)
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+PHASE2_GATE = REPO_ROOT / "scripts" / "ci" / "check_pr_body_phase2_gates.py"
+MERGE_GATE = REPO_ROOT / "scripts" / "ci" / "check_pr_merge_readiness.py"
+CURRENT_HEAD_CHECKS_GATE = REPO_ROOT / "scripts" / "ci" / "check_current_head_pr_checks.py"
+DISPOSITION_GATE = REPO_ROOT / "scripts" / "orchestration" / "check_review_threads_disposition.py"
+RUN_TIMEOUT_SEC = 120
+MERGE_GATE_TIMEOUT_SEC = 480
+EXPERIMENT_RUNNER_EVIDENCE_MODES = ("advisory", "required")
+
+
+@dataclass(frozen=True)
+class GateResult:
+    """Result of one gate subprocess."""
+
+    name: str
+    argv: list[str]
+    returncode: int
+    stdout: str
+    stderr: str
+
+
+@dataclass(frozen=True)
+class GatePolicy:
+    """Static gate classification used by the wrapper output."""
+
+    gate_class: Literal["hard", "soft", "external", "advisory"]
+    lane: Literal[
+        "pr-governance", "review-governance", "required-checks", "review-proof", "unclassified"
+    ]
+    blocking: bool
+
+
+GATE_POLICIES: dict[str, GatePolicy] = {
+    "pre-closeout-review-governance": GatePolicy(
+        gate_class="hard", lane="review-governance", blocking=True
+    ),
+    "phase2-pr-body-gates": GatePolicy(gate_class="hard", lane="pr-governance", blocking=True),
+    "merge-readiness-gate": GatePolicy(gate_class="hard", lane="review-governance", blocking=True),
+    "current-head-checks": GatePolicy(gate_class="hard", lane="required-checks", blocking=True),
+    "review-threads-disposition": GatePolicy(gate_class="hard", lane="review-proof", blocking=True),
+}
+
+BLOCKING_MERGE_READY_GATES: tuple[str, ...] = (
+    "phase2-pr-body-gates",
+    "merge-readiness-gate",
+    "current-head-checks",
+    "review-threads-disposition",
+)
+
+
+def _validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    """Enforce CI vs local mode contract for the wrapper CLI."""
+
+    has_event = bool((args.event_path or "").strip())
+    has_local_pr = args.pr_number is not None or bool((args.repo or "").strip())
+
+    if args.pre_closeout:
+        if has_event:
+            parser.error("--pre-closeout is local-only; use --pr-number and --repo.")
+        if not args.require_auth:
+            parser.error("--pre-closeout requires --require-auth.")
+        if args.body:
+            parser.error("--pre-closeout always validates the live PR body; omit --body.")
+
+    if has_event and has_local_pr:
+        parser.error(
+            "Use either --event-path (CI) or both --pr-number and --repo (local), not both."
+        )
+
+    if has_event:
+        return
+
+    if (args.pr_number is not None) != bool((args.repo or "").strip()):
+        parser.error("For local mode provide both --pr-number and --repo.")
+
+    if args.pr_number is None and not (args.repo or "").strip():
+        parser.error("Provide either --event-path (CI) or both --pr-number and --repo (local).")
+
+
+def _experiment_runner_evidence_mode(value: str | None) -> str:
+    """Normalize the Phase2 Experiment Runner evidence mode."""
+
+    normalized = (value or "advisory").strip().lower()
+    if normalized not in EXPERIMENT_RUNNER_EVIDENCE_MODES:
+        allowed = ", ".join(EXPERIMENT_RUNNER_EVIDENCE_MODES)
+        raise argparse.ArgumentTypeError(
+            f"Experiment Runner evidence mode must be one of: {allowed}"
+        )
+    return normalized
+
+
+def _run_gate(name: str, script_path: Path, extra_args: list[str]) -> GateResult:
+    """Run a gate script and capture its output without mutating its behavior."""
+
+    argv = [sys.executable, str(script_path), *extra_args]
+    timeout_seconds = (
+        MERGE_GATE_TIMEOUT_SEC if script_path in (MERGE_GATE, DISPOSITION_GATE) else RUN_TIMEOUT_SEC
+    )
+    try:
+        result = subprocess.run(  # nosec B603 # B603: fixed interpreter/script paths; args validated by parser; timeout and failure controls reviewed (remove-by: 2027-01-31, ref: PR-main-nightly-nosec-ttl)
+            argv,
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = (exc.stdout or "").strip() if isinstance(exc.stdout, str) else ""
+        return GateResult(
+            name=name,
+            argv=argv,
+            returncode=1,
+            stdout=stdout,
+            stderr=f"Timed out after {timeout_seconds}s while running {script_path.name}: {exc}",
+        )
+    return GateResult(
+        name=name,
+        argv=argv,
+        returncode=result.returncode,
+        stdout=result.stdout.strip(),
+        stderr=result.stderr.strip(),
+    )
+
+
+def _github_cli_path() -> str:
+    """Resolve gh binary path for read-only PR metadata access."""
+
+    gh_path = shutil.which("gh")
+    if not gh_path:
+        raise RuntimeError("GitHub CLI `gh` is required to fetch PR body in local mode.")
+    return gh_path
+
+
+def _fetch_pr_body(pr_number: int, repo: str) -> str:
+    """Fetch live PR body so Phase2 mirror checks work in local wrapper mode."""
+
+    env = os.environ.copy()
+    if not (env.get("GH_TOKEN") or env.get("GITHUB_TOKEN")):
+        auth_status = subprocess.run(  # nosec B603 # B603: absolute gh path with fixed auth-status argv; timeout and failure controls reviewed (remove-by: 2027-01-31, ref: PR-main-nightly-nosec-ttl)
+            [_github_cli_path(), "auth", "status"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=RUN_TIMEOUT_SEC,
+            env=env,
+        )
+        if auth_status.returncode != 0:
+            stderr = (
+                auth_status.stderr.strip() or auth_status.stdout.strip() or "unknown gh auth error"
+            )
+            raise RuntimeError(
+                "GH_TOKEN/GITHUB_TOKEN is unset and gh auth status failed; "
+                f"run `gh auth login` or export GH_TOKEN. Details: {stderr}"
+            )
+    argv = [
+        _github_cli_path(),
+        "pr",
+        "view",
+        str(pr_number),
+        "--repo",
+        repo,
+        "--json",
+        "body",
+        "--jq",
+        ".body",
+    ]
+    result = subprocess.run(  # nosec B603 # B603: absolute gh path with fixed read-only argv; timeout and failure controls reviewed (remove-by: 2027-01-31, ref: PR-main-nightly-nosec-ttl)
+        argv,
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=RUN_TIMEOUT_SEC,
+        env=env,
+    )
+    if result.returncode != 0:
+        stderr = result.stderr.strip() or "unknown gh error"
+        raise RuntimeError(f"Failed to fetch PR body for #{pr_number}: {stderr}")
+    return result.stdout
+
+
+def _phase2_args(args: argparse.Namespace) -> list[str]:
+    if args.event_path:
+        return [
+            "--event-path",
+            args.event_path,
+            "--experiment-runner-evidence-mode",
+            args.experiment_runner_evidence_mode,
+        ]
+    phase2_args = ["--pr-number", str(args.pr_number)]
+    if args.body:
+        phase2_args.extend(["--body", args.body])
+    phase2_args.extend(["--experiment-runner-evidence-mode", args.experiment_runner_evidence_mode])
+    return phase2_args
+
+
+def _merge_gate_args(args: argparse.Namespace) -> list[str]:
+    if args.event_path:
+        return ["--event-path", args.event_path]
+    return ["--pr-number", str(args.pr_number), "--repo", args.repo]
+
+
+def _pre_closeout_gate_args(args: argparse.Namespace) -> list[str]:
+    """Build the local-only pre-closeout mapping validation argv."""
+
+    return [*_merge_gate_args(args), "--pre-closeout"]
+
+
+def _require_pre_closeout_auth() -> None:
+    """Require both strict-auth tokens before any pre-closeout network call."""
+
+    missing = [
+        name for name in ("GH_TOKEN", "GITHUB_TOKEN") if not (os.environ.get(name) or "").strip()
+    ]
+    if missing:
+        raise RuntimeError(
+            "pre-closeout strict auth requires both GH_TOKEN and GITHUB_TOKEN; "
+            f"missing: {', '.join(missing)}"
+        )
+
+    result = subprocess.run(  # nosec B603 # B603: absolute gh path with fixed auth-status argv; timeout and failure controls reviewed (remove-by: 2027-01-31, ref: PR-main-nightly-nosec-ttl)
+        [_github_cli_path(), "auth", "status"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=RUN_TIMEOUT_SEC,
+        env=os.environ.copy(),
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            "pre-closeout strict auth failed: GH_TOKEN is not accepted by `gh auth status`"
+        )
+
+
+def _current_head_checks_args(args: argparse.Namespace) -> list[str]:
+    if args.event_path:
+        return ["--event-path", args.event_path]
+    return ["--pr-number", str(args.pr_number), "--repo", args.repo]
+
+
+def _event_pr_number(event_path: str) -> int | None:
+    """Extract PR number from a GitHub event payload for deterministic CI routing."""
+
+    if not event_path.strip():
+        return None
+    try:
+        payload = json.loads(Path(event_path).read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    pull_request = payload.get("pull_request")
+    if not isinstance(pull_request, dict):
+        return None
+    pr_number = pull_request.get("number")
+    if isinstance(pr_number, bool) or pr_number is None:
+        return None
+    if isinstance(pr_number, int):
+        return pr_number
+    if isinstance(pr_number, str) and pr_number.isdigit():
+        return int(pr_number)
+    return None
+
+
+def _disposition_args(args: argparse.Namespace) -> list[str]:
+    disposition_args: list[str] = []
+    disposition_pr_number = args.pr_number
+    if disposition_pr_number is None:
+        disposition_pr_number = _event_pr_number(args.event_path)
+    if disposition_pr_number is not None:
+        disposition_args.extend(["--pr-number", str(disposition_pr_number)])
+    if args.require_auth:
+        disposition_args.append("--require-auth")
+    return disposition_args
+
+
+def _disposition_gate_skipped(result: GateResult) -> bool:
+    """True when disposition exited 0 via advisory SKIP instead of strict evidence."""
+
+    if result.name != "review-threads-disposition":
+        return False
+    if result.returncode != 0:
+        return False
+    combined_output = "\n".join(part for part in (result.stdout, result.stderr) if part)
+    return "SKIP:" in combined_output
+
+
+def _print_gate_output(result: GateResult) -> None:
+    """Render one gate block for deterministic local/CI diagnostics."""
+
+    policy = GATE_POLICIES.get(
+        result.name,
+        GatePolicy(gate_class="advisory", lane="unclassified", blocking=False),
+    )
+    status = "PASS" if result.returncode == 0 else "FAIL"
+    blocking_label = "blocking" if policy.blocking else "advisory"
+    print(f"[{status}] {result.name} ({policy.gate_class}; lane={policy.lane}; {blocking_label})")
+    if result.stdout:
+        print(result.stdout)
+    if result.stderr:
+        print(result.stderr)
+
+
+def _print_merge_ready_bundle(*, experiment_runner_evidence_mode: str = "advisory") -> None:
+    """Render the canonical blocking bundle before gate execution output."""
+
+    print("Blocking merge-ready bundle:")
+    for gate_name in BLOCKING_MERGE_READY_GATES:
+        policy = GATE_POLICIES[gate_name]
+        blocking_value = "yes" if policy.blocking else "no"
+        print(
+            f"- {gate_name}: class={policy.gate_class}, "
+            f"lane={policy.lane}, blocking={blocking_value}"
+        )
+    print("Advisory / external signals:")
+    print("- third-party review bots remain advisory unless GitHub branch protection promotes them")
+    if experiment_runner_evidence_mode == "required":
+        print(
+            "- Experiment Runner Evidence mode=required; Phase2 fails closed when the "
+            "PR body/mapping lacks a valid oracle-only artifact or explicit "
+            "not-applicable reason"
+        )
+    else:
+        print(
+            "- Experiment Runner Evidence mode=advisory; Phase2 reports missing "
+            "oracle-only artifact or not-applicable reason without blocking this "
+            "script, but non-trivial PRs remain process-blocked until required "
+            "evidence or an explicit coordinator/operator exception is recorded"
+        )
+    print(
+        "- Lane Start Provenance is diagnostic dry-run in this phase; Phase2 reports "
+        "missing repo bootstrap packet/start_pr_lane evidence without blocking merge readiness"
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Run canonical PR governance gates and emit a single merge verdict."
+    )
+    parser.add_argument(
+        "--event-path",
+        default="",
+        help="Path to GitHub event payload JSON for CI mode.",
+    )
+    parser.add_argument(
+        "--body",
+        default="",
+        help="Explicit PR body text for local Phase2 validation.",
+    )
+    parser.add_argument(
+        "--pr-number",
+        type=int,
+        help="PR number for local mode (must be paired with --repo).",
+    )
+    parser.add_argument(
+        "--repo",
+        default="",
+        help="Repo full name owner/repo for local mode.",
+    )
+    parser.add_argument(
+        "--require-auth",
+        action="store_true",
+        help="Upgrade local disposition checks to strict CI-like auth semantics.",
+    )
+    parser.add_argument(
+        "--pre-closeout",
+        action="store_true",
+        help=(
+            "Before the sole mapping commit, validate the local canonical artifact "
+            "against all live actionable bot items and the live PR-body link. This "
+            "does not check thread resolution, current-head CI, or merge readiness."
+        ),
+    )
+    parser.add_argument(
+        "--experiment-runner-evidence-mode",
+        default=os.environ.get("PULSEPLATE_EXPERIMENT_RUNNER_EVIDENCE_MODE", "advisory"),
+        help=(
+            "Forward Experiment Runner Evidence enforcement to Phase2: advisory "
+            "(default) or required. Can also be set with "
+            "PULSEPLATE_EXPERIMENT_RUNNER_EVIDENCE_MODE."
+        ),
+    )
+    parsed = parser.parse_args(argv)
+    try:
+        parsed.experiment_runner_evidence_mode = _experiment_runner_evidence_mode(
+            parsed.experiment_runner_evidence_mode
+        )
+    except argparse.ArgumentTypeError as exc:
+        parser.error(str(exc))
+    _validate_args(parsed, parser)
+
+    if parsed.pre_closeout:
+        try:
+            _require_pre_closeout_auth()
+        except RuntimeError as exc:
+            print(f"ERROR: {exc}")
+            return 1
+        result = _run_gate(
+            "pre-closeout-review-governance",
+            MERGE_GATE,
+            _pre_closeout_gate_args(parsed),
+        )
+        _print_gate_output(result)
+        if result.returncode != 0:
+            print("ERROR: pre-closeout validation failed; do not create the mapping commit.")
+            return 1
+        print(
+            "pre-closeout-check: passed; this authorizes only the mapping closeout commit "
+            "and is not merge-readiness evidence."
+        )
+        return 0
+
+    phase2_args = _phase2_args(parsed)
+    phase2_result = _run_gate("phase2-pr-body-gates", PHASE2_GATE, phase2_args)
+
+    gate_results = [
+        phase2_result,
+        _run_gate("merge-readiness-gate", MERGE_GATE, _merge_gate_args(parsed)),
+        _run_gate(
+            "current-head-checks",
+            CURRENT_HEAD_CHECKS_GATE,
+            _current_head_checks_args(parsed),
+        ),
+        _run_gate(
+            "review-threads-disposition",
+            DISPOSITION_GATE,
+            _disposition_args(parsed),
+        ),
+    ]
+
+    failed = [result.name for result in gate_results if result.returncode != 0]
+    disposition_skipped = any(_disposition_gate_skipped(result) for result in gate_results)
+    if disposition_skipped:
+        failed.append("review-threads-disposition")
+    _print_merge_ready_bundle(
+        experiment_runner_evidence_mode=parsed.experiment_runner_evidence_mode
+    )
+    for result in gate_results:
+        _print_gate_output(result)
+
+    if failed:
+        if "review-threads-disposition" in failed and disposition_skipped:
+            print("ERROR: review-threads-disposition ran in advisory SKIP mode.")
+            print("Re-run with --require-auth and GH_TOKEN for merge-readiness evidence.")
+        print("ERROR: orchestration merge-check failed.")
+        unique_failed = list(dict.fromkeys(failed))
+        print(f"Failing gates: {', '.join(unique_failed)}")
+        return 1
+
+    print("orchestration-merge-check: passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

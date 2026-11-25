@@ -1,0 +1,261 @@
+# Privacy Policy
+
+**Status:** Canonical legal document
+**Last updated:** 2026-08-27
+**Policy version:** `2026-08-27.eu-first.v2`
+**Scope:** All product tiers (FREE / PRO / VIP)
+**Markets:** CIS / EU / US
+**Positioning:** Consumer wellness product, not a clinical system
+
+---
+
+## 🇷🇺 RU Version
+
+### Какие данные мы собираем
+
+**Данные аккаунта и доступа:**
+
+- Email и связанные данные аккаунта, если функция аккаунтов включена
+- Технические идентификаторы доступа, связанные с API-ключами и entitlement-проверками
+
+**Псевдонимные идентификаторы безопасности:**
+
+- Хешированные и усечённые client fingerprints для rate limiting, abuse prevention и request correlation
+- Эти идентификаторы рассматриваются как псевдонимные данные и не используются как публичный user profile
+
+**Wellness и AI-артефакты:**
+
+- Wellness-профиль и вычисления могут обрабатываться в request scope
+- Некоторые прямые user-bound артефакты могут сохраняться в минимизированном виде:
+  - feedback on AI/RAG responses
+  - user knowledge/personalization artifacts
+  - signed audit metadata for privileged AI actions
+  - credential-bound client-reported FitChef support outcomes
+
+FitChef outcome row означает только принятое от авторизованного клиента
+утверждение `acknowledged` или `dismissed`. Оно не доказывает human click,
+предыдущий успешный handoff, consent, understanding, navigation, plan execution
+или product effectiveness. Этот flow напрямую не передаёт outcome field/row AI
+provider или другому third-party processor; aggregate metrics регулируются
+настроенной telemetry policy.
+
+### Что мы не обещаем
+
+- Мы **не обещаем**, что весь продукт работает без хранения данных
+- Мы **не позиционируем** продукт как HIPAA-ready, clinical-grade или Part 2 compliant
+- Мы **не используем** текущий wellness runtime для клинических записей, crisis workflows или SUD records
+
+### AI / Automated Analysis
+
+Некоторые поверхности выполняют **automated wellness analysis**:
+
+- BMI / body-fat / nutrition-target calculations
+- nutrition planning and weekly-plan generation
+- AI insight surfaces (`/insight`, `/api/v1/insight`, `/api/v1/pro/cbt/insight`)
+- FitChef structured coaching (`/api/v1/pro/fitchef/explain`, `/api/v1/vip/fitchef/insight`)
+
+Для таких поверхностей действуют общие правила:
+
+- результат носит wellness / educational характер
+- не предназначен для emergency use
+- не должен использоваться как единственное основание для treatment decisions
+- при признаках клинического риска нужен переход к qualified professional support
+- backend tracing хранит только HMAC-отпечатки, длины и usage metadata; raw prompts/completions не экспортируются в v1
+
+### Внешние и self-hosted processors
+
+При включении AI-функций запрос может обрабатываться:
+
+- локальным/runtime processing PulsePlate
+- self-hosted provider (например, Ollama-compatible)
+- external provider family (например, xAI/Grok, OpenAI-compatible, Anthropic-compatible, Pico)
+- OTLP collector/vendor tracing processor, если задан `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` (telemetry processor, not an AI model provider)
+
+Конкретный processor зависит от deployment configuration. OTLP collector или tracing vendor создаёт дополнительный путь обработки и retention для trace metadata, который регулируется конфигурацией collector/vendored deployment. Такой telemetry-only export сам по себе не активирует regulated lane, если trace metadata остаётся non-identifying, не включает regulated content и остаётся в пределах настроенного telemetry-control boundary. Retention и downstream processing у внешних processors регулируются их собственными условиями и настройками развертывания.
+
+### Хранение и удаление
+
+- Псевдонимные security identifiers удаляются по retention policy
+- Direct-user SQL artifacts могут быть экспортированы или удалены через внутренний support-led DSAR workflow
+- FitChef support outcomes хранятся до support-led удаления или отдельно рассмотренного изменения policy
+- Audit envelopes и indirect security artifacts не считаются public self-service artifacts и живут по retention/security policy
+
+### Ваши права
+
+Если на вас распространяется GDPR или аналогичные режимы, вы можете запросить:
+
+- доступ к direct-user artifacts
+- удаление direct-user artifacts, где это технически и юридически поддерживается
+- исправление неточных account records
+- прекращение использования AI surfaces для новых automated-analysis requests
+
+### Связанные документы
+
+- `GET /privacy` — runtime JSON contract
+- `GET /terms` — runtime legal publication for service scope and acceptable use
+- `docs/compliance/DATA_CLASSIFICATION_AND_PROCESSING_MATRIX.md`
+- `docs/compliance/AI_TRANSPARENCY_AND_PROFILING_NOTICE.md`
+- `docs/compliance/DSAR_AND_DELETION_MAP.md`
+- `docs/legal/Disclaimer.md`
+
+---
+
+## 🇬🇧 EN Version
+
+### What Data We Collect
+
+**Account and access data:**
+
+- Email and account-linked data when account functionality is enabled
+- Access-control and entitlement data associated with API keys and subscription checks
+
+**Pseudonymous security identifiers:**
+
+- Hashed and truncated client fingerprints used for rate limiting, abuse prevention, and request correlation
+- These identifiers are treated as pseudonymous data and are not presented as a public user profile
+
+**Wellness and AI artifacts:**
+
+- Wellness-profile inputs may be processed within request scope
+- Some direct-user artifacts may be persisted in minimized form:
+  - feedback on AI/RAG responses
+  - user knowledge/personalization artifacts
+  - signed audit metadata for privileged AI actions
+  - credential-bound client-reported FitChef support outcomes
+
+A FitChef outcome row means only an accepted authenticated client-reported
+`acknowledged` or `dismissed` assertion. It does not prove a human click, a
+prior successful handoff, consent, understanding, navigation, plan execution,
+or product effectiveness. This flow directly sends no outcome field or row to
+an AI provider or other third-party processor; aggregate metrics remain subject
+to the configured telemetry policy.
+
+### What We Do Not Promise
+
+- We do **not** promise that the entire product is zero-storage or purely local-only
+- We do **not** position the current product as HIPAA-ready, clinical-grade, or 42 CFR Part 2 compliant
+- We do **not** use the current wellness runtime for clinical records, crisis workflows, or substance use disorder records
+
+### AI / Automated Analysis
+
+Some surfaces perform **automated wellness analysis**, including:
+
+- BMI, body-fat, and nutrition-target calculations
+- nutrition planning and weekly-plan generation
+- AI insight surfaces (`/insight`, `/api/v1/insight`, `/api/v1/pro/cbt/insight`)
+- FitChef structured coaching (`/api/v1/pro/fitchef/explain`, `/api/v1/vip/fitchef/insight`)
+
+For these surfaces:
+
+- outputs are intended for wellness and educational use
+- they are not for emergency use
+- they must not be used as the sole basis for treatment decisions
+- signs of clinical risk require escalation to qualified professional support
+- backend tracing stores only HMAC fingerprints, lengths, and bounded usage metadata; raw prompts/completions are not exported in v1
+
+### External and Self-Hosted Processors
+
+When AI features are enabled, requests may be processed by:
+
+- PulsePlate local/runtime processing
+- a self-hosted provider family (for example, Ollama-compatible deployments)
+- an external provider family (for example, xAI/Grok, OpenAI-compatible, Anthropic-compatible, or Pico)
+- an OTLP collector or tracing vendor processor when `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` is configured (a telemetry processor, not an AI model provider)
+
+The active processor depends on deployment configuration. An OTLP collector or tracing vendor adds a separate processing and retention path for trace metadata, governed by the collector or vendor deployment configuration. That telemetry-only export does not activate the regulated lane by itself when trace metadata remains non-identifying, excludes regulated content, and stays within the configured telemetry-control boundary. Retention and downstream processing at external processors are governed by the selected provider or deployment terms.
+
+### Retention and Deletion
+
+- Pseudonymous security identifiers are cleaned up through retention policy
+- Direct-user SQL artifacts can be exported or deleted through an internal support-led DSAR workflow
+- FitChef support outcomes are retained until support-led deletion or a separately reviewed policy change
+- Audit envelopes and indirect security artifacts are retention-managed and are not treated as public self-service artifacts
+
+### Your Rights
+
+Where GDPR or a similar regime applies, you may request:
+
+- access to direct-user artifacts
+- deletion of direct-user artifacts where technically and legally supported
+- correction of inaccurate account records
+- discontinuation of new automated-analysis requests by avoiding or disabling AI surfaces
+
+### Related Documents
+
+- `GET /privacy` runtime JSON contract
+- `GET /terms` runtime legal publication for service scope and acceptable use
+- `docs/compliance/DATA_CLASSIFICATION_AND_PROCESSING_MATRIX.md`
+- `docs/compliance/AI_TRANSPARENCY_AND_PROFILING_NOTICE.md`
+- `docs/compliance/DSAR_AND_DELETION_MAP.md`
+- `docs/legal/Disclaimer.md`
+
+---
+
+## 🇪🇸 ES Version
+
+### Qué Datos Recopilamos
+
+- Datos de cuenta y acceso cuando la funcionalidad de cuenta está habilitada
+- Identificadores de seguridad seudónimos para rate limiting, prevención de abuso y correlación de solicitudes
+- Artefactos minimizados vinculados al usuario para feedback de AI/RAG, personalización y metadatos de auditoría firmada
+- Outcomes de soporte de FitChef reportados por un cliente autorizado y vinculados a su credencial
+
+Una fila de outcome de FitChef significa solamente una afirmación
+`acknowledged` o `dismissed` aceptada del cliente autorizado. No demuestra un
+click humano, handoff previo exitoso, consentimiento, comprensión, navegación,
+ejecución de plan ni efectividad del producto. Este flow no envía directamente
+el campo o la fila de outcome a un proveedor AI u otro processor externo; las
+métricas agregadas siguen la política de telemetría configurada.
+
+### Qué No Prometemos
+
+- No prometemos un producto completamente sin almacenamiento o solo local
+- No posicionamos el producto actual como HIPAA-ready, clinical-grade o 42 CFR Part 2 compliant
+- No usamos el runtime de wellness para registros clínicos, workflows de crisis o registros de trastorno por uso de sustancias
+
+### AI / Análisis Automatizado
+
+Algunas superficies realizan análisis automatizado de wellness:
+
+- cálculos de BMI, body-fat y nutrition targets
+- planificación nutricional y weekly-plan generation
+- superficies AI insight (`/insight`, `/api/v1/insight`, `/api/v1/pro/cbt/insight`)
+- coaching estructurado de FitChef (`/api/v1/pro/fitchef/explain`, `/api/v1/vip/fitchef/insight`)
+
+Estos resultados son para wellness y educación, no para emergencias ni decisiones de tratamiento.
+El tracing backend solo almacena huellas HMAC, longitudes y metadatos de uso limitados; no exporta prompts/completions en texto plano en v1.
+
+### Procesadores Externos y Self-Hosted
+
+Cuando las funciones de AI están habilitadas, las solicitudes pueden ser procesadas por:
+
+- PulsePlate runtime local
+- una familia self-hosted (por ejemplo, Ollama-compatible)
+- una familia externa (por ejemplo, xAI/Grok, OpenAI-compatible, Anthropic-compatible o Pico)
+- un collector OTLP o processor de tracing vendor cuando `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` está configurado (un procesador de telemetría, no un proveedor de modelo de AI)
+
+El processor activo depende de la configuración del deployment. Un collector OTLP o tracing vendor añade una ruta separada de procesamiento y retención para trace metadata, gobernada por la configuración del collector o vendor. Ese export telemetry-only no activa por sí solo el regulated lane cuando la trace metadata sigue siendo non-identifying, excluye regulated content y permanece dentro del telemetry-control boundary configurado. La retención y el procesamiento downstream en processors externos se rigen por los términos del provider o deployment seleccionado.
+
+### Retención y Eliminación
+
+- Los identificadores de seguridad seudónimos siguen la política de retención
+- Los artefactos SQL vinculados directamente al usuario pueden exportarse o eliminarse mediante un flujo interno DSAR
+- Los outcomes de soporte de FitChef se conservan hasta su eliminación support-led o un cambio de policy revisado por separado
+- Los audit envelopes y artefactos indirectos de seguridad se gestionan por retención y no son artefactos públicos self-service
+
+---
+
+## 📍 Legal Compliance
+
+This privacy policy is designed to align with:
+
+- **EU / GDPR-style expectations:** transparency, minimization, retention, and data-subject request readiness
+- **CIS markets:** wellness positioning and baseline privacy governance
+- **US wellness posture:** general privacy principles without claiming clinical compliance
+
+**See also:**
+
+- `GET /privacy` API endpoint — runtime JSON response with current processing disclosures
+- `GET /terms` API endpoint — runtime service-scope and acceptable-use disclosures
+- `docs/compliance/PROVIDER_INVENTORY.md`
+- `docs/compliance/US_REGULATED_LANE_RFC_42_CFR_PART_2.md`

@@ -1,0 +1,393 @@
+# Agent Message Protocol (Envelope v1)
+
+**Purpose:** Make multi-agent orchestration **parseable and robust across models** by standardizing machine-readable envelopes for:
+
+- task packets (coordinator → agent)
+- agent results (agent → coordinator)
+- repair requests (coordinator → agent)
+
+**Status:** Canonical (dev-only). This protocol defines **format**, not runtime behavior, and it describes a derived transport view over the canonical bootstrap packet rather than a second source of truth.
+
+**Anti-drift rule:** do not duplicate envelope rules across other docs; link here.
+
+---
+
+## Why this exists
+
+Different models frequently vary in:
+
+- adding preambles (“Sure, here’s…”) or extra Markdown
+- missing required fields
+- returning partial JSON, truncated outputs, or inconsistent key names
+
+The coordinator needs a stable way to extract the structured payload and to request a deterministic “repair” response.
+
+---
+
+## Core rule (non-negotiable)
+
+When envelopes are enabled for a task, an agent MUST return the required JSON **inside the required tags**.
+
+- The coordinator parses **only** the substring between tags.
+- Any text outside tags is ignored and must not be relied on.
+
+---
+
+## Strict JSON requirements (required)
+
+- ASCII double quotes (`"`) only
+- no trailing commas
+- no comments
+- tags must appear on their own lines
+- actual agent output MUST NOT wrap envelope JSON in Markdown code fences (```)
+- documentation examples in this file use fences for readability only
+
+---
+
+## Validation rules (required)
+
+### Envelope activation (how it is enabled)
+
+Envelope mode is considered enabled when the coordinator:
+
+- sends a `<TASK_PACKET_V1>`, and
+- sets `output_requirements.must_return` to require an `<AGENT_RESULT_V1>` envelope only (no preamble).
+
+In the live repo baseline, that requirement is derived from the canonical bootstrap packet emitted by `scripts/orchestration/task_bootstrap.py`; the protocol here describes the transport view, not a parallel builder.
+
+### Envelope count
+
+- **Exactly one** `<AGENT_RESULT_V1>` envelope is valid per agent response.
+- If multiple `<AGENT_RESULT_V1>` envelopes are present, coordinator MUST treat the response as **unparseable** and issue a `REPAIR_REQUEST_V1`.
+
+### Allowed enums (minimum)
+
+- `TASK_PACKET_V1.mode`: `docs-only` | `analysis` | `runtime`
+- `AGENT_RESULT_V1.status`: `ok` | `blocked` | `error`
+- `AGENT_RESULT_V1.deliverables[].type`: `doc` | `policy` | `analysis` | `plan` | `risk` | `test` | `other`
+
+### Type expectations (minimum)
+
+- `protocol_version`: string `"1.0"`
+- `task_id`: string (opaque identifier; do not parse semantics)
+- `constraints`: array of strings
+- `context_loaded_paths`: array of strings (paths only; no prose)
+- `deliverables`: array of objects
+  - each deliverable has:
+    - `type`: string enum (see above)
+    - `summary`: string (1–3 sentences)
+- `next_steps`: array of strings (MUST NOT exceed 5 in envelope mode)
+
+---
+
+## Envelope types + required keys
+
+### 1) `<TASK_PACKET_V1>` (Coordinator → agent)
+
+`<TASK_PACKET_V1>` is a derived envelope view over the canonical bootstrap packet. The repo SoT remains `scripts/orchestration/task_bootstrap.py`; any transport serializer/projector must derive from that artifact instead of authoring a second packet contract.
+
+Minimum required keys:
+
+- `protocol_version` (string; `"1.0"`)
+- `task_id` (string)
+- `role` (string; target agent name)
+- `mode` (string; e.g. `"docs-only"`, `"runtime"`, `"analysis"`)
+- `request` (string)
+- `constraints` (array of strings)
+- `inputs.must_read_paths` (array of strings; paths)
+- `inputs.recommended_skills` (array of strings; optional but recommended when skill routing is enabled)
+- `inputs.skill_routing` (object; optional compact evidence map for why those skills were selected; when present, it should expose `task_classification`, `envelope_mode_hint` (aligned with `bootstrap_sync_policy.resolve_analysis_envelope_mode`), `required`, `recommended`, `conditional`, `blocked`, `explanation`, and `research_connector_policy`; Evidence: `scripts/orchestration/task_bootstrap.py:786-919`, `scripts/orchestration/task_bootstrap.py:849-859`, `scripts/orchestration/skill_router.py:558-615`, `scripts/orchestration/skill_router.py:659-696`, `scripts/orchestration/skill_router.py:1783-1912`, `tests/test_task_bootstrap.py:147-183`, `tests/test_skill_router.py:1339-1405`)
+- `output_requirements.must_return` (array of strings)
+- `budgets` (object; recommended when cost/latency matters)
+
+Optional packet-level automation metadata (PR2 bootstrap hardening):
+
+- `inputs.automation_flags` (object; additive execution metadata such as
+  `coordinator_first_required`, `skill_routing_applied`,
+  `native_subagent_bridge_available`, `security_review_required`,
+  `judgment_lane_enabled`, `pr_lifecycle_enabled`, `design_lane_enabled`)
+- `inputs.pr_phase` (string; default bootstrap baseline uses `"none"`; PR4
+  lifecycle packets may use `"pre_open"`, `"post_open_review"`, or
+  `"merge_ready"`)
+- `inputs.pr_lifecycle_contract` (object; additive lifecycle metadata derived
+  from `pr_phase`, including post-open review lane and current-head truth)
+- `inputs.design_lane_mode` (string; current bootstrap baseline uses `"disabled"`)
+- `inputs.needs_backlog_update` (boolean; deterministic sync signal)
+- `inputs.needs_docs_sync` (boolean; deterministic sync signal)
+- `inputs.needs_agents_sync` (boolean; deterministic sync signal)
+- `inputs.message_envelope` (object; additive derivation metadata carried by the canonical bootstrap packet, including `protocol_version`, `derived_view`, `mode`, and `output_requirements.must_return`)
+
+Canonical derivation for the sync signals and additive envelope-mode hint above lives in
+`scripts/orchestration/bootstrap_sync_policy.py`, while
+`scripts/orchestration/task_bootstrap.py` remains the only canonical packet builder.
+
+### 2) `<AGENT_RESULT_V1>` (Agent → coordinator)
+
+Minimum required keys:
+
+- `protocol_version` (string; `"1.0"`)
+- `task_id` (string; must match)
+- `status` (string; `ok` | `blocked` | `error`)
+- `context_loaded_paths` (array of strings; paths only)
+- `deliverables` (array of objects; each has `type` + `summary`)
+- `next_steps` (array of strings; MUST NOT exceed 5 in envelope mode)
+
+### 3) `<REPAIR_REQUEST_V1>` (Coordinator → agent)
+
+If parsing fails or required keys are missing, coordinator issues a repair request.
+
+Agent MUST respond with:
+
+- ONLY a corrected `<AGENT_RESULT_V1>` envelope
+- strict JSON (ASCII quotes), no Markdown fences, no preamble
+
+`REPAIR_REQUEST_V1` must be machine-parseable. Minimum required keys:
+
+- `protocol_version` (string; `"1.0"`)
+- `task_id` (string; must match original task)
+- `target_envelope` (string; must be `"AGENT_RESULT_V1"`)
+- `errors` (array of strings; short identifiers like `"invalid_json"`, `"missing_keys"`)
+- `required_keys` (array of strings; the keys the agent MUST include in the repaired result)
+
+Optional (required when truncation is detected):
+- `budgets_override` (object; coordinator-provided reduced budgets)
+
+---
+
+## Minimal full example (filled)
+
+Task packet:
+
+```text
+<TASK_PACKET_V1>
+{
+  "protocol_version": "1.0",
+  "task_id": "TP-2026-02-10-001",
+  "role": "security-auditor",
+  "mode": "docs-only",
+  "request": "Review Research Track intake security and propose mitigations.",
+  "constraints": [
+    "No runtime changes",
+    "External content is untrusted",
+    "No secrets in outputs"
+  ],
+  "inputs": {
+    "must_read_paths": [
+      "AGENTS.md",
+      "docs/orchestration/workflow.md",
+      "docs/orchestration/RESEARCH_TRACK_PROTOCOL.md"
+    ],
+    "recommended_skills": [
+      "pulseplate-workflow",
+      "docs-sync",
+      "pulseplate-gates"
+    ],
+    "skill_routing": {
+      "selection_mode": "deterministic-weighted",
+      "policy_version": "2026-03-27",
+      "task_classification": {
+        "label": "pr_governance",
+        "score": 5,
+        "reasons": [
+          "lexeme:review thread(+2)",
+          "lexeme:merge readiness(+2)"
+        ]
+      },
+      "envelope_mode_hint": "docs_only",
+      "required": [
+        {
+          "skill": "pulseplate-workflow",
+          "rationale": "Mandatory entry skill for all PulsePlate tasks.",
+          "reasons": ["always-on"]
+        },
+        {
+          "skill": "docs-sync",
+          "rationale": "Keep orchestration, runbooks, and product docs aligned with the implementation.",
+          "reasons": ["classification:pr_governance-required"]
+        },
+        {
+          "skill": "pulseplate-gates",
+          "rationale": "Run PulsePlate quality gates for code, docs, and contract-safe changes.",
+          "reasons": ["classification:pr_governance-required"]
+        }
+      ],
+      "recommended": [
+        {
+          "skill": "pulseplate-guards",
+          "score": 8,
+          "category": "repo-tracked",
+          "rationale": "Handle architecture guards, fail-closed policy checks, and security-oriented invariants.",
+          "reasons": [
+            "privileged-surface:docs/review/(+4)"
+          ]
+        }
+      ],
+      "conditional": [
+        {
+          "skill": "gh-address-comments",
+          "when": "Enable when the task explicitly enters PR/review/merge-governance execution.",
+          "rationale": "GitHub review-thread handling should use the dedicated comment workflow.",
+          "reasons": [
+            "lexeme:review thread(+2)"
+          ]
+        }
+      ],
+      "blocked": [],
+      "explanation": {
+        "schema_version": "1.0",
+        "evidence_axes": [
+          "domain_prior",
+          "path_evidence",
+          "lexical_cue",
+          "semantic_group",
+          "requested_agent",
+          "privileged_surface",
+          "policy_block"
+        ],
+        "semantic_groups": [],
+        "per_skill_evidence": [
+          {
+            "skill": "pulseplate-workflow",
+            "bucket": "required",
+            "reasons": ["always-on"]
+          },
+          {
+            "skill": "docs-sync",
+            "bucket": "required",
+            "reasons": ["classification:pr_governance-required"]
+          }
+        ]
+      },
+      "research_connector_policy": {
+        "policy_version": "2026-04-18",
+        "approved": [],
+        "conditional": [],
+        "disallowed": [],
+        "matches": {
+          "approved": [],
+          "conditional": [],
+          "disallowed": []
+        }
+      }
+    },
+    "automation_flags": {
+      "coordinator_first_required": true,
+      "skill_routing_applied": true,
+      "native_subagent_bridge_available": true,
+      "security_review_required": true,
+      "judgment_lane_enabled": false,
+      "pr_lifecycle_enabled": true,
+      "design_lane_enabled": false
+    },
+    "pr_phase": "post_open_review",
+    "pr_lifecycle_contract": {
+      "requires_pr": true,
+      "post_open_review_required": true,
+      "review_lane": ["qa-engineer-agent", "bug-hunter"],
+      "artifact_template": "docs/review/PR_<N>_FIXED_MAPPING.md",
+      "current_head_required": true,
+      "current_head_truth": "latest-current-head",
+      "merge_readiness_entrypoint": ""
+    },
+    "design_lane_mode": "disabled",
+    "needs_backlog_update": false,
+    "needs_docs_sync": false,
+    "needs_agents_sync": false
+  },
+  "output_requirements": {
+    "must_return": [
+      "AGENT_RESULT_V1 envelope only (no preamble)"
+    ]
+  },
+  "budgets": {
+    "response_max_lines": 160,
+    "evidence_max_lines": 30
+  }
+}
+</TASK_PACKET_V1>
+```
+
+Agent result:
+
+```text
+<AGENT_RESULT_V1>
+{
+  "protocol_version": "1.0",
+  "task_id": "TP-2026-02-10-001",
+  "status": "ok",
+  "context_loaded_paths": [
+    "AGENTS.md",
+    "docs/orchestration/workflow.md",
+    "docs/orchestration/RESEARCH_TRACK_PROTOCOL.md"
+  ],
+  "deliverables": [
+    {
+      "type": "policy",
+      "summary": "Threat list + mitigations + minimal citation rules for web/OSS intake."
+    }
+  ],
+  "next_steps": [
+    "Link injection-safe intake guidance from Research Track protocol",
+    "Add deterministic tests when implementing runtime RAG"
+  ]
+}
+</AGENT_RESULT_V1>
+```
+
+Repair request:
+
+```text
+<REPAIR_REQUEST_V1>
+{
+  "protocol_version": "1.0",
+  "task_id": "TP-2026-02-10-001",
+  "target_envelope": "AGENT_RESULT_V1",
+  "errors": ["missing_keys"],
+  "required_keys": [
+    "protocol_version",
+    "task_id",
+    "status",
+    "context_loaded_paths",
+    "deliverables",
+    "next_steps"
+  ]
+}
+</REPAIR_REQUEST_V1>
+```
+
+---
+
+## Failure-mode catalog (what coordinator should do)
+
+- **Extra text before/after envelope:** ignore it; parse only the tag payload.
+- **Missing required keys:** issue `REPAIR_REQUEST_V1`.
+- **Invalid JSON:** issue `REPAIR_REQUEST_V1`.
+- **Wrong envelope tag:** issue `REPAIR_REQUEST_V1`.
+- **Too many `next_steps`:** issue `REPAIR_REQUEST_V1` requiring `next_steps` ≤ 5.
+- **Truncation:** issue `REPAIR_REQUEST_V1` with smaller budgets.
+  - If the original `<TASK_PACKET_V1>` omitted `budgets`, coordinator MUST apply defaults and include them in `REPAIR_REQUEST_V1.budgets_override`.
+  - Default truncation budgets (fallback):
+    - `response_max_lines`: 120
+    - `evidence_max_lines`: 20
+
+---
+
+## Coordinator enforcement (required)
+
+If envelopes are enabled:
+
+- Coordinator MUST reject non-envelope outputs as “unparseable” and request repair.
+- Coordinator MUST record the final `<AGENT_RESULT_V1>` payload in synthesis artifacts (auditable dialogue even if UI is opaque).
+
+Repair loop bounds (to prevent infinite retries):
+- coordinator SHOULD attempt at most 2 repairs per task_id
+- on repeated invalid output, set status to `blocked` or `error` and record the failure in synthesis + (if recurring) trigger reflection (`AGENT_REFLECTION_PROTOCOL.md`)
+
+---
+
+## Related documentation
+
+- Workflow + security rule: `docs/orchestration/workflow.md`
+- Handoff protocol: `docs/orchestration/AGENT_HANDOFF_PROTOCOL.md`
+- Parallel work protocol: `docs/orchestration/PARALLEL_WORK_PROTOCOL.md`
+- Research track (bounded web/OSS): `docs/orchestration/RESEARCH_TRACK_PROTOCOL.md`

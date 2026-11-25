@@ -1,0 +1,158 @@
+# Using Compose Specification (no version required)
+
+services:
+  # Main application service
+  pulseplate:
+    platform: linux/amd64
+    build:
+      context: .
+      target: production
+      args:
+        BUILDPLATFORM: linux/amd64
+        TARGETPLATFORM: linux/amd64
+        PULSEPLATE_PYTHON_INDEX_URL: ${PULSEPLATE_PYTHON_INDEX_URL:?PULSEPLATE_PYTHON_INDEX_URL is required for Docker builds}
+        PULSEPLATE_PYTHON_TRUSTED_HOST: ${PULSEPLATE_PYTHON_TRUSTED_HOST:-}
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONPATH=/app
+      - API_KEY=${API_KEY}
+      - ENVIRONMENT=production
+      - SUBSCRIPTION_DB_ENABLED=${SUBSCRIPTION_DB_ENABLED:-true}
+      - DATABASE_URL=${DATABASE_URL:?DATABASE_URL is required}
+      - SERVER_SALT=${SERVER_SALT:?SERVER_SALT is required}
+      - APPLE_SHARED_SECRET=${APPLE_SHARED_SECRET:?APPLE_SHARED_SECRET is required}
+      - EXPORT_TOKEN_SECRET=${EXPORT_TOKEN_SECRET:?EXPORT_TOKEN_SECRET is required}
+      - PRIVATE_EXPORTS_ENABLED=${PRIVATE_EXPORTS_ENABLED:-true}
+      - EXPORT_TOKEN_TTL_SECONDS=${EXPORT_TOKEN_TTL_SECONDS:-900}
+      - VIP_LLM_INSIGHT_REQUESTS_PER_MONTH=${VIP_LLM_INSIGHT_REQUESTS_PER_MONTH:-30}
+      - PRO_LLM_INSIGHT_REQUESTS_PER_MONTH=${PRO_LLM_INSIGHT_REQUESTS_PER_MONTH:-20}
+      - OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=${OTEL_EXPORTER_OTLP_TRACES_ENDPOINT:-}
+      - OTEL_SDK_DISABLED=${OTEL_SDK_DISABLED:-true}
+      - OTEL_SERVICE_NAME=${OTEL_SERVICE_NAME:-pulseplate-api}
+      - PULSE_OBS_HMAC_KEY=${PULSE_OBS_HMAC_KEY:-}
+      - ALLOW_PROMPT_EVENTS=${ALLOW_PROMPT_EVENTS:-false}
+      - CBT_AGENT_EXECUTION_MODE=${CBT_AGENT_EXECUTION_MODE:-auto-safe}
+      - AGENT_CONTROL_AUDIT_LOG_PATH=${AGENT_CONTROL_AUDIT_LOG_PATH:-/app/logs/agent_control_audit.jsonl}
+      - LLM_PROVIDER=${LLM_PROVIDER:-perplexity}
+      - PERPLEXITY_API_KEY=${PERPLEXITY_API_KEY:-__replace_me__}
+      - PERPLEXITY_ENDPOINT=${PERPLEXITY_ENDPOINT:-https://api.perplexity.ai}
+      - PERPLEXITY_MODEL=${PERPLEXITY_MODEL:-sonar}
+      - FITCHEF_AGENT_API_ENABLED=${FITCHEF_AGENT_API_ENABLED:-false}
+      - FITCHEF_AGENT_API_MODEL=${FITCHEF_AGENT_API_MODEL:-}
+      - FITCHEF_AGENT_API_REASONING_EFFORT=${FITCHEF_AGENT_API_REASONING_EFFORT:-}
+    volumes:
+      - ./data:/app/data:ro
+      - artifacts-volume:/app/artifacts:rw
+      - cache-volume:/app/cache:rw
+      - logs-volume:/app/logs:rw
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/db', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - pulseplate-network
+
+  # Development service
+  pulseplate-dev:
+    platform: linux/amd64
+    build:
+      context: .
+      target: development
+      args:
+        BUILDPLATFORM: linux/amd64
+        TARGETPLATFORM: linux/amd64
+        PULSEPLATE_PYTHON_INDEX_URL: ${PULSEPLATE_PYTHON_INDEX_URL:?PULSEPLATE_PYTHON_INDEX_URL is required for Docker builds}
+        PULSEPLATE_PYTHON_TRUSTED_HOST: ${PULSEPLATE_PYTHON_TRUSTED_HOST:-}
+    ports:
+      - "8001:8000"
+    environment:
+      - PYTHONPATH=/app
+      - API_KEY=${API_KEY}
+      - ENVIRONMENT=development
+      - SUBSCRIPTION_DB_ENABLED=${SUBSCRIPTION_DB_ENABLED:-false}
+      - SERVER_SALT=${SERVER_SALT:?SERVER_SALT is required}
+      - APPLE_SHARED_SECRET=${APPLE_SHARED_SECRET:-replace_me_with_apple_shared_secret}
+      - EXPORT_TOKEN_SECRET=${EXPORT_TOKEN_SECRET:-__set_me__}
+      - PRIVATE_EXPORTS_ENABLED=${PRIVATE_EXPORTS_ENABLED:-true}
+      - EXPORT_TOKEN_TTL_SECONDS=${EXPORT_TOKEN_TTL_SECONDS:-900}
+      - VIP_LLM_INSIGHT_REQUESTS_PER_MONTH=${VIP_LLM_INSIGHT_REQUESTS_PER_MONTH:-30}
+      - PRO_LLM_INSIGHT_REQUESTS_PER_MONTH=${PRO_LLM_INSIGHT_REQUESTS_PER_MONTH:-20}
+      - OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=${OTEL_EXPORTER_OTLP_TRACES_ENDPOINT:-}
+      - OTEL_SDK_DISABLED=${OTEL_SDK_DISABLED:-true}
+      - OTEL_SERVICE_NAME=${OTEL_SERVICE_NAME:-pulseplate-api}
+      - PULSE_OBS_HMAC_KEY=${PULSE_OBS_HMAC_KEY:-}
+      - ALLOW_PROMPT_EVENTS=${ALLOW_PROMPT_EVENTS:-false}
+      - CBT_AGENT_EXECUTION_MODE=${CBT_AGENT_EXECUTION_MODE:-auto-safe}
+      - AGENT_CONTROL_AUDIT_LOG_PATH=${AGENT_CONTROL_AUDIT_LOG_PATH:-/app/logs/agent_control_audit.jsonl}
+      - LLM_PROVIDER=${LLM_PROVIDER:-perplexity}
+      - PERPLEXITY_API_KEY=${PERPLEXITY_API_KEY:-__replace_me__}
+      - PERPLEXITY_ENDPOINT=${PERPLEXITY_ENDPOINT:-https://api.perplexity.ai}
+      - PERPLEXITY_MODEL=${PERPLEXITY_MODEL:-sonar}
+      - FITCHEF_AGENT_API_ENABLED=${FITCHEF_AGENT_API_ENABLED:-false}
+      - FITCHEF_AGENT_API_MODEL=${FITCHEF_AGENT_API_MODEL:-}
+      - FITCHEF_AGENT_API_REASONING_EFFORT=${FITCHEF_AGENT_API_REASONING_EFFORT:-}
+    volumes:
+      - .:/app:rw
+      - pulseplate-dev-venv:/app/.venv
+      - /app/__pycache__
+      - /app/.pytest_cache
+    restart: unless-stopped
+    profiles:
+      - dev
+    networks:
+      - pulseplate-network
+
+  # Redis for caching (optional)
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    profiles:
+      - cache
+    networks:
+      - pulseplate-network
+
+  # PostgreSQL for production data (canonical prod DB)
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:?POSTGRES_DB is required}
+      - POSTGRES_USER=${POSTGRES_USER:?POSTGRES_USER is required}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - pulseplate-network
+
+volumes:
+  pulseplate-dev-venv:
+  redis-data:
+    driver: local
+  postgres-data:
+    driver: local
+  cache-volume:
+    driver: local
+  logs-volume:
+    driver: local
+  artifacts-volume:
+    driver: local
+
+networks:
+  pulseplate-network:
+    driver: bridge

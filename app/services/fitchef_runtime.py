@@ -1,0 +1,1445 @@
+"""FitChef runtime orchestration. / Оркестрация runtime FitChef."""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import inspect
+import logging
+import math
+import os
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Any, Callable, Generic, Literal, Protocol, TypeVar, cast
+
+from fastapi import HTTPException, status
+from fastapi.concurrency import run_in_threadpool
+from fastapi.encoders import jsonable_encoder
+
+from app.middleware.api_tiers import (
+    SubscriptionTier,
+    derive_subject_id_from_api_key,
+    get_subscription_tier,
+)
+from app.schemas.fitchef import (
+    FitChefClarificationV1,
+    FitChefCoachInsightResult,
+    FitChefCoachInsightTaskEnvelope,
+    FitChefDistortionSimulatorResult,
+    FitChefDistortionSimulatorTaskEnvelope,
+    FitChefExecutionMode,
+    FitChefIdentityLoopMapperResult,
+    FitChefIdentityLoopMapperTaskEnvelope,
+    FitChefIdentityLoopValue,
+    FitChefMascotInsightResult,
+    FitChefMascotInsightTaskEnvelope,
+    FitChefQuotaState,
+    FitChefSlipSupportResult,
+    FitChefSlipSupportTaskEnvelope,
+    FitChefShoppingFollowupResult,
+    FitChefShoppingFollowupTaskEnvelope,
+    FitChefSourceItem,
+    FitChefWeeklyReflectionResult,
+    FitChefWeeklyReflectionTaskEnvelope,
+    FitChefWeeklyPlanResult,
+    FitChefWeeklyPlanTaskEnvelope,
+)
+from app.schemas.shopping_list import ShoppingListDTO
+from app.security.agent_control_plane import (
+    AUDIT_SIGNING_KEY_ENV,
+    persist_audit_envelope,
+    require_policy_allow,
+    sign_audit_envelope,
+)
+from app.security.llm_monthly_quota import attempt_consume_llm_monthly_quota
+from app.security.server_salt import require_server_salt
+from app.services.fitchef_claim_evidence_assurance import (
+    FitChefSourceOccurrenceV1,
+    FitChefSourceSnapshotV1,
+    build_distortion_field_assurance_assessment,
+    build_distortion_field_assurance_unavailable,
+    build_fitchef_source_items,
+    build_fitchef_source_prompt_context,
+    freeze_fitchef_source_snapshot,
+)
+from app.telemetry.genai import finalize_llm_span, llm_span, retrieval_span, set_attributes
+from core.compliance import get_transparency_registry, sanitize_chunk_preview
+from core.data_sanitizer import sanitize_rag_markdown
+from core.insight.fitchef_companion import (
+    FitChefCoachingDraft,
+    FitChefIdentityLoopDraft,
+    build_identity_loop_mapper_prompt,
+    build_mascot_prompt,
+    build_distortion_simulator_prompt,
+    build_slip_support_prompt,
+    build_weekly_reflection_prompt,
+    has_high_distress_boundary,
+    prepare_distortion_simulator_draft,
+    prepare_identity_loop_mapper_draft,
+    prepare_mascot_draft,
+    prepare_slip_support_draft,
+    prepare_weekly_reflection_draft,
+)
+from core.pii_redaction import redact_pii_from_text
+from settings import is_raw_explicit_developer_env
+
+logger = logging.getLogger(__name__)
+
+LLM_TIMEOUT_SECONDS: float = 60.0
+FITCHEF_AGENT_API_ENABLED_ENV = "FITCHEF_AGENT_API_ENABLED"
+FITCHEF_AGENT_API_MODEL_ENV = "FITCHEF_AGENT_API_MODEL"
+FITCHEF_AGENT_API_REASONING_EFFORT_ENV = "FITCHEF_AGENT_API_REASONING_EFFORT"
+_FITCHEF_AGENT_API_TRUE = frozenset({"1", "true", "yes", "on"})
+_FITCHEF_AGENT_API_FALSE = frozenset({"", "0", "false", "no", "off"})
+CBT_POLICY_ALLOWLIST = {
+    ("rag.retrieve", "corpus://cbt-agent"),
+    ("rag.retrieve", "corpus://fitchef-agent"),
+    ("llm.generate", "provider://default"),
+}
+WeeklyPlanBuilder = Callable[..., Any]
+ShoppingFollowupBuilder = Callable[..., ShoppingListDTO]
+
+CORE_WEEKLY_PROFILE_FIELDS: tuple[str, ...] = (
+    "sex",
+    "age",
+    "height_cm",
+    "weight_kg",
+    "activity",
+    "goal",
+)
+
+
+class WeeklyProfileInputError(ValueError):
+    """Deterministic, value-free weekly profile admission error."""
+
+    def __init__(
+        self,
+        *,
+        missing_fields: tuple[str, ...] = (),
+        invalid_fields: tuple[str, ...] = (),
+    ) -> None:
+        self.missing_fields = missing_fields
+        self.invalid_fields = invalid_fields
+        super().__init__(f"missing_fields={missing_fields!r}; invalid_fields={invalid_fields!r}")
+
+    def __repr__(self) -> str:
+        return (
+            "WeeklyProfileInputError("
+            f"missing_fields={self.missing_fields!r}, "
+            f"invalid_fields={self.invalid_fields!r})"
+        )
+
+
+def _is_valid_weekly_profile_field(field: str, value: object) -> bool:
+    """Apply the explicit native-value contract for one core profile field."""
+
+    if field == "sex":
+        return type(value) is str and value in {"female", "male"}
+    if field == "age":
+        return type(value) is int and 1 <= value <= 120
+    if field == "height_cm":
+        if type(value) is int:
+            return 0 < value <= 300
+        return type(value) is float and math.isfinite(value) and 0 < value <= 300
+    if field == "weight_kg":
+        if type(value) is int:
+            return 0 < value <= 500
+        return type(value) is float and math.isfinite(value) and 0 < value <= 500
+    if field == "activity":
+        return type(value) is str and value in {
+            "sedentary",
+            "light",
+            "moderate",
+            "active",
+            "very_active",
+        }
+    if field == "goal":
+        return type(value) is str and value in {"loss", "maintain", "gain"}
+    return False
+
+
+def _require_weekly_profile_input(request_data: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a stable checked snapshot of the authoritative top-level profile input."""
+
+    snapshot = dict(request_data)
+    missing_fields = tuple(field for field in CORE_WEEKLY_PROFILE_FIELDS if field not in snapshot)
+    invalid_fields = tuple(
+        field
+        for field in CORE_WEEKLY_PROFILE_FIELDS
+        if field in snapshot and not _is_valid_weekly_profile_field(field, snapshot[field])
+    )
+    if missing_fields or invalid_fields:
+        raise WeeklyProfileInputError(
+            missing_fields=missing_fields,
+            invalid_fields=invalid_fields,
+        )
+    return snapshot
+
+
+class _StructuredDraft(Protocol):
+    """Common structured-coach draft contract."""
+
+    @property
+    def warnings(self) -> list[str]:
+        """Structured safety warnings emitted by draft normalization."""
+        ...  # pragma: no cover - Protocol marker only.
+
+
+StructuredDraftT = TypeVar("StructuredDraftT", bound=_StructuredDraft)
+
+
+def _resolve_paid_runtime_tier(api_key: str) -> Literal["PRO", "VIP"]:
+    """Resolve the effective paid tier for PRO-accessible runtime surfaces.
+
+    RU: Возвращает фактический платный tier для runtime surface с PRO-доступом.
+    EN: Returns the effective paid tier for runtime surfaces that allow PRO access.
+    """
+
+    return "VIP" if get_subscription_tier(api_key) is SubscriptionTier.VIP else "PRO"
+
+
+def _require_llm_provider() -> Any:
+    """Return a usable LLM provider or fail closed with a stable 503.
+
+    RU: Возвращает валидный LLM provider или fail-closed с устойчивым 503.
+    EN: Returns a usable LLM provider or fails closed with a stable 503.
+    """
+
+    try:
+        from llm import get_provider
+    except ImportError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="LLM provider not available",
+        ) from None
+
+    provider = get_provider()
+    if provider is None or not callable(getattr(provider, "generate", None)):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="LLM provider not available",
+        )
+    return provider
+
+
+def _require_fitchef_llm_provider(prompt: str) -> Any:
+    """Select the optional, development-only Agent API for FitChef tasks."""
+
+    enabled = (os.getenv(FITCHEF_AGENT_API_ENABLED_ENV) or "").strip().lower()
+    if enabled in _FITCHEF_AGENT_API_FALSE:
+        return _require_llm_provider()
+    if enabled not in _FITCHEF_AGENT_API_TRUE:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="fitchef_agent_api_configuration_invalid",
+        )
+    if not is_raw_explicit_developer_env():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="fitchef_agent_api_development_only",
+        )
+
+    from providers.perplexity_agent import PerplexityAgentProvider
+
+    try:
+        provider = PerplexityAgentProvider(
+            api_key=os.getenv("PERPLEXITY_API_KEY", ""),
+            model=os.getenv(FITCHEF_AGENT_API_MODEL_ENV, ""),
+            reasoning_effort=os.getenv(FITCHEF_AGENT_API_REASONING_EFFORT_ENV, ""),
+        )
+        provider.require_prompt_in_budget(prompt)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="fitchef_agent_api_configuration_invalid",
+        ) from None
+    return provider
+
+
+async def _await_provider_generate(provider: Any, prompt: str) -> object:
+    """Call provider.generate across sync/async implementations.
+
+    RU: Поддерживает async provider, sync provider и sync provider, который
+    возвращает coroutine object.
+    EN: Supports async providers, sync providers, and sync providers that
+    return a coroutine object.
+    """
+
+    generate = provider.generate
+    raw_payload: object
+    if inspect.iscoroutinefunction(generate):
+        raw_payload = generate(prompt)
+    else:
+        raw_payload = await run_in_threadpool(generate, prompt)
+
+    if asyncio.iscoroutine(raw_payload):
+        raw_payload = await raw_payload
+    return raw_payload
+
+
+async def _generate_with_timeout(provider: Any, prompt: str) -> object:
+    """Apply the canonical outer timeout to provider.generate()."""
+
+    return await asyncio.wait_for(
+        _await_provider_generate(provider, prompt),
+        timeout=LLM_TIMEOUT_SECONDS,
+    )
+
+
+def _build_fitchef_reflection_query(summary: str, goal: str) -> str:
+    """Build retrieval text for FitChef reflection flows."""
+
+    return f"Weekly reflection summary: {summary}\nGoal: {goal}"
+
+
+def _build_fitchef_slip_support_query(event_text: str, goal: str | None) -> str:
+    """Build retrieval text for FitChef slip-support flows."""
+
+    if goal:
+        return f"Slip support event: {event_text}\nGoal: {goal}"
+    return f"Slip support event: {event_text}"
+
+
+def _build_distortion_simulator_query(
+    situation: str,
+    automatic_thought: str,
+    emotion: str,
+    goal: str | None,
+) -> str:
+    """Build retrieval text for distortion-simulator flows."""
+
+    parts = [
+        f"Situation: {situation}",
+        f"Automatic thought: {automatic_thought}",
+        f"Emotion: {emotion}",
+    ]
+    if goal:
+        parts.append(f"Goal: {goal}")
+    return "\n".join(parts)
+
+
+def _build_identity_loop_mapper_query(
+    goal: str,
+    recent_pattern: str,
+    self_talk: str,
+    trigger_context: str | None,
+) -> str:
+    """Build retrieval text for identity-loop mapper flows."""
+
+    parts = [
+        f"Goal: {goal}",
+        f"Recent pattern: {recent_pattern}",
+        f"Self-talk: {self_talk}",
+    ]
+    if trigger_context:
+        parts.append(f"Trigger context: {trigger_context}")
+    return "\n".join(parts)
+
+
+def _build_cbt_prompt(query: str, rag_context: str) -> str:
+    """Build CBT prompt. / Собрать CBT prompt."""
+
+    system_prompt = """You are a supportive wellness coach using evidence-based CBT (Cognitive Behavioral Therapy) principles. Your role is to:
+
+1. Help users identify and challenge unhelpful thought patterns
+2. Suggest practical CBT techniques (thought records, cognitive restructuring)
+3. Encourage self-compassion and gradual progress
+4. Focus on nutrition and wellness goals
+
+IMPORTANT BOUNDARIES:
+- You are NOT a therapist and cannot provide therapy or diagnose conditions
+- Avoid medical advice; suggest consulting professionals for health concerns
+- If someone expresses crisis/self-harm thoughts, encourage them to seek professional help
+- Use non-judgmental, supportive language
+
+Respond with practical, actionable suggestions based on CBT principles."""
+
+    if rag_context:
+        return f"""{system_prompt}
+
+RELEVANT CBT KNOWLEDGE:
+{rag_context}
+
+USER QUESTION:
+{query}
+
+Provide a helpful, CBT-informed response:"""
+    return f"""{system_prompt}
+
+USER QUESTION:
+{query}
+
+Provide a helpful, CBT-informed response:"""
+
+
+def _sha256_hex(value: str) -> str:
+    """Return audit-safe sha256 digest. / Вернуть audit-safe sha256 digest."""
+
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _build_weekly_user_profile(profile_data: dict[str, Any]) -> Any:
+    """Create UserProfile from an already-checked weekly profile snapshot."""
+
+    from core.targets import UserProfile
+
+    diet_flags = profile_data.get("diet_flags", [])
+    if isinstance(diet_flags, list):
+        diet_flags = set(diet_flags)
+
+    medical_conditions = profile_data.get("medical_conditions", [])
+    if isinstance(medical_conditions, list):
+        medical_conditions = set(medical_conditions)
+
+    profile = UserProfile(
+        sex=cast(Literal["male", "female"], profile_data["sex"]),
+        age=cast(int, profile_data["age"]),
+        height_cm=cast(float, profile_data["height_cm"]),
+        weight_kg=cast(float, profile_data["weight_kg"]),
+        activity=cast(
+            Literal["sedentary", "light", "moderate", "active", "very_active"],
+            profile_data["activity"],
+        ),
+        goal=cast(Literal["loss", "maintain", "gain"], profile_data["goal"]),
+        deficit_pct=profile_data.get("deficit_pct"),
+        surplus_pct=profile_data.get("surplus_pct"),
+        bodyfat=profile_data.get("bodyfat"),
+        region=profile_data.get("region") or "BY",
+        timezone=profile_data.get("timezone") or "UTC",
+        diet_flags=diet_flags,
+        life_stage=cast(
+            Literal["child", "teen", "adult", "pregnant", "lactating", "elderly"],
+            profile_data.get("life_stage") or "adult",
+        ),
+        medical_conditions=medical_conditions,
+    )
+    return profile
+
+
+def build_weekly_user_profile(profile_data: Mapping[str, Any]) -> Any:
+    """Public profile helper for weekly runtime. / Публичный helper профиля для weekly runtime."""
+
+    checked_profile_data = _require_weekly_profile_input(profile_data)
+    profile = _build_weekly_user_profile(checked_profile_data)
+    return profile
+
+
+def _run_weekly_menu_builder(
+    profile_data: dict[str, Any],
+    menu_builder: WeeklyPlanBuilder,
+) -> dict[str, Any]:
+    """Run weekly menu builder and serialize result. / Выполнить weekly builder и сериализовать результат."""
+
+    profile = build_weekly_user_profile(profile_data)
+    menu = menu_builder(profile)
+    if menu is None:
+        return {"mode": "echo"}
+    encoded_menu = jsonable_encoder(menu)
+    if isinstance(encoded_menu, dict):
+        return encoded_menu
+    return {"mode": "echo"}
+
+
+def _persist_privileged_action_audit(
+    *,
+    action: str,
+    target: str,
+    mode: str,
+    endpoint: str,
+    metadata: dict[str, object],
+) -> None:
+    """Persist privileged audit envelope. / Сохранить audit envelope привилегированного действия."""
+
+    decision = require_policy_allow(action, target, allowlist=CBT_POLICY_ALLOWLIST)
+    audit_metadata = {
+        "endpoint": endpoint,
+        "mode": mode,
+        **metadata,
+    }
+    signing_secret = (os.getenv(AUDIT_SIGNING_KEY_ENV) or "").strip() or require_server_salt()
+    envelope = sign_audit_envelope(
+        decision,
+        metadata=audit_metadata,
+        secret=signing_secret,
+    )
+    persist_audit_envelope(envelope, metadata=audit_metadata)
+
+
+@dataclass(frozen=True)
+class _FitChefVipTextTaskConfig:
+    """Shared config for VIP FitChef text flows."""
+
+    retrieval_text: str
+    api_key: str
+    endpoint: str
+    method: str
+    mode: FitChefExecutionMode
+    prompt_builder: Callable[[str], str]
+    draft_builder: Callable[[str], FitChefCoachingDraft]
+    unavailable_detail: str
+    log_label: str
+
+
+@dataclass(frozen=True)
+class _FitChefVipTextTaskOutput:
+    """Shared result for VIP FitChef text flows."""
+
+    prepared: FitChefCoachingDraft
+    sources: list[FitChefSourceItem]
+    confidence: float
+    warnings: list[str]
+    quota_state: FitChefQuotaState
+    transparency_notice_id: str
+    wellness_boundary: str
+
+
+@dataclass(frozen=True)
+class _FitChefStructuredTaskConfig(Generic[StructuredDraftT]):
+    """Shared config for structured FitChef coaching flows."""
+
+    retrieval_text: str
+    api_key: str
+    endpoint: str
+    method: str
+    mode: FitChefExecutionMode
+    tier: Literal["PRO", "VIP"]
+    rag_target: Literal["corpus://cbt-agent", "corpus://fitchef-agent"]
+    agent_id: Literal["cbt-agent", "fitchef-agent"]
+    prompt_builder: Callable[[str], str]
+    draft_builder: Callable[[str], StructuredDraftT]
+    unavailable_detail: str
+    log_label: str
+
+
+@dataclass(frozen=True)
+class _FitChefStructuredTaskOutput(Generic[StructuredDraftT]):
+    """Shared output for structured FitChef coaching flows."""
+
+    draft: StructuredDraftT
+    source_snapshot: FitChefSourceSnapshotV1
+    sources: list[FitChefSourceItem]
+    confidence: float
+    warnings: list[str]
+    quota_state: FitChefQuotaState
+    transparency_notice_id: str
+    wellness_boundary: str
+
+
+async def _run_fitchef_vip_text_task(
+    config: _FitChefVipTextTaskConfig,
+) -> _FitChefVipTextTaskOutput:
+    """Run the shared VIP FitChef text orchestration flow."""
+
+    rag_context_str = ""
+    sources: list[FitChefSourceItem] = []
+    confidence = 0.0
+    warnings: list[str] = []
+    quota_state: FitChefQuotaState = "not_consumed"
+    redaction_applied = False
+    sanitization_applied = False
+
+    try:
+        await run_in_threadpool(
+            _persist_privileged_action_audit,
+            action="rag.retrieve",
+            target="corpus://fitchef-agent",
+            mode=config.mode,
+            endpoint=config.endpoint,
+            metadata={
+                "method": config.method,
+                "query_hash": _sha256_hex(config.retrieval_text),
+                "query_length": len(config.retrieval_text),
+            },
+        )
+    except (PermissionError, RuntimeError) as exc:
+        logger.error("%s RAG gate failed", config.log_label, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="rag_retrieval_unavailable",
+        ) from exc
+
+    try:
+        from core.rag.vector_rag import retrieve_context_structured
+
+        rag_ctx = await run_in_threadpool(
+            retrieve_context_structured,
+            config.retrieval_text,
+            max_chunks=5,
+            agent_id="fitchef-agent",
+            user_tier="VIP",
+            subject_id=derive_subject_id_from_api_key(config.api_key),
+        )
+
+        if rag_ctx.chunks:
+            context_parts: list[str] = []
+            for chunk in rag_ctx.chunks:
+                sanitized_chunk = sanitize_rag_markdown(chunk.content)
+                if sanitized_chunk != chunk.content:
+                    sanitization_applied = True
+                sanitized_content = redact_pii_from_text(sanitized_chunk) or ""
+                if sanitized_content != sanitized_chunk:
+                    redaction_applied = True
+                if not sanitized_content.strip():
+                    continue
+                context_parts.append(f"[{chunk.file}]\n{sanitized_content}")
+                sources.append(
+                    FitChefSourceItem(
+                        chunk_id=chunk.chunk_id,
+                        file=chunk.file,
+                        preview=sanitize_chunk_preview(sanitized_content) or "",
+                        score=chunk.score,
+                    )
+                )
+            if context_parts:
+                rag_context_str = "\n\n".join(context_parts)
+                confidence = rag_ctx.confidence
+    except Exception:
+        logger.warning("%s RAG retrieval failed", config.log_label, exc_info=True)
+        warnings.append("rag_retrieval_failed")
+
+    if sanitization_applied:
+        warnings.append("source_content_sanitized")
+    if redaction_applied:
+        warnings.append("source_content_redacted")
+
+    transparency_notice = get_transparency_registry().get("ai_generated_insight")
+    if transparency_notice is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="transparency_registry_unavailable",
+        )
+    notice_surface_id = transparency_notice.get("surface_id")
+    notice_boundary = transparency_notice.get("boundary")
+    if notice_surface_id is None or notice_boundary is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="transparency_registry_incomplete",
+        )
+
+    prompt = config.prompt_builder(rag_context_str)
+
+    try:
+        await run_in_threadpool(
+            _persist_privileged_action_audit,
+            action="llm.generate",
+            target="provider://default",
+            mode=config.mode,
+            endpoint=config.endpoint,
+            metadata={
+                "method": config.method,
+                "prompt_hash": _sha256_hex(prompt),
+                "prompt_length": len(prompt),
+                "source_count": len(sources),
+            },
+        )
+    except (PermissionError, RuntimeError) as exc:
+        logger.error("%s LLM gate failed", config.log_label, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="llm_generation_unavailable",
+        ) from exc
+
+    try:
+        provider = _require_fitchef_llm_provider(prompt)
+
+        allowed = await run_in_threadpool(
+            attempt_consume_llm_monthly_quota,
+            config.api_key,
+            tier="VIP",
+        )
+        if not allowed:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="quota_exceeded",
+            )
+        raw_message = await _generate_with_timeout(provider, prompt)
+        if not isinstance(raw_message, str) or not raw_message.strip():
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="LLM provider returned empty response",
+            )
+        prepared = config.draft_builder(raw_message)
+        quota_state = "consumed"
+    except ImportError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="LLM provider not available",
+        ) from None
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="LLM provider call timed out",
+        ) from None
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("%s generation failed", config.log_label, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=config.unavailable_detail,
+        ) from exc
+
+    result = _FitChefVipTextTaskOutput(
+        prepared=prepared,
+        sources=sources,
+        confidence=min(max(confidence, 0.0), 1.0),
+        warnings=[*warnings, *prepared.warnings],
+        quota_state=quota_state,
+        transparency_notice_id=str(notice_surface_id),
+        wellness_boundary=str(notice_boundary),
+    )
+    return result
+
+
+async def _run_fitchef_structured_task(
+    config: _FitChefStructuredTaskConfig[StructuredDraftT],
+) -> _FitChefStructuredTaskOutput[StructuredDraftT]:
+    """Run the shared structured FitChef coaching orchestration flow."""
+
+    rag_context_str = ""
+    sources: list[FitChefSourceItem] = []
+    confidence = 0.0
+    warnings: list[str] = []
+    quota_state: FitChefQuotaState = "not_consumed"
+    redaction_applied = False
+    sanitization_applied = False
+
+    try:
+        await run_in_threadpool(
+            _persist_privileged_action_audit,
+            action="rag.retrieve",
+            target=config.rag_target,
+            mode=config.mode,
+            endpoint=config.endpoint,
+            metadata={
+                "method": config.method,
+                "query_hash": _sha256_hex(config.retrieval_text),
+                "query_length": len(config.retrieval_text),
+            },
+        )
+    except (PermissionError, RuntimeError) as exc:
+        logger.error("%s RAG gate failed", config.log_label, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="rag_retrieval_unavailable",
+        ) from exc
+
+    try:
+        from core.rag.vector_rag import retrieve_context_structured
+
+        rag_ctx = await run_in_threadpool(
+            retrieve_context_structured,
+            config.retrieval_text,
+            max_chunks=5,
+            agent_id=config.agent_id,
+            user_tier=config.tier,
+            subject_id=derive_subject_id_from_api_key(config.api_key),
+        )
+
+        candidate_occurrences: list[FitChefSourceOccurrenceV1] = []
+        candidate_redaction_applied = False
+        candidate_sanitization_applied = False
+        if rag_ctx.chunks:
+            for chunk in rag_ctx.chunks:
+                if len(candidate_occurrences) >= 5:
+                    break
+                sanitized_chunk = sanitize_rag_markdown(chunk.content)
+                if sanitized_chunk != chunk.content:
+                    candidate_sanitization_applied = True
+                sanitized_content = redact_pii_from_text(sanitized_chunk) or ""
+                if sanitized_content != sanitized_chunk:
+                    candidate_redaction_applied = True
+                if not sanitized_content.strip():
+                    continue
+                candidate_occurrences.append(
+                    FitChefSourceOccurrenceV1(
+                        ordinal=len(candidate_occurrences),
+                        chunk_id=chunk.chunk_id,
+                        file=chunk.file,
+                        content=sanitized_content,
+                        preview=sanitize_chunk_preview(sanitized_content) or "",
+                        score=chunk.score,
+                    )
+                )
+        candidate_snapshot = freeze_fitchef_source_snapshot(tuple(candidate_occurrences))
+        candidate_context = build_fitchef_source_prompt_context(candidate_snapshot)
+        candidate_sources = build_fitchef_source_items(candidate_snapshot)
+
+        source_snapshot = candidate_snapshot
+        rag_context_str = candidate_context
+        sources = candidate_sources
+        confidence = rag_ctx.confidence if candidate_occurrences else 0.0
+        sanitization_applied = candidate_sanitization_applied
+        redaction_applied = candidate_redaction_applied
+    except Exception:
+        logger.warning("%s RAG retrieval failed", config.log_label)
+        warnings.append("rag_retrieval_failed")
+        source_snapshot = freeze_fitchef_source_snapshot(())
+
+    if sanitization_applied:
+        warnings.append("source_content_sanitized")
+    if redaction_applied:
+        warnings.append("source_content_redacted")
+
+    transparency_notice = get_transparency_registry().get("fitchef_structured_v1")
+    if transparency_notice is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="transparency_registry_unavailable",
+        )
+    notice_surface_id = transparency_notice.get("surface_id")
+    notice_boundary = transparency_notice.get("boundary")
+    if notice_surface_id is None or notice_boundary is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="transparency_registry_incomplete",
+        )
+
+    prompt = config.prompt_builder(rag_context_str)
+
+    try:
+        await run_in_threadpool(
+            _persist_privileged_action_audit,
+            action="llm.generate",
+            target="provider://default",
+            mode=config.mode,
+            endpoint=config.endpoint,
+            metadata={
+                "method": config.method,
+                "prompt_hash": _sha256_hex(prompt),
+                "prompt_length": len(prompt),
+                "source_count": len(sources),
+                "structured_surface": True,
+            },
+        )
+    except (PermissionError, RuntimeError) as exc:
+        logger.error("%s LLM gate failed", config.log_label, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="llm_generation_unavailable",
+        ) from exc
+
+    try:
+        provider = _require_fitchef_llm_provider(prompt)
+        allowed = await run_in_threadpool(
+            attempt_consume_llm_monthly_quota,
+            config.api_key,
+            tier=config.tier,
+        )
+        if not allowed:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="quota_exceeded",
+            )
+        raw_message = await _generate_with_timeout(provider, prompt)
+        if not isinstance(raw_message, str) or not raw_message.strip():
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="LLM provider returned empty response",
+            )
+        draft = config.draft_builder(raw_message)
+        quota_state = "consumed"
+    except ImportError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="LLM provider not available",
+        ) from None
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="LLM provider call timed out",
+        ) from None
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("%s generation failed", config.log_label, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=config.unavailable_detail,
+        ) from exc
+
+    return _FitChefStructuredTaskOutput(
+        draft=draft,
+        source_snapshot=source_snapshot,
+        sources=sources,
+        confidence=min(max(confidence, 0.0), 1.0),
+        warnings=[*warnings, *draft.warnings],
+        quota_state=quota_state,
+        transparency_notice_id=str(notice_surface_id),
+        wellness_boundary=str(notice_boundary),
+    )
+
+
+async def run_coach_insight_task(
+    task: FitChefCoachInsightTaskEnvelope,
+) -> FitChefCoachInsightResult:
+    """Run coach-insight orchestration. / Выполнить оркестрацию coach-insight."""
+
+    safe_query = task.input.safe_query
+    api_key = task.input.api_key
+    endpoint = task.input.endpoint
+    method = task.input.method
+
+    rag_context_str = ""
+    sources: list[FitChefSourceItem] = []
+    confidence = 0.0
+    rag_used = False
+    quota_state: FitChefQuotaState = "not_consumed"
+    warnings: list[str] = []
+    redaction_applied = False
+    sanitization_applied = False
+    effective_tier = _resolve_paid_runtime_tier(api_key)
+
+    try:
+        await run_in_threadpool(
+            _persist_privileged_action_audit,
+            action="rag.retrieve",
+            target="corpus://cbt-agent",
+            mode=task.mode,
+            endpoint=endpoint,
+            metadata={
+                "method": method,
+                "query_hash": _sha256_hex(safe_query),
+                "query_length": len(safe_query),
+            },
+        )
+    except (PermissionError, RuntimeError) as exc:
+        logger.error("RAG privileged-action gate failed", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="rag_retrieval_unavailable",
+        ) from exc
+
+    try:
+        from core.rag.vector_rag import retrieve_context_structured
+
+        with retrieval_span(
+            user_tier=effective_tier,
+            route=endpoint,
+            max_chunks=5,
+            agent_id="cbt-agent",
+        ) as span:
+            rag_ctx = await run_in_threadpool(
+                retrieve_context_structured,
+                safe_query,
+                max_chunks=5,
+                agent_id="cbt-agent",
+                user_tier=effective_tier,
+                subject_id=derive_subject_id_from_api_key(api_key),
+            )
+            set_attributes(span, **{"pulseplate.rag.hops": rag_ctx.hops})
+
+        if rag_ctx.chunks:
+            context_parts = []
+            for chunk in rag_ctx.chunks:
+                sanitized_chunk = sanitize_rag_markdown(chunk.content)
+                if sanitized_chunk != chunk.content:
+                    sanitization_applied = True
+                sanitized_content = redact_pii_from_text(sanitized_chunk) or ""
+                if sanitized_content != sanitized_chunk:
+                    redaction_applied = True
+                if not sanitized_content.strip():
+                    continue
+                context_parts.append(f"[{chunk.file}]\n{sanitized_content}")
+                sources.append(
+                    FitChefSourceItem(
+                        chunk_id=chunk.chunk_id,
+                        file=chunk.file,
+                        preview=sanitize_chunk_preview(sanitized_content) or "",
+                        score=chunk.score,
+                    )
+                )
+            if context_parts:
+                rag_used = True
+                confidence = rag_ctx.confidence
+                rag_context_str = "\n\n".join(context_parts)
+    except Exception:
+        logger.warning("RAG retrieval failed for CBT insight", exc_info=True)
+        warnings.append("rag_retrieval_failed")
+
+    if sanitization_applied:
+        warnings.append("source_content_sanitized")
+    if redaction_applied:
+        warnings.append("source_content_redacted")
+
+    transparency_notice = get_transparency_registry().get("ai_generated_insight")
+    if transparency_notice is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="transparency_registry_unavailable",
+        )
+    notice_surface_id = transparency_notice.get("surface_id")
+    notice_boundary = transparency_notice.get("boundary")
+    if notice_surface_id is None or notice_boundary is None:
+        logger.error("Transparency registry entry is incomplete for ai_generated_insight")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="transparency_registry_incomplete",
+        )
+    prompt = _build_cbt_prompt(safe_query, rag_context_str)
+
+    try:
+        await run_in_threadpool(
+            _persist_privileged_action_audit,
+            action="llm.generate",
+            target="provider://default",
+            mode=task.mode,
+            endpoint=endpoint,
+            metadata={
+                "method": method,
+                "prompt_hash": _sha256_hex(prompt),
+                "prompt_length": len(prompt),
+                "rag_used": rag_used,
+                "source_count": len(sources),
+            },
+        )
+    except (PermissionError, RuntimeError) as exc:
+        logger.error("LLM privileged-action gate failed", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="llm_generation_unavailable",
+        ) from exc
+
+    try:
+        provider = _require_llm_provider()
+        allowed = await run_in_threadpool(
+            attempt_consume_llm_monthly_quota,
+            api_key,
+            tier=effective_tier,
+        )
+        if not allowed:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="quota_exceeded",
+            )
+        quota_state = "consumed"
+        with llm_span(
+            provider_name=getattr(provider, "name", "unknown"),
+            user_tier=effective_tier,
+            route=endpoint,
+            prompt_text=prompt,
+        ) as span:
+            raw_insight = await _generate_with_timeout(provider, prompt)
+            finalize_llm_span(span, raw_insight if isinstance(raw_insight, str) else "")
+        if not isinstance(raw_insight, str):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Failed to generate CBT insight",
+            )
+        insight_text = raw_insight
+        if not insight_text:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="LLM provider returned empty response",
+            )
+    except ImportError:
+        logger.error("LLM provider not available")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="LLM provider not available",
+        )
+    except asyncio.TimeoutError:
+        logger.error("LLM provider call timed out after %s seconds", LLM_TIMEOUT_SECONDS)
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="LLM provider call timed out",
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("LLM generation failed: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Failed to generate CBT insight",
+        ) from exc
+
+    bounded_confidence = min(max(confidence, 0.0), 1.0)
+    result = FitChefCoachInsightResult(
+        insight=insight_text,
+        rag_used=rag_used,
+        sources=sources,
+        confidence=bounded_confidence,
+        uncertainty=round(max(0.0, 1.0 - bounded_confidence), 4),
+        warnings=warnings,
+        mode=task.mode,
+        quota_state=quota_state,
+        automated_analysis=True,
+        transparency_notice_id=str(notice_surface_id),
+        wellness_boundary=str(notice_boundary),
+    )
+    return result
+
+
+async def run_distortion_simulator_task(
+    task: FitChefDistortionSimulatorTaskEnvelope,
+) -> FitChefDistortionSimulatorResult:
+    """Run the PRO distortion-simulator orchestration flow."""
+
+    safe_situation = task.input.safe_situation
+    safe_automatic_thought = task.input.safe_automatic_thought
+    safe_emotion = task.input.safe_emotion
+    safe_goal = task.input.safe_goal
+    lang = task.input.lang
+    if has_high_distress_boundary(safe_situation, safe_automatic_thought, safe_emotion, safe_goal):
+        raise HTTPException(status_code=400, detail="fitchef_high_distress_boundary")
+    retrieval_text = _build_distortion_simulator_query(
+        safe_situation,
+        safe_automatic_thought,
+        safe_emotion,
+        safe_goal,
+    )
+    shared_result = await _run_fitchef_structured_task(
+        _FitChefStructuredTaskConfig(
+            retrieval_text=retrieval_text,
+            api_key=task.input.api_key,
+            endpoint=task.input.endpoint,
+            method=task.input.method,
+            mode=task.mode,
+            tier=_resolve_paid_runtime_tier(task.input.api_key),
+            rag_target="corpus://cbt-agent",
+            agent_id="cbt-agent",
+            prompt_builder=lambda rag_context: build_distortion_simulator_prompt(
+                safe_situation,
+                safe_automatic_thought,
+                safe_emotion,
+                safe_goal,
+                rag_context,
+                lang=lang,
+            ),
+            draft_builder=lambda raw_message: prepare_distortion_simulator_draft(
+                raw_message,
+                situation=safe_situation,
+                automatic_thought=safe_automatic_thought,
+                emotion=safe_emotion,
+                goal=safe_goal,
+                lang=lang,
+            ),
+            unavailable_detail="fitchef_distortion_simulator_unavailable",
+            log_label="FitChef distortion simulator",
+        )
+    )
+
+    draft = shared_result.draft
+    try:
+        claim_evidence_assessment = build_distortion_field_assurance_assessment(
+            shared_result.source_snapshot,
+            result_sources=shared_result.sources,
+        )
+    except Exception:
+        claim_evidence_assessment = build_distortion_field_assurance_unavailable(
+            reason_code="assessment_unavailable"
+        )
+    return FitChefDistortionSimulatorResult(
+        distortion_labels=draft.distortion_labels,
+        why_it_matches=draft.why_it_matches,
+        evidence_for=draft.evidence_for,
+        evidence_against=draft.evidence_against,
+        balanced_reframe=draft.balanced_reframe,
+        next_small_action=draft.next_small_action,
+        claim_evidence_assessment=claim_evidence_assessment,
+        sources=shared_result.sources,
+        confidence=shared_result.confidence,
+        warnings=shared_result.warnings,
+        mode=task.mode,
+        quota_state=shared_result.quota_state,
+        transparency_notice_id=shared_result.transparency_notice_id,
+        wellness_boundary=shared_result.wellness_boundary,
+    )
+
+
+async def run_identity_loop_mapper_task(
+    task: FitChefIdentityLoopMapperTaskEnvelope,
+) -> FitChefIdentityLoopMapperResult:
+    """Run the VIP identity-loop mapper orchestration flow."""
+
+    safe_goal = task.input.safe_goal
+    safe_recent_pattern = task.input.safe_recent_pattern
+    safe_self_talk = task.input.safe_self_talk
+    safe_trigger_context = task.input.safe_trigger_context
+    retrieval_text = _build_identity_loop_mapper_query(
+        safe_goal,
+        safe_recent_pattern,
+        safe_self_talk,
+        safe_trigger_context,
+    )
+    shared_result = await _run_fitchef_structured_task(
+        _FitChefStructuredTaskConfig[FitChefIdentityLoopDraft](
+            retrieval_text=retrieval_text,
+            api_key=task.input.api_key,
+            endpoint=task.input.endpoint,
+            method=task.input.method,
+            mode=task.mode,
+            tier="VIP",
+            rag_target="corpus://cbt-agent",
+            agent_id="cbt-agent",
+            prompt_builder=lambda rag_context: build_identity_loop_mapper_prompt(
+                safe_goal,
+                safe_recent_pattern,
+                safe_self_talk,
+                safe_trigger_context,
+                rag_context,
+            ),
+            draft_builder=lambda raw_message: prepare_identity_loop_mapper_draft(
+                raw_message,
+                goal=safe_goal,
+                recent_pattern=safe_recent_pattern,
+                self_talk=safe_self_talk,
+                trigger_context=safe_trigger_context,
+            ),
+            unavailable_detail="fitchef_identity_loop_mapper_unavailable",
+            log_label="FitChef identity loop mapper",
+        )
+    )
+
+    draft = shared_result.draft
+    return FitChefIdentityLoopMapperResult(
+        identity_loop=FitChefIdentityLoopValue(
+            belief=draft.belief,
+            behavior=draft.behavior,
+            short_term_reward=draft.short_term_reward,
+            long_term_cost=draft.long_term_cost,
+        ),
+        identity_shift_statement=draft.identity_shift_statement,
+        replacement_action=draft.replacement_action,
+        repair_if_slip=draft.repair_if_slip,
+        sources=shared_result.sources,
+        confidence=shared_result.confidence,
+        warnings=shared_result.warnings,
+        mode=task.mode,
+        quota_state=shared_result.quota_state,
+        transparency_notice_id=shared_result.transparency_notice_id,
+        wellness_boundary=shared_result.wellness_boundary,
+    )
+
+
+async def run_weekly_plan_task(
+    task: FitChefWeeklyPlanTaskEnvelope,
+    *,
+    menu_builder: WeeklyPlanBuilder | None,
+) -> FitChefWeeklyPlanResult:
+    """Run weekly-plan orchestration. / Выполнить оркестрацию weekly-plan."""
+
+    request_data = _require_weekly_profile_input(task.input.request_data)
+    if menu_builder is None:
+        result = FitChefWeeklyPlanResult(menu={"mode": "echo"})
+        return result
+
+    menu_payload = await run_in_threadpool(
+        _run_weekly_menu_builder,
+        request_data,
+        menu_builder,
+    )
+    result = FitChefWeeklyPlanResult(menu=menu_payload)
+    return result
+
+
+async def run_mascot_insight_task(
+    task: FitChefMascotInsightTaskEnvelope,
+) -> FitChefMascotInsightResult:
+    """Run FitChef mascot insight orchestration. / Выполнить mascot-insight оркестрацию."""
+
+    safe_query = task.input.safe_query
+    shared_result = await _run_fitchef_vip_text_task(
+        _FitChefVipTextTaskConfig(
+            retrieval_text=safe_query,
+            api_key=task.input.api_key,
+            endpoint=task.input.endpoint,
+            method=task.input.method,
+            mode=task.mode,
+            prompt_builder=lambda rag_context: build_mascot_prompt(safe_query, rag_context),
+            draft_builder=lambda raw_message: prepare_mascot_draft(raw_message, query=safe_query),
+            unavailable_detail="fitchef_mascot_unavailable",
+            log_label="FitChef mascot",
+        )
+    )
+
+    result: FitChefMascotInsightResult = FitChefMascotInsightResult(
+        message=shared_result.prepared.message,
+        sources=shared_result.sources,
+        confidence=shared_result.confidence,
+        warnings=shared_result.warnings,
+        action_items=shared_result.prepared.action_items,
+        mode=task.mode,
+        quota_state=shared_result.quota_state,
+        transparency_notice_id=shared_result.transparency_notice_id,
+        wellness_boundary=shared_result.wellness_boundary,
+    )
+    return result
+
+
+async def run_weekly_reflection_task(
+    task: FitChefWeeklyReflectionTaskEnvelope,
+) -> FitChefWeeklyReflectionResult:
+    """Run FitChef weekly reflection orchestration."""
+
+    safe_summary = task.input.safe_summary
+    safe_goal = task.input.safe_goal
+    if safe_goal is None or not safe_goal.strip():
+        clarification_notice_id = "fitchef_weekly_reflection_clarification_v1"
+        clarification_notice = get_transparency_registry().get(clarification_notice_id)
+        if clarification_notice is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="transparency_registry_unavailable",
+            )
+        if not isinstance(clarification_notice, Mapping):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="transparency_registry_incomplete",
+            )
+        notice_surface_id = clarification_notice.get("surface_id")
+        notice_boundary = clarification_notice.get("boundary")
+        required_notice_values = (
+            clarification_notice.get("title"),
+            clarification_notice.get("analysis_kind"),
+            clarification_notice.get("notice"),
+            clarification_notice.get("emergency_use"),
+            clarification_notice.get("treatment_decision_use"),
+            clarification_notice.get("escalation"),
+        )
+        if (
+            notice_surface_id != clarification_notice_id
+            or not isinstance(notice_boundary, str)
+            or not notice_boundary.strip()
+            or any(
+                not isinstance(value, str) or not value.strip() for value in required_notice_values
+            )
+            or clarification_notice.get("endpoints")
+            != ("/api/v1/insight/fitchef/weekly-reflection",)
+            or clarification_notice.get("inputs_used") != ("presence of request-scoped goal",)
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="transparency_registry_incomplete",
+            )
+        return FitChefWeeklyReflectionResult(
+            message="What goal should this weekly reflection support right now?",
+            sources=[],
+            confidence=0.0,
+            warnings=["clarification_required:weekly_reflection.current_goal"],
+            action_items=[],
+            mode=task.mode,
+            quota_state="not_consumed",
+            transparency_notice_id=clarification_notice_id,
+            wellness_boundary=notice_boundary,
+            response_state="clarification_required",
+            clarification=FitChefClarificationV1(),
+        )
+
+    retrieval_text = _build_fitchef_reflection_query(safe_summary, safe_goal)
+    shared_result = await _run_fitchef_vip_text_task(
+        _FitChefVipTextTaskConfig(
+            retrieval_text=retrieval_text,
+            api_key=task.input.api_key,
+            endpoint=task.input.endpoint,
+            method=task.input.method,
+            mode=task.mode,
+            prompt_builder=lambda rag_context: build_weekly_reflection_prompt(
+                safe_summary,
+                safe_goal,
+                rag_context,
+            ),
+            draft_builder=lambda raw_message: prepare_weekly_reflection_draft(
+                raw_message,
+                summary=safe_summary,
+                goal=safe_goal,
+            ),
+            unavailable_detail="fitchef_weekly_reflection_unavailable",
+            log_label="FitChef weekly reflection",
+        )
+    )
+
+    result: FitChefWeeklyReflectionResult = FitChefWeeklyReflectionResult(
+        message=shared_result.prepared.message,
+        sources=shared_result.sources,
+        confidence=shared_result.confidence,
+        warnings=shared_result.warnings,
+        action_items=shared_result.prepared.action_items,
+        mode=task.mode,
+        quota_state=shared_result.quota_state,
+        transparency_notice_id=shared_result.transparency_notice_id,
+        wellness_boundary=shared_result.wellness_boundary,
+        response_state="generated",
+        clarification=None,
+    )
+    return result
+
+
+async def run_slip_support_task(
+    task: FitChefSlipSupportTaskEnvelope,
+) -> FitChefSlipSupportResult:
+    """Run FitChef slip-support orchestration."""
+
+    safe_event_text = task.input.safe_event_text
+    safe_goal = task.input.safe_goal
+    retrieval_text = _build_fitchef_slip_support_query(safe_event_text, safe_goal)
+    shared_result = await _run_fitchef_vip_text_task(
+        _FitChefVipTextTaskConfig(
+            retrieval_text=retrieval_text,
+            api_key=task.input.api_key,
+            endpoint=task.input.endpoint,
+            method=task.input.method,
+            mode=task.mode,
+            prompt_builder=lambda rag_context: build_slip_support_prompt(
+                safe_event_text,
+                safe_goal,
+                rag_context,
+            ),
+            draft_builder=lambda raw_message: prepare_slip_support_draft(
+                raw_message,
+                event_text=safe_event_text,
+                goal=safe_goal,
+            ),
+            unavailable_detail="fitchef_slip_support_unavailable",
+            log_label="FitChef slip-support",
+        )
+    )
+
+    result: FitChefSlipSupportResult = FitChefSlipSupportResult(
+        message=shared_result.prepared.message,
+        sources=shared_result.sources,
+        confidence=shared_result.confidence,
+        warnings=shared_result.warnings,
+        action_items=shared_result.prepared.action_items,
+        mode=task.mode,
+        quota_state=shared_result.quota_state,
+        transparency_notice_id=shared_result.transparency_notice_id,
+        wellness_boundary=shared_result.wellness_boundary,
+    )
+    return result
+
+
+def _run_shopping_followup_builder(
+    task: FitChefShoppingFollowupTaskEnvelope,
+    shopping_list_builder: ShoppingFollowupBuilder,
+) -> ShoppingListDTO:
+    """Run shopping-followup builder. / Выполнить builder shopping-followup."""
+
+    if task.input.plan_data is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal error: plan_data is None",
+        )
+
+    shopping_list = shopping_list_builder(
+        plan_data=task.input.plan_data,
+        preferences=task.input.preferences,
+        source="inline_plan",
+    )
+    return shopping_list
+
+
+async def run_shopping_followup_task(
+    task: FitChefShoppingFollowupTaskEnvelope,
+    *,
+    shopping_list_builder: ShoppingFollowupBuilder,
+) -> FitChefShoppingFollowupResult:
+    """Run shopping-followup orchestration. / Выполнить оркестрацию shopping-followup."""
+
+    shopping_list = await run_in_threadpool(
+        _run_shopping_followup_builder,
+        task,
+        shopping_list_builder,
+    )
+    result = FitChefShoppingFollowupResult(shopping_list=shopping_list)
+    return result

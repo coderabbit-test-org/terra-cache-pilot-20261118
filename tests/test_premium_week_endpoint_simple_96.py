@@ -1,0 +1,213 @@
+"""
+Simple tests for premium week endpoint to reach 96% coverage.
+"""
+
+import os
+import sys
+from unittest.mock import Mock, patch
+
+from fastapi.testclient import TestClient
+
+# Import the FastAPI app from the app package
+from app import app
+
+
+def _make_canonical_week_payload() -> dict[str, object]:
+    """Return a weekly-plan payload that matches the public endpoint contract.
+
+    RU: Фейковые build_week ответы должны быть каноническими.
+    EN: Fake build_week responses must use the canonical typed weekly-plan shape.
+    """
+    return {
+        "daily_menus": [
+            {
+                "meals": [
+                    {
+                        "title": "Protein bowl",
+                        "title_translated": "Protein bowl",
+                        "grams": {"serving_g": 420.0},
+                        "kcal": 550.0,
+                        "macros": {"protein_g": 42.0},
+                        "micros": {"iron_mg": 4.2},
+                        "price_est": 8.5,
+                    }
+                ],
+                "kcal": 550.0,
+                "macros": {"protein_g": 42.0},
+                "micros": {"iron_mg": 4.2},
+                "coverage": {"protein": 0.8},
+                "tips": ["Stay hydrated"],
+                "total_cost": 8.5,
+            }
+        ],
+        "weekly_coverage": {"protein": 0.8},
+        "shopping_list": {"apple": 5.0},
+        "total_cost": 25.50,
+        "adherence_score": 0.85,
+    }
+
+
+class TestPremiumWeekEndpointSimple96:
+    """Simple tests for premium week endpoint coverage."""
+
+    def test_generate_week_plan_with_targets(self) -> None:
+        """Test generate_week_plan with provided targets - lines 93-117."""
+        client = TestClient(app)
+
+        with (
+            patch.dict(os.environ, {"API_KEY": "test_api_key"}),
+            patch("app.routers.premium_week.FoodDB") as mock_fooddb,
+            patch("app.routers.premium_week.RecipeDB") as mock_recipedb,
+            patch("app.routers.premium_week.build_week") as mock_build_week,
+        ):
+            # Mock database objects
+            mock_fooddb.return_value = Mock()
+            mock_recipedb.return_value = Mock()
+
+            # Mock build_week response
+            mock_build_week.return_value = _make_canonical_week_payload()
+
+            payload = {
+                "sex": "male",
+                "age": 30,
+                "height_cm": 175,
+                "weight_kg": 70,
+                "activity": "moderate",
+                "goal": "maintain",
+                "diet_flags": ["VEG"],
+                "lang": "en",
+            }
+
+            response = client.post(
+                "/api/v1/premium/plan/week",
+                json=payload,
+                headers={"X-API-Key": "test_api_key"},
+            )
+
+            assert response.status_code == 200
+            data = response.json()
+            assert "daily_menus" in data
+            assert "weekly_coverage" in data
+            assert "shopping_list" in data
+            assert "total_cost" in data
+            assert "adherence_score" in data
+
+    def test_generate_week_plan_with_profile(self) -> None:
+        """Test generate_week_plan with user profile - lines 93-117."""
+        client = TestClient(app)
+
+        with (
+            patch.dict(os.environ, {"API_KEY": "test_api_key"}),
+            patch("app.routers.premium_week.FoodDB") as mock_fooddb,
+            patch("app.routers.premium_week.RecipeDB") as mock_recipedb,
+            patch("app.services.nutrition_targets.estimate_targets_from_profile") as mock_estimate,
+            patch("app.routers.premium_week.build_week") as mock_build_week,
+        ):
+            # Mock database objects
+            mock_fooddb.return_value = Mock()
+            mock_recipedb.return_value = Mock()
+
+            # Mock profile-derived planning target response.
+            mock_estimate.return_value = {
+                "kcal": 2000,
+                "macros": {"protein_g": 150, "fat_g": 65, "carbs_g": 250},
+                "micro": {"iron_mg": 18, "calcium_mg": 1000},
+                "water_ml": 2000,
+                "activity_week": {"moderate_aerobic_min": 150},
+            }
+
+            # Mock build_week response
+            mock_build_week.return_value = _make_canonical_week_payload()
+
+            payload = {
+                "sex": "male",
+                "age": 30,
+                "height_cm": 175,
+                "weight_kg": 70,
+                "activity": "moderate",
+                "goal": "maintain",
+                "diet_flags": ["VEG"],
+                "lang": "en",
+            }
+
+            response = client.post(
+                "/api/v1/premium/plan/week",
+                json=payload,
+                headers={"X-API-Key": "test_api_key"},
+            )
+
+            assert response.status_code == 200
+            data = response.json()
+            assert "daily_menus" in data
+            assert "weekly_coverage" in data
+            assert "shopping_list" in data
+            assert "total_cost" in data
+            assert "adherence_score" in data
+
+    def test_generate_week_plan_missing_profile_data(self) -> None:
+        """Test generate_week_plan with missing profile data - lines 101-102."""
+        client = TestClient(app)
+
+        with (
+            patch.dict(os.environ, {"API_KEY": "test_api_key"}),
+            patch("app.routers.premium_week.FoodDB") as mock_fooddb,
+            patch("app.routers.premium_week.RecipeDB") as mock_recipedb,
+        ):
+            # Mock database objects
+            mock_fooddb.return_value = Mock()
+            mock_recipedb.return_value = Mock()
+
+            payload = {
+                "sex": "male",
+                "age": 30,
+                # Missing height_cm and weight_kg
+                "activity": "moderate",
+                "goal": "maintain",
+                "diet_flags": ["VEG"],
+                "lang": "en",
+            }
+
+            response = client.post(
+                "/api/v1/premium/plan/week",
+                json=payload,
+                headers={"X-API-Key": "test_api_key"},
+            )
+
+            assert response.status_code == 422, response.text
+            assert response.headers["content-type"].startswith("application/json")
+            assert response.json() == {"detail": "Invalid weekly plan request payload"}
+
+    def test_generate_week_plan_profile_payload_legacy_alias(self) -> None:
+        """Test legacy premium week alias with a profile-derived payload."""
+        client = TestClient(app)
+
+        with (
+            patch.dict(os.environ, {"API_KEY": "test_api_key"}),
+            patch("app.routers.premium_week.FoodDB") as mock_fooddb,
+            patch("app.routers.premium_week.RecipeDB") as mock_recipedb,
+        ):
+            # Mock database objects
+            mock_fooddb.return_value = Mock()
+            mock_recipedb.return_value = Mock()
+
+            payload = {
+                "sex": "male",
+                "age": 30,
+                "height_cm": 175,
+                "weight_kg": 70,
+                "activity": "moderate",
+                "goal": "maintain",
+                "diet_flags": ["VEG"],
+                "lang": "en",
+            }
+
+            response = client.post(
+                "/api/v1/premium/plan/week",
+                json=payload,
+                headers={"X-API-Key": "test_api_key"},
+            )
+
+            assert response.status_code == 200
+            assert response.headers.get("content-type", "").startswith("application/json")
+            data = response.json()
+            assert "daily_menus" in data or "week_summary" in data

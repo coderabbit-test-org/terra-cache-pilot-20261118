@@ -1,0 +1,4546 @@
+#!/usr/bin/env python3
+"""Install pinned requirements through a local wheelhouse and startup-hook guard."""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+from email import policy
+from email.parser import BytesParser
+import io
+import errno
+import fcntl
+import stat
+import struct
+import tarfile
+import tomllib
+import zipfile
+import base64
+import http.client
+import hashlib
+import netrc
+import platform
+from contextlib import closing, contextmanager
+from datetime import date
+import json
+import os
+import re
+import shutil
+import ssl
+import socket
+import subprocess  # nosec B404 # B404: subprocess is required for selected pip/Python calls and typed failures (remove-by: 2027-02-01, ref: PR-litellm-hardening)
+import sys
+import sysconfig
+import tempfile
+import time
+from pathlib import Path, PurePosixPath
+from typing import Iterator, Sequence, cast
+from urllib.parse import ParseResult, quote, unquote, urljoin, urlparse
+import signal
+import threading
+from types import FrameType
+from uuid import uuid4
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_REQUIREMENTS_FILE = REPO_ROOT / "requirements.txt"
+DEFAULT_DEV_REQUIREMENTS_FILE = REPO_ROOT / "requirements-dev.txt"
+DEFAULT_TEST_REQUIREMENTS_FILE = REPO_ROOT / "requirements-test.txt"
+DEFAULT_CI_LITE_REQUIREMENTS_FILE = REPO_ROOT / "requirements-ci-lite.txt"
+DEFAULT_RAG_VECTOR_REQUIREMENTS_FILE = REPO_ROOT / "requirements-rag-vector.txt"
+DEFAULT_CONSTRAINTS_FILE = REPO_ROOT / "constraints.txt"
+DEFAULT_STARTUP_HOOK_GUARD_PATH = REPO_ROOT / "scripts" / "ci" / "check_python_startup_hooks.py"
+DEFAULT_EMERGENCY_WHEEL_MANIFEST = REPO_ROOT / "scripts" / "ci" / "emergency_python_wheels.json"
+RETIRED_EMERGENCY_WHEEL_MANIFEST_GENERATED_AT = "2026-06-29"
+
+DEFAULT_DEPENDENCY_SECURITY_SCHEMA = (
+    REPO_ROOT / "tests" / "fixtures" / "dependency_security_schema.json"
+)
+APPROVED_INDEX_ENV_VAR = "PULSEPLATE_PYTHON_INDEX_URL"
+TRUSTED_HOST_ENV_VAR = "PULSEPLATE_PYTHON_TRUSTED_HOST"
+EMERGENCY_WHEEL_MANIFEST_ENV_VAR = "PULSEPLATE_PYTHON_EMERGENCY_WHEEL_MANIFEST"
+AMBIENT_INDEX_OVERRIDE_ENV_VARS: tuple[str, ...] = (
+    "PIP_INDEX_URL",
+    "PIP_EXTRA_INDEX_URL",
+    "UV_INDEX_URL",
+    "UV_EXTRA_INDEX_URL",
+)
+BLOCKED_INDEX_HOSTS: tuple[str, ...] = (
+    "pypi.org",
+    "files.pythonhosted.org",
+    "test.pypi.org",
+)
+REQUIRED_HTTPS_INDEX_HOSTS: tuple[str, ...] = ("packages.pulseplate.app",)
+EMERGENCY_WHEEL_OPERATION_SECONDS = 60
+MAX_EMERGENCY_WHEEL_BYTES = 16 * 1024 * 1024
+ALLOWED_EMERGENCY_WHEEL_HOSTS: tuple[str, ...] = ("files.pythonhosted.org",)
+INSTALL_MODES: tuple[str, ...] = ("wheelhouse", "direct-proxy")
+REQUIREMENTS_PROFILES: tuple[str, ...] = (
+    "runtime",
+    "runtime-dev",
+    "runtime-test",
+    "ci-test",
+    "ci-lite",
+    "rag-vector",
+)
+PIP_NETWORK_RETRIES = 5
+PIP_NETWORK_TIMEOUT_SECONDS = 60
+PRIVATE_INDEX_PROJECT_PAGE_BYTES = 100_000
+PRIVATE_INDEX_HEALTH_TIMEOUT_SECONDS = 15
+PRIVATE_INDEX_HEALTH_RETRY_BACKOFF_SECONDS: tuple[float, ...] = (1.0, 2.0, 4.0, 8.0)
+DOCKER_SINGLE_PASS_LOCKED_INSTALL_ENV = "PULSEPLATE_DOCKER_SINGLE_PASS_LOCKED_INSTALL"  # nosec B105 # B105: public env key contract, not a password (remove-by: 2026-12-31, ref: PR-docker-gha-buildx-pip-cache)
+DOCKER_PIP_LAYER_CACHE_ENV = "PULSEPLATE_DOCKER_PIP_LAYER_CACHE"
+PSYCOPG_SDK_ENV = "PULSEPLATE_PSYCOPG_C_SDK"
+PSYCOPG_C_VERSION = "3.3.4"
+PSYCOPG_C_SOURCE_NAME = "psycopg_c-3.3.4.tar.gz"
+PSYCOPG_C_SOURCE_SHA256 = (
+    "ed810612" "8b2d0435" "9c185fc9" "641b4409" "abfce4d0" "b6fb1d1f" "f6800646" "e27f1a22"
+)
+PSYCOPG_C_PYPROJECT_SHA256 = (
+    "6183883f" "8db769e5" "db8f4549" "668c6488" "1add1ea8" "a5eb858c" "1db7a98e" "c075499b"
+)
+PSYCOPG_C_DERIVED_PYPROJECT_SHA256 = (
+    "85acd573" "97b94b3e" "7135d898" "cdae2cf3" "59fe199d" "a492cd8d" "c05ed42a" "b92698d7"
+)
+PSYCOPG_C_MEMBER_SHA256 = (
+    "5275940e" "632aa2d0" "56835aa3" "70e7cb8e" "8bf0f6af" "3b029abc" "33fd973c" "bb2a2338"
+)
+PSYCOPG_C_DERIVED_MEMBER_SHA256 = (
+    "9f095e64" "2bf11f1e" "46dfbdde" "24302ac3" "5dabcd6e" "90fa9fdd" "69a8a172" "917e8515"
+)
+PSYCOPG_C_BUILD_PINS = frozenset(
+    {("setuptools", "84.1.0"), ("wheel", "0.47.0"), ("packaging", "25.0")}
+)
+PSYCOPG_C_SOURCE_MAX_BYTES = 8 * 1024 * 1024
+
+PSYCOPG_C_BUILD_ARTIFACTS = {
+    "packaging-25.0-py3-none-any.whl": (
+        66469,
+        ("29572ef2" "b1f17581" "046b3a22" "27d5c611" "fb25ec70" "ca1ba855" "4b24b0e6" "9331a484"),
+        ("5b611a60" "9c38fefc" "3d616bf4" "5d20aec9" "8fb7d53f" "245daca9" "e2c30fc8" "5c7ac282"),
+    ),
+    "setuptools-84.1.0-py3-none-any.whl": (
+        819380,
+        ("5231689c" "6ac8156c" "d155cfb9" "8c3fd6fb" "252c3e7e" "9bd3d78b" "64d3c55f" "132624c9"),
+        ("adc9c90a" "8475c9ef" "ce59d6db" "e2bfdfc3" "a68a9806" "a83b7771" "245ac6e9" "bb0e8649"),
+    ),
+    "wheel-0.47.0-py3-none-any.whl": (
+        32218,
+        ("212281ca" "b4dff978" "f6cedd49" "9cd893e1" "f620791c" "a6ff7107" "cf270781" "e587eced"),
+        ("d6e8cbbf" "a21513ed" "46be4027" "e61784b1" "31b12c5c" "afacbde6" "913ce5ad" "01767643"),
+    ),
+}
+
+
+def admitted_psycopg_source_url(*, body: bytes, project_url: str) -> str:
+    """Select one exact reviewed source from the existing Simple-page decoder."""
+    if __package__:
+        from scripts.ci.check_private_python_proxy_health import _parse_simple_page_anchors
+    else:
+        from check_private_python_proxy_health import _parse_simple_page_anchors
+
+    project = urlparse(project_url)
+    if (
+        project.scheme != "https"
+        or not project.hostname
+        or project.username is not None
+        or project.password is not None
+        or project.query
+        or project.fragment
+    ):
+        raise RuntimeError("Psycopg source admission requires a verified HTTPS project origin.")
+    anchors, malformed = _parse_simple_page_anchors(body)
+    if malformed:
+        raise RuntimeError("Psycopg source project page contains an ambiguous anchor.")
+    selected: list[str] = []
+    for anchor in anchors:
+        resolved = urlparse(urljoin(project_url, anchor.href))
+        filename = unquote(resolved.path.rsplit("/", 1)[-1])
+        if filename != PSYCOPG_C_SOURCE_NAME:
+            continue
+        if (
+            resolved.scheme != "https"
+            or resolved.netloc.lower() != project.netloc.lower()
+            or resolved.username is not None
+            or resolved.password is not None
+            or resolved.query
+            or resolved.fragment != f"sha256={PSYCOPG_C_SOURCE_SHA256}"
+        ):
+            raise RuntimeError("Psycopg source URL/hash differs from the exact approved origin.")
+        selected.append(resolved._replace(fragment="").geturl())
+    if len(selected) != 1:
+        raise RuntimeError("The private proxy must advertise exactly one reviewed Psycopg source.")
+    return selected[0]
+
+
+def prefetch_psycopg_source(*, output: Path, index_url: str, trusted_host: str | None) -> None:
+    """Fetch archive bytes directly, without pip metadata or a build-backend invocation."""
+    if trusted_host:
+        raise RuntimeError("Psycopg source acquisition requires verified HTTPS.")
+    project_url, body = _read_private_index_project_page(
+        index_url=index_url, package="psycopg-c", trusted_host=None
+    )
+    source_url = admitted_psycopg_source_url(body=body, project_url=project_url)
+    parsed = urlparse(source_url)
+    if parsed.hostname is None:
+        raise RuntimeError("The admitted Psycopg source has no HTTPS host.")
+    headers: dict[str, str] = {}
+    authorization = _admit_private_proxy_netrc_auth(parsed_url=parsed, trusted_host=None)
+    if authorization is not None:
+        headers["Authorization"] = authorization
+    if output.exists() or output.is_symlink():
+        raise RuntimeError("Psycopg source output directory must be new.")
+    output.mkdir(parents=True, mode=0o700)
+    connection = http.client.HTTPSConnection(
+        parsed.hostname, port=parsed.port, timeout=PRIVATE_INDEX_HEALTH_TIMEOUT_SECONDS
+    )
+    try:
+        connection.request("GET", parsed.path, headers=headers)
+        response = connection.getresponse()
+        if response.status != 200:
+            raise RuntimeError(f"Psycopg source acquisition rejected HTTP {response.status}.")
+        payload = response.read(PSYCOPG_C_SOURCE_MAX_BYTES + 1)
+    finally:
+        connection.close()
+    if (
+        len(payload) > PSYCOPG_C_SOURCE_MAX_BYTES
+        or hashlib.sha256(payload).hexdigest() != PSYCOPG_C_SOURCE_SHA256
+    ):
+        raise RuntimeError("Psycopg source bytes do not match the reviewed archive.")
+    destination = output / PSYCOPG_C_SOURCE_NAME
+    with destination.open("xb") as stream:
+        stream.write(payload)
+    inspect_psycopg_source(destination)
+
+
+def _read_regular_input(path: Path, *, maximum: int) -> bytes:
+    """Read bounded cooperative inputs without following a leaf or ancestor link."""
+    absolute = path.absolute()
+    if ".." in absolute.parts or any(parent.is_symlink() for parent in absolute.parents):
+        raise RuntimeError("Input path must contain only real directories.")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise RuntimeError("Exact source admission requires no-follow filesystem reads.")
+
+    def identity(value: os.stat_result) -> tuple[int, ...]:
+        return (
+            value.st_dev,
+            value.st_ino,
+            value.st_mode,
+            value.st_nlink,
+            value.st_uid,
+            value.st_gid,
+            value.st_size,
+            value.st_mtime_ns,
+            value.st_ctime_ns,
+        )
+
+    with os.fdopen(os.open(absolute, flags), "rb") as stream:
+        before = os.fstat(stream.fileno())
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > maximum:
+            raise RuntimeError("Input must be a bounded regular single-link file.")
+        content = stream.read(maximum + 1)
+        after = os.fstat(stream.fileno())
+    current = absolute.lstat()
+    if (
+        len(content) > maximum
+        or identity(before) != identity(after)
+        or identity(after) != identity(current)
+    ):
+        raise RuntimeError("Input identity changed during acquisition.")
+    return content
+
+
+def inspect_psycopg_source(path: Path) -> dict[str, bytes]:
+    """Recognize only the reviewed release, without importing its build backend."""
+    if path.name != PSYCOPG_C_SOURCE_NAME:
+        raise RuntimeError("Only the exact reviewed Psycopg C source name is supported.")
+    payload = _read_regular_input(path, maximum=PSYCOPG_C_SOURCE_MAX_BYTES)
+    if hashlib.sha256(payload).hexdigest() != PSYCOPG_C_SOURCE_SHA256:
+        raise RuntimeError("Psycopg C original source SHA-256 mismatch.")
+    files: dict[str, bytes] = {}
+    seen: set[str] = set()
+    expanded = 0
+    with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as archive:
+        for member in archive:
+            name = PurePosixPath(member.name)
+            if (
+                member.name in seen
+                or "\\" in member.name
+                or name.is_absolute()
+                or ".." in name.parts
+                or not name.parts
+                or name.parts[0] != "psycopg_c-3.3.4"
+                or not (member.isfile() or member.isdir())
+                or len(seen) >= 34
+            ):
+                raise RuntimeError("Psycopg source member layout is not the exact release.")
+            seen.add(member.name)
+            expanded += member.size
+            if expanded > 6_665_795:
+                raise RuntimeError("Psycopg source exceeds its reviewed expanded size.")
+            if member.isfile():
+                stream = archive.extractfile(member)
+                if stream is None:
+                    raise RuntimeError("Psycopg source member cannot be read.")
+                files[member.name] = stream.read(member.size + 1)
+                if len(files[member.name]) != member.size:
+                    raise RuntimeError("Psycopg source member is truncated.")
+    if len(seen) != 34 or expanded != 6_665_795:
+        raise RuntimeError("Psycopg source inventory differs from the reviewed release.")
+    if _psycopg_member_digest(files) != PSYCOPG_C_MEMBER_SHA256:
+        raise RuntimeError("Psycopg source member identity mismatch.")
+    pyproject = files["psycopg_c-3.3.4/pyproject.toml"]
+    if hashlib.sha256(pyproject).hexdigest() != PSYCOPG_C_PYPROJECT_SHA256:
+        raise RuntimeError("Psycopg build metadata differs from the reviewed original.")
+    expected = {
+        "requires": [
+            "setuptools == 80.3.1",
+            "wheel >= 0.37",
+            "tomli >= 2.0.1; python_version < '3.11'",
+        ],
+        "build-backend": "cython_backend",
+        "backend-path": ["build_backend"],
+    }
+    if tomllib.loads(pyproject.decode("utf-8"))["build-system"] != expected:
+        raise RuntimeError("Psycopg build backend or requirements are not supported.")
+    return files
+
+
+def _psycopg_member_digest(files: dict[str, bytes]) -> str:
+    inventory = [
+        {"name": name, "bytes": len(content), "sha256": hashlib.sha256(content).hexdigest()}
+        for name, content in files.items()
+    ]
+    return hashlib.sha256(
+        json.dumps(inventory, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def derive_psycopg_source(path: Path, destination: Path) -> dict[str, str]:
+    """Change one exact build pin; all runtime, backend and license bytes stay bound."""
+    original = inspect_psycopg_source(path)
+    derived = dict(original)
+    member = "psycopg_c-3.3.4/pyproject.toml"
+    derived[member] = original[member].replace(b"setuptools == 80.3.1", b"setuptools == 84.1.0")
+    if (
+        hashlib.sha256(derived[member]).hexdigest() != PSYCOPG_C_DERIVED_PYPROJECT_SHA256
+        or _psycopg_member_digest(derived) != PSYCOPG_C_DERIVED_MEMBER_SHA256
+        or [name for name in original if original[name] != derived[name]] != [member]
+    ):
+        raise RuntimeError("Psycopg source transform is not the sole admitted metadata change.")
+    if destination.exists() or destination.is_symlink():
+        raise RuntimeError("Derived Psycopg source destination must be new.")
+    destination.mkdir(parents=True, mode=0o700)
+    for name, content in derived.items():
+        target = destination.joinpath(*PurePosixPath(name).parts[1:])
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("xb") as stream:
+            stream.write(content)
+    return {
+        "original_source_sha256": PSYCOPG_C_SOURCE_SHA256,
+        "original_members_sha256": PSYCOPG_C_MEMBER_SHA256,
+        "derived_members_sha256": PSYCOPG_C_DERIVED_MEMBER_SHA256,
+        "derived_pyproject_sha256": PSYCOPG_C_DERIVED_PYPROJECT_SHA256,
+    }
+
+
+def prefetch_psycopg_build_wheels(
+    *, output: Path, python_executable: str, index_url: str, trusted_host: str | None
+) -> None:
+    """Acquire the reviewed binary tools and Wheel's existing Packaging closure."""
+    if __package__:
+        from scripts.ci.check_private_python_proxy_health import trusted_exact_pin_wheel_hashes
+    else:
+        from check_private_python_proxy_health import trusted_exact_pin_wheel_hashes
+
+    if output.exists():
+        raise RuntimeError("Psycopg build input destination must be new.")
+    output.mkdir(parents=True, mode=0o700)
+    admitted: dict[str, str] = {}
+    for package, version in sorted(PSYCOPG_C_BUILD_PINS):
+        project_url, body = _read_private_index_project_page(
+            index_url=index_url, package=package, trusted_host=trusted_host
+        )
+        admitted.update(
+            trusted_exact_pin_wheel_hashes(
+                body=body,
+                normalized_project=package,
+                expected_version=version,
+                project_url=project_url,
+            )
+        )
+    command = [
+        python_executable,
+        "-m",
+        "pip",
+        "download",
+        "--no-deps",
+        "--only-binary=:all:",
+        "--index-url",
+        index_url,
+        "--dest",
+        str(output),
+        "setuptools==84.1.0",
+        "wheel==0.47.0",
+        "packaging==25.0",
+    ]
+    if trusted_host:
+        command.extend(["--trusted-host", trusted_host])
+    run_command(command, timeout=300)
+    artifacts = [
+        inspect_locked_wheel(wheel_path=p, expected_artifacts=PSYCOPG_C_BUILD_PINS)
+        for p in output.iterdir()
+    ]
+    if {a.artifact_key for a in artifacts} != PSYCOPG_C_BUILD_PINS or len(artifacts) != 3:
+        raise RuntimeError("Psycopg build input inventory is incomplete or duplicated.")
+    for artifact in artifacts:
+        if admitted.get(artifact.path.name.lower()) != artifact.snapshot.digest:
+            raise RuntimeError("Psycopg binary build tool lacks private-proxy hash admission.")
+    _validate_psycopg_build_closure(artifacts)
+
+
+def _validate_psycopg_build_closure(artifacts: Sequence[ValidatedWheel]) -> None:
+    """Reject missing or additional active build requirements on each admitted ABI."""
+    from pip._vendor.packaging.markers import default_environment
+    from pip._vendor.packaging.requirements import Requirement
+
+    if len(artifacts) != 3 or {a.artifact_key for a in artifacts} != PSYCOPG_C_BUILD_PINS:
+        raise RuntimeError("Psycopg binary build input inventory is incomplete.")
+    for artifact in artifacts:
+        if PSYCOPG_C_BUILD_ARTIFACTS.get(artifact.path.name) != (
+            artifact.snapshot.size,
+            artifact.snapshot.digest,
+            artifact.metadata_digest,
+        ):
+            raise RuntimeError(
+                "Psycopg binary build input fingerprint differs from the reviewed wheel."
+            )
+    pins = dict(PSYCOPG_C_BUILD_PINS)
+    for minor in (11, 12, 13):
+        environment = {
+            **default_environment(),
+            "extra": "",
+            "python_version": f"3.{minor}",
+            "python_full_version": f"3.{minor}.0",
+            "sys_platform": "linux",
+        }
+        for artifact in artifacts:
+            for raw in artifact.requires_dist:
+                requirement = Requirement(raw)
+                if requirement.marker is not None and not requirement.marker.evaluate(environment):
+                    continue
+                name = _normalized_package_name(requirement.name)
+                if (
+                    requirement.url
+                    or requirement.extras
+                    or name not in pins
+                    or pins[name] not in requirement.specifier
+                ):
+                    raise RuntimeError(
+                        "Psycopg binary build-tool closure differs from the admitted pins."
+                    )
+
+
+def _process_network_inventory() -> dict[str, tuple[int, bytes | None]]:
+    """Read interface flags and IPv4 addresses from this process's native namespace."""
+    inventory: dict[str, tuple[int, bytes | None]] = {}
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as descriptor:
+        for _, name in socket.if_nameindex():
+            encoded = name.encode("utf-8")
+            if len(encoded) > 15:
+                raise RuntimeError("Backend network interface identity cannot be represented.")
+            request = struct.pack("16sH14x", encoded, 0)
+            flags_reply = fcntl.ioctl(descriptor.fileno(), 0x8913, request)
+            flags = struct.unpack_from("H", flags_reply, 16)[0]
+            try:
+                address_reply = fcntl.ioctl(descriptor.fileno(), 0x8915, request)
+            except OSError as exc:
+                if exc.errno != errno.EADDRNOTAVAIL:
+                    raise RuntimeError("Backend IPv4 interface state is unavailable.") from exc
+                address = None
+            else:
+                address = address_reply[20:24]
+                if len(address) != 4:
+                    raise RuntimeError("Backend IPv4 interface result is malformed.")
+            inventory[name] = (flags, address)
+    return inventory
+
+
+def _network_table_lines(path: str) -> list[list[str]]:
+    with Path(path).open("rb") as stream:
+        payload = stream.read(64 * 1024 + 1)
+    if len(payload) > 64 * 1024:
+        raise RuntimeError("Backend network table exceeds the bounded inspection size.")
+    return [line.split() for line in payload.decode("ascii").splitlines() if line.strip()]
+
+
+def _assert_backend_network_isolated() -> None:
+    """Require no usable external interface, address or route; names grant no exemption."""
+    interfaces = _process_network_inventory()
+    if "lo" not in interfaces or any(
+        name != "lo" and (flags & 1 or address is not None)
+        for name, (flags, address) in interfaces.items()
+    ):
+        raise RuntimeError("Psycopg backend requires kernel network isolation.")
+    ipv4 = _network_table_lines("/proc/net/route")
+    if ipv4 and ipv4[0] != [
+        "Iface",
+        "Destination",
+        "Gateway",
+        "Flags",
+        "RefCnt",
+        "Use",
+        "Metric",
+        "Mask",
+        "MTU",
+        "Window",
+        "IRTT",
+    ]:
+        raise RuntimeError("Backend IPv4 route table is unavailable or malformed.")
+    if any(len(row) != 11 or row[0] != "lo" for row in ipv4[1:]):
+        raise RuntimeError("Psycopg backend has an external or malformed IPv4 route.")
+    if any(len(row) != 6 or row[-1] != "lo" for row in _network_table_lines("/proc/net/if_inet6")):
+        raise RuntimeError("Psycopg backend has an external or malformed IPv6 address.")
+    if any(
+        len(row) != 10 or row[-1] != "lo" for row in _network_table_lines("/proc/net/ipv6_route")
+    ):
+        raise RuntimeError("Psycopg backend has an external or malformed IPv6 route.")
+
+
+@dataclass(frozen=True)
+class PsycopgSdkTarget:
+    """One finite SDK target descriptor; native origin and ABI proof stay separate."""
+
+    machine: str
+    minor: int
+    elf_machine: int
+    openssl_target: str
+    source_image: str
+
+    @property
+    def python_tag(self) -> str:
+        return f"cp3{self.minor}"
+
+    @property
+    def wheel_platform(self) -> str:
+        return "linux_" + self.machine
+
+    @property
+    def soabi(self) -> str:
+        return f"cpython-3{self.minor}-{self.machine}-linux-gnu"
+
+
+PSYCOPG_SDK_TARGETS = (
+    PsycopgSdkTarget(
+        "x86_64",
+        11,
+        62,
+        "linux-x86_64",
+        "python@sha256:9fd630803ec3446920ed6b64d20150bd724c1751e71817293a4230522c1a384a",
+    ),
+    PsycopgSdkTarget(
+        "x86_64",
+        12,
+        62,
+        "linux-x86_64",
+        "python@sha256:a594f7e9df8a4c431265125b5f5d90cd1b81c8a8797fefee69d5b3544be11111",
+    ),
+    PsycopgSdkTarget(
+        "x86_64",
+        13,
+        62,
+        "linux-x86_64",
+        "python@sha256:7a6b87c02e1f4d6bb572e379235cbbdd7892add0572442c9b0b860a3f5aa9857",
+    ),
+    PsycopgSdkTarget(
+        "aarch64",
+        13,
+        183,
+        "linux-aarch64",
+        "python@sha256:f0320b9bf735a4c4db05e7578e487cbed66c097e36b59a3864ca6d3e7c7dcea9",
+    ),
+)
+
+
+def _psycopg_sdk_target(source_image: str | None = None) -> PsycopgSdkTarget:
+    """Recognize actual loader ABI before SDK effects; never normalize aliases."""
+    candidates = [
+        target
+        for target in PSYCOPG_SDK_TARGETS
+        if sys.platform == "linux"
+        and platform.machine() == target.machine
+        and sys.version_info[:2] == (3, target.minor)
+    ]
+    if len(candidates) != 1:
+        raise RuntimeError(
+            "Unsupported Psycopg C SDK target; only the four admitted Linux tuples are supported."
+        )
+    target = candidates[0]
+    gil_disabled = sysconfig.get_config_var("Py_GIL_DISABLED")
+    if (
+        sys.implementation.name != "cpython"
+        or sys.implementation.cache_tag != f"cpython-3{target.minor}"
+        or struct.calcsize("P") != 8
+        or type(gil_disabled) not in (int, type(None))
+        or gil_disabled not in (0, None)
+        or sys.abiflags != ""
+        or sysconfig.get_config_var("SOABI") != target.soabi
+        or sysconfig.get_config_var("EXT_SUFFIX") != "." + target.soabi + ".so"
+        or (source_image is not None and source_image != target.source_image)
+    ):
+        raise RuntimeError("Psycopg C SDK actual CPython ABI/source-image binding mismatch.")
+    return target
+
+
+def _psycopg_build_environment(native_root: Path, work: Path) -> dict[str, str]:
+    """Require the admitted Linux guest's actual isolated backend execution boundary."""
+    _psycopg_sdk_target()
+    _assert_backend_network_isolated()
+    if any((Path.home() / name).exists() for name in (".netrc", "_netrc", ".docker")):
+        raise RuntimeError("Psycopg backend cannot inherit credential material.")
+    forbidden = {
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "NETRC",
+        "PULSEPLATE_PYTHON_INDEX_URL",
+        "DEVPI_CI_PASSWORD",
+        "DEVPI_CI_USER",
+    }
+    if any(os.environ.get(name) for name in forbidden):
+        raise RuntimeError("Psycopg backend environment contains acquisition credentials/settings.")
+    local = native_root / "usr/local"
+    for relative in (
+        "bin/pg_config",
+        "include/libpq-fe.h",
+        "lib/libpq.so.5",
+        "lib/libssl.so.3",
+        "lib/libcrypto.so.3",
+    ):
+        if not (local / relative).is_file():
+            raise RuntimeError("Psycopg backend requires the complete admitted native client SDK.")
+    home = work / "home"
+    home.mkdir(mode=0o700)
+    return {
+        "HOME": str(home),
+        "PATH": f"{local}/bin:/usr/local/bin:/usr/bin:/bin",
+        "LANG": "C.UTF-8",
+        "TMPDIR": str(work),
+        "PIP_NO_INDEX": "1",
+        "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+        "PIP_CONFIG_FILE": os.devnull,
+        "CPPFLAGS": f"-I{local}/include",
+        "LDFLAGS": f"-L{local}/lib -Wl,-rpath,/usr/local/lib",
+        "LD_LIBRARY_PATH": str(local / "lib"),
+        "PKG_CONFIG_PATH": str(local / "lib/pkgconfig"),
+    }
+
+
+def build_psycopg_c_sdk(
+    *, source: Path, build_wheels: Path, native_root: Path, output: Path
+) -> None:
+    """Produce a genuine wheel in the admitted secret-free network-disabled guest."""
+    target = _psycopg_sdk_target()
+    if output.exists() or output.is_symlink():
+        raise RuntimeError("Psycopg wheel output must be new.")
+    build_artifacts = [
+        inspect_locked_wheel(wheel_path=p, expected_artifacts=PSYCOPG_C_BUILD_PINS)
+        for p in build_wheels.iterdir()
+    ]
+    if (
+        len(build_artifacts) != 3
+        or {a.artifact_key for a in build_artifacts} != PSYCOPG_C_BUILD_PINS
+    ):
+        raise RuntimeError("Psycopg source build requires exactly the verified binary build tools.")
+    _validate_psycopg_build_closure(build_artifacts)
+    output.mkdir(parents=True, mode=0o700)
+    with tempfile.TemporaryDirectory(prefix="psycopg-c-build-") as temporary:
+        work = Path(temporary)
+        environment = _psycopg_build_environment(native_root, work)
+        derived = work / "psycopg_c-3.3.4"
+        fingerprints = derive_psycopg_source(source, derived)
+        venv = work / "build-venv"
+        run_command(
+            [sys.executable, "-I", "-m", "venv", str(venv)],
+            environment=environment,
+            cwd=work,
+            timeout=120,
+        )
+        build_python = str(venv / "bin/python")
+        run_command(
+            [
+                build_python,
+                "-I",
+                "-m",
+                "pip",
+                "install",
+                "--no-index",
+                "--no-deps",
+                "--only-binary=:all:",
+                "--find-links",
+                str(build_wheels),
+                "setuptools==84.1.0",
+                "wheel==0.47.0",
+                "packaging==25.0",
+            ],
+            environment=environment,
+            cwd=work,
+            timeout=120,
+        )
+        run_command(
+            [
+                build_python,
+                "-I",
+                "-m",
+                "pip",
+                "wheel",
+                "--no-index",
+                "--no-deps",
+                "--no-build-isolation",
+                "--wheel-dir",
+                str(output),
+                str(derived),
+            ],
+            environment=environment,
+            cwd=work,
+            timeout=1800,
+        )
+    wheels = list(output.glob("*.whl"))
+    if len(wheels) != 1:
+        raise RuntimeError("Psycopg source build did not produce exactly one wheel.")
+    wheel = inspect_locked_wheel(
+        wheel_path=wheels[0], expected_artifacts=frozenset({("psycopg-c", "3.3.4")})
+    )
+    native = _inspect_psycopg_c_extensions(wheel.path)
+    receipt = {
+        **fingerprints,
+        "python_tag": target.python_tag,
+        "platform": target.wheel_platform,
+        "filename": wheel.path.name,
+        "wheel_sha256": wheel.snapshot.digest,
+        "metadata_sha256": wheel.metadata_digest,
+        "extensions": native,
+        "build_wheels": {a.path.name: a.snapshot.digest for a in build_artifacts},
+        "native_libraries": {
+            name: hashlib.sha256((native_root / "usr/local/lib" / name).read_bytes()).hexdigest()
+            for name in ("libpq.so.5", "libssl.so.3", "libcrypto.so.3")
+        },
+    }
+    (output / "psycopg-c-sdk.json").write_text(
+        json.dumps(receipt, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+    )
+    read_psycopg_c_sdk(output)
+
+
+def _inspect_psycopg_c_extensions(wheel: Path) -> dict[str, str]:
+    """Check the bounded SDK headers/tags; native readelf/loaded calls prove linkage."""
+    target = _psycopg_sdk_target()
+    with zipfile.ZipFile(wheel) as archive:
+        try:
+            info = archive.getinfo("psycopg_c-3.3.4.dist-info/WHEEL")
+            if info.file_size > 16 * 1024:
+                raise RuntimeError("Psycopg SDK WHEEL metadata exceeds its bound.")
+            metadata = BytesParser(policy=policy.default).parsebytes(archive.read(info))
+        except (KeyError, zipfile.BadZipFile) as error:
+            raise RuntimeError("Psycopg SDK WHEEL metadata is missing or malformed.") from error
+        if (
+            metadata.defects
+            or metadata.get_all("Wheel-Version", []) != ["1.0"]
+            or metadata.get_all("Root-Is-Purelib", []) != ["false"]
+            or metadata.get_all("Tag", [])
+            != [f"{target.python_tag}-{target.python_tag}-{target.wheel_platform}"]
+        ):
+            raise RuntimeError("Psycopg SDK WHEEL tag is not the selected native ABI.")
+        members = [info for info in archive.infolist() if info.filename.endswith(".so")]
+        expected = {f"psycopg_c/{name}.{target.soabi}.so" for name in ("_psycopg", "pq")}
+        if len(members) != 2 or {info.filename for info in members} != expected:
+            raise RuntimeError("Psycopg C wheel requires both exact native extension members.")
+        if any(info.file_size > 16 * 1024 * 1024 for info in members):
+            raise RuntimeError("Psycopg C extension exceeds the bounded SDK member size.")
+        extensions = {info.filename: archive.read(info) for info in members}
+    for payload in extensions.values():
+        if (
+            len(payload) < 64
+            or payload[:7] != b"\x7fELF\x02\x01\x01"
+            or struct.unpack_from("<HHI", payload, 16) != (3, target.elf_machine, 1)
+            or struct.unpack_from("<H", payload, 52)[0] != 64
+            or b"libpq.so.5\x00" not in payload
+        ):
+            raise RuntimeError("Psycopg C extension lacks the selected ELF64 header/libpq marker.")
+    return {name: hashlib.sha256(payload).hexdigest() for name, payload in extensions.items()}
+
+
+def read_psycopg_c_sdk(directory: Path, *, native_root: Path | None = None) -> ValidatedWheel:
+    """Cross-bind the one exact generated wheel, original/derived source and SDK inputs."""
+    target = _psycopg_sdk_target()
+    raw = _read_regular_input(directory / "psycopg-c-sdk.json", maximum=64 * 1024)
+
+    def unique(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise RuntimeError("Psycopg SDK contains duplicate fields.")
+            result[key] = value
+        return result
+
+    receipt = json.loads(raw, object_pairs_hook=unique)
+    expected_fields = {
+        "original_source_sha256",
+        "original_members_sha256",
+        "derived_members_sha256",
+        "derived_pyproject_sha256",
+        "python_tag",
+        "platform",
+        "filename",
+        "wheel_sha256",
+        "metadata_sha256",
+        "extensions",
+        "build_wheels",
+        "native_libraries",
+    }
+    if type(receipt) is not dict or set(receipt) != expected_fields:
+        raise RuntimeError("Psycopg SDK fields differ from the exact supported operation.")
+    bindings = {
+        "original_source_sha256": PSYCOPG_C_SOURCE_SHA256,
+        "original_members_sha256": PSYCOPG_C_MEMBER_SHA256,
+        "derived_members_sha256": PSYCOPG_C_DERIVED_MEMBER_SHA256,
+        "derived_pyproject_sha256": PSYCOPG_C_DERIVED_PYPROJECT_SHA256,
+        "python_tag": target.python_tag,
+        "platform": target.wheel_platform,
+    }
+    if any(receipt.get(k) != v for k, v in bindings.items()):
+        raise RuntimeError("Psycopg SDK source, platform or interpreter binding mismatch.")
+    filename = receipt["filename"]
+    tag = bindings["python_tag"]
+    if filename != f"psycopg_c-3.3.4-{tag}-{tag}-{target.wheel_platform}.whl":
+        raise RuntimeError("Psycopg SDK wheel filename is not the exact native ABI.")
+    wheel = inspect_locked_wheel(
+        wheel_path=directory / filename, expected_artifacts=frozenset({("psycopg-c", "3.3.4")})
+    )
+    if (
+        wheel.snapshot.digest != receipt["wheel_sha256"]
+        or wheel.metadata_digest != receipt["metadata_sha256"]
+        or _inspect_psycopg_c_extensions(wheel.path) != receipt["extensions"]
+    ):
+        raise RuntimeError("Psycopg SDK wheel/member/METADATA identity mismatch.")
+    build = receipt["build_wheels"]
+    if type(build) is not dict or set(build) != {
+        "setuptools-84.1.0-py3-none-any.whl",
+        "wheel-0.47.0-py3-none-any.whl",
+        "packaging-25.0-py3-none-any.whl",
+    }:
+        raise RuntimeError("Psycopg SDK binary build input binding mismatch.")
+    if build != {name: value[1] for name, value in PSYCOPG_C_BUILD_ARTIFACTS.items()}:
+        raise RuntimeError("Psycopg SDK build-wheel fingerprints differ from the reviewed inputs.")
+    libraries = receipt["native_libraries"]
+    if type(libraries) is not dict or set(libraries) != {
+        "libpq.so.5",
+        "libssl.so.3",
+        "libcrypto.so.3",
+    }:
+        raise RuntimeError("Psycopg SDK native library binding mismatch.")
+    if any(
+        type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None
+        for value in [*build.values(), *libraries.values()]
+    ):
+        raise RuntimeError("Psycopg SDK hashes must be complete SHA-256 values.")
+    if native_root is not None:
+        _check_psycopg_native_libraries(native_root, libraries)
+    return wheel
+
+
+def _check_psycopg_native_libraries(native_root: Path, libraries: dict[str, str]) -> None:
+    """Static three-DSO consistency only; independent qualified export owns origin."""
+    directory = native_root / "usr/local/lib"
+    alias = directory / "libpq.so.5"
+    absolute = directory.absolute()
+    if ".." in absolute.parts or any(part.is_symlink() for part in (absolute, *absolute.parents)):
+        raise RuntimeError("Psycopg native root must contain only real directories.")
+    before = alias.lstat()
+    if not stat.S_ISLNK(before.st_mode) or os.readlink(alias) != "libpq.so.5.18":
+        raise RuntimeError("Psycopg SDK requires the exact internal libpq SONAME alias.")
+    targets = {
+        "libpq.so.5": "libpq.so.5.18",
+        "libssl.so.3": "libssl.so.3",
+        "libcrypto.so.3": "libcrypto.so.3",
+    }
+    for name, target in targets.items():
+        payload = _read_regular_input(directory / target, maximum=16 * 1024**2)
+        if hashlib.sha256(payload).hexdigest() != libraries[name]:
+            raise RuntimeError("Psycopg SDK actual native library bytes differ from receipt.")
+    after = alias.lstat()
+    fields = (
+        "st_dev",
+        "st_ino",
+        "st_mode",
+        "st_nlink",
+        "st_uid",
+        "st_gid",
+        "st_size",
+        "st_mtime_ns",
+        "st_ctime_ns",
+    )
+    if os.readlink(alias) != "libpq.so.5.18" or any(
+        getattr(before, k) != getattr(after, k) for k in fields
+    ):
+        raise RuntimeError("Psycopg SDK SONAME alias changed during static validation.")
+
+
+MAX_WHEEL_METADATA_BYTES = 2 * 1024 * 1024
+MAX_WHEEL_MEMBERS = 100_000
+MAX_WHEEL_CENTRAL_DIRECTORY_BYTES = 32 * 1024 * 1024
+ZIP_END_OF_CENTRAL_DIRECTORY_SIZE = 22
+ZIP_MAX_COMMENT_BYTES = 65_535
+ZIP_END_OF_CENTRAL_DIRECTORY_SIGNATURE = b"PK\x05\x06"
+
+
+@dataclass(frozen=True)
+class FileSnapshot:
+    """Content and filesystem identity captured before resolver work."""
+
+    digest: str
+    mode: int
+    device: int
+    inode: int
+    owner_uid: int
+    size: int
+
+
+@dataclass(frozen=True)
+class ValidatedWheel:
+    """One statically validated wheel bound to immutable filesystem identity."""
+
+    path: Path
+    artifact_key: tuple[str, str]
+    snapshot: FileSnapshot
+    metadata_digest: str = ""
+    requires_dist: tuple[str, ...] = ()
+
+
+def _canonical_wheel_version(raw_version: str, *, label: str) -> str:
+    from pip._vendor.packaging.version import InvalidVersion, Version
+
+    try:
+        return str(Version(raw_version))
+    except InvalidVersion as exc:
+        raise RuntimeError(f"{label}: invalid package version") from exc
+
+
+def _validate_wheel_member_name(wheel_path: Path, member_name: str) -> PurePosixPath:
+    if "\\" in member_name:
+        raise RuntimeError(f"{wheel_path.name}: wheel member contains a backslash")
+    member_path = PurePosixPath(member_name)
+    if member_path.is_absolute() or ".." in member_path.parts:
+        raise RuntimeError(f"{wheel_path.name}: wheel member escapes the archive root")
+    return member_path
+
+
+def _validate_zip_central_directory_bounds(
+    *,
+    descriptor: int,
+    wheel_path: Path,
+    file_size: int,
+) -> None:
+    """Bound parser work before ``ZipFile`` materializes the central directory."""
+
+    if file_size < ZIP_END_OF_CENTRAL_DIRECTORY_SIZE:
+        raise RuntimeError(f"{wheel_path.name}: malformed wheel archive")
+    tail_size = min(
+        file_size,
+        ZIP_END_OF_CENTRAL_DIRECTORY_SIZE + ZIP_MAX_COMMENT_BYTES,
+    )
+    pread = getattr(os, "pread", None)
+    if not callable(pread):
+        raise RuntimeError("Wheel validation requires POSIX descriptor-bound reads.")
+    tail = pread(descriptor, tail_size, file_size - tail_size)
+    search_end = len(tail)
+    while True:
+        offset = tail.rfind(
+            ZIP_END_OF_CENTRAL_DIRECTORY_SIGNATURE,
+            0,
+            search_end,
+        )
+        if offset < 0:
+            raise RuntimeError(f"{wheel_path.name}: malformed wheel archive")
+        if offset + ZIP_END_OF_CENTRAL_DIRECTORY_SIZE <= len(tail):
+            (
+                signature,
+                disk_number,
+                central_directory_disk,
+                entries_on_disk,
+                total_entries,
+                central_directory_size,
+                central_directory_offset,
+                comment_size,
+            ) = struct.unpack_from("<4s4H2LH", tail, offset)
+            if (
+                signature == ZIP_END_OF_CENTRAL_DIRECTORY_SIGNATURE
+                and offset + ZIP_END_OF_CENTRAL_DIRECTORY_SIZE + comment_size == len(tail)
+            ):
+                break
+        search_end = offset
+
+    if disk_number or central_directory_disk or entries_on_disk != total_entries:
+        raise RuntimeError(f"{wheel_path.name}: multi-disk wheel archives are forbidden")
+    if (
+        total_entries == 0xFFFF
+        or central_directory_size == 0xFFFFFFFF
+        or central_directory_offset == 0xFFFFFFFF
+    ):
+        raise RuntimeError(f"{wheel_path.name}: ZIP64 wheel archives are forbidden")
+    if total_entries > MAX_WHEEL_MEMBERS:
+        raise RuntimeError(f"{wheel_path.name}: wheel contains too many archive members")
+    if central_directory_size > MAX_WHEEL_CENTRAL_DIRECTORY_BYTES:
+        raise RuntimeError(f"{wheel_path.name}: wheel central directory exceeds the size limit")
+    end_of_central_directory = file_size - tail_size + offset
+    if central_directory_offset + central_directory_size != end_of_central_directory:
+        raise RuntimeError(f"{wheel_path.name}: malformed wheel central directory bounds")
+
+
+def _single_metadata_header(
+    *,
+    wheel_path: Path,
+    metadata: object,
+    header_name: str,
+) -> str:
+    get_all = getattr(metadata, "get_all", None)
+    values = get_all(header_name, []) if callable(get_all) else []
+    if len(values) != 1 or not isinstance(values[0], str) or not values[0].strip():
+        raise RuntimeError(
+            f"{wheel_path.name}: METADATA must contain exactly one {header_name} header"
+        )
+    return values[0].strip()
+
+
+def inspect_locked_wheel(
+    *,
+    wheel_path: Path,
+    expected_artifacts: frozenset[tuple[str, str]],
+) -> ValidatedWheel:
+    from pip._vendor.packaging.requirements import InvalidRequirement, Requirement
+    from pip._vendor.packaging.utils import (
+        InvalidWheelFilename,
+        canonicalize_name,
+        parse_wheel_filename,
+    )
+
+    try:
+        filename_name, filename_version, _, _ = parse_wheel_filename(wheel_path.name)
+    except (InvalidWheelFilename, ValueError) as exc:
+        raise RuntimeError(f"{wheel_path.name}: malformed wheel filename") from exc
+    filename_key = (
+        str(canonicalize_name(filename_name)),
+        str(filename_version),
+    )
+    if filename_key not in expected_artifacts:
+        raise RuntimeError(
+            f"{wheel_path.name}: unexpected wheel artifact " f"{filename_key[0]}=={filename_key[1]}"
+        )
+
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    nonblocking = getattr(os, "O_NONBLOCK", None)
+    if no_follow is None or nonblocking is None:
+        raise RuntimeError("Wheel validation requires POSIX no-follow nonblocking reads.")
+    try:
+        descriptor = os.open(wheel_path, os.O_RDONLY | no_follow | nonblocking)
+    except OSError as exc:
+        raise RuntimeError(
+            f"{wheel_path.name}: wheel must remain a regular non-symlink file"
+        ) from exc
+    try:
+        wheel_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(wheel_stat.st_mode):
+            raise RuntimeError(f"{wheel_path.name}: wheel artifact is not a regular file")
+        digest = hashlib.sha256()
+        while chunk := os.read(descriptor, 1024 * 1024):
+            digest.update(chunk)
+        _validate_zip_central_directory_bounds(
+            descriptor=descriptor,
+            wheel_path=wheel_path,
+            file_size=wheel_stat.st_size,
+        )
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        with os.fdopen(descriptor, "rb") as wheel_stream:
+            descriptor = -1
+            try:
+                with zipfile.ZipFile(wheel_stream, "r") as wheel:
+                    metadata_members: list[zipfile.ZipInfo] = []
+                    members = wheel.infolist()
+                    if len(members) > MAX_WHEEL_MEMBERS:
+                        raise RuntimeError(
+                            f"{wheel_path.name}: wheel member count changed during parsing"
+                        )
+                    member_names: set[str] = set()
+                    for member in members:
+                        if member.filename in member_names:
+                            raise RuntimeError(
+                                f"{wheel_path.name}: wheel contains duplicate archive members"
+                            )
+                        member_names.add(member.filename)
+                        member_path = _validate_wheel_member_name(wheel_path, member.filename)
+                        member_mode = member.external_attr >> 16
+                        if member_mode and stat.S_ISLNK(member_mode):
+                            raise RuntimeError(
+                                f"{wheel_path.name}: wheel contains a symlink member"
+                            )
+                        if (
+                            len(member_path.parts) == 2
+                            and member_path.parts[0].endswith(".dist-info")
+                            and member_path.parts[1] == "METADATA"
+                        ):
+                            metadata_members.append(member)
+                    if len(metadata_members) != 1:
+                        raise RuntimeError(
+                            f"{wheel_path.name}: wheel must contain exactly one "
+                            "*.dist-info/METADATA"
+                        )
+                    metadata_member = metadata_members[0]
+                    if metadata_member.file_size > MAX_WHEEL_METADATA_BYTES:
+                        raise RuntimeError(
+                            f"{wheel_path.name}: METADATA exceeds the static size limit"
+                        )
+                    metadata_bytes = wheel.read(metadata_member)
+                final_metadata = os.fstat(wheel_stream.fileno())
+            except zipfile.BadZipFile as exc:
+                raise RuntimeError(f"{wheel_path.name}: malformed wheel archive") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    path_metadata = wheel_path.lstat()
+    identity = (
+        wheel_stat.st_dev,
+        wheel_stat.st_ino,
+        wheel_stat.st_size,
+        wheel_stat.st_mode,
+        wheel_stat.st_uid,
+    )
+    if (
+        stat.S_ISLNK(path_metadata.st_mode)
+        or identity
+        != (
+            final_metadata.st_dev,
+            final_metadata.st_ino,
+            final_metadata.st_size,
+            final_metadata.st_mode,
+            final_metadata.st_uid,
+        )
+        or identity
+        != (
+            path_metadata.st_dev,
+            path_metadata.st_ino,
+            path_metadata.st_size,
+            path_metadata.st_mode,
+            path_metadata.st_uid,
+        )
+    ):
+        raise RuntimeError(f"{wheel_path.name}: wheel identity changed during validation")
+    artifact_snapshot = FileSnapshot(
+        digest=digest.hexdigest(),
+        mode=stat.S_IMODE(wheel_stat.st_mode),
+        device=wheel_stat.st_dev,
+        inode=wheel_stat.st_ino,
+        owner_uid=wheel_stat.st_uid,
+        size=wheel_stat.st_size,
+    )
+
+    metadata_message = BytesParser(policy=policy.default).parsebytes(metadata_bytes)
+    if metadata_message.defects:
+        raise RuntimeError(f"{wheel_path.name}: malformed wheel METADATA headers")
+    metadata_name = _single_metadata_header(
+        wheel_path=wheel_path,
+        metadata=metadata_message,
+        header_name="Name",
+    )
+    metadata_version = _single_metadata_header(
+        wheel_path=wheel_path,
+        metadata=metadata_message,
+        header_name="Version",
+    )
+    metadata_key = (
+        str(canonicalize_name(metadata_name)),
+        _canonical_wheel_version(metadata_version, label=f"{wheel_path.name} METADATA"),
+    )
+    if metadata_key != filename_key:
+        raise RuntimeError(f"{wheel_path.name}: filename and METADATA Name/Version do not match")
+
+    metadata_path = PurePosixPath(metadata_member.filename)
+    dist_info_stem = metadata_path.parts[0][: -len(".dist-info")]
+    if "-" not in dist_info_stem:
+        raise RuntimeError(f"{wheel_path.name}: malformed dist-info directory")
+    dist_info_name, dist_info_version = dist_info_stem.rsplit("-", 1)
+    dist_info_key = (
+        str(canonicalize_name(dist_info_name)),
+        _canonical_wheel_version(dist_info_version, label=f"{wheel_path.name} dist-info"),
+    )
+    if dist_info_key != filename_key:
+        raise RuntimeError(f"{wheel_path.name}: dist-info and filename Name/Version do not match")
+
+    dependency_links = metadata_message.get_all("Dependency-Link", [])
+    if dependency_links:
+        raise RuntimeError(f"{wheel_path.name}: Dependency-Link metadata is forbidden")
+    for raw_requirement in metadata_message.get_all("Requires-Dist", []):
+        if not isinstance(raw_requirement, str):
+            raise RuntimeError(f"{wheel_path.name}: malformed Requires-Dist metadata")
+        try:
+            requirement = Requirement(raw_requirement)
+        except InvalidRequirement as exc:
+            raise RuntimeError(
+                f"{wheel_path.name}: malformed Requires-Dist metadata: {raw_requirement!r}"
+            ) from exc
+        if requirement.url is not None:
+            raise RuntimeError(
+                f"{wheel_path.name}: direct-reference Requires-Dist metadata is forbidden"
+            )
+    return ValidatedWheel(
+        path=wheel_path,
+        artifact_key=filename_key,
+        snapshot=artifact_snapshot,
+        metadata_digest=hashlib.sha256(metadata_bytes).hexdigest(),
+        requires_dist=tuple(metadata_message.get_all("Requires-Dist", [])),
+    )
+
+
+def _env_truthy(name: str) -> bool:
+    """Return True when env is set to a common affirmative string."""
+    value = os.environ.get(name, "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def docker_single_pass_locked_install_enabled() -> bool:
+    """Docker single-pass: install once on target interpreter, then run startup-hook guard there."""
+    return _env_truthy(DOCKER_SINGLE_PASS_LOCKED_INSTALL_ENV)
+
+
+def docker_pip_layer_cache_enabled() -> bool:
+    """When True, omit pip --no-cache-dir so BuildKit cache mounts can reuse HTTP wheels."""
+    return _env_truthy(DOCKER_PIP_LAYER_CACHE_ENV)
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    parser.add_argument(
+        "--python-executable",
+        default=sys.executable,
+        help="Python interpreter used to run pip and the startup-hook guard.",
+    )
+    parser.add_argument(
+        "--requirements-file",
+        type=Path,
+        default=DEFAULT_REQUIREMENTS_FILE,
+        help="Pinned runtime requirements file.",
+    )
+    parser.add_argument(
+        "--dev-requirements-file",
+        type=Path,
+        default=DEFAULT_DEV_REQUIREMENTS_FILE,
+        help="Pinned development requirements file.",
+    )
+    parser.add_argument(
+        "--test-requirements-file",
+        type=Path,
+        default=DEFAULT_TEST_REQUIREMENTS_FILE,
+        help="Pinned test requirements file.",
+    )
+    parser.add_argument(
+        "--ci-lite-requirements-file",
+        type=Path,
+        default=DEFAULT_CI_LITE_REQUIREMENTS_FILE,
+        help="Pinned lightweight CI requirements file for non-test control-plane jobs.",
+    )
+    parser.add_argument(
+        "--rag-vector-requirements-file",
+        type=Path,
+        default=DEFAULT_RAG_VECTOR_REQUIREMENTS_FILE,
+        help="Pinned optional vector/ML requirements file used when requirements-profile is rag-vector.",
+    )
+    parser.add_argument(
+        "--constraints-file",
+        type=Path,
+        default=DEFAULT_CONSTRAINTS_FILE,
+        help="Constraints file applied during download/install when present.",
+    )
+    parser.add_argument(
+        "--wheelhouse-dir",
+        type=Path,
+        help="Existing wheelhouse directory. If omitted, a temporary wheelhouse is built.",
+    )
+    parser.add_argument(
+        "--install-dev",
+        action="store_true",
+        help="Install development requirements after runtime requirements.",
+    )
+    parser.add_argument(
+        "--install-test",
+        action="store_true",
+        help="Install test requirements after runtime requirements.",
+    )
+    parser.add_argument(
+        "--requirements-profile",
+        choices=REQUIREMENTS_PROFILES,
+        help=(
+            "Explicit pinned dependency profile. "
+            "When set, it replaces the legacy --install-dev/--install-test flags."
+        ),
+    )
+    parser.add_argument(
+        "--require-virtualenv",
+        action="store_true",
+        help="Fail if the target Python interpreter is not inside a virtual environment.",
+    )
+    parser.add_argument(
+        "--upgrade-pip",
+        action="store_true",
+        help="Explicitly upgrade pip before wheel resolution.",
+    )
+    parser.add_argument(
+        "--upgrade-pip-spec",
+        default="pip>=26.2.2,<27.0",
+        help=(
+            "Simple numeric pip requirement spec (no extras/markers/wildcards), e.g. "
+            "'pip', 'pip==24.0', or 'pip>=23,<24', used with --upgrade-pip or "
+            "--upgrade-pip-only. "
+            "Docker uses this to keep a range in the Dockerfile while emergency fallback "
+            "remains exact-artifact scoped."
+        ),
+    )
+    parser.add_argument(
+        "--upgrade-pip-only",
+        action="store_true",
+        help="Upgrade pip via the governed proxy/fallback path and exit without installing requirements.",
+    )
+    parser.add_argument(
+        "--guard-script",
+        type=Path,
+        default=DEFAULT_STARTUP_HOOK_GUARD_PATH,
+        help="Path to the startup-hook guard script used for static .pth scanning.",
+    )
+    parser.add_argument(
+        "--emergency-wheel-manifest",
+        type=Path,
+        help=(
+            "Optional JSON manifest for exact emergency wheel fallback. "
+            f"Defaults to ${EMERGENCY_WHEEL_MANIFEST_ENV_VAR} or "
+            f"{DEFAULT_EMERGENCY_WHEEL_MANIFEST} when present."
+        ),
+    )
+    parser.add_argument(
+        "--index-url",
+        help=f"Approved private package proxy URL. Defaults to ${APPROVED_INDEX_ENV_VAR}.",
+    )
+    parser.add_argument(
+        "--trusted-host",
+        help=f"Optional trusted host for the approved proxy. Defaults to ${TRUSTED_HOST_ENV_VAR}.",
+    )
+    parser.add_argument(
+        "--install-mode",
+        choices=INSTALL_MODES,
+        default="wheelhouse",
+        help=(
+            "Installation transport. 'wheelhouse' keeps the hermetic local wheelhouse path; "
+            "'direct-proxy' installs from the approved proxy without creating a local wheelhouse."
+        ),
+    )
+
+    parser.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help=(
+            "Validate min dependency floor versions against approved proxy/fallback and exit "
+            "without installing any requirements."
+        ),
+    )
+    parser.add_argument("--prefetch-psycopg-build-wheels", type=Path)
+    parser.add_argument("--prefetch-psycopg-source", type=Path)
+    parser.add_argument("--build-psycopg-c", action="store_true")
+    parser.add_argument("--validate-psycopg-sdk", action="store_true")
+    parser.add_argument("--psycopg-source-archive", type=Path)
+    parser.add_argument("--psycopg-build-wheels", type=Path)
+    parser.add_argument("--psycopg-native-root", type=Path)
+    parser.add_argument("--psycopg-wheel-output", type=Path)
+    parser.add_argument("--psycopg-sdk", type=Path)
+    parser.add_argument("--prefetch-only", action="store_true")
+    parser.add_argument("--consume-only", action="store_true")
+    return parser.parse_args(argv)
+
+
+def resolve_requirement_files(
+    *,
+    requirements_file: Path,
+    dev_requirements_file: Path,
+    test_requirements_file: Path,
+    ci_lite_requirements_file: Path,
+    rag_vector_requirements_file: Path,
+    install_dev: bool,
+    install_test: bool,
+    requirements_profile: str | None,
+) -> list[Path]:
+    """Return the pinned requirement surfaces to download/install."""
+    profile_files: dict[str, list[tuple[str, Path]]] = {
+        "runtime": [("Requirements file", requirements_file)],
+        "runtime-dev": [
+            ("Requirements file", requirements_file),
+            ("Dev requirements file", dev_requirements_file),
+        ],
+        "runtime-test": [
+            ("Requirements file", requirements_file),
+            ("Test requirements file", test_requirements_file),
+        ],
+        "ci-test": [
+            ("CI lite requirements file", ci_lite_requirements_file),
+            ("CI test requirements file", test_requirements_file),
+        ],
+        "ci-lite": [("CI lite requirements file", ci_lite_requirements_file)],
+        "rag-vector": [
+            ("Requirements file", requirements_file),
+            ("RAG vector requirements file", rag_vector_requirements_file),
+        ],
+    }
+    if requirements_profile is not None:
+        return [
+            validate_requirement_file(path, label=label)
+            for label, path in profile_files[requirements_profile]
+        ]
+
+    requirement_files = [validate_requirement_file(requirements_file, label="Requirements file")]
+    if install_test:
+        requirement_files.append(
+            validate_requirement_file(test_requirements_file, label="Test requirements file")
+        )
+    if install_dev:
+        requirement_files.append(
+            validate_requirement_file(dev_requirements_file, label="Dev requirements file")
+        )
+    return requirement_files
+
+
+def validate_requirement_file(requirement_file: Path, *, label: str) -> Path:
+    """Return an existing requirements surface or fail closed with a stable label."""
+    if not requirement_file.exists():
+        raise FileNotFoundError(f"{label} not found: {requirement_file}")
+    return requirement_file
+
+
+def resolve_emergency_wheel_manifest_path(manifest_path: Path | None) -> Path | None:
+    """Resolve the optional emergency wheel manifest from CLI/env/default path."""
+    if manifest_path is not None:
+        return manifest_path
+    env_path = os.environ.get(EMERGENCY_WHEEL_MANIFEST_ENV_VAR, "").strip()
+    if env_path:
+        return Path(env_path)
+    if DEFAULT_EMERGENCY_WHEEL_MANIFEST.exists():
+        return DEFAULT_EMERGENCY_WHEEL_MANIFEST
+    return None
+
+
+def _parse_iso_date(value: str, *, field_name: str) -> date:
+    """Parse YYYY-MM-DD date strings for time-boxed fallback manifests."""
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value) is None:
+        raise RuntimeError(
+            f"Emergency wheel manifest field {field_name!r} must use YYYY-MM-DD: {value!r}"
+        )
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Emergency wheel manifest field {field_name!r} must use YYYY-MM-DD: {value!r}"
+        ) from exc
+
+
+def _validate_sha256(value: str, *, filename: str) -> str:
+    """Return a normalized sha256 digest or fail closed."""
+    digest = value.strip().lower()
+    if len(digest) != 64 or any(ch not in "01234567" "89abcdef" for ch in digest):
+        raise RuntimeError(
+            f"Emergency wheel manifest sha256 is invalid for {filename!r}: {value!r}"
+        )
+    return digest
+
+
+def _normalize_artifact_sha256(artifact: dict[str, object], *, filename: str) -> str:
+    """Return an emergency artifact digest from a direct string or split parts."""
+
+    direct_digest = artifact.get("sha256")
+    if isinstance(direct_digest, str) and direct_digest.strip():
+        return _validate_sha256(direct_digest, filename=filename)
+    digest_parts = artifact.get("sha256_parts")
+    if (
+        isinstance(digest_parts, list)
+        and digest_parts
+        and all(isinstance(part, str) and part.strip() for part in digest_parts)
+    ):
+        return _validate_sha256("".join(digest_parts), filename=filename)
+    raise RuntimeError(
+        "Emergency wheel artifacts require non-empty package/version/filename/url and "
+        "either sha256 or sha256_parts."
+    )
+
+
+def _manifest_is_retired_marker(payload: dict[str, object]) -> bool:
+    """Return True for the empty compatibility marker used after fallback retirement."""
+    artifacts = payload.get("artifacts")
+    generated_at = payload.get("generated_at")
+    reason = payload.get("reason")
+    return (
+        artifacts == []
+        and generated_at == RETIRED_EMERGENCY_WHEEL_MANIFEST_GENERATED_AT
+        and isinstance(reason, str)
+        and reason.strip().lower().startswith("retired:")
+    )
+
+
+def load_emergency_wheel_manifest(manifest_path: Path | None) -> list[dict[str, str]]:
+    """Load and validate an optional exact-wheel fallback manifest."""
+    resolved_path = resolve_emergency_wheel_manifest_path(manifest_path)
+    if resolved_path is None:
+        return []
+    if not resolved_path.exists():
+        raise FileNotFoundError(f"Emergency wheel manifest not found: {resolved_path}")
+
+    try:
+        payload = json.loads(resolved_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"Emergency wheel manifest is not valid JSON: {resolved_path}: {exc}"
+        ) from exc
+
+    if not isinstance(payload, dict):
+        raise RuntimeError("Emergency wheel manifest root must be a JSON object.")
+    if payload.get("schema_version") != 1:
+        raise RuntimeError("Emergency wheel manifest schema_version must equal 1.")
+
+    artifacts = payload.get("artifacts")
+    if artifacts == []:
+        if _manifest_is_retired_marker(payload):
+            return []
+        raise RuntimeError(
+            "Emergency wheel manifest may be empty only as the retired compatibility marker."
+        )
+
+    expires_at = payload.get("expires_at")
+    if not isinstance(expires_at, str) or not expires_at.strip():
+        raise RuntimeError("Emergency wheel manifest must define non-empty expires_at.")
+    default_expires_at = _parse_iso_date(expires_at, field_name="expires_at")
+
+    if not isinstance(artifacts, list) or not artifacts:
+        raise RuntimeError("Emergency wheel manifest must define a non-empty artifacts list.")
+
+    normalized_artifacts: list[dict[str, str]] = []
+    for index, artifact in enumerate(artifacts):
+        if not isinstance(artifact, dict):
+            raise RuntimeError(f"Emergency wheel artifact #{index} must be an object.")
+        package = artifact.get("package")
+        version = artifact.get("version")
+        filename = artifact.get("filename")
+        url = artifact.get("url")
+        if not all(
+            isinstance(value, str) and value.strip() for value in (package, version, filename, url)
+        ):
+            raise RuntimeError(
+                "Emergency wheel artifacts require non-empty package/version/filename/url "
+                "and either sha256 or sha256_parts."
+            )
+        package_text = cast(str, package).strip()
+        version_text = cast(str, version).strip()
+        filename_text = cast(str, filename).strip()
+        url_text = cast(str, url).strip()
+        sha256_text = _normalize_artifact_sha256(artifact, filename=filename_text)
+        artifact_expires_at = artifact.get("expires_at")
+        if artifact_expires_at is None:
+            effective_expires_at = default_expires_at
+        elif isinstance(artifact_expires_at, str) and artifact_expires_at.strip():
+            effective_expires_at = _parse_iso_date(
+                artifact_expires_at.strip(),
+                field_name=f"artifacts[{index}].expires_at",
+            )
+        else:
+            raise RuntimeError(
+                f"Emergency wheel artifact #{index} expires_at must be a non-empty YYYY-MM-DD string."
+            )
+        if effective_expires_at < date.today():
+            continue
+        parsed_url = urlparse(url_text)
+        hostname = (parsed_url.hostname or "").rstrip(".").lower()
+        if parsed_url.scheme != "https" or hostname not in ALLOWED_EMERGENCY_WHEEL_HOSTS:
+            raise RuntimeError("Emergency wheel artifacts must use approved https hosts only.")
+        normalized_artifacts.append(
+            {
+                "package": package_text,
+                "version": version_text,
+                "filename": filename_text,
+                "url": url_text,
+                "sha256": _validate_sha256(sha256_text, filename=filename_text),
+            }
+        )
+    if not normalized_artifacts:
+        raise RuntimeError(
+            "Emergency wheel manifest is expired; refresh the mirror or rotate the fallback: "
+            f"{resolved_path}"
+        )
+    return normalized_artifacts
+
+
+def _requirement_line_requests_exact_version(line: str, *, package: str, version: str) -> bool:
+    """Return True when a requirements line pins package==version exactly."""
+    stripped = line.split("#", 1)[0].strip().lower()
+    if not stripped or stripped.startswith(("-r ", "--requirement ", "-c ", "--constraint ")):
+        return False
+    return stripped == f"{package.lower()}=={version.lower()}"
+
+
+def _collect_exact_requirement_pins(lines: Sequence[str]) -> set[str]:
+    """Return normalized exact-package pins from requirement-like lines."""
+    exact_pins: set[str] = set()
+    for line in lines:
+        stripped = line.split("#", 1)[0].strip().lower()
+        if not stripped or stripped.startswith(("-r ", "--requirement ", "-c ", "--constraint ")):
+            continue
+        if "==" not in stripped:
+            continue
+        exact_pins.add(stripped)
+    return exact_pins
+
+
+def _collect_unmarked_exact_requirement_pin_versions(
+    lines: Sequence[str],
+) -> dict[str, set[str]]:
+    """Return package -> exact versions for unmarked requirement pins."""
+    exact_versions: dict[str, set[str]] = {}
+    for line in lines:
+        stripped = line.split("#", 1)[0].strip().lower()
+        if (
+            not stripped
+            or ";" in stripped
+            or stripped.startswith(("-r ", "--requirement ", "-c ", "--constraint "))
+        ):
+            continue
+        match = re.fullmatch(
+            r"([a-z0-9][a-z0-9._-]*)(?:\[[^]]+\])?\s*==\s*([^,;\s]+)",
+            stripped,
+        )
+        if match is None:
+            continue
+        package = re.sub(r"[-_.]+", "-", match.group(1))
+        exact_versions.setdefault(package, set()).add(match.group(2))
+    return exact_versions
+
+
+def _constraint_line_repeats_exact_min_floor(
+    line: str,
+    *,
+    exact_versions_by_package: dict[str, set[str]],
+) -> bool:
+    """Return True for package>=version floors already enforced by an exact pin."""
+    stripped = line.split("#", 1)[0].strip().lower()
+    if (
+        not stripped
+        or ";" in stripped
+        or stripped.startswith(("-r ", "--requirement ", "-c ", "--constraint "))
+    ):
+        return False
+    match = re.fullmatch(
+        r"([a-z0-9][a-z0-9._-]*)(?:\[[^]]+\])?\s*>=\s*([^,;\s]+)",
+        stripped,
+    )
+    if match is None:
+        return False
+    package = re.sub(r"[-_.]+", "-", match.group(1))
+    floor_version = match.group(2)
+    return any(
+        _version_satisfies_lower_bound(exact_version, floor_version)
+        for exact_version in exact_versions_by_package.get(package, set())
+    )
+
+
+def _version_satisfies_lower_bound(exact_version: str, floor_version: str) -> bool:
+    """Return True when an exact requirement version satisfies a lower-bound floor."""
+    try:
+        from packaging.version import Version
+    except Exception:  # noqa: BLE001 - installer can run before project deps are installed.
+        try:
+            from pip._vendor.packaging.version import Version
+        except Exception:  # noqa: BLE001 - keep non-PEP440 shapes fail-closed.
+            return exact_version == floor_version
+    try:
+        return bool(Version(exact_version) >= Version(floor_version))
+    except Exception:  # noqa: BLE001 - malformed/nonstandard versions keep the floor.
+        return exact_version == floor_version
+
+
+def _requirement_line_package_name(line: str) -> str | None:
+    """Return the normalized package name requested by a requirement-like line."""
+    stripped = line.split("#", 1)[0].strip().lower()
+    if not stripped or stripped.startswith(("-r ", "--requirement ", "-c ", "--constraint ")):
+        return None
+    match = re.match(r"([a-z0-9][a-z0-9._-]*)(?:\[[^]]+\])?\s*(?:===|==|~=|!=|<=|>=|<|>)", stripped)
+    if match is None:
+        return None
+    return re.sub(r"[-_.]+", "-", match.group(1))
+
+
+def _load_exact_requirement_pins(requirement_file: Path) -> set[str]:
+    """Read one requirement surface once and collect exact pins."""
+    return _collect_exact_requirement_pins(
+        requirement_file.read_text(encoding="utf-8").splitlines()
+    )
+
+
+def requirement_files_request_artifact(
+    requirement_files: Sequence[Path], *, package: str, version: str
+) -> bool:
+    """Return True when any selected requirements surface pins package==version."""
+    expected_pin = f"{package.lower()}=={version.lower()}"
+    for requirement_file in requirement_files:
+        if expected_pin in _load_exact_requirement_pins(requirement_file):
+            return True
+    return False
+
+
+def requirement_surfaces_request_artifact(
+    requirement_files: Sequence[Path],
+    *,
+    constraints_file: Path | None,
+    package: str,
+    version: str,
+) -> bool:
+    """Return True when selected requirement surfaces or constraints pin package==version."""
+    expected_pin = f"{package.lower()}=={version.lower()}"
+    if requirement_files_request_artifact(
+        requirement_files,
+        package=package,
+        version=version,
+    ):
+        return True
+
+    validated_constraints_file = validate_constraints_file(constraints_file)
+    if validated_constraints_file is None:
+        return False
+    return expected_pin in _load_exact_requirement_pins(validated_constraints_file)
+
+
+def _wheel_filename_tags(filename: str) -> set[str] | None:
+    """Return expanded wheel tags from a parseable wheel filename.
+
+    Older tests use deliberately shortened fake wheel names. Returning None for
+    those keeps legacy fixtures usable while production wheel filenames remain
+    tag-filtered.
+    """
+    if not filename.endswith(".whl"):
+        return None
+    parts = filename[:-4].rsplit("-", 3)
+    if len(parts) != 4:
+        return None
+    python_tag, abi_tag, platform_tag = parts[1:]
+    if not python_tag or not abi_tag or not platform_tag:
+        return None
+    return {
+        f"{python_part}-{abi_part}-{platform_part}"
+        for python_part in python_tag.split(".")
+        for abi_part in abi_tag.split(".")
+        for platform_part in platform_tag.split(".")
+        if python_part and abi_part and platform_part
+    }
+
+
+def _fallback_supported_wheel_tags_for_runtime(
+    *,
+    major: int,
+    minor: int,
+    implementation_name: str,
+    platform_name: str,
+    sysconfig_platform: str,
+    machine_name: str,
+) -> set[str]:
+    """Return conservative stdlib-only wheel tags for one interpreter/platform."""
+    if implementation_name == "cpython":
+        current_python_tag = f"cp{major}{minor}"
+        python_abi_tags = {f"{current_python_tag}-{current_python_tag}"}
+        python_abi_tags.update(f"cp{major}{abi_minor}-abi3" for abi_minor in range(2, minor + 1))
+    else:
+        current_python_tag = f"py{major}"
+        python_abi_tags = {f"{current_python_tag}-none"}
+
+    platform_tags = {"any"}
+    normalized_platform = sysconfig_platform.replace("-", "_").replace(".", "_")
+    if normalized_platform:
+        platform_tags.add(normalized_platform)
+
+    machine = machine_name.lower().replace("-", "_")
+    if machine in {"amd64", "x86_64"}:
+        machine = "x86_64"
+    elif machine in {"aarch64", "arm64"}:
+        machine = "aarch64"
+
+    if platform_name.startswith("linux") and machine:
+        platform_tags.add(f"linux_{machine}")
+        if machine == "x86_64":
+            platform_tags.update(
+                {"manylinux1_x86_64", "manylinux2010_x86_64", "manylinux2014_x86_64"}
+            )
+            platform_tags.update(
+                f"manylinux_2_{glibc_minor}_x86_64" for glibc_minor in range(17, 40)
+            )
+    elif platform_name == "darwin":
+        if "arm64" in normalized_platform:
+            platform_tags.add("macosx_11_0_arm64")
+            platform_tags.add("macosx_11_0_universal2")
+        elif "x86_64" in normalized_platform:
+            platform_tags.add("macosx_10_9_x86_64")
+            platform_tags.add("macosx_10_9_universal2")
+    elif platform_name.startswith("win"):
+        platform_tags.add("win_amd64" if machine == "x86_64" else f"win_{machine}")
+
+    supported_tags = {"py3-none-any", f"py{major}-none-any"}
+    supported_tags.update(
+        f"{python_abi_tag}-{platform_tag}"
+        for python_abi_tag in python_abi_tags
+        for platform_tag in platform_tags
+    )
+    return supported_tags
+
+
+def _fallback_supported_wheel_tags() -> set[str]:
+    """Return conservative stdlib-only wheel tags for the current interpreter."""
+    return _fallback_supported_wheel_tags_for_runtime(
+        major=sys.version_info.major,
+        minor=sys.version_info.minor,
+        implementation_name=sys.implementation.name,
+        platform_name=sys.platform,
+        sysconfig_platform=sysconfig.get_platform(),
+        machine_name=platform.machine(),
+    )
+
+
+def _current_supported_wheel_tags() -> set[str]:
+    """Return supported wheel tags without making packaging a hard dependency."""
+    try:
+        from packaging import tags as packaging_tags
+    except Exception:  # noqa: BLE001 - installer must run before project deps are installed.
+        return _fallback_supported_wheel_tags()
+    return {str(tag) for tag in packaging_tags.sys_tags()}
+
+
+def resolve_python_executable(python_executable: str) -> str:
+    """Return a validated absolute interpreter path while preserving its final symlink."""
+    candidate_text = python_executable.strip()
+    if not candidate_text or "\x00" in candidate_text:
+        raise RuntimeError("Python executable must be a non-empty path or command name.")
+
+    try:
+        if os.path.dirname(candidate_text):
+            candidate = Path(candidate_text).expanduser()
+        else:
+            discovered = shutil.which(candidate_text)
+            if discovered is None:
+                raise RuntimeError(f"Unable to resolve Python executable: {candidate_text}")
+            candidate = Path(discovered)
+
+        if not candidate.is_absolute():
+            candidate = Path.cwd() / candidate
+        invocation_path = candidate.parent.resolve(strict=True) / candidate.name
+        resolved_target = invocation_path.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        if isinstance(exc, RuntimeError) and str(exc).startswith(
+            "Unable to resolve Python executable:"
+        ):
+            raise
+        raise RuntimeError(f"Unable to resolve Python executable: {candidate_text}: {exc}") from exc
+
+    if not resolved_target.is_file() or not os.access(resolved_target, os.X_OK):
+        raise RuntimeError(
+            "Python executable must resolve to an executable regular file: " f"{candidate_text}"
+        )
+    return str(invocation_path)
+
+
+def _path_qualified_python_executable_for_probe(python_executable: str) -> str:
+    """Return the validated interpreter invocation used for wheel-tag probing."""
+    return resolve_python_executable(python_executable)
+
+
+def _require_psycopg_sdk_interpreter(python_executable: str) -> None:
+    """Allow this loader interpreter, including its venv symlinks, for the exact SDK."""
+    _psycopg_sdk_target()
+    target = Path(_path_qualified_python_executable_for_probe(python_executable))
+    try:
+        matches_loader = target.samefile(sys.executable)
+    except OSError as exc:
+        raise RuntimeError("Unable to compare the Psycopg SDK target interpreter.") from exc
+    if not matches_loader:
+        raise RuntimeError(
+            "Psycopg C SDK operations require the installer interpreter or its venv symlink."
+        )
+
+
+# CPython 3.11–3.13 delegates venv site-directory activation to
+# addsitepackages. The selected interpreter still owns pyvenv.cfg parsing.
+_PREFIX_ONLY_PROBE = """import site, sys
+if sys.implementation.name != "cpython" or sys.version_info[:2] not in ((3, 11), (3, 12), (3, 13)):
+    raise SystemExit(2)
+site.addsitepackages = lambda known_paths, prefixes=None: known_paths
+site.venv(set())
+"""
+
+
+def _isolated_probe_environment() -> dict[str, str]:
+    keys: tuple[str, ...] = ("HOME", "PYTHONUSERBASE", "PYTHONNOUSERSITE")
+    if os.name == "nt":
+        keys += ("SYSTEMROOT", "USERPROFILE", "APPDATA", "HOMEDRIVE", "HOMEPATH")
+    return {key: os.environ[key] for key in keys if key in os.environ}
+
+
+def _target_python_wheel_tag_payload(python_executable: str) -> dict[str, object]:
+    """Probe wheel-tag data from the requested target interpreter."""
+    probe_python = _path_qualified_python_executable_for_probe(python_executable)
+    metadata = """
+import json, platform, sys, sysconfig
+print(json.dumps(dict(tags=wheel_tags, major=sys.version_info.major, minor=sys.version_info.minor,
+                      implementation_name=sys.implementation.name, platform_name=sys.platform,
+                      sysconfig_platform=sysconfig.get_platform(), machine_name=platform.machine())))
+"""
+    # Only ordinary site roots with no .pth or customization can establish
+    # absence here. Include the user site when normal startup would enable it.
+    # An installed provider or startup override is a separate unqualified
+    # execution surface. Reject it before importing external package code.
+    discovery = _PREFIX_ONLY_PROBE + """
+import os
+from importlib.machinery import PathFinder
+roots = site.getsitepackages()
+user_allowed = (site.ENABLE_USER_SITE is not False and not os.environ.get("PYTHONNOUSERSITE")
+                and (not hasattr(os, "geteuid") or os.getuid() == os.geteuid())
+                and (not hasattr(os, "getegid") or os.getgid() == os.getegid()))
+if user_allowed:
+    roots.append(site.getusersitepackages())
+search = [os.getcwd(), *sys.path, *roots]
+eligible = True
+for root in roots:
+    try:
+        entries = os.listdir(root)
+    except FileNotFoundError:
+        continue
+    if any(name.endswith(".pth") for name in entries):
+        eligible = False
+for name in ("packaging", "sitecustomize", "usercustomize"):
+    if PathFinder.find_spec(name, search) is not None:
+        eligible = False
+if not eligible:
+    raise SystemExit(3)
+wheel_tags = None
+""" + metadata
+    if any(
+        value
+        for key, value in os.environ.items()
+        if (
+            key.startswith("PYTHON")
+            and key
+            not in {
+                "PYTHONUSERBASE",
+                "PYTHONNOUSERSITE",
+                "PYTHONDONTWRITEBYTECODE",
+                "PYTHONUNBUFFERED",
+                "PYTHONHASHSEED",
+            }
+        )
+        or key == "__PYVENV_LAUNCHER__"
+    ):
+        raise RuntimeError("External wheel-tag target requires a qualified import environment")
+    try:
+        invocation = Path(probe_python)
+        identity = invocation.stat()
+        result = subprocess.run(  # nosec B603 # B603: fixed isolated target metadata probe, no external package import (remove-by: 2027-01-01, ref: PR-2017)
+            [probe_python, "-I", "-S", "-c", discovery],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            env=_isolated_probe_environment(),
+            timeout=30,
+        )
+        if not os.path.samestat(identity, invocation.stat()):
+            raise OSError
+    except subprocess.TimeoutExpired:
+        error: RuntimeError | None = _InstallProcessTimeout("Installer interpreter check timed out")
+    except (OSError, UnicodeError):
+        error = RuntimeError("Unable to probe supported wheel tags")
+    else:
+        error = None
+    if error is not None:
+        raise error
+    if result.returncode in (2, 3) and not result.stdout:
+        raise RuntimeError("External wheel-tag target requires independent provider qualification")
+    if result.returncode != 0:
+        raise RuntimeError("Unable to probe supported wheel tags")
+    try:
+        payload = json.loads(result.stdout)
+    except (ValueError, RecursionError):
+        payload = None
+    if not isinstance(payload, dict) or payload.get("tags", False) is not None:
+        raise RuntimeError("Invalid wheel-tag probe payload")
+    return payload
+
+
+def _target_wheel_tag_payload_int(
+    payload: dict[str, object],
+    key: str,
+    *,
+    python_executable: str,
+) -> int:
+    value = payload.get(key)
+    if type(value) is not int or value < 1:
+        raise RuntimeError(f"Invalid wheel-tag probe payload from {python_executable}")
+    return value
+
+
+def _supported_wheel_tags_for_python(python_executable: str | None) -> set[str]:
+    """Return wheel tags for the target interpreter, defaulting to the current process."""
+    if python_executable is None or python_executable == sys.executable:
+        return _current_supported_wheel_tags()
+
+    target = resolve_python_executable(python_executable)
+    current = resolve_python_executable(sys.executable)
+    if target == current:
+        return _current_supported_wheel_tags()
+    # Sibling aliases may share current-runtime tags. A shared binary in a
+    # different invocation directory still needs independent qualification.
+    if os.path.dirname(target) == os.path.dirname(current):
+        try:
+            same_executable = os.path.samefile(target, current)
+        except OSError as exc:
+            raise RuntimeError(
+                "Unable to compare wheel-tag target to the current interpreter"
+            ) from exc
+        if same_executable:
+            return _current_supported_wheel_tags()
+
+    payload = _target_python_wheel_tag_payload(target)
+    tags = payload.get("tags")
+    if (
+        isinstance(tags, list)
+        and tags
+        and all(
+            isinstance(tag, str) and re.fullmatch(r"[A-Za-z0-9_]+-[A-Za-z0-9_]+-[A-Za-z0-9_]+", tag)
+            for tag in tags
+        )
+    ):
+        return set(tags)
+    if tags is not None or any(
+        not isinstance(payload.get(key), str) or not payload[key]
+        for key in ("implementation_name", "platform_name", "sysconfig_platform", "machine_name")
+    ):
+        raise RuntimeError("Invalid wheel-tag probe payload")
+    try:
+        return _fallback_supported_wheel_tags_for_runtime(
+            major=_target_wheel_tag_payload_int(
+                payload,
+                "major",
+                python_executable=python_executable,
+            ),
+            minor=_target_wheel_tag_payload_int(
+                payload,
+                "minor",
+                python_executable=python_executable,
+            ),
+            implementation_name=str(payload["implementation_name"]),
+            platform_name=str(payload["platform_name"]),
+            sysconfig_platform=str(payload["sysconfig_platform"]),
+            machine_name=str(payload["machine_name"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"Invalid wheel-tag probe payload from {python_executable}") from exc
+
+
+def _emergency_artifact_matches_runtime(
+    artifact: dict[str, str],
+    *,
+    supported_tags: set[str],
+) -> bool:
+    """Return True when an emergency wheel can be installed by this runtime."""
+    wheel_tags = _wheel_filename_tags(artifact["filename"])
+    if wheel_tags is None:
+        return True
+    return bool(wheel_tags & supported_tags)
+
+
+def _filter_runtime_compatible_artifacts(
+    artifacts: Sequence[dict[str, str]],
+    *,
+    python_executable: str | None = None,
+) -> list[dict[str, str]]:
+    """Drop incompatible wheels and collapse duplicate exact emergency artifacts."""
+    if not artifacts:
+        if python_executable is not None:
+            resolve_python_executable(python_executable)
+        return []
+    compatible_artifacts: list[dict[str, str]] = []
+    seen_artifact_digests_by_filename: dict[str, str] = {}
+    supported_tags = _supported_wheel_tags_for_python(python_executable)
+    for artifact in artifacts:
+        if not _emergency_artifact_matches_runtime(artifact, supported_tags=supported_tags):
+            continue
+        filename = artifact["filename"]
+        digest = _emergency_artifact_sha256(artifact)
+        previous_digest = seen_artifact_digests_by_filename.get(filename)
+        if previous_digest is None:
+            seen_artifact_digests_by_filename[filename] = digest
+            compatible_artifacts.append(artifact)
+            continue
+        if previous_digest != digest:
+            raise RuntimeError(f"Conflicting emergency artifact digests for {filename}")
+    return compatible_artifacts
+
+
+def emergency_artifacts_requested_by_surfaces(
+    *,
+    requirement_files: Sequence[Path],
+    constraints_file: Path | None,
+    manifest_path: Path | None,
+    python_executable: str | None = None,
+) -> list[dict[str, str]]:
+    """Return active emergency artifacts requested by selected requirement surfaces."""
+    requested_requirement_pins: set[str] = set()
+    for requirement_file in requirement_files:
+        requested_requirement_pins.update(_load_exact_requirement_pins(requirement_file))
+
+    validated_constraints_file = validate_constraints_file(constraints_file)
+    requested_constraint_pins = (
+        _load_exact_requirement_pins(validated_constraints_file)
+        if validated_constraints_file is not None
+        else set()
+    )
+
+    requested_artifacts: list[dict[str, str]] = []
+    for artifact in load_emergency_wheel_manifest(manifest_path):
+        expected_pin = f"{artifact['package'].lower()}=={artifact['version'].lower()}"
+        if (
+            expected_pin not in requested_requirement_pins
+            and expected_pin not in requested_constraint_pins
+        ):
+            continue
+        requested_artifacts.append(artifact)
+    return _filter_runtime_compatible_artifacts(
+        requested_artifacts,
+        python_executable=python_executable,
+    )
+
+
+def _emergency_artifact_path(url: str, filename: str) -> str:
+    """Bind the final transport to one literal public artifact and local leaf."""
+    if (
+        not filename.endswith(".whl")
+        or not re.fullmatch(r"[A-Za-z0-9_.+-]+", filename)
+        or not url.startswith("https://files.pythonhosted.org/packages/")
+        or any(ch in url for ch in "?#;\\")
+        or any(ord(ch) <= 32 or ord(ch) >= 127 for ch in url)
+    ):
+        raise RuntimeError("Invalid emergency wheel origin, path or filename")
+    path = urlparse(url).path
+    parts = path.split("/")[1:]
+    for part in parts:
+        if (
+            not re.fullmatch(r"(?:[a-zA-Z0-9_.+-]|%[0-9A-Fa-f]{2})+", part)
+            or not re.fullmatch(r"[a-zA-Z0-9_.+-]+", unquote(part))
+            or unquote(part) in (".", "..")
+        ):
+            raise RuntimeError("Invalid emergency wheel URL path component")
+    if unquote(parts[-1]) != filename:
+        raise RuntimeError("Emergency wheel URL does not match admitted filename")
+    return path
+
+
+def _wheel_remaining(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise RuntimeError("Emergency wheel operation timed out")
+    return remaining
+
+
+@contextmanager
+def _wheel_deadline() -> Iterator[float]:
+    """Interrupt blocking DNS, TLS, header and file operations on the POSIX CLI."""
+    deadline = time.monotonic() + EMERGENCY_WHEEL_OPERATION_SECONDS
+    if (
+        not hasattr(signal, "setitimer")
+        or threading.current_thread() is not threading.main_thread()
+        or signal.getitimer(signal.ITIMER_REAL)[0] != 0
+    ):
+        # Keep any enclosing timer intact. Cooperative checks bound acceptance.
+        yield deadline
+        return
+
+    def expired(_signum: int, _frame: FrameType | None) -> None:
+        raise RuntimeError("Emergency wheel operation timed out")
+
+    previous = signal.signal(signal.SIGALRM, expired)
+    try:
+        signal.setitimer(signal.ITIMER_REAL, _wheel_remaining(deadline))
+        yield deadline
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def _open_emergency_directory(directory: Path, *, create: bool = False) -> int:
+    """Hold each real directory while walking the supplied wheelhouse path."""
+    parts = directory.absolute().parts
+    if ".." in parts:
+        raise RuntimeError("Unsafe emergency wheel directory")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fd = os.open(parts[0], flags)
+    try:
+        # Darwin exposes these two root-owned aliases even for tempfile's own
+        # /var/folders paths. Walk their literal targets with no-follow FDs.
+        relative = parts[1:]
+        if sys.platform == "darwin" and relative and relative[0] in ("tmp", "var"):
+            alias = relative[0]
+            metadata = os.stat(alias, dir_fd=fd, follow_symlinks=False)
+            if stat.S_ISLNK(metadata.st_mode):
+                private = os.stat("private", dir_fd=fd, follow_symlinks=False)
+                root = os.fstat(fd)
+                if (
+                    metadata.st_uid != 0
+                    or root.st_uid != 0
+                    or root.st_mode & 0o022
+                    or private.st_uid != 0
+                    or not stat.S_ISDIR(private.st_mode)
+                    or private.st_mode & 0o022
+                    or os.readlink(alias, dir_fd=fd) != "private/" + alias
+                ):
+                    raise RuntimeError("Untrusted Darwin temporary-directory alias")
+                relative = ("private", *relative)
+        for part in relative:
+            if create:
+                try:
+                    os.mkdir(part, 0o700, dir_fd=fd)
+                except FileExistsError:
+                    pass
+            child = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _cached_emergency_sha256(destination: Path) -> str | None:
+    """Hash one held regular file, rejecting aliases, swaps and partial reads."""
+    with _wheel_deadline() as deadline:
+        directory = _open_emergency_directory(destination.parent, create=True)
+        try:
+            try:
+                fd = os.open(
+                    destination.name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=directory
+                )
+            except FileNotFoundError:
+                return None
+            try:
+                before = os.fstat(fd)
+                if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+                    raise RuntimeError("Unsafe cached emergency wheel")
+                if before.st_size > MAX_EMERGENCY_WHEEL_BYTES:
+                    raise RuntimeError("Cached emergency wheel exceeds byte limit")
+            except BaseException:
+                os.close(fd)
+                raise
+            with os.fdopen(fd, "rb") as stream:
+                digest = hashlib.sha256()
+                length = 0
+                while True:
+                    _wheel_remaining(deadline)
+                    remaining = MAX_EMERGENCY_WHEEL_BYTES - length
+                    chunk = stream.read(min(1024**2, remaining + 1))
+                    if not chunk:
+                        break
+                    if len(chunk) > remaining:
+                        raise RuntimeError("Cached emergency wheel exceeds byte limit")
+                    digest.update(chunk)
+                    length += len(chunk)
+                after = os.fstat(fd)
+                if after.st_size > MAX_EMERGENCY_WHEEL_BYTES:
+                    raise RuntimeError("Cached emergency wheel exceeds byte limit")
+                named = destination.lstat()
+                fields = (
+                    "st_dev",
+                    "st_ino",
+                    "st_mode",
+                    "st_nlink",
+                    "st_size",
+                    "st_mtime_ns",
+                    "st_ctime_ns",
+                )
+                if length != before.st_size or any(
+                    getattr(before, field) != getattr(current, field)
+                    for current in (after, named)
+                    for field in fields
+                ):
+                    raise RuntimeError("Cached emergency wheel changed during read")
+                _wheel_remaining(deadline)
+                return digest.hexdigest()
+        finally:
+            os.close(directory)
+
+
+def _download_with_sha256(*, url: str, destination: Path, expected_sha256: str) -> None:
+    """Publish one complete verified wheel without replacing an existing leaf."""
+    path = _emergency_artifact_path(url, destination.name)
+    with _wheel_deadline() as deadline:
+        directory = _open_emergency_directory(destination.parent, create=True)
+        temp = f".{destination.name}.{uuid4().hex}.tmp"
+        try:
+            fd = os.open(
+                temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory
+            )
+            with os.fdopen(fd, "wb", buffering=0) as stream:
+                created = os.fstat(fd)
+                linked = False
+
+                def remove_owned(name: str) -> None:
+                    named = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                    if not os.path.samestat(created, named):
+                        raise RuntimeError("Emergency wheel cleanup entry was replaced")
+                    os.unlink(name, dir_fd=directory)
+
+                try:
+                    digest = hashlib.sha256()
+                    with closing(
+                        http.client.HTTPSConnection(
+                            "files.pythonhosted.org", timeout=_wheel_remaining(deadline)
+                        )
+                    ) as connection:
+                        connection.request("GET", path)
+                        wire = connection.sock
+                        if wire is None:
+                            raise RuntimeError("Emergency wheel TLS socket unavailable")
+                        wire.settimeout(_wheel_remaining(deadline))
+                        with connection.getresponse() as response:
+                            if response.status != 200:
+                                raise RuntimeError(f"Emergency wheel HTTP status {response.status}")
+                            declared = response.getheader("Content-Length")
+                            if declared is not None:
+                                if not re.fullmatch(r"[0-9]+", declared):
+                                    raise RuntimeError("Invalid emergency wheel response length")
+                                digits = declared.lstrip("0") or "0"
+                                if (
+                                    len(digits) > len(str(MAX_EMERGENCY_WHEEL_BYTES))
+                                    or int(digits) > MAX_EMERGENCY_WHEEL_BYTES
+                                ):
+                                    raise RuntimeError("Emergency wheel exceeds byte limit")
+                                if response.chunked:
+                                    raise RuntimeError("Ambiguous emergency wheel response length")
+                            count = 0
+                            while not response.isclosed():
+                                wire.settimeout(_wheel_remaining(deadline))
+                                remaining = MAX_EMERGENCY_WHEEL_BYTES - count
+                                chunk = response.read1(min(1024**2, remaining + 1))
+                                if not chunk:
+                                    break
+                                if len(chunk) > remaining:
+                                    raise RuntimeError("Emergency wheel exceeds byte limit")
+                                digest.update(chunk)
+                                stream.write(chunk)
+                                count += len(chunk)
+                            if declared is not None and str(count) != (declared.lstrip("0") or "0"):
+                                raise RuntimeError("Incomplete emergency wheel response")
+                        stream.flush()
+                        written = os.fstat(fd)
+                    if digest.hexdigest() != expected_sha256:
+                        raise RuntimeError(
+                            f"Emergency wheel sha256 mismatch for {destination.name}"
+                        )
+                    _wheel_remaining(deadline)
+                    checked_dir = _open_emergency_directory(destination.parent)
+                    try:
+                        if not os.path.samestat(os.fstat(directory), os.fstat(checked_dir)):
+                            raise RuntimeError("Emergency wheel directory changed")
+                    finally:
+                        os.close(checked_dir)
+                    current = os.stat(temp, dir_fd=directory, follow_symlinks=False)
+                    if (
+                        not os.path.samestat(written, current)
+                        or current.st_nlink != 1
+                        or current.st_ctime_ns != written.st_ctime_ns
+                        or current.st_size != count
+                    ):
+                        raise RuntimeError("Emergency wheel temporary file changed")
+                    os.link(
+                        temp,
+                        destination.name,
+                        src_dir_fd=directory,
+                        dst_dir_fd=directory,
+                        follow_symlinks=False,
+                    )
+                    linked = True
+                    published = destination.lstat()
+                    if not os.path.samestat(written, published) or published.st_size != count:
+                        raise RuntimeError("Emergency wheel publication changed")
+                    _wheel_remaining(deadline)
+                    remove_owned(temp)
+                except BaseException as primary:
+                    for name in ([destination.name, temp] if linked else [temp]):
+                        try:
+                            remove_owned(name)
+                        except FileNotFoundError:
+                            pass
+                        except (OSError, RuntimeError) as secondary:
+                            primary.add_note("Emergency wheel cleanup: " + type(secondary).__name__)
+                    raise
+        finally:
+            os.close(directory)
+
+
+def _emergency_artifact_sha256(artifact: dict[str, str]) -> str:
+    """Return the exact expected digest for an emergency artifact."""
+
+    digest = artifact.get("sha256")
+    if isinstance(digest, str) and digest.strip():
+        return digest.strip()
+    digest_parts = artifact.get("sha256_parts")
+    if isinstance(digest_parts, list) and all(isinstance(part, str) for part in digest_parts):
+        joined_digest = "".join(digest_parts).strip()
+        if joined_digest:
+            return joined_digest
+    raise RuntimeError(f"Emergency artifact missing sha256 digest: {artifact.get('filename')}")
+
+
+def stage_emergency_wheels(
+    *,
+    requirement_files: Sequence[Path],
+    constraints_file: Path | None,
+    wheelhouse_dir: Path,
+    manifest_path: Path | None,
+    python_executable: str | None = None,
+) -> list[Path]:
+    """Download exact emergency wheels requested by the selected requirement files."""
+    requested_artifacts = emergency_artifacts_requested_by_surfaces(
+        requirement_files=requirement_files,
+        constraints_file=constraints_file,
+        manifest_path=manifest_path,
+        python_executable=python_executable,
+    )
+    return _stage_emergency_artifacts(
+        artifacts=requested_artifacts,
+        wheelhouse_dir=wheelhouse_dir,
+        python_executable=python_executable,
+    )
+
+
+def _stage_emergency_artifacts(
+    *,
+    artifacts: Sequence[dict[str, str]],
+    wheelhouse_dir: Path,
+    python_executable: str | None = None,
+) -> list[Path]:
+    """Download selected exact emergency artifacts into a wheelhouse."""
+    staged_paths: list[Path] = []
+    for artifact in _filter_runtime_compatible_artifacts(
+        artifacts,
+        python_executable=python_executable,
+    ):
+        destination = wheelhouse_dir / artifact["filename"]
+        _emergency_artifact_path(artifact["url"], artifact["filename"])
+        existing_sha256 = _cached_emergency_sha256(destination)
+        if existing_sha256 is not None:
+            if existing_sha256 != _emergency_artifact_sha256(artifact):
+                raise RuntimeError(f"Existing emergency wheel has unexpected sha256: {destination}")
+        else:
+            _download_with_sha256(
+                url=artifact["url"],
+                destination=destination,
+                expected_sha256=_emergency_artifact_sha256(artifact),
+            )
+        staged_paths.append(destination)
+    return staged_paths
+
+
+def build_pip_download_command(
+    *,
+    python_executable: str,
+    requirement_file: Path,
+    wheelhouse_dir: Path,
+    constraints_file: Path | None,
+    index_url: str,
+    trusted_host: str | None,
+    no_dependencies: bool = False,
+) -> list[str]:
+    constraints_file = validate_constraints_file(constraints_file)
+    command = [
+        python_executable,
+        "-m",
+        "pip",
+        "download",
+        "--retries",
+        str(PIP_NETWORK_RETRIES),
+        "--timeout",
+        str(PIP_NETWORK_TIMEOUT_SECONDS),
+        "--only-binary",
+        ":all:",
+        "--find-links",
+        str(wheelhouse_dir),
+        "--dest",
+        str(wheelhouse_dir),
+        "--requirement",
+        str(requirement_file),
+    ]
+    command.extend(["--index-url", index_url])
+    if no_dependencies:
+        command.append("--no-deps")
+    if trusted_host:
+        command.extend(["--trusted-host", trusted_host])
+    if constraints_file is not None:
+        command.extend(["--constraint", str(constraints_file)])
+    return command
+
+
+def build_pip_install_command(
+    *,
+    python_executable: str,
+    requirement_file: Path,
+    wheelhouse_dir: Path,
+    constraints_file: Path | None,
+) -> list[str]:
+    constraints_file = validate_constraints_file(constraints_file)
+    command = [
+        python_executable,
+        "-m",
+        "pip",
+        "install",
+        "--no-deps",
+        "--no-index",
+        "--find-links",
+        str(wheelhouse_dir),
+        "--requirement",
+        str(requirement_file),
+    ]
+    if constraints_file is not None:
+        command.extend(["--constraint", str(constraints_file)])
+    return command
+
+
+def build_pip_proxy_install_command(
+    *,
+    python_executable: str,
+    requirement_file: Path,
+    constraints_file: Path | None,
+    index_url: str,
+    trusted_host: str | None,
+    find_links_dir: Path | None = None,
+    allow_pip_download_cache: bool | None = None,
+) -> list[str]:
+    constraints_file = validate_constraints_file(constraints_file)
+    use_pip_cache = (
+        docker_pip_layer_cache_enabled()
+        if allow_pip_download_cache is None
+        else allow_pip_download_cache
+    )
+    command = [
+        python_executable,
+        "-m",
+        "pip",
+        "install",
+        "--no-deps",
+        "--retries",
+        str(PIP_NETWORK_RETRIES),
+        "--timeout",
+        str(PIP_NETWORK_TIMEOUT_SECONDS),
+        "--only-binary",
+        ":all:",
+        "--index-url",
+        index_url,
+        "--requirement",
+        str(requirement_file),
+    ]
+    if find_links_dir is not None:
+        command.extend(["--find-links", str(find_links_dir)])
+    if not use_pip_cache:
+        try:
+            install_idx = command.index("install")
+        except ValueError as exc:
+            raise RuntimeError("pip proxy install command is missing the install verb") from exc
+        command.insert(install_idx + 1, "--no-cache-dir")
+    if trusted_host:
+        command.extend(["--trusted-host", trusted_host])
+    if constraints_file is not None:
+        command.extend(["--constraint", str(constraints_file)])
+    return command
+
+
+def validate_constraints_file(constraints_file: Path | None) -> Path | None:
+    """Return an existing constraints file or fail closed when a path is invalid."""
+    if constraints_file is None:
+        return None
+    if not constraints_file.exists():
+        raise FileNotFoundError(f"Constraints file not found: {constraints_file}")
+    return constraints_file
+
+
+@contextmanager
+def effective_constraints_file_for_requirement(
+    requirement_file: Path,
+    constraints_file: Path | None,
+) -> Iterator[Path | None]:
+    """Yield constraints with duplicate exact pins removed for one requirement file."""
+    validated_constraints_file = validate_constraints_file(constraints_file)
+    if validated_constraints_file is None:
+        yield None
+        return
+
+    requirement_lines = requirement_file.read_text(encoding="utf-8").splitlines()
+    requirement_exact_pins = _collect_exact_requirement_pins(requirement_lines)
+    exact_versions_by_package = _collect_unmarked_exact_requirement_pin_versions(requirement_lines)
+    if not requirement_exact_pins:
+        yield validated_constraints_file
+        return
+
+    constraint_lines = validated_constraints_file.read_text(encoding="utf-8").splitlines(
+        keepends=True
+    )
+    filtered_constraint_lines = []
+    removed_redundant_constraint = False
+    for line in constraint_lines:
+        normalized_line = line.split("#", 1)[0].strip().lower()
+        if (normalized_line and normalized_line in requirement_exact_pins) or (
+            _constraint_line_repeats_exact_min_floor(
+                line,
+                exact_versions_by_package=exact_versions_by_package,
+            )
+        ):
+            removed_redundant_constraint = True
+            continue
+        filtered_constraint_lines.append(line)
+
+    if not removed_redundant_constraint:
+        yield validated_constraints_file
+        return
+    if not filtered_constraint_lines:
+        yield None
+        return
+
+    temp_fd, temp_name = tempfile.mkstemp(
+        prefix=f".{validated_constraints_file.stem}.effective-",
+        suffix=validated_constraints_file.suffix,
+        dir=validated_constraints_file.parent,
+    )
+    effective_constraints_path = Path(temp_name)
+    try:
+        os.close(temp_fd)
+        effective_constraints_path.write_text(
+            "".join(filtered_constraint_lines),
+            encoding="utf-8",
+        )
+        yield effective_constraints_path
+    finally:
+        effective_constraints_path.unlink(missing_ok=True)
+
+
+def normalize_trusted_host(trusted_host: str | None) -> str | None:
+    """Return a normalized trusted-host value or None when unset."""
+    if trusted_host is None:
+        return None
+    stripped = trusted_host.strip()
+    return stripped or None
+
+
+def validate_private_proxy_url(index_url: str) -> str:
+    """Validate that the approved package source is a non-public proxy."""
+    normalized = index_url.strip()
+    if not normalized:
+        raise RuntimeError("Approved Python package proxy URL must not be empty.")
+    parsed = urlparse(normalized)
+    hostname = parsed.hostname
+    if parsed.scheme not in {"http", "https"} or not hostname:
+        raise RuntimeError("Approved Python package proxy must be an http(s) URL with a hostname.")
+    canonical_hostname = hostname.rstrip(".").lower()
+    if canonical_hostname in BLOCKED_INDEX_HOSTS:
+        raise RuntimeError(
+            f"Approved Python package proxy must not point to public host: {canonical_hostname}"
+        )
+    if parsed.username is not None or parsed.password is not None:
+        raise RuntimeError(
+            "Credentialed Python package proxy URLs are forbidden; use a clean "
+            "index URL with .netrc-backed CI credentials."
+        )
+    if canonical_hostname in REQUIRED_HTTPS_INDEX_HOSTS and parsed.scheme != "https":
+        raise RuntimeError(
+            "Approved Python package proxy host must use https: " f"{canonical_hostname}"
+        )
+    return normalized
+
+
+def reject_ambient_index_overrides() -> None:
+    """Fail closed when ambient pip/uv index overrides are present."""
+    overrides = [
+        env_var
+        for env_var in AMBIENT_INDEX_OVERRIDE_ENV_VARS
+        if os.environ.get(env_var, "").strip()
+    ]
+    if overrides:
+        joined = ", ".join(overrides)
+        raise RuntimeError(
+            "Ambient Python package index overrides are forbidden for canonical installs: "
+            f"{joined}. Use {APPROVED_INDEX_ENV_VAR} / {TRUSTED_HOST_ENV_VAR} instead."
+        )
+
+
+def resolve_private_proxy_settings(
+    *,
+    index_url: str | None,
+    trusted_host: str | None,
+) -> tuple[str, str | None]:
+    """Resolve and validate the approved private package proxy contract."""
+    resolved_index_url = index_url or os.environ.get(APPROVED_INDEX_ENV_VAR)
+    if not resolved_index_url:
+        raise RuntimeError(
+            "Approved Python package proxy is required for canonical installs. "
+            f"Set {APPROVED_INDEX_ENV_VAR} or pass --index-url."
+        )
+    reject_ambient_index_overrides()
+    validated_index_url = validate_private_proxy_url(resolved_index_url)
+    resolved_trusted_host = normalize_trusted_host(
+        trusted_host or os.environ.get(TRUSTED_HOST_ENV_VAR)
+    )
+    _admit_private_proxy_netrc_auth(
+        parsed_url=urlparse(validated_index_url), trusted_host=resolved_trusted_host
+    )
+    return validated_index_url, resolved_trusted_host
+
+
+def load_dependency_security_floors(
+    schema_path: Path | None = None,
+) -> dict[str, str]:
+    """Load min dependency floors from canonical schema."""
+    path = schema_path or DEFAULT_DEPENDENCY_SECURITY_SCHEMA
+    if not path.exists():
+        raise FileNotFoundError(f"Dependency security schema not found: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Dependency security schema is not valid JSON: {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Dependency security schema must be a JSON object: {path}")
+    min_versions = payload.get("min_versions")
+    if not isinstance(min_versions, dict) or not min_versions:
+        raise RuntimeError(f"Dependency security schema must define non-empty min_versions: {path}")
+    floors: dict[str, str] = {}
+    for package, version in min_versions.items():
+        if not isinstance(package, str) or not package.strip():
+            raise RuntimeError(
+                f"Dependency security schema contains invalid package name in {path}: {package!r}"
+            )
+        if not isinstance(version, str) or not version.strip():
+            raise RuntimeError(
+                f"Dependency security schema has invalid version for {package!r} in {path}"
+            )
+        floors[package.strip().lower()] = version.strip()
+    return floors
+
+
+def _resolver_miss_error(
+    runtime_error: RuntimeError,
+    *,
+    package: str,
+    version: str,
+    ignored_transport_packages: Sequence[str] = (),
+) -> bool:
+    """Return True when pip failed because package floor is unavailable on index."""
+    if not isinstance(runtime_error, _CompletedPipFailure):
+        return False
+    message = runtime_error._resolver_output
+    normalized_message = message.lower()
+    requirement_text = f"{package}=={version}"
+    package_name = _normalized_package_name(package)
+    normalized_requirement = requirement_text.lower()
+
+    def line_mentions_requested_or_ignored_project(line: str) -> bool:
+        return _line_mentions_requested_project(line, package=package) or any(
+            _line_mentions_requested_project(line, package=ignored_package)
+            for ignored_package in ignored_transport_packages
+        )
+
+    def line_mentions_only_requested_or_ignored_package(line: str) -> bool:
+        if _line_has_transport_failure_excluding_package_name(line, package=package):
+            return line_mentions_requested_or_ignored_project(line)
+        if normalized_requirement in line:
+            return True
+        if re.fullmatch(rf"\s*{re.escape(package_name)}\s*", line):
+            return True
+        return package_name in line and ("cannot install" in line or "the user requested" in line)
+
+    network_diagnostics = "\n".join(
+        line
+        for line in normalized_message.splitlines()
+        if not line_mentions_only_requested_or_ignored_package(line)
+    )
+    if _pip_upgrade_network_failure(network_diagnostics):
+        return False
+    resolver_markers = (
+        f"No matching distribution found for {requirement_text}",
+        f"Could not find a version that satisfies the requirement {requirement_text}",
+    )
+    if any(marker in message for marker in resolver_markers):
+        return True
+
+    pip26_no_candidate_markers = (
+        f"cannot install {normalized_requirement} because these package versions have conflicting dependencies.",
+        f"the user requested {normalized_requirement}",
+        "no matching distributions available for your environment",
+    )
+    if not all(marker in normalized_message for marker in pip26_no_candidate_markers):
+        return False
+
+    missing_package_line = re.compile(rf"^\s*{re.escape(package_name)}\s*$", re.MULTILINE)
+    return bool(missing_package_line.search(normalized_message))
+
+
+def _normalized_package_name(package: str) -> str:
+    """Return the normalized package spelling used by simple-index paths."""
+    return re.sub(r"[-_.]+", "-", package).lower()
+
+
+def _package_name_variants(package: str) -> set[str]:
+    """Return package spellings commonly emitted in pip/simple-index output."""
+    package_name = _normalized_package_name(package)
+    return {package_name, package_name.replace("-", "_")}
+
+
+def _line_mentions_requested_project(line: str, *, package: str) -> bool:
+    """Return True when a diagnostic line points at the requested simple project."""
+    normalized_line = line.lower().replace("\\", "/")
+    return any(
+        re.search(rf"(?:/|\+simple/){re.escape(variant)}(?:/|['\" )]|$)", normalized_line)
+        is not None
+        for variant in _package_name_variants(package)
+    )
+
+
+def _line_has_transport_failure_excluding_package_name(line: str, *, package: str) -> bool:
+    """Detect transport failures without treating package spelling as a network marker."""
+    scrubbed_line = line.lower()
+    for variant in _package_name_variants(package):
+        scrubbed_line = re.sub(re.escape(variant), "", scrubbed_line, flags=re.IGNORECASE)
+    return _pip_upgrade_network_failure(scrubbed_line)
+
+
+def _package_scoped_proxy_retry_failure(runtime_error: RuntimeError, *, package: str) -> bool:
+    """Return True when pip's own retry log proves a package-scoped proxy timeout."""
+    if not isinstance(runtime_error, _CompletedPipFailure):
+        return False
+    return any(
+        _line_mentions_requested_project(line, package=package)
+        and _line_has_transport_failure_excluding_package_name(line, package=package)
+        for line in runtime_error._resolver_output.splitlines()
+    )
+
+
+def _pip_upgrade_resolver_miss(runtime_error: RuntimeError) -> bool:
+    """Return True when pip failed because the pip spec is absent from the proxy."""
+    if not isinstance(runtime_error, _CompletedPipFailure):
+        return False
+    message = runtime_error._resolver_output.lower()
+    resolver_markers = (
+        "no matching distribution found for pip",
+        "could not find a version that satisfies the requirement pip",
+    )
+    return any(
+        marker in message for marker in resolver_markers
+    ) and not _pip_upgrade_network_failure(message)
+
+
+def _pip_upgrade_network_failure(message: str) -> bool:
+    """Return True when pip output includes transport/proxy failure markers."""
+    network_markers = (
+        "connection aborted",
+        "connection error",
+        "connection reset",
+        "connection refused",
+        "connect timeout",
+        "cloudflare",
+        "521",
+        "error 5",
+        "http 5",
+        "max retries exceeded",
+        "proxy error",
+        "read timeout",
+        "retrying",
+        "server error",
+        "ssl",
+        "temporarily unavailable",
+        "timed out",
+        "tls",
+    )
+    return any(marker in message for marker in network_markers)
+
+
+def _simple_project_url(index_url: str, package: str) -> str:
+    """Return the approved index project URL used to prove proxy health before fallback."""
+    normalized_package = re.sub(r"[-_.]+", "-", package).lower()
+    base = index_url.rstrip("/") + "/"
+    return f"{base}{quote(normalized_package, safe='')}/"
+
+
+def _simple_project_page_looks_valid(*, package: str, body: bytes) -> bool:
+    """Return True when a response body looks like a PEP 503 project page."""
+    normalized_package = re.sub(r"[-_.]+", "-", package).lower()
+    package_markers = (f"{normalized_package}-", f"{normalized_package.replace('-', '_')}-")
+    text = body.decode("utf-8", errors="ignore").lower()
+    return "href=" in text and any(marker in text for marker in package_markers)
+
+
+def _simple_project_page_has_version(*, package: str, version: str, body: bytes) -> bool:
+    """Return True when a PEP 503 project page advertises the exact package version."""
+    normalized_package = re.sub(r"[-_.]+", "-", package).lower()
+    text = body[:100_000].decode("utf-8", errors="ignore").lower()
+    version_boundary = r"(?=(?:-|\.tar\.gz|\.zip|\.whl|[\"'#<]))"
+    patterns = (
+        rf"{re.escape(normalized_package)}-{re.escape(version)}{version_boundary}",
+        rf"{re.escape(normalized_package.replace('-', '_'))}-{re.escape(version)}{version_boundary}",
+    )
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
+def _redact_url_credentials(url: str) -> str:
+    """Remove inline credentials from a URL before including it in diagnostics."""
+    parsed = urlparse(url)
+    if parsed.hostname is None:
+        return url
+    netloc = parsed.hostname
+    if parsed.port is not None:
+        netloc = f"{netloc}:{parsed.port}"
+    return parsed._replace(netloc=netloc).geturl()
+
+
+def _redact_url_credentials_in_text(value: str) -> str:
+    """Remove inline URL credentials from arbitrary diagnostic text."""
+    return re.sub(
+        r"\b(?P<scheme>https?://)(?P<userinfo>[^/\s?#]+@)(?P<host>[^@\s/?#]+)",
+        lambda match: f"{match.group('scheme')}{match.group('host')}",
+        value,
+    )
+
+
+def _netrc_credentials(hostname: str | None) -> tuple[str, str] | None:
+    """Resolve Requests' first existing default candidate; absence alone is anonymous."""
+    if not hostname:
+        return None
+    try:
+        # Native pip-vendored Requests NETRC_FILES order; stdlib owns parsing.
+        # Retain filename-less parsing for .netrc's existing owner/mode checks.
+        for filename in (".netrc", "_netrc"):
+            candidate = Path(os.path.expanduser(f"~/{filename}"))
+            try:
+                candidate.stat()
+            except FileNotFoundError:
+                continue
+            parsed_credentials = netrc.netrc() if filename == ".netrc" else netrc.netrc(candidate)
+            credentials = parsed_credentials.authenticators(hostname)
+            break
+        else:
+            return None
+    except (netrc.NetrcParseError, OSError, UnicodeError) as exc:
+        raise RuntimeError(
+            f"Unable to read default netrc credentials ({type(exc).__name__})."
+        ) from None
+    if credentials is None:
+        return None
+    if (
+        not isinstance(credentials, tuple)
+        or len(credentials) != 3
+        or not all(isinstance(value, str) for value in credentials)
+    ):
+        raise RuntimeError("Indeterminate default netrc credentials are forbidden.")
+    login, account, password = credentials
+    # Native pip's requests selects account when login is empty. stdlib owns
+    # named-machine/default-stanza selection; do not parse another auth source.
+    principal = login or account
+    if not principal.strip() or not password:
+        raise RuntimeError("Indeterminate default netrc credentials are forbidden.")
+    if principal.strip().lower() == "root":
+        raise RuntimeError("Root devpi credentials are forbidden in default netrc.")
+    return principal, password
+
+
+def _trusted_host_matches_url(*, trusted_host: str | None, parsed_url: ParseResult) -> bool:
+    """Return True when the operator trusted-host applies to the project URL host."""
+    if not trusted_host:
+        return False
+    hostname = str(parsed_url.hostname or "").lower()
+    if not hostname:
+        return False
+    trusted = trusted_host.strip()
+    try:
+        authority = urlparse(f"//{trusted}")
+        trusted_hostname = (authority.hostname or "").lower()
+        trusted_port = authority.port
+        url_port = parsed_url.port
+        suffix = trusted.split("]", 1)[1] if trusted.startswith("[") else trusted.partition(":")[2]
+        malformed = (
+            not trusted_hostname
+            or authority.netloc != trusted
+            or any(
+                character.isspace() or ord(character) < 32 or ord(character) == 127
+                for character in trusted
+            )
+            or authority.username is not None
+            or authority.password is not None
+            or bool(authority.path or authority.query or authority.fragment)
+            or (
+                trusted.startswith("[")
+                and suffix != ""
+                and (not suffix.startswith(":") or not suffix[1:].isdecimal())
+            )
+            or (not trusted.startswith("[") and ":" in trusted and not suffix.isdecimal())
+        )
+    except ValueError:
+        raise RuntimeError("Invalid private proxy trusted-host authority.") from None
+    if malformed:
+        raise RuntimeError("Invalid private proxy trusted-host authority.")
+    # Native pip adapter mounts retain trailing dots and explicit port spelling.
+    return trusted_hostname == hostname and (
+        trusted_port is None
+        or (url_port is not None and authority.netloc.rpartition(":")[2] == str(url_port))
+    )
+
+
+def _admit_private_proxy_netrc_auth(
+    *, parsed_url: ParseResult, trusted_host: str | None
+) -> str | None:
+    """Admit default-netrc credentials only on verified HTTPS and reuse the result."""
+    trusted_transport = _trusted_host_matches_url(trusted_host=trusted_host, parsed_url=parsed_url)
+    credentials = _netrc_credentials(parsed_url.hostname)
+    if credentials is None:
+        return None
+    if parsed_url.scheme != "https" or trusted_transport:
+        raise RuntimeError(
+            "Default netrc credentials require verified HTTPS. Use the existing HTTPS "
+            "private proxy and remove its matching trusted-host override."
+        )
+    principal, password = credentials
+    encoded = f"{principal}:{password}".encode("utf-8")
+    return "Basic " + base64.b64encode(encoded).decode("ascii")
+
+
+class _PrivateIndexTLSRejected(RuntimeError):
+    """Terminal verified-TLS failure cannot authorize an emergency fallback."""
+
+
+def _read_private_index_project_page(
+    *,
+    index_url: str,
+    package: str,
+    trusted_host: str | None,
+) -> tuple[str, bytes]:
+    """Return the approved proxy simple-index project page or fail closed."""
+    project_url = _simple_project_url(index_url, package)
+    safe_url = _redact_url_credentials(project_url)
+    parsed = urlparse(project_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise RuntimeError(
+            "Approved Python package proxy health check requires an http(s) project URL: "
+            f"{package}: {safe_url}"
+        )
+    if parsed.username is not None or parsed.password is not None:
+        raise RuntimeError(
+            "Credentialed Python package proxy health check URLs are forbidden: "
+            f"{package}: {safe_url}"
+        )
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    headers: dict[str, str] = {}
+    netrc_header = _admit_private_proxy_netrc_auth(parsed_url=parsed, trusted_host=trusted_host)
+    if netrc_header is not None:
+        headers["Authorization"] = netrc_header
+    status: int
+    body: bytes
+    tls_failure_class: str | None = None
+    for attempt in range(1, PIP_NETWORK_RETRIES + 1):
+        conn: http.client.HTTPConnection | None = None
+        failure_class: str | None = None
+        try:
+            if parsed.scheme == "http":
+                conn = http.client.HTTPConnection(
+                    parsed.hostname,
+                    port=parsed.port,
+                    timeout=PRIVATE_INDEX_HEALTH_TIMEOUT_SECONDS,
+                )
+            else:
+                conn = http.client.HTTPSConnection(
+                    parsed.hostname,
+                    port=parsed.port,
+                    timeout=PRIVATE_INDEX_HEALTH_TIMEOUT_SECONDS,
+                )
+            conn.request("GET", path, headers=headers)
+            response = conn.getresponse()
+            status = response.status
+            body = response.read(PRIVATE_INDEX_PROJECT_PAGE_BYTES)
+        except Exception as exc:  # noqa: BLE001 - any probe failure must keep fallback fail-closed.
+            failure_class = type(exc).__name__
+            if isinstance(exc, ssl.SSLError):
+                tls_failure_class = tls_failure_class or type(exc).__name__
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception as exc:  # noqa: BLE001 - cleanup failures cannot admit fallback.
+                    failure_class = failure_class or type(exc).__name__
+                    if isinstance(exc, ssl.SSLError):
+                        tls_failure_class = tls_failure_class or type(exc).__name__
+        if failure_class is not None:
+            if attempt == PIP_NETWORK_RETRIES:
+                if tls_failure_class is not None:
+                    raise _PrivateIndexTLSRejected(
+                        "Approved Python package proxy TLS verification failed before "
+                        f"emergency fallback: {tls_failure_class}"
+                    ) from None
+                raise RuntimeError(
+                    "Approved Python package proxy health check failed before emergency fallback: "
+                    f"{package}: {safe_url}: {failure_class}"
+                ) from None
+            _sleep_before_private_index_retry(attempt)
+            continue
+        tls_failure_class = None
+        if status >= 500 and attempt < PIP_NETWORK_RETRIES:
+            _sleep_before_private_index_retry(attempt)
+            continue
+        break
+    else:  # pragma: no cover - range is non-empty while PIP_NETWORK_RETRIES is positive.
+        raise RuntimeError(
+            "Approved Python package proxy health check failed before emergency fallback: "
+            f"{package}: {safe_url}: retry budget exhausted"
+        )
+    if status < 200 or status >= 300:
+        raise RuntimeError(
+            "Approved Python package proxy health check failed before emergency fallback: "
+            f"{package}: {safe_url}: HTTP {status}"
+        )
+    return safe_url, body
+
+
+def _sleep_before_private_index_retry(attempt: int) -> None:
+    """Sleep briefly before retrying an approved-proxy health probe."""
+    index = max(0, min(attempt - 1, len(PRIVATE_INDEX_HEALTH_RETRY_BACKOFF_SECONDS) - 1))
+    time.sleep(PRIVATE_INDEX_HEALTH_RETRY_BACKOFF_SECONDS[index])
+
+
+def _require_private_index_project_health(
+    *,
+    index_url: str,
+    package: str,
+    trusted_host: str | None,
+) -> None:
+    """Fail closed unless the approved proxy serves the package project page."""
+    safe_url, body = _read_private_index_project_page(
+        index_url=index_url,
+        package=package,
+        trusted_host=trusted_host,
+    )
+    if not _simple_project_page_looks_valid(package=package, body=body):
+        raise RuntimeError(
+            "Approved Python package proxy health check failed before emergency fallback: "
+            f"{package}: {safe_url}: invalid simple-index project page"
+        )
+
+
+def _private_index_project_has_version(
+    *,
+    index_url: str,
+    package: str,
+    version: str,
+    trusted_host: str | None,
+) -> bool:
+    """Return True when the approved proxy advertises the exact package version."""
+    safe_url, body = _read_private_index_project_page(
+        index_url=index_url,
+        package=package,
+        trusted_host=trusted_host,
+    )
+    if not _simple_project_page_looks_valid(package=package, body=body):
+        raise RuntimeError(
+            "Approved Python package proxy health check failed before dependency floor preflight: "
+            f"{package}: {safe_url}: invalid simple-index project page"
+        )
+    if package == "psycopg-c" and version == PSYCOPG_C_VERSION:
+        admitted_psycopg_source_url(body=body, project_url=safe_url)
+        return True
+    return _simple_project_page_has_version(package=package, version=version, body=body)
+
+
+def _parse_simple_version(value: str) -> tuple[int, ...]:
+    """Parse the numeric version shape used by emergency pip bootstrap wheels."""
+    if re.fullmatch(r"\d+(?:\.\d+)*", value) is None:
+        raise RuntimeError(f"Unsupported emergency pip version format: {value!r}")
+    return tuple(int(part) for part in value.split("."))
+
+
+def _compare_versions(left: str, right: str) -> int:
+    left_parts = list(_parse_simple_version(left))
+    right_parts = list(_parse_simple_version(right))
+    width = max(len(left_parts), len(right_parts))
+    left_parts.extend([0] * (width - len(left_parts)))
+    right_parts.extend([0] * (width - len(right_parts)))
+    if left_parts < right_parts:
+        return -1
+    if left_parts > right_parts:
+        return 1
+    return 0
+
+
+def _pip_spec_allows_version(pip_spec: str, version: str) -> bool:
+    """Return True when a narrow pip requirement spec permits an emergency artifact."""
+    normalized_spec = pip_spec.strip().lower()
+    package_match = re.match(r"^pip\s*(.*)$", normalized_spec)
+    if package_match is None:
+        raise RuntimeError(f"pip upgrade spec must target pip: {pip_spec!r}")
+    constraints = package_match.group(1).strip()
+    if not constraints:
+        return True
+
+    for raw_constraint in constraints.split(","):
+        constraint = raw_constraint.strip()
+        match = re.fullmatch(r"(==|>=|<=|>|<)\s*(\d+(?:\.\d+)*)", constraint)
+        if match is None:
+            raise RuntimeError(
+                f"Unsupported pip upgrade spec constraint {constraint!r} in {pip_spec!r}"
+            )
+        operator, expected_version = match.groups()
+        comparison = _compare_versions(version, expected_version)
+        if operator == "==" and comparison != 0:
+            return False
+        if operator == ">=" and comparison < 0:
+            return False
+        if operator == "<=" and comparison > 0:
+            return False
+        if operator == ">" and comparison <= 0:
+            return False
+        if operator == "<" and comparison >= 0:
+            return False
+    return True
+
+
+def _select_pip_emergency_artifact(
+    *,
+    manifest_path: Path | None,
+    pip_spec: str,
+    python_executable: str | None = None,
+) -> dict[str, str]:
+    """Select the highest active emergency pip artifact allowed by the Docker range."""
+    candidates = [
+        artifact
+        for artifact in load_emergency_wheel_manifest(manifest_path)
+        if artifact["package"].lower() == "pip"
+        and _pip_spec_allows_version(pip_spec, artifact["version"])
+    ]
+    candidates = _filter_runtime_compatible_artifacts(
+        candidates,
+        python_executable=python_executable,
+    )
+    if not candidates:
+        raise RuntimeError(f"No active emergency pip artifact satisfies upgrade spec {pip_spec!r}.")
+    return max(candidates, key=lambda artifact: _parse_simple_version(artifact["version"]))
+
+
+def _stage_pip_upgrade_emergency_wheel(
+    *,
+    wheelhouse_dir: Path,
+    manifest_path: Path | None,
+    pip_spec: str,
+    python_executable: str | None = None,
+) -> Path:
+    """Download the exact emergency pip wheel selected for the upgrade range."""
+    artifact = _select_pip_emergency_artifact(
+        manifest_path=manifest_path,
+        pip_spec=pip_spec,
+        python_executable=python_executable,
+    )
+    destination = wheelhouse_dir / artifact["filename"]
+    _emergency_artifact_path(artifact["url"], artifact["filename"])
+    existing_sha256 = _cached_emergency_sha256(destination)
+    if existing_sha256 is not None:
+        if existing_sha256 != _emergency_artifact_sha256(artifact):
+            raise RuntimeError(f"Existing emergency pip wheel has unexpected sha256: {destination}")
+    else:
+        _download_with_sha256(
+            url=artifact["url"],
+            destination=destination,
+            expected_sha256=_emergency_artifact_sha256(artifact),
+        )
+    return destination
+
+
+def verify_emergency_artifact_for_floor(
+    *,
+    manifest_path: Path | None,
+    package: str,
+    version: str,
+    python_executable: str | None = None,
+) -> bool:
+    """Return True when exact emergency fallback artifact exists and verifies."""
+    artifacts = [
+        artifact
+        for artifact in load_emergency_wheel_manifest(manifest_path)
+        if artifact["package"].lower() == package.lower() and artifact["version"] == version
+    ]
+    artifacts = _filter_runtime_compatible_artifacts(
+        artifacts,
+        python_executable=python_executable,
+    )
+    if not artifacts:
+        return False
+    with tempfile.TemporaryDirectory(prefix="pulseplate-floor-emergency-") as temp_dir:
+        for artifact in artifacts:
+            _emergency_artifact_path(artifact["url"], artifact["filename"])
+            destination = Path(temp_dir) / artifact["filename"]
+            _download_with_sha256(
+                url=artifact["url"],
+                destination=destination,
+                expected_sha256=_emergency_artifact_sha256(artifact),
+            )
+    return True
+
+
+def run_dependency_floor_preflight(
+    *,
+    python_executable: str,
+    index_url: str,
+    trusted_host: str | None,
+    emergency_wheel_manifest: Path | None,
+) -> None:
+    """Fail fast when dependency floors are unavailable through the approved proxy."""
+    floors = load_dependency_security_floors()
+    for package, version in sorted(floors.items()):
+        proxy_error: RuntimeError | None = None
+        try:
+            if _private_index_project_has_version(
+                index_url=index_url,
+                package=package,
+                version=version,
+                trusted_host=trusted_host,
+            ):
+                continue
+        except _PrivateIndexTLSRejected:
+            raise
+        except RuntimeError as exc:
+            proxy_error = exc
+        if verify_emergency_artifact_for_floor(
+            manifest_path=emergency_wheel_manifest,
+            package=package,
+            version=version,
+            python_executable=python_executable,
+        ):
+            if proxy_error is None:
+                print(
+                    "WARNING: floor preflight proxy miss tolerated via emergency fallback: "
+                    f"{package}=={version}"
+                )
+            else:
+                print(
+                    "WARNING: floor preflight proxy probe failure tolerated via exact "
+                    f"emergency fallback: {package}=={version}: {proxy_error}"
+                )
+            continue
+        if proxy_error is not None:
+            raise RuntimeError(
+                "Dependency floor preflight failed for approved proxy: "
+                f"{package}=={version}: {proxy_error}"
+            ) from proxy_error
+        raise RuntimeError(
+            "Dependency floor preflight failed for approved proxy: "
+            f"{package}=={version}: exact version is not advertised by approved proxy"
+        )
+
+
+def is_virtualenv_python(python_executable: str) -> bool:
+    """Return True when the target interpreter runs inside a virtualenv."""
+    resolved_python = resolve_python_executable(python_executable)
+    probe = _PREFIX_ONLY_PROBE + (
+        "import json\n"
+        "print(json.dumps(dict(executable=sys.executable, prefix=sys.prefix, base_prefix=sys.base_prefix)))"
+    )
+    try:
+        invocation = Path(resolved_python)
+        initial = invocation.stat()
+        result = subprocess.run(  # nosec B603 # B603: argv uses an explicit Python executable and fixed venv probe code only (remove-by: 2027-01-01, ref: PR-litellm-hardening)
+            [resolved_python, "-I", "-S", "-c", probe],
+            check=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=_isolated_probe_environment(),
+            timeout=30,
+            text=True,
+            encoding="utf-8",
+        )
+        if not os.path.samestat(initial, invocation.stat()) or not os.access(invocation, os.X_OK):
+            raise OSError
+    except subprocess.TimeoutExpired:
+        failure: RuntimeError | None = _InstallProcessTimeout(
+            "Installer interpreter check timed out"
+        )
+    except (OSError, subprocess.CalledProcessError, UnicodeError):
+        failure = RuntimeError("Unable to probe virtualenv state")
+    else:
+        failure = None
+    if failure is not None:
+        raise failure
+    try:
+
+        def unique_fields(pairs: list[tuple[str, object]]) -> dict[str, object]:
+            fields = dict(pairs)
+            if len(fields) != len(pairs):
+                raise ValueError
+            return fields
+
+        payload = json.loads(result.stdout, object_pairs_hook=unique_fields)
+    except (ValueError, RecursionError):
+        payload = None
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"executable", "prefix", "base_prefix"}
+        or payload["executable"] != resolved_python
+        or any(
+            not isinstance(payload.get(key), str)
+            or not payload[key]
+            or "\x00" in payload[key]
+            or not Path(payload[key]).is_absolute()
+            for key in ("prefix", "base_prefix")
+        )
+    ):
+        raise RuntimeError("Unable to probe virtualenv state: invalid prefix metadata")
+    return bool(payload["prefix"] != payload["base_prefix"])
+
+
+PIP_CHILD_SELECTOR = "--pulseplate-owned-pip-child"
+PIP_TRANSPORT_ERROR = "ERROR: locked pip transport rejected."
+PIP_CHILD_IMPORT_ERROR = "ERROR: locked pip child import failed."
+PIP_EXECUTION_IMPORT_ERROR = "ERROR: locked pip execution import failed."
+
+
+class _PipTransportRejected(RuntimeError):
+    """Constant, value-free failure at the owned native transport boundary."""
+
+
+def _install_pip_transport_guard() -> object:
+    """Guard the trusted native pip adapter contract until child termination.
+
+    This is a bounded current-client correction, not a recognizer for arbitrary
+    plugins, monkeypatched pip, unknown implementations or future releases.
+    """
+    from pip._internal.exceptions import InstallationError
+    from pip._internal.network import session as native
+    from pip._vendor.requests.adapters import HTTPAdapter
+    from pip._vendor.requests.models import PreparedRequest
+
+    class _NativePipTransportRejected(_PipTransportRejected, InstallationError):
+        """Use native pip's ordinary controlled-error path without a traceback."""
+
+    send = HTTPAdapter.send
+    cert_verify = HTTPAdapter.cert_verify
+    secure = (native.HTTPAdapter, native.CacheControlAdapter)
+
+    def guarded_send(
+        self: HTTPAdapter,
+        request: PreparedRequest,
+        stream: bool = False,
+        timeout: object = None,
+        verify: bool | str = True,
+        cert: object = None,
+        proxies: object = None,
+    ) -> object:
+        # Iterate keys only: Mapping.__contains__ may retrieve a value.
+        if any(key.lower() == "authorization" for key in request.headers):
+            enabled_verify = verify is True or (
+                type(verify) is str
+                and bool(verify)
+                and (os.path.isfile(verify) or os.path.isdir(verify))
+            )
+            if (
+                urlparse(request.url).scheme.lower() != "https"
+                or type(self) not in secure
+                or getattr(self.cert_verify, "__func__", None) is not cert_verify
+                or not enabled_verify
+            ):
+                raise _NativePipTransportRejected(PIP_TRANSPORT_ERROR)
+        return send(self, request, stream, timeout, verify, cert, proxies)
+
+    HTTPAdapter.send = guarded_send
+    return send  # Test restoration is permitted only after complete quiescence.
+
+
+def _run_owned_pip_child(argv: Sequence[str]) -> int:
+    """Run pip lazily with the guard retained after CLI return and exceptions."""
+    try:
+        _install_pip_transport_guard()
+        from pip._internal.cli.main import main as pip_main
+    except _PipTransportRejected:
+        print(PIP_TRANSPORT_ERROR, file=sys.stderr)
+        return 1
+    except ImportError:
+        print(PIP_CHILD_IMPORT_ERROR, file=sys.stderr)
+        return 1
+    try:
+        return cast(int, pip_main(list(argv)))
+    except _PipTransportRejected:
+        print(PIP_TRANSPORT_ERROR, file=sys.stderr)
+        return 1
+    except ImportError:
+        print(PIP_EXECUTION_IMPORT_ERROR, file=sys.stderr)
+        return 1
+
+
+class _CompletedPipFailure(RuntimeError):
+    """Keep completed pip diagnostics private for the existing resolver classifiers."""
+
+    def __init__(self, status: int, stderr: str, stdout: str) -> None:
+        super().__init__(f"Command failed: pip exited with status {status}")
+        self._resolver_output = "\n".join(
+            _redact_url_credentials_in_text(part).strip() for part in (stderr, stdout)
+        )
+
+
+class _InstallProcessTimeout(RuntimeError):
+    """A timed-out command has no completed resolver result."""
+
+
+def run_command(
+    command: Sequence[str],
+    *,
+    environment: dict[str, str] | None = None,
+    cwd: Path | None = None,
+    timeout: int | None = None,
+) -> None:
+    """Expose fixed failure categories; preserve completed pip output for private classification."""
+    if not command:
+        raise RuntimeError("Command failed: empty command")
+
+    original_argv = [str(part) for part in command]
+    try:
+        resolved_python = resolve_python_executable(original_argv[0])
+    except (OSError, RuntimeError, ValueError):
+        resolved_python = None
+    if resolved_python is None:
+        raise RuntimeError("Command failed: Python executable unavailable")
+    argv = [resolved_python, *original_argv[1:]]
+    pip_offset = 2 if original_argv[1:2] == ["-I"] else 1
+    is_pip = original_argv[pip_offset : pip_offset + 2] == ["-m", "pip"]
+    if is_pip:
+        argv = [
+            resolved_python,
+            str(Path(__file__).resolve()),
+            PIP_CHILD_SELECTOR,
+            *original_argv[pip_offset + 2 :],
+        ]
+    try:
+        result = subprocess.run(  # nosec B603 # B603: commands are built internally from pinned requirement/install helpers only (remove-by: 2027-01-01, ref: PR-litellm-hardening)
+            argv,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+            cwd=cwd,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        failure: RuntimeError = _InstallProcessTimeout("Installer subprocess timed out")
+    except UnicodeError:
+        failure = RuntimeError("Command failed: subprocess output decoding failed")
+    except (OSError, ValueError):
+        failure = RuntimeError("Command failed: subprocess could not launch")
+    else:
+        if result.returncode == 0:
+            return
+        if is_pip and result.returncode > 0:
+            failure = _CompletedPipFailure(
+                result.returncode, result.stderr or "", result.stdout or ""
+            )
+        else:
+            failure = RuntimeError(
+                f"Command failed: subprocess exited with status {result.returncode}"
+            )
+    raise failure
+
+
+def upgrade_pip(
+    python_executable: str,
+    *,
+    pip_spec: str,
+    index_url: str,
+    trusted_host: str | None,
+    emergency_wheel_manifest: Path | None,
+) -> None:
+    use_pip_cache = docker_pip_layer_cache_enabled()
+    command = [
+        python_executable,
+        "-m",
+        "pip",
+        "install",
+        "--upgrade",
+        "--retries",
+        str(PIP_NETWORK_RETRIES),
+        "--timeout",
+        str(PIP_NETWORK_TIMEOUT_SECONDS),
+        "--only-binary",
+        ":all:",
+        "--index-url",
+        index_url,
+        pip_spec,
+    ]
+    if not use_pip_cache:
+        command.insert(command.index("install") + 1, "--no-cache-dir")
+    if trusted_host:
+        command.extend(["--trusted-host", trusted_host])
+    try:
+        run_command(command, timeout=300)
+        return
+    except _CompletedPipFailure as exc:
+        if not _pip_upgrade_resolver_miss(exc):
+            raise
+        _require_private_index_project_health(
+            index_url=index_url,
+            package="pip",
+            trusted_host=trusted_host,
+        )
+
+    with tempfile.TemporaryDirectory(prefix="pulseplate-pip-emergency-wheelhouse-") as temp_dir:
+        wheelhouse_dir = Path(temp_dir)
+        _stage_pip_upgrade_emergency_wheel(
+            wheelhouse_dir=wheelhouse_dir,
+            manifest_path=emergency_wheel_manifest,
+            pip_spec=pip_spec,
+            python_executable=python_executable,
+        )
+        fallback_command = [
+            python_executable,
+            "-m",
+            "pip",
+            "install",
+            "--upgrade",
+            "--no-index",
+            "--find-links",
+            str(wheelhouse_dir),
+            pip_spec,
+        ]
+        if not use_pip_cache:
+            fallback_command.insert(fallback_command.index("install") + 1, "--no-cache-dir")
+        run_command(fallback_command, timeout=120)
+
+
+def collect_startup_hook_failure_lines(
+    *,
+    guard_script: Path,
+    python_executable: str,
+) -> list[str]:
+    """Run the stock or explicitly selected custom guard without publishing its output."""
+    # Preserve the venv invocation, including its final symlink. The guard can
+    # be selected explicitly even in installer layouts without the stock sibling.
+    try:
+        python = resolve_python_executable(python_executable)
+        invocation = Path(python)
+        target = invocation.stat()
+        selected = guard_script.resolve(strict=True)
+        stock_path = Path(__file__).resolve(strict=True).with_name("check_python_startup_hooks.py")
+        stock = selected == stock_path
+        guard_info = selected.stat()
+        if (
+            not invocation.is_absolute()
+            or not stat.S_ISREG(target.st_mode)
+            or not stat.S_ISREG(guard_info.st_mode)
+            or (Path(os.path.abspath(guard_script)) == stock_path and not stock)
+        ):
+            raise ValueError
+    except (OSError, RuntimeError, ValueError):
+        inputs_valid = False
+    else:
+        inputs_valid = True
+    if not inputs_valid:
+        raise RuntimeError("Startup-hook guard or selected Python executable unavailable")
+
+    # The stock script uses only the stdlib. A custom guard may import trusted
+    # siblings from its own directory; -S keeps its selected script directory
+    # but prevents site startup. Neither child inherits import or loader overrides.
+    flags = ["-P", "-S"] if stock else ["-S"]
+    env = {"PATH": os.defpath, "LC_ALL": "C", "LANG": "C"}
+    site_inputs: tuple[str, ...] = ("HOME", "PYTHONUSERBASE", "PYTHONNOUSERSITE")
+    if os.name == "nt":
+        site_inputs += ("SYSTEMROOT", "USERPROFILE", "APPDATA", "HOMEDRIVE", "HOMEPATH")
+        system_root = Path(os.environ.get("SYSTEMROOT", ""))
+        env["PATH"] = str(system_root / "System32") if system_root.is_absolute() else ""
+    env.update({key: os.environ[key] for key in site_inputs if key in os.environ})
+    try:
+        if (
+            guard_script.resolve(strict=True) != selected
+            or not os.path.samestat(selected.stat(), guard_info)
+            or not os.path.samestat(invocation.stat(), target)
+            or not os.access(invocation, os.X_OK)
+        ):
+            raise ValueError
+        result = subprocess.run(  # nosec B603 # B603: argv uses the selected Python interpreter plus a fixed repo guard script path (remove-by: 2027-01-01, ref: PR-litellm-hardening)
+            [python, *flags, str(selected), "--python-executable", python],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE if stock else subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            timeout=60,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        failure: RuntimeError | None = _InstallProcessTimeout(
+            "Installer interpreter check timed out"
+        )
+    except (OSError, ValueError, RuntimeError):
+        failure = RuntimeError("Startup-hook guard failed to launch or inputs changed")
+    else:
+        failure = None
+    if failure is not None:
+        raise failure
+    if result.returncode == 0:
+        if (
+            stock
+            and result.stdout
+            != b"startup-hook-guard: no unexpected executable .pth files detected."
+            + os.linesep.encode("ascii")
+        ):
+            raise RuntimeError("Invalid stock startup-hook guard clean response")
+        return []
+    if result.returncode == 1:
+        return ["ERROR: startup-hook guard reported findings or an incomplete finding response."]
+    raise RuntimeError("Startup-hook guard failed")
+
+
+def _staging_python_path(staging_dir: Path) -> Path:
+    """Return the canonical Python executable inside a disposable staging venv."""
+    if os_name_is_windows():
+        return staging_dir / "Scripts" / "python.exe"
+    return staging_dir / "bin" / "python"
+
+
+def os_name_is_windows() -> bool:
+    """Return True when the current platform uses Windows-style venv paths."""
+    return sys.platform.startswith("win")
+
+
+@contextmanager
+def staged_python_environment(target_python: str) -> Iterator[str]:
+    """Create a disposable venv used to verify startup hooks before target install."""
+    with tempfile.TemporaryDirectory(prefix="pulseplate-staging-venv-") as temp_dir:
+        staging_dir = Path(temp_dir)
+        run_command([target_python, "-m", "venv", str(staging_dir)], timeout=120)
+        yield str(_staging_python_path(staging_dir))
+
+
+def install_from_wheelhouse(
+    *,
+    python_executable: str,
+    requirement_files: Sequence[Path],
+    constraints_file: Path | None,
+    wheelhouse_dir: Path,
+) -> None:
+    for requirement_file in requirement_files:
+        with effective_constraints_file_for_requirement(
+            requirement_file,
+            constraints_file,
+        ) as effective_constraints_file:
+            run_command(
+                build_pip_install_command(
+                    python_executable=python_executable,
+                    requirement_file=requirement_file,
+                    wheelhouse_dir=wheelhouse_dir,
+                    constraints_file=effective_constraints_file,
+                )
+            )
+
+
+def install_from_proxy(
+    *,
+    python_executable: str,
+    requirement_files: Sequence[Path],
+    constraints_file: Path | None,
+    index_url: str,
+    trusted_host: str | None,
+    find_links_dir: Path | None = None,
+    allow_pip_download_cache: bool | None = None,
+) -> None:
+    for requirement_file in requirement_files:
+        with effective_constraints_file_for_requirement(
+            requirement_file,
+            constraints_file,
+        ) as effective_constraints_file:
+            run_command(
+                build_pip_proxy_install_command(
+                    python_executable=python_executable,
+                    requirement_file=requirement_file,
+                    constraints_file=effective_constraints_file,
+                    index_url=index_url,
+                    trusted_host=trusted_host,
+                    find_links_dir=find_links_dir,
+                    allow_pip_download_cache=allow_pip_download_cache,
+                )
+            )
+
+
+def build_wheelhouse(
+    *,
+    python_executable: str,
+    requirement_files: Sequence[Path],
+    constraints_file: Path | None,
+    wheelhouse_dir: Path,
+    index_url: str,
+    trusted_host: str | None,
+    no_dependencies: bool = False,
+) -> None:
+    wheelhouse_dir.mkdir(parents=True, exist_ok=True)
+    for requirement_file in requirement_files:
+        with effective_constraints_file_for_requirement(
+            requirement_file,
+            constraints_file,
+        ) as effective_constraints_file:
+            run_command(
+                build_pip_download_command(
+                    python_executable=python_executable,
+                    requirement_file=requirement_file,
+                    wheelhouse_dir=wheelhouse_dir,
+                    constraints_file=effective_constraints_file,
+                    index_url=index_url,
+                    trusted_host=trusted_host,
+                    **({"no_dependencies": True} if no_dependencies else {}),
+                )
+            )
+
+
+def _artifacts_with_resolver_miss(
+    exc: RuntimeError,
+    *,
+    requested_artifacts: Sequence[dict[str, str]],
+    ignored_transport_packages: Sequence[str] = (),
+) -> list[dict[str, str]]:
+    """Return requested emergency artifacts named by the resolver miss output."""
+    return [
+        artifact
+        for artifact in requested_artifacts
+        if _resolver_miss_error(
+            exc,
+            package=artifact["package"],
+            version=artifact["version"],
+            ignored_transport_packages=ignored_transport_packages,
+        )
+    ]
+
+
+def _emergency_artifact_key(artifact: dict[str, str]) -> tuple[str, str]:
+    """Return a stable key for already-staged emergency artifacts."""
+    return (artifact["package"].lower(), artifact["version"].lower())
+
+
+def _require_private_index_health_unless_package_scoped_retry(
+    *,
+    exc: RuntimeError,
+    index_url: str,
+    package: str,
+    trusted_host: str | None,
+) -> None:
+    """Keep generic fallback health-gated while accepting exact package retry evidence."""
+    if _package_scoped_proxy_retry_failure(exc, package=package):
+        return
+    _require_private_index_project_health(
+        index_url=index_url,
+        package=package,
+        trusted_host=trusted_host,
+    )
+
+
+def build_wheelhouse_with_emergency_fallback(
+    *,
+    python_executable: str,
+    requirement_files: Sequence[Path],
+    constraints_file: Path | None,
+    wheelhouse_dir: Path,
+    index_url: str,
+    trusted_host: str | None,
+    emergency_wheel_manifest: Path | None,
+) -> None:
+    """Retry wheelhouse build with staged emergency wheels only after proxy failure."""
+    requested_artifacts: list[dict[str, str]] | None = None
+    staged_artifact_keys: set[tuple[str, str]] = set()
+    while True:
+        try:
+            build_wheelhouse(
+                python_executable=python_executable,
+                requirement_files=requirement_files,
+                constraints_file=constraints_file,
+                wheelhouse_dir=wheelhouse_dir,
+                index_url=index_url,
+                trusted_host=trusted_host,
+            )
+            return
+        except _CompletedPipFailure as exc:
+            if requested_artifacts is None:
+                requested_artifacts = emergency_artifacts_requested_by_surfaces(
+                    requirement_files=requirement_files,
+                    constraints_file=constraints_file,
+                    manifest_path=emergency_wheel_manifest,
+                    python_executable=python_executable,
+                )
+            remaining_artifacts = [
+                artifact
+                for artifact in requested_artifacts
+                if _emergency_artifact_key(artifact) not in staged_artifact_keys
+            ]
+            resolver_miss_artifacts = _artifacts_with_resolver_miss(
+                exc,
+                requested_artifacts=remaining_artifacts,
+                ignored_transport_packages=[package for package, _version in staged_artifact_keys],
+            )
+            if not resolver_miss_artifacts:
+                raise
+            for artifact in resolver_miss_artifacts:
+                _require_private_index_health_unless_package_scoped_retry(
+                    exc=exc,
+                    index_url=index_url,
+                    package=artifact["package"],
+                    trusted_host=trusted_host,
+                )
+            staged_wheels = _stage_emergency_artifacts(
+                artifacts=resolver_miss_artifacts,
+                wheelhouse_dir=wheelhouse_dir,
+                python_executable=python_executable,
+            )
+            if not staged_wheels:
+                raise
+            staged_artifact_keys.update(
+                _emergency_artifact_key(artifact) for artifact in resolver_miss_artifacts
+            )
+
+
+def install_from_proxy_with_emergency_fallback(
+    *,
+    python_executable: str,
+    requirement_files: Sequence[Path],
+    constraints_file: Path | None,
+    index_url: str,
+    trusted_host: str | None,
+    emergency_wheelhouse_dir: Path,
+    emergency_wheel_manifest: Path | None,
+    allow_pip_download_cache: bool | None = None,
+) -> None:
+    """Retry proxy install with local emergency wheels only after the proxy fails."""
+    requested_artifacts: list[dict[str, str]] | None = None
+    staged_artifact_keys: set[tuple[str, str]] = set()
+    while True:
+        try:
+            install_from_proxy(
+                python_executable=python_executable,
+                requirement_files=requirement_files,
+                constraints_file=constraints_file,
+                index_url=index_url,
+                trusted_host=trusted_host,
+                find_links_dir=emergency_wheelhouse_dir if staged_artifact_keys else None,
+                allow_pip_download_cache=allow_pip_download_cache,
+            )
+            return
+        except _CompletedPipFailure as exc:
+            if requested_artifacts is None:
+                requested_artifacts = emergency_artifacts_requested_by_surfaces(
+                    requirement_files=requirement_files,
+                    constraints_file=constraints_file,
+                    manifest_path=emergency_wheel_manifest,
+                    python_executable=python_executable,
+                )
+            remaining_artifacts = [
+                artifact
+                for artifact in requested_artifacts
+                if _emergency_artifact_key(artifact) not in staged_artifact_keys
+            ]
+            resolver_miss_artifacts = _artifacts_with_resolver_miss(
+                exc,
+                requested_artifacts=remaining_artifacts,
+                ignored_transport_packages=[package for package, _version in staged_artifact_keys],
+            )
+            if not resolver_miss_artifacts:
+                raise
+            for artifact in resolver_miss_artifacts:
+                _require_private_index_health_unless_package_scoped_retry(
+                    exc=exc,
+                    index_url=index_url,
+                    package=artifact["package"],
+                    trusted_host=trusted_host,
+                )
+            staged_wheels = _stage_emergency_artifacts(
+                artifacts=resolver_miss_artifacts,
+                wheelhouse_dir=emergency_wheelhouse_dir,
+                python_executable=python_executable,
+            )
+            if not staged_wheels:
+                raise
+            staged_artifact_keys.update(
+                _emergency_artifact_key(artifact) for artifact in resolver_miss_artifacts
+            )
+
+
+def install_with_guard(
+    *,
+    python_executable: str,
+    requirement_files: Sequence[Path],
+    constraints_file: Path | None,
+    wheelhouse_dir: Path,
+    guard_script: Path,
+    index_url: str,
+    trusted_host: str | None,
+    emergency_wheel_manifest: Path | None,
+    consume_only: bool = False,
+) -> int:
+    if not consume_only:
+        build_wheelhouse_with_emergency_fallback(
+            python_executable=python_executable,
+            requirement_files=requirement_files,
+            constraints_file=constraints_file,
+            wheelhouse_dir=wheelhouse_dir,
+            index_url=index_url,
+            trusted_host=trusted_host,
+            emergency_wheel_manifest=emergency_wheel_manifest,
+        )
+
+    with staged_python_environment(python_executable) as staging_python:
+        install_from_wheelhouse(
+            python_executable=staging_python,
+            requirement_files=requirement_files,
+            constraints_file=constraints_file,
+            wheelhouse_dir=wheelhouse_dir,
+        )
+
+        failure_lines = collect_startup_hook_failure_lines(
+            guard_script=guard_script,
+            python_executable=staging_python,
+        )
+        if failure_lines:
+            for line in failure_lines:
+                print(line)
+            return 1
+
+    install_from_wheelhouse(
+        python_executable=python_executable,
+        requirement_files=requirement_files,
+        constraints_file=constraints_file,
+        wheelhouse_dir=wheelhouse_dir,
+    )
+    return 0
+
+
+def _exact_locked_artifacts(requirement_files: Sequence[Path]) -> frozenset[tuple[str, str]]:
+    """Use native requirement semantics for the bounded SDK/prefetch/consume operation."""
+    from pip._vendor.packaging.requirements import Requirement
+    from pip._vendor.packaging.utils import canonicalize_name
+    from pip._vendor.packaging.version import Version
+
+    pins: dict[str, str] = {}
+    for path in requirement_files:
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            requirement = Requirement(line)
+            specifiers = tuple(requirement.specifier)
+            name = str(canonicalize_name(requirement.name))
+            if (
+                len(specifiers) != 1
+                or specifiers[0].operator != "=="
+                or "*" in specifiers[0].version
+                or requirement.marker
+                or requirement.url
+                or (name == "psycopg" and requirement.extras != {"c"})
+                or (name == "psycopg-c" and requirement.extras)
+            ):
+                raise RuntimeError(
+                    "Exact SDK installation requires ordinary unmarked compiled pins."
+                )
+            version = str(Version(specifiers[0].version))
+            if name in pins and pins[name] != version:
+                raise RuntimeError("Selected compiled profiles contain conflicting exact pins.")
+            pins[name] = version
+    return frozenset(pins.items())
+
+
+def _validate_exact_wheelhouse(
+    *, wheelhouse: Path, expected: frozenset[tuple[str, str]]
+) -> tuple[ValidatedWheel, ...]:
+    if wheelhouse.is_symlink() or not wheelhouse.is_dir():
+        raise RuntimeError("Consume-only requires an existing regular wheelhouse directory.")
+    artifacts = tuple(
+        inspect_locked_wheel(wheel_path=path, expected_artifacts=expected)
+        for path in sorted(wheelhouse.iterdir())
+    )
+    if len(artifacts) != len(expected) or {a.artifact_key for a in artifacts} != expected:
+        raise RuntimeError("Wheelhouse does not contain exactly the selected compiled artifacts.")
+    return artifacts
+
+
+def _stage_psycopg_sdk_wheel(*, sdk: Path, wheelhouse: Path) -> ValidatedWheel:
+    artifact = read_psycopg_c_sdk(sdk)
+    wheelhouse.mkdir(parents=True, exist_ok=True)
+    destination = wheelhouse / artifact.path.name
+    if destination.exists() or destination.is_symlink():
+        raise RuntimeError("Psycopg SDK wheel cannot replace an existing wheelhouse member.")
+    payload = _read_regular_input(artifact.path, maximum=16 * 1024 * 1024)
+    if hashlib.sha256(payload).hexdigest() != artifact.snapshot.digest:
+        raise RuntimeError("Psycopg SDK wheel changed before acquisition.")
+    with destination.open("xb") as stream:
+        stream.write(payload)
+    return artifact
+
+
+def acquire_locked_wheelhouse(
+    *,
+    python_executable: str,
+    requirement_files: Sequence[Path],
+    constraints_file: Path | None,
+    wheelhouse: Path,
+    index_url: str,
+    trusted_host: str | None,
+    sdk: Path | None,
+) -> None:
+    """Acquire binary pins and the exact genuine SDK wheel, without source execution."""
+    expected = _exact_locked_artifacts(requirement_files)
+    needs_c = ("psycopg-c", PSYCOPG_C_VERSION) in expected
+    if any(name == "psycopg-c" and version != PSYCOPG_C_VERSION for name, version in expected):
+        raise RuntimeError("Only the admitted Psycopg C version can use source-built admission.")
+    if needs_c and sdk is None:
+        raise RuntimeError("This compiled profile requires its genuine matching Psycopg C SDK.")
+    if needs_c:
+        _require_psycopg_sdk_interpreter(python_executable)
+    if wheelhouse.exists() or wheelhouse.is_symlink():
+        raise RuntimeError("Prefetch wheelhouse destination must be new.")
+    wheelhouse.mkdir(parents=True, mode=0o700)
+    admitted_c = None
+    if needs_c:
+        if sdk is None:
+            raise RuntimeError("The exact C profile has no admitted SDK.")
+        admitted_c = _stage_psycopg_sdk_wheel(sdk=sdk, wheelhouse=wheelhouse)
+    build_wheelhouse(
+        python_executable=python_executable,
+        requirement_files=requirement_files,
+        constraints_file=constraints_file,
+        wheelhouse_dir=wheelhouse,
+        index_url=index_url,
+        trusted_host=trusted_host,
+        no_dependencies=True,
+    )
+    artifacts = _validate_exact_wheelhouse(wheelhouse=wheelhouse, expected=expected)
+    if admitted_c is not None and not any(
+        a.artifact_key == admitted_c.artifact_key
+        and a.snapshot.digest == admitted_c.snapshot.digest
+        for a in artifacts
+    ):
+        raise RuntimeError("The acquired profile lost its admitted Psycopg C wheel.")
+
+
+def install_with_guard_from_proxy(
+    *,
+    python_executable: str,
+    requirement_files: Sequence[Path],
+    constraints_file: Path | None,
+    guard_script: Path,
+    index_url: str,
+    trusted_host: str | None,
+    emergency_wheel_manifest: Path | None,
+) -> int:
+    with tempfile.TemporaryDirectory(prefix="pulseplate-emergency-wheelhouse-") as temp_dir:
+        emergency_wheelhouse_dir = Path(temp_dir)
+
+        if docker_single_pass_locked_install_enabled():
+            if len(requirement_files) != 1:
+                print(
+                    "ERROR: Docker single-pass locked install requires exactly one requirements file "
+                    f"(got {len(requirement_files)}). Combine manifests or disable "
+                    f"{DOCKER_SINGLE_PASS_LOCKED_INSTALL_ENV}.",
+                    file=sys.stderr,
+                )
+                return 1
+            allow_cache = docker_pip_layer_cache_enabled()
+            install_from_proxy_with_emergency_fallback(
+                python_executable=python_executable,
+                requirement_files=requirement_files,
+                constraints_file=constraints_file,
+                index_url=index_url,
+                trusted_host=trusted_host,
+                emergency_wheelhouse_dir=emergency_wheelhouse_dir,
+                emergency_wheel_manifest=emergency_wheel_manifest,
+                allow_pip_download_cache=allow_cache,
+            )
+            failure_lines = collect_startup_hook_failure_lines(
+                guard_script=guard_script,
+                python_executable=python_executable,
+            )
+            if failure_lines:
+                for line in failure_lines:
+                    print(line)
+                return 1
+            return 0
+
+        with staged_python_environment(python_executable) as staging_python:
+            install_from_proxy_with_emergency_fallback(
+                python_executable=staging_python,
+                requirement_files=requirement_files,
+                constraints_file=constraints_file,
+                index_url=index_url,
+                trusted_host=trusted_host,
+                emergency_wheelhouse_dir=emergency_wheelhouse_dir,
+                emergency_wheel_manifest=emergency_wheel_manifest,
+                allow_pip_download_cache=False,
+            )
+
+            failure_lines = collect_startup_hook_failure_lines(
+                guard_script=guard_script,
+                python_executable=staging_python,
+            )
+            if failure_lines:
+                for line in failure_lines:
+                    print(line)
+                return 1
+
+        install_from_proxy_with_emergency_fallback(
+            python_executable=python_executable,
+            requirement_files=requirement_files,
+            constraints_file=constraints_file,
+            index_url=index_url,
+            trusted_host=trusted_host,
+            emergency_wheelhouse_dir=emergency_wheelhouse_dir,
+            emergency_wheel_manifest=emergency_wheel_manifest,
+            allow_pip_download_cache=docker_pip_layer_cache_enabled(),
+        )
+        failure_lines = collect_startup_hook_failure_lines(
+            guard_script=guard_script,
+            python_executable=python_executable,
+        )
+        if failure_lines:
+            for line in failure_lines:
+                print(line)
+            return 1
+        return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    child_args = list(sys.argv[1:] if argv is None else argv)
+    if child_args[:1] == [PIP_CHILD_SELECTOR]:
+        return _run_owned_pip_child(child_args[1:])
+    try:
+        args = parse_args(argv)
+        operation_selectors = (
+            args.build_psycopg_c,
+            args.validate_psycopg_sdk,
+            args.prefetch_psycopg_source is not None,
+            args.prefetch_psycopg_build_wheels is not None,
+            args.preflight_only,
+            args.prefetch_only,
+            args.consume_only,
+            args.upgrade_pip_only,
+        )
+        if sum(operation_selectors) > 1:
+            raise RuntimeError("Locked installer operation selectors are mutually exclusive.")
+        if args.validate_psycopg_sdk:
+            supplied = {value.split("=", 1)[0] for value in child_args if value.startswith("--")}
+            if (
+                supplied != {"--validate-psycopg-sdk", "--psycopg-sdk", "--psycopg-native-root"}
+                or args.psycopg_sdk is None
+                or args.psycopg_native_root is None
+            ):
+                raise RuntimeError(
+                    "Static SDK validation requires only explicit SDK/native-root operands."
+                )
+            forbidden = {
+                "GH_TOKEN",
+                "GITHUB_TOKEN",
+                "NETRC",
+                "PULSEPLATE_PYTHON_NETRC",
+                "PULSEPLATE_PYTHON_INDEX_URL",
+                "PULSEPLATE_PYTHON_TRUSTED_HOST",
+                "DEVPI_CI_USER",
+                "DEVPI_CI_PASSWORD",
+                "PIP_INDEX_URL",
+                "PIP_EXTRA_INDEX_URL",
+                "UV_INDEX_URL",
+                "UV_EXTRA_INDEX_URL",
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "ALL_PROXY",
+                "http_proxy",
+                "https_proxy",
+                "all_proxy",
+                "PIP_PROXY",
+                "LD_LIBRARY_PATH",
+                "LD_PRELOAD",
+                "LD_AUDIT",
+                "OPENSSL_CONF",
+                "OPENSSL_MODULES",
+                PSYCOPG_SDK_ENV,
+            }
+            if any(os.environ.get(name) for name in forbidden) or os.environ.get(
+                "PIP_CONFIG_FILE"
+            ) not in (None, os.devnull):
+                raise RuntimeError(
+                    "Static SDK validation cannot inherit credential or SDK loader state."
+                )
+            if any(
+                (Path.home() / name).exists() or (Path.home() / name).is_symlink()
+                for name in (".netrc", "_netrc", ".docker", ".config/pip/pip.conf", ".pip/pip.conf")
+            ):
+                raise RuntimeError("Static SDK validation HOME contains acquisition carriers.")
+            _psycopg_sdk_target()
+            _assert_backend_network_isolated()
+            read_psycopg_c_sdk(args.psycopg_sdk, native_root=args.psycopg_native_root)
+            print(
+                "Psycopg SDK static bytes checked; independent origin/native proof remains required."
+            )
+            return 0
+        build_inputs = (
+            args.psycopg_source_archive,
+            args.psycopg_build_wheels,
+            args.psycopg_native_root,
+            args.psycopg_wheel_output,
+        )
+        if not args.build_psycopg_c and any(value is not None for value in build_inputs):
+            raise RuntimeError(
+                "Psycopg build inputs require the explicit --build-psycopg-c operation."
+            )
+        explicit_options = {value.split("=", 1)[0] for value in child_args}
+        psycopg_install_options = {
+            "--requirements-file",
+            "--dev-requirements-file",
+            "--test-requirements-file",
+            "--ci-lite-requirements-file",
+            "--rag-vector-requirements-file",
+            "--constraints-file",
+            "--requirements-profile",
+            "--install-dev",
+            "--install-test",
+            "--require-virtualenv",
+            "--upgrade-pip",
+            "--upgrade-pip-spec",
+            "--guard-script",
+            "--emergency-wheel-manifest",
+            "--install-mode",
+            "--psycopg-sdk",
+            "--wheelhouse-dir",
+        }
+        if (
+            args.prefetch_psycopg_source is not None
+            or args.prefetch_psycopg_build_wheels is not None
+        ):
+            forbidden_options = psycopg_install_options
+            if args.prefetch_psycopg_source is not None:
+                forbidden_options = forbidden_options | {"--python-executable"}
+            if explicit_options & forbidden_options:
+                raise RuntimeError(
+                    "Psycopg prefetch operations do not accept install modifiers or unused target Python."
+                )
+        args.python_executable = resolve_python_executable(args.python_executable)
+        if args.build_psycopg_c:
+            if any(value is None for value in build_inputs) or explicit_options & (
+                psycopg_install_options | {"--index-url", "--trusted-host", "--python-executable"}
+            ):
+                raise RuntimeError(
+                    "Exact Psycopg build requires all four explicit inputs and no acquisition/install mode."
+                )
+            build_psycopg_c_sdk(
+                source=args.psycopg_source_archive,
+                build_wheels=args.psycopg_build_wheels,
+                native_root=args.psycopg_native_root,
+                output=args.psycopg_wheel_output,
+            )
+            return 0
+        if args.requirements_profile and (args.install_dev or args.install_test):
+            print(
+                "ERROR: requirements-profile cannot be combined with "
+                "--install-dev or --install-test."
+            )
+            return 1
+
+        if args.consume_only:
+            if (
+                args.index_url
+                or args.trusted_host
+                or args.upgrade_pip
+                or args.wheelhouse_dir is None
+            ):
+                raise RuntimeError(
+                    "Consume-only requires an explicit wheelhouse and no acquisition flags."
+                )
+            index_url, trusted_host = "", None
+        else:
+            index_url, trusted_host = resolve_private_proxy_settings(
+                index_url=args.index_url,
+                trusted_host=args.trusted_host,
+            )
+
+        if args.prefetch_psycopg_build_wheels is not None:
+            prefetch_psycopg_build_wheels(
+                output=args.prefetch_psycopg_build_wheels,
+                python_executable=args.python_executable,
+                index_url=index_url,
+                trusted_host=trusted_host,
+            )
+            return 0
+        if args.prefetch_psycopg_source is not None:
+            prefetch_psycopg_source(
+                output=args.prefetch_psycopg_source, index_url=index_url, trusted_host=trusted_host
+            )
+            return 0
+
+        if args.require_virtualenv and not is_virtualenv_python(args.python_executable):
+            print("ERROR: refusing to install packages with a non-virtualenv interpreter.")
+            print(f"Python executable: {args.python_executable}")
+            return 1
+
+        if args.preflight_only or args.upgrade_pip_only:
+            if args.upgrade_pip or args.upgrade_pip_only:
+                upgrade_pip(
+                    args.python_executable,
+                    pip_spec=args.upgrade_pip_spec,
+                    index_url=index_url,
+                    trusted_host=trusted_host,
+                    emergency_wheel_manifest=args.emergency_wheel_manifest,
+                )
+        if args.upgrade_pip_only:
+            return 0
+
+        if args.preflight_only:
+            run_dependency_floor_preflight(
+                python_executable=args.python_executable,
+                index_url=index_url,
+                trusted_host=trusted_host,
+                emergency_wheel_manifest=args.emergency_wheel_manifest,
+            )
+            return 0
+
+        validated_constraints_file = validate_constraints_file(args.constraints_file)
+        requirement_files = resolve_requirement_files(
+            requirements_file=args.requirements_file,
+            dev_requirements_file=args.dev_requirements_file,
+            test_requirements_file=args.test_requirements_file,
+            ci_lite_requirements_file=args.ci_lite_requirements_file,
+            rag_vector_requirements_file=args.rag_vector_requirements_file,
+            install_dev=args.install_dev,
+            install_test=args.install_test,
+            requirements_profile=args.requirements_profile,
+        )
+
+        sdk = args.psycopg_sdk
+        if sdk is None and os.environ.get(PSYCOPG_SDK_ENV):
+            sdk = Path(os.environ[PSYCOPG_SDK_ENV])
+        contains_c = any(
+            "psycopg-c"
+            in _collect_unmarked_exact_requirement_pin_versions(
+                path.read_text(encoding="utf-8").splitlines()
+            )
+            for path in requirement_files
+        )
+        if sdk is not None and not contains_c:
+            raise RuntimeError("The selected profile has no Psycopg C SDK consumer.")
+        if contains_c:
+            if sdk is None:
+                raise RuntimeError(
+                    "This compiled profile requires its genuine matching Psycopg C SDK."
+                )
+            _require_psycopg_sdk_interpreter(args.python_executable)
+            read_psycopg_c_sdk(sdk)
+        if args.upgrade_pip:
+            upgrade_pip(
+                args.python_executable,
+                pip_spec=args.upgrade_pip_spec,
+                index_url=index_url,
+                trusted_host=trusted_host,
+                emergency_wheel_manifest=args.emergency_wheel_manifest,
+            )
+        if args.consume_only or args.prefetch_only or sdk is not None or contains_c:
+            expected = _exact_locked_artifacts(requirement_files)
+            if args.prefetch_only:
+                if args.wheelhouse_dir is None:
+                    raise RuntimeError(
+                        "Prefetch-only requires its explicit new wheelhouse destination."
+                    )
+                acquire_locked_wheelhouse(
+                    python_executable=args.python_executable,
+                    requirement_files=requirement_files,
+                    constraints_file=validated_constraints_file,
+                    wheelhouse=args.wheelhouse_dir,
+                    index_url=index_url,
+                    trusted_host=trusted_host,
+                    sdk=sdk,
+                )
+                return 0
+            with tempfile.TemporaryDirectory(prefix="pulseplate-sdk-wheelhouse-") as temporary:
+                wheelhouse = args.wheelhouse_dir or (Path(temporary) / "wheels")
+                if not args.consume_only:
+                    acquire_locked_wheelhouse(
+                        python_executable=args.python_executable,
+                        requirement_files=requirement_files,
+                        constraints_file=validated_constraints_file,
+                        wheelhouse=wheelhouse,
+                        index_url=index_url,
+                        trusted_host=trusted_host,
+                        sdk=sdk,
+                    )
+                _validate_exact_wheelhouse(wheelhouse=wheelhouse, expected=expected)
+                if contains_c:
+                    if sdk is None:
+                        raise RuntimeError(
+                            "Consume-only requires the matching genuine Psycopg C SDK."
+                        )
+                    admitted_c = read_psycopg_c_sdk(sdk)
+                    current_c = inspect_locked_wheel(
+                        wheel_path=wheelhouse / admitted_c.path.name, expected_artifacts=expected
+                    )
+                    if current_c.snapshot.digest != admitted_c.snapshot.digest:
+                        raise RuntimeError(
+                            "Consumed Psycopg C differs from the admitted SDK wheel."
+                        )
+                return install_with_guard(
+                    python_executable=args.python_executable,
+                    requirement_files=requirement_files,
+                    constraints_file=validated_constraints_file,
+                    wheelhouse_dir=wheelhouse,
+                    guard_script=args.guard_script,
+                    index_url="",
+                    trusted_host=None,
+                    emergency_wheel_manifest=None,
+                    consume_only=True,
+                )
+
+        if args.install_mode == "direct-proxy":
+            return install_with_guard_from_proxy(
+                python_executable=args.python_executable,
+                requirement_files=requirement_files,
+                constraints_file=validated_constraints_file,
+                guard_script=args.guard_script,
+                index_url=index_url,
+                trusted_host=trusted_host,
+                emergency_wheel_manifest=args.emergency_wheel_manifest,
+            )
+
+        if args.wheelhouse_dir is not None:
+            return install_with_guard(
+                python_executable=args.python_executable,
+                requirement_files=requirement_files,
+                constraints_file=validated_constraints_file,
+                wheelhouse_dir=args.wheelhouse_dir,
+                guard_script=args.guard_script,
+                index_url=index_url,
+                trusted_host=trusted_host,
+                emergency_wheel_manifest=args.emergency_wheel_manifest,
+            )
+
+        with tempfile.TemporaryDirectory(prefix="pulseplate-wheelhouse-") as temp_dir:
+            wheelhouse_dir = Path(temp_dir)
+            return install_with_guard(
+                python_executable=args.python_executable,
+                requirement_files=requirement_files,
+                constraints_file=validated_constraints_file,
+                wheelhouse_dir=wheelhouse_dir,
+                guard_script=args.guard_script,
+                index_url=index_url,
+                trusted_host=trusted_host,
+                emergency_wheel_manifest=args.emergency_wheel_manifest,
+            )
+    except (FileNotFoundError, RuntimeError) as exc:
+        print("ERROR: locked install failed: " f"{_redact_url_credentials_in_text(str(exc))}")
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

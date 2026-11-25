@@ -1,0 +1,164 @@
+from __future__ import annotations
+
+from fastapi import FastAPI
+from fastapi.routing import APIRoute
+
+from app.middleware.api_tiers import require_pro_tier, require_vip_tier
+from app.routers.billing import _require_manual_billing_transport_key
+from app.routers.api_key import api_key_header
+from tests.security._api_authz_contracts import (
+    _contains_dependency,
+    _dependency_key,
+    _flatten_dependency_calls,
+    _load_routes,
+)
+
+CANONICAL_PREFIX_GUARD = {
+    "/api/v1/pro/": require_pro_tier,
+    "/api/v1/vip/": require_vip_tier,
+}
+LEGACY_HTTP_ALIAS_ALLOWLIST = {
+    ("POST", "/api/v1/vip/weekly-plan"),
+}
+PRE_ENTITLEMENT_ROUTE_ALLOWLIST = {
+    ("POST", "/api/v1/pro/payments/activate"): api_key_header,
+    ("GET", "/api/v1/pro/payments/activations/{activation_id}"): api_key_header,
+    ("POST", "/api/v1/pro/payments/ru-by/manual-intent"): _require_manual_billing_transport_key,
+    ("POST", "/api/v1/pro/payments/ru-by/reconcile"): _require_manual_billing_transport_key,
+    (
+        "GET",
+        "/api/v1/pro/payments/ru-by/reconcile/{intent_id}",
+    ): _require_manual_billing_transport_key,
+}
+
+
+def _canonical_pro_vip_routes(routes: list[APIRoute]) -> list[APIRoute]:
+    canonical: list[APIRoute] = []
+    for route in routes:
+        if route.deprecated:
+            continue
+        if (getattr(route, "openapi_extra", None) or {}).get("x-alias-of"):
+            continue
+        if route.path.startswith("/api/v1/pro/") or route.path.startswith("/api/v1/vip/"):
+            canonical.append(route)
+    return canonical
+
+
+def test_canonical_pro_vip_routes_do_not_duplicate_method_path(app: FastAPI) -> None:
+    seen: dict[tuple[str, str], str] = {}
+    duplicates: list[str] = []
+
+    for route in _canonical_pro_vip_routes(_load_routes(app)):
+        endpoint_name = f"{route.endpoint.__module__}.{route.endpoint.__name__}"
+        for method in sorted((route.methods or set()) - {"HEAD", "OPTIONS"}):
+            key = (method, route.path)
+            previous = seen.get(key)
+            if previous is not None:
+                duplicates.append(f"{method} {route.path}: {previous} and {endpoint_name}")
+            seen[key] = endpoint_name
+
+    assert not duplicates, "Duplicate canonical PRO/VIP route registrations:\n" + "\n".join(
+        duplicates
+    )
+
+
+def test_canonical_pro_vip_routes_require_expected_tier_dependency(app: FastAPI) -> None:
+    routes = _canonical_pro_vip_routes(_load_routes(app))
+    missing_guards: list[str] = []
+    saw_prefixes = {prefix: False for prefix in CANONICAL_PREFIX_GUARD}
+
+    for route in routes:
+        for prefix, expected_guard in CANONICAL_PREFIX_GUARD.items():
+            if not route.path.startswith(prefix):
+                continue
+            saw_prefixes[prefix] = True
+            flattened_calls = _flatten_dependency_calls(route)
+            matching_allowlist = [
+                dependency
+                for method, path in PRE_ENTITLEMENT_ROUTE_ALLOWLIST
+                if path == route.path and method in (route.methods or set())
+                for dependency in [PRE_ENTITLEMENT_ROUTE_ALLOWLIST[(method, path)]]
+            ]
+            if matching_allowlist:
+                expected_dependency = matching_allowlist[0]
+                if not _contains_dependency(flattened_calls, expected_dependency):
+                    methods = ",".join(sorted(route.methods))
+                    names = ", ".join(
+                        getattr(call, "__name__", type(call).__name__) for call in flattened_calls
+                    )
+                    missing_guards.append(
+                        f"{methods} {route.path} missing "
+                        f"{getattr(expected_dependency, '__name__', type(expected_dependency).__name__)}; "
+                        f"got [{names}]"
+                    )
+                break
+            if not _contains_dependency(flattened_calls, expected_guard):
+                methods = ",".join(sorted(route.methods))
+                names = ", ".join(
+                    getattr(call, "__name__", type(call).__name__) for call in flattened_calls
+                )
+                missing_guards.append(
+                    f"{methods} {route.path} missing {expected_guard.__name__}; got [{names}]"
+                )
+            break
+
+    assert all(
+        saw_prefixes.values()
+    ), f"Expected guarded canonical prefixes missing: {saw_prefixes}"
+    assert not missing_guards, "Canonical PRO/VIP route guard drift detected:\n" + "\n".join(
+        missing_guards
+    )
+
+
+def test_canonical_vip_routes_keep_api_key_header_dependency(app: FastAPI) -> None:
+    routes = [
+        route
+        for route in _canonical_pro_vip_routes(_load_routes(app))
+        if route.path.startswith("/api/v1/vip/")
+    ]
+    missing_header: list[str] = []
+
+    for route in routes:
+        flattened_calls = _flatten_dependency_calls(route)
+        if not _contains_dependency(flattened_calls, api_key_header):
+            methods = ",".join(sorted(route.methods))
+            missing_header.append(f"{methods} {route.path}")
+
+    assert not missing_header, "Canonical VIP routes must keep API key extraction:\n" + "\n".join(
+        missing_header
+    )
+
+
+def test_legacy_vip_weekly_plan_alias_is_deprecated_and_not_treated_as_canonical(
+    app: FastAPI,
+) -> None:
+    routes = _load_routes(app)
+    alias_route = next(
+        route
+        for route in routes
+        if route.path == "/api/v1/vip/weekly-plan" and "POST" in route.methods
+    )
+
+    flattened_calls = _flatten_dependency_calls(alias_route)
+
+    assert alias_route.deprecated is True
+    assert ("POST", alias_route.path) in LEGACY_HTTP_ALIAS_ALLOWLIST
+    assert not _contains_dependency(flattened_calls, require_vip_tier)
+    assert _contains_dependency(flattened_calls, api_key_header)
+
+
+def test_legacy_http_alias_allowlist_matches_deprecated_routes(app: FastAPI) -> None:
+    routes = _load_routes(app)
+
+    for method, path in LEGACY_HTTP_ALIAS_ALLOWLIST:
+        matching_routes = [
+            route
+            for route in routes
+            if path in {route.path, getattr(route, "path_format", route.path)}
+            and method in (route.methods or set())
+            and bool(getattr(route, "deprecated", False))
+        ]
+        assert matching_routes, (
+            f"LEGACY_HTTP_ALIAS_ALLOWLIST entry ({method} {path}) does not map "
+            "to any deprecated alias route in the live router table"
+        )

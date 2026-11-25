@@ -1,0 +1,238 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-10-04",
+  "review_by": "2026-11-30",
+  "reason": "Manual source review 2026-10-31: retain bounded SQLite, util-linux libuuid, PCRE2, SLJIT, OpenSSL and PostgreSQL client dispositions; qualify exact maintained zlib 1.3.2.1-motley, signed ncurses 6.6-20261024 and official Alertmanager 0.34.2 source/UI. Original17 obligations and missed deadlines remain in existing security owners. Seven contained zlib patch inputs are removed from this qualification candidate; achieved retirement and native/image acceptance remain pending. Reassess immediately on new findings or source/recipe/toolchain/provenance changes. On 2026-11-04 the selected ncurses build input became the codeload archive of commit dc909d77781ef5c2a0684e9ad9eb9f0c0baf5ecc. The verified upstream signature on Git tag v6_6_20261024 authenticates that commit, and the ncurses row pins the downloaded archive bytes by SHA-256 and SHA3-256. The separately signed release ncurses-6.6-20261024.tgz remains the historical October 31 input.",
+  "artifacts": [
+    {
+      "name": "sqlite-autoconf",
+      "version": "3530200",
+      "filename": "sqlite-autoconf-3530200.tar.gz",
+      "url": "https://sqlite.org/2026/sqlite-autoconf-3530200.tar.gz",
+      "sha3_256_parts": [
+        "025328da",
+        "165109f4",
+        "8abccc6e",
+        "74785080",
+        "60804412",
+        "bed2bd81",
+        "d47e98ba",
+        "1b72983b"
+      ]
+    },
+    {
+      "name": "util-linux",
+      "version": "2.42.3",
+      "filename": "util-linux-2.42.3.tar.gz",
+      "url": "https://www.kernel.org/pub/linux/utils/util-linux/v2.42/util-linux-2.42.3.tar.gz",
+      "sha3_256_parts": [
+        "3edc35e7",
+        "d261478b",
+        "f9910ec8",
+        "7b70ae0c",
+        "2be133e8",
+        "ab523e26",
+        "83ccfc07",
+        "04d51652"
+      ],
+      "sha256_parts": [
+        "2f4c3484",
+        "f67c7968",
+        "8a50974b",
+        "9e0ae52d",
+        "089fe07a",
+        "63d2dbb5",
+        "9b20e50e",
+        "d26fe89f"
+      ]
+    },
+    {
+      "name": "pcre2",
+      "version": "10.49",
+      "filename": "pcre2-10.49.tar.gz",
+      "url": "https://codeload.github.com/PCRE2Project/pcre2/legacy.tar.gz/refs/tags/pcre2-10.49",
+      "sha3_256_parts": [
+        "6510970e",
+        "92ea9410",
+        "b44f85c6",
+        "06c389c3",
+        "473ba05d",
+        "2d6338f0",
+        "ce763cc4",
+        "ccaa382c"
+      ]
+    },
+    {
+      "name": "sljit",
+      "version": "de0259c7aaf36aa40cba8014f3fad3edde9307f9",
+      "filename": "sljit-de0259c7aaf36aa40cba8014f3fad3edde9307f9.tar.gz",
+      "url": "https://codeload.github.com/zherczeg/sljit/legacy.tar.gz/de0259c7aaf36aa40cba8014f3fad3edde9307f9",
+      "sha3_256_parts": [
+        "7ad00681",
+        "4d4d9c69",
+        "8832b145",
+        "41634b9c",
+        "c12039ba",
+        "e7b3bb54",
+        "7909fda5",
+        "1ee11a80"
+      ]
+    },
+    {
+      "name": "zlib",
+      "version": "1.3.2.1-motley",
+      "filename": "zlib-71747d1d39168833e0cae8ed84b8ce77cb049699.tar.gz",
+      "url": "https://codeload.github.com/madler/zlib/tar.gz/71747d1d39168833e0cae8ed84b8ce77cb049699",
+      "sha3_256_parts": [
+        "d0327903",
+        "5bd9536a",
+        "0d4e0396",
+        "a593acd3",
+        "30c7ed51",
+        "fc42f7d8",
+        "aa834509",
+        "57f30a16"
+      ],
+      "sha256_parts": [
+        "c9db0fa6",
+        "5f2ab543",
+        "2d7d9709",
+        "7c058c81",
+        "e0cfff25",
+        "0f9e900a",
+        "c3dc1d70",
+        "989d4dd5"
+      ]
+    },
+    {
+      "name": "ncurses",
+      "version": "6.6-20261024",
+      "filename": "ncurses-snapshots-dc909d77781ef5c2a0684e9ad9eb9f0c0baf5ecc.tar.gz",
+      "url": "https://codeload.github.com/ThomasDickey/ncurses-snapshots/tar.gz/dc909d77781ef5c2a0684e9ad9eb9f0c0baf5ecc",
+      "sha3_256_parts": [
+        "3c75e58a",
+        "86e20f38",
+        "0f2e245e",
+        "75c8ac48",
+        "b2b0fa61",
+        "881f0a81",
+        "394f5656",
+        "82c9532e"
+      ],
+      "sha256_parts": [
+        "4c1a95b8",
+        "f05f0f86",
+        "65988fa4",
+        "07693d33",
+        "224776f4",
+        "6e4728c1",
+        "5db910a2",
+        "f653fe29"
+      ]
+    },
+    {
+      "name": "openssl",
+      "version": "3.5.9",
+      "filename": "openssl-3.5.9.tar.gz",
+      "url": "https://codeload.github.com/openssl/openssl/legacy.tar.gz/45e844fa2a14ec92d146bd8f5778ac130b6625fb",
+      "sha3_256_parts": [
+        "7392920f",
+        "1897e1e2",
+        "d9dc8483",
+        "68aff6e4",
+        "bdc94213",
+        "44286d60",
+        "ba517b9f",
+        "14b202a0"
+      ],
+      "sha256_parts": [
+        "32662f03",
+        "fc8e90bc",
+        "8b8fc0ac",
+        "b115ed41",
+        "3eec5045",
+        "a127e9af",
+        "9f6c234b",
+        "c3d0a8f2"
+      ]
+    },
+    {
+      "name": "postgresql",
+      "version": "18.6",
+      "filename": "postgresql-18.6.tar.gz",
+      "url": "https://ftp.postgresql.org/pub/source/v18.6/postgresql-18.6.tar.gz",
+      "sha3_256_parts": [
+        "672dab27",
+        "4f12efd4",
+        "9d7d431e",
+        "77b42d23",
+        "5d9583f1",
+        "91608821",
+        "b0e48dc1",
+        "d09fb4c0"
+      ],
+      "sha256_parts": [
+        "983ee554",
+        "ec53dbeb",
+        "9b70797b",
+        "ef9fcf4e",
+        "67e117e7",
+        "e48ca146",
+        "3cc80b3f",
+        "f8e8ff3f"
+      ]
+    },
+    {
+      "name": "alertmanager-source",
+      "version": "e8349048265ccc0871c3d0d668b05eacc68baf50",
+      "filename": "alertmanager-e8349048265ccc0871c3d0d668b05eacc68baf50.tar.gz",
+      "url": "https://codeload.github.com/prometheus/alertmanager/tar.gz/e8349048265ccc0871c3d0d668b05eacc68baf50",
+      "sha3_256_parts": [
+        "06d88cbe",
+        "f612a0d4",
+        "ddb99117",
+        "7e5628a3",
+        "519a192b",
+        "16505581",
+        "b4e0c098",
+        "5797fac7"
+      ],
+      "sha256_parts": [
+        "81e69f87",
+        "954aedb5",
+        "57ed67d9",
+        "ef0218a1",
+        "c0c9b9e0",
+        "c3184c9d",
+        "dffe07bd",
+        "247239fc"
+      ]
+    },
+    {
+      "name": "alertmanager-ui",
+      "version": "0.34.2",
+      "filename": "alertmanager-web-ui-0.34.2.tar.gz",
+      "url": "https://github.com/prometheus/alertmanager/releases/download/v0.34.2/alertmanager-web-ui-0.34.2.tar.gz",
+      "sha3_256_parts": [
+        "94cca0b0",
+        "c04577a8",
+        "6deea79a",
+        "58e337ef",
+        "8a5854ea",
+        "026df8f9",
+        "92eb4040",
+        "c813f743"
+      ],
+      "sha256_parts": [
+        "3d6b13c5",
+        "af094724",
+        "e0bed8f7",
+        "57399e08",
+        "af44d40d",
+        "6c6cd873",
+        "92a1f8ee",
+        "6ed1e457"
+      ]
+    }
+  ]
+}

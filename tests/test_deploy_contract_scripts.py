@@ -1,0 +1,19850 @@
+import base64
+import gzip
+import io
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import zipfile
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+import pytest
+import yaml
+
+from scripts.ci import fetch_docker_source_artifacts as alertmanager_source
+from scripts.ci import prometheus_source_image as prometheus_source
+from scripts.orchestration.creative_code_patch_workspace import (
+    git_env_without_parent_state,
+    safe_git_config_args,
+)
+from tests.helpers.prometheus_control import pinned_prometheus_control_bytes
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+CD_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "cd.yml"
+PRODUCTION_COMPOSE_PATH = REPO_ROOT / "deploy" / "docker-compose.production.yaml"
+PRODUCTION_COMPOSE_TEXT = PRODUCTION_COMPOSE_PATH.read_text(encoding="utf-8")
+SELF_HOSTED_COMPOSE_PATH = REPO_ROOT / "deploy" / "docker-compose.production.selfhosted.yaml"
+STAGING_COMPOSE_PATH = REPO_ROOT / "deploy" / "docker-compose.staging.yaml"
+PROMETHEUS_CONFIG_PATH = REPO_ROOT / "deploy" / "prometheus" / "prometheus.yml"
+PROMETHEUS_RULES_PATH = REPO_ROOT / "deploy" / "prometheus" / "alias-alerts.yml"
+PROMETHEUS_MANIFEST_PATH = REPO_ROOT / "deploy" / "prometheus" / "image-manifest.json"
+ALERTMANAGER_CONFIG_PATH = REPO_ROOT / "deploy" / "alertmanager" / "alertmanager.yml"
+ALERTMANAGER_IGNORE_PATH = REPO_ROOT / "deploy" / "alertmanager" / "trivy-ignore.yaml"
+ALERTMANAGER_RUNTIME_REF = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:bc6c847d25e48a8bcddfd8fef0aec25b6ac890346b4bfe6dea3d2d82cd0dc3b9"
+POSTGRES_MANIFEST_PATH = REPO_ROOT / "deploy" / "postgres-pgvector" / "image-manifest.json"
+# Parser/caller fixtures only: these coordinates do not claim an artifact or native build.
+PROMETHEUS_SOURCE_REVISION = prometheus_source.REVISION
+PROMETHEUS_INDEX_DIGEST = "sha256:" + "1" * 64  # Synthetic transport identity.
+PROMETHEUS_PLATFORM_MANIFEST_DIGEST = "sha256:" + "2" * 64
+PROMETHEUS_CONFIG_DIGEST = "sha256:" + "3" * 64
+PROMETHEUS_RUNTIME_REF = (
+    prometheus_source.IMAGE_REPOSITORY + "@" + PROMETHEUS_PLATFORM_MANIFEST_DIGEST
+)
+
+
+def _synthetic_prometheus_manifest() -> dict[str, object]:
+    """Static manifest/caller data, never a successful native or API receipt."""
+    inputs = prometheus_source.declared_inputs()
+    inputs["oras"]["retained"] = {
+        "source_head": "1" * 40,
+        "run_id": 1,
+        "artifact_id": 1,
+        "artifact_name": "prometheus-oras-1-1",
+        "artifact_digest": "sha256:" + "a" * 64,
+        "binary_sha256": "b" * 64,
+        "binary_bytes": 1,
+        "input_digest": "sha256:" + "c" * 64,
+    }
+    selection = {
+        "repository": prometheus_source.IMAGE_REPOSITORY,
+        "platform": "linux/amd64",
+        "root_media_type": prometheus_source.OCI_MANIFEST,
+        "manifest_digest": PROMETHEUS_PLATFORM_MANIFEST_DIGEST,
+        "config_digest": PROMETHEUS_CONFIG_DIGEST,
+        "layers": [row["descriptor"] for row in prometheus_source.BASE_LAYER_CONTRACTS]
+        + [{"mediaType": prometheus_source.OCI_LAYER, "size": 1, "digest": "sha256:" + "4" * 64}],
+        "diff_ids": [row["diff_id"] for row in prometheus_source.BASE_LAYER_CONTRACTS]
+        + ["sha256:" + "5" * 64],
+        "runtime_ref": PROMETHEUS_RUNTIME_REF,
+        "binaries": {
+            name: {"sha256": "6" * 64, "version": "3.15.0"} for name in ("prometheus", "promtool")
+        },
+        "ui_inventory_sha256": prometheus_source.sha(
+            prometheus_source.canonical_data(prometheus_source.UI_FILES)
+        ),
+        "source_revision": PROMETHEUS_SOURCE_REVISION,
+        "version": "3.15.0",
+    }
+    candidate = {
+        "repository": {"id": 1043311030, "full_name": prometheus_source.GHCR_REPOSITORY},
+        "producer": {
+            "workflow_id": 1,
+            "workflow_path": ".github/workflows/build.yml",
+            "source_head": "1" * 40,
+            "source_ref": "refs/heads/synthetic-parser-fixture",
+            "pr_number": 2477,
+            "run_id": 1,
+            "run_attempt": 1,
+            "job_ids": [1],
+            "raw_producer": {
+                name: {
+                    "bytes": (REPO_ROOT / name).stat().st_size,
+                    "sha256": hashlib.sha256((REPO_ROOT / name).read_bytes()).hexdigest(),
+                }
+                for name in prometheus_source.PRODUCER_FILES
+            },
+            "input_projection_sha256": "7" * 64,
+        },
+        "artifact": {
+            "id": 1,
+            "name": "prometheus-source-candidate-1-1",
+            "digest": "sha256:" + "8" * 64,
+            "size": 1,
+            "expires_at": "2099-01-01T00:00:00Z",
+            "archive_sha256": "8" * 64,
+        },
+        "outputs": {
+            name: "9" * 64
+            for name in (
+                "oci_archive_sha256",
+                "docker_archive_sha256",
+                "native_report_sha256",
+                "pair_report_sha256",
+                "spdx_sha256",
+                "provenance_bundle_sha256",
+                "sbom_bundle_sha256",
+            )
+        },
+    }
+    return {
+        "schema": prometheus_source.IMAGE_SCHEMA,
+        "phase": "candidate_selected",
+        "inputs": inputs,
+        "selection": selection,
+        "candidate": candidate,
+    }
+
+
+PROMETHEUS_MANIFEST_ERRORS = {
+    "malformed": "JSONDecodeError",
+    "duplicate": "QualificationError:duplicate_JSON_key",
+    "missing": "QualificationError:selection_keys",
+    "extra": "QualificationError:image_manifest_keys",
+    "wrong-platform-digest": "QualificationError:selection_distinct_identity",
+    "wrong-source-revision": "QualificationError:selection_fixed_identity",
+    "wrong-runtime-ref": "QualificationError:selection_distinct_identity",
+    "index-digest-runtime-ref": "QualificationError:selection_distinct_identity",
+    "wrong-type": "QualificationError:selection_fixed_identity",
+}
+
+
+def _synthetic_prometheus_manifest_text() -> str:
+    return json.dumps(_synthetic_prometheus_manifest(), indent=2) + "\n"
+
+
+_HISTORICAL_AM_TEST_ROOT: Path | None = None
+
+
+_HISTORICAL_AM_EXPECTED_MODULES = {
+    "alertmanager": {
+        "github.com/KimMachineGun/automemlimit": "v0.7.5",
+        "github.com/alecthomas/kingpin/v2": "v2.4.0",
+        "github.com/alecthomas/units": "v0.0.0-20240927000941-0f3dac36c52b",
+        "github.com/armon/go-metrics": "v0.4.1",
+        "github.com/aws/aws-sdk-go-v2": "v1.43.2",
+        "github.com/aws/aws-sdk-go-v2/config": "v1.32.33",
+        "github.com/aws/aws-sdk-go-v2/credentials": "v1.19.32",
+        "github.com/aws/aws-sdk-go-v2/feature/ec2/imds": "v1.18.33",
+        "github.com/aws/aws-sdk-go-v2/internal/configsources": "v1.4.33",
+        "github.com/aws/aws-sdk-go-v2/internal/endpoints/v2": "v2.7.33",
+        "github.com/aws/aws-sdk-go-v2/internal/v4a": "v1.4.34",
+        "github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding": "v1.13.14",
+        "github.com/aws/aws-sdk-go-v2/service/internal/presigned-url": "v1.13.33",
+        "github.com/aws/aws-sdk-go-v2/service/signin": "v1.5.2",
+        "github.com/aws/aws-sdk-go-v2/service/sns": "v1.42.2",
+        "github.com/aws/aws-sdk-go-v2/service/sso": "v1.33.2",
+        "github.com/aws/aws-sdk-go-v2/service/ssooidc": "v1.38.2",
+        "github.com/aws/aws-sdk-go-v2/service/sts": "v1.45.2",
+        "github.com/aws/smithy-go": "v1.27.5",
+        "github.com/beorn7/perks": "v1.0.1",
+        "github.com/cenkalti/backoff/v5": "v5.0.3",
+        "github.com/cespare/xxhash/v2": "v2.3.0",
+        "github.com/coreos/go-systemd/v22": "v22.7.0",
+        "github.com/docker/go-units": "v0.5.0",
+        "github.com/felixge/httpsnoop": "v1.0.4",
+        "github.com/fsnotify/fsnotify": "v1.10.1",
+        "github.com/go-logr/logr": "v1.4.4",
+        "github.com/go-logr/stdr": "v1.2.2",
+        "github.com/go-openapi/analysis": "v0.25.5",
+        "github.com/go-openapi/errors": "v0.22.8",
+        "github.com/go-openapi/jsonpointer": "v1.0.0",
+        "github.com/go-openapi/jsonreference": "v1.0.0",
+        "github.com/go-openapi/loads": "v0.25.0",
+        "github.com/go-openapi/runtime": "v0.33.0",
+        "github.com/go-openapi/runtime/server-middleware": "v0.33.0",
+        "github.com/go-openapi/spec": "v0.22.9",
+        "github.com/go-openapi/strfmt": "v0.27.0",
+        "github.com/go-openapi/swag": "v0.28.0",
+        "github.com/go-openapi/swag/cmdutils": "v0.28.0",
+        "github.com/go-openapi/swag/conv": "v0.28.0",
+        "github.com/go-openapi/swag/fileutils": "v0.28.0",
+        "github.com/go-openapi/swag/jsonutils": "v0.28.0",
+        "github.com/go-openapi/swag/loading": "v0.28.0",
+        "github.com/go-openapi/swag/mangling": "v0.28.0",
+        "github.com/go-openapi/swag/netutils": "v0.28.0",
+        "github.com/go-openapi/swag/pools": "v0.28.0",
+        "github.com/go-openapi/swag/stringutils": "v0.28.0",
+        "github.com/go-openapi/swag/typeutils": "v0.28.0",
+        "github.com/go-openapi/swag/yamlutils": "v0.28.0",
+        "github.com/go-openapi/validate": "v0.26.1",
+        "github.com/go-viper/mapstructure/v2": "v2.5.0",
+        "github.com/golang-jwt/jwt/v5": "v5.3.1",
+        "github.com/google/btree": "v1.1.3",
+        "github.com/google/uuid": "v1.6.0",
+        "github.com/grpc-ecosystem/grpc-gateway/v2": "v2.29.0",
+        "github.com/hashicorp/errwrap": "v1.1.0",
+        "github.com/hashicorp/go-immutable-radix": "v1.3.1",
+        "github.com/hashicorp/go-metrics": "v0.6.0",
+        "github.com/hashicorp/go-msgpack/v2": "v2.1.5",
+        "github.com/hashicorp/go-multierror": "v1.1.1",
+        "github.com/hashicorp/go-sockaddr": "v1.0.7",
+        "github.com/hashicorp/golang-lru": "v0.5.4",
+        "github.com/hashicorp/golang-lru/v2": "v2.0.7",
+        "github.com/hashicorp/memberlist": "v0.6.0",
+        "github.com/jessevdk/go-flags": "v1.6.1",
+        "github.com/jpillora/backoff": "v1.0.0",
+        "github.com/julienschmidt/httprouter": "v1.3.0",
+        "github.com/klauspost/compress": "v1.19.1",
+        "github.com/mdlayher/socket": "v0.6.0",
+        "github.com/mdlayher/vsock": "v1.3.0",
+        "github.com/miekg/dns": "v1.1.72",
+        "github.com/munnerz/goautoneg": "v0.0.0-20191010083416-a7dc8b61c822",
+        "github.com/mwitkow/go-conntrack": "v0.0.0-20190716064945-2f068394615f",
+        "github.com/oklog/run": "v1.2.0",
+        "github.com/oklog/ulid/v2": "v2.1.2",
+        "github.com/pbnjay/memory": "v0.0.0-20210728143218-7b4eea64cf58",
+        "github.com/pierrec/lz4/v4": "v4.1.26",
+        "github.com/prometheus/alertmanager": "0.34.1",
+        "github.com/prometheus/client_golang": "v1.24.1",
+        "github.com/prometheus/client_model": "v0.6.2",
+        "github.com/prometheus/common": "v0.70.1",
+        "github.com/prometheus/exporter-toolkit": "v0.17.1",
+        "github.com/prometheus/procfs": "v0.21.1",
+        "github.com/prometheus/sigv4": "v0.4.1",
+        "github.com/rs/cors": "v1.11.1",
+        "github.com/sean-/seed": "v0.0.0-20170313163322-e2103e2c3529",
+        "github.com/twmb/franz-go": "v1.21.5",
+        "github.com/twmb/franz-go/pkg/kmsg": "v1.13.1",
+        "github.com/twmb/franz-go/plugin/kslog": "v1.0.0",
+        "github.com/xhit/go-str2duration/v2": "v2.1.0",
+        "go.opentelemetry.io/auto/sdk": "v1.2.1",
+        "go.opentelemetry.io/contrib/instrumentation/net/http/httptrace/otelhttptrace": "v0.69.0",
+        "go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp": "v0.69.0",
+        "go.opentelemetry.io/otel": "v1.44.0",
+        "go.opentelemetry.io/otel/exporters/otlp/otlptrace": "v1.44.0",
+        "go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc": "v1.44.0",
+        "go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp": "v1.44.0",
+        "go.opentelemetry.io/otel/metric": "v1.44.0",
+        "go.opentelemetry.io/otel/sdk": "v1.44.0",
+        "go.opentelemetry.io/otel/trace": "v1.44.0",
+        "go.opentelemetry.io/proto/otlp": "v1.10.0",
+        "go.yaml.in/yaml/v2": "v2.4.4",
+        "go.yaml.in/yaml/v3": "v3.0.4",
+        "golang.org/x/crypto": "v0.57.0",
+        "golang.org/x/net": "v0.60.0",
+        "golang.org/x/oauth2": "v0.36.0",
+        "golang.org/x/sync": "v0.23.0",
+        "golang.org/x/sys": "v0.48.0",
+        "golang.org/x/text": "v0.42.0",
+        "golang.org/x/time": "v0.15.0",
+        "google.golang.org/genproto/googleapis/api": "v0.0.0-20260526163538-3dc84a4a5aaa",
+        "google.golang.org/genproto/googleapis/rpc": "v0.0.0-20260526163538-3dc84a4a5aaa",
+        "google.golang.org/grpc": "v1.83.2",
+        "google.golang.org/protobuf": "v1.36.11",
+        "gopkg.in/telebot.v3": "v3.3.8",
+        "gopkg.in/yaml.v2": "v2.4.0",
+        "stdlib": "v1.27.3",
+    },
+    "amtool": {
+        "github.com/alecthomas/kingpin/v2": "v2.4.0",
+        "github.com/alecthomas/units": "v0.0.0-20240927000941-0f3dac36c52b",
+        "github.com/armon/go-metrics": "v0.4.1",
+        "github.com/aws/aws-sdk-go-v2": "v1.43.2",
+        "github.com/aws/aws-sdk-go-v2/config": "v1.32.33",
+        "github.com/aws/aws-sdk-go-v2/credentials": "v1.19.32",
+        "github.com/aws/aws-sdk-go-v2/feature/ec2/imds": "v1.18.33",
+        "github.com/aws/aws-sdk-go-v2/internal/configsources": "v1.4.33",
+        "github.com/aws/aws-sdk-go-v2/internal/endpoints/v2": "v2.7.33",
+        "github.com/aws/aws-sdk-go-v2/internal/v4a": "v1.4.34",
+        "github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding": "v1.13.14",
+        "github.com/aws/aws-sdk-go-v2/service/internal/presigned-url": "v1.13.33",
+        "github.com/aws/aws-sdk-go-v2/service/signin": "v1.5.2",
+        "github.com/aws/aws-sdk-go-v2/service/sso": "v1.33.2",
+        "github.com/aws/aws-sdk-go-v2/service/ssooidc": "v1.38.2",
+        "github.com/aws/aws-sdk-go-v2/service/sts": "v1.45.2",
+        "github.com/aws/smithy-go": "v1.27.5",
+        "github.com/beorn7/perks": "v1.0.1",
+        "github.com/cenkalti/backoff/v5": "v5.0.3",
+        "github.com/cespare/xxhash/v2": "v2.3.0",
+        "github.com/coreos/go-systemd/v22": "v22.7.0",
+        "github.com/felixge/httpsnoop": "v1.0.4",
+        "github.com/fsnotify/fsnotify": "v1.10.1",
+        "github.com/go-logr/logr": "v1.4.4",
+        "github.com/go-logr/stdr": "v1.2.2",
+        "github.com/go-openapi/analysis": "v0.25.5",
+        "github.com/go-openapi/errors": "v0.22.8",
+        "github.com/go-openapi/jsonpointer": "v1.0.0",
+        "github.com/go-openapi/jsonreference": "v1.0.0",
+        "github.com/go-openapi/loads": "v0.25.0",
+        "github.com/go-openapi/runtime": "v0.33.0",
+        "github.com/go-openapi/runtime/server-middleware": "v0.33.0",
+        "github.com/go-openapi/spec": "v0.22.9",
+        "github.com/go-openapi/strfmt": "v0.27.0",
+        "github.com/go-openapi/swag": "v0.28.0",
+        "github.com/go-openapi/swag/cmdutils": "v0.28.0",
+        "github.com/go-openapi/swag/conv": "v0.28.0",
+        "github.com/go-openapi/swag/fileutils": "v0.28.0",
+        "github.com/go-openapi/swag/jsonutils": "v0.28.0",
+        "github.com/go-openapi/swag/loading": "v0.28.0",
+        "github.com/go-openapi/swag/mangling": "v0.28.0",
+        "github.com/go-openapi/swag/netutils": "v0.28.0",
+        "github.com/go-openapi/swag/pools": "v0.28.0",
+        "github.com/go-openapi/swag/stringutils": "v0.28.0",
+        "github.com/go-openapi/swag/typeutils": "v0.28.0",
+        "github.com/go-openapi/swag/yamlutils": "v0.28.0",
+        "github.com/go-openapi/validate": "v0.26.1",
+        "github.com/go-viper/mapstructure/v2": "v2.5.0",
+        "github.com/golang-jwt/jwt/v5": "v5.3.1",
+        "github.com/google/btree": "v1.1.3",
+        "github.com/google/uuid": "v1.6.0",
+        "github.com/grpc-ecosystem/grpc-gateway/v2": "v2.29.0",
+        "github.com/hashicorp/errwrap": "v1.1.0",
+        "github.com/hashicorp/go-immutable-radix": "v1.3.1",
+        "github.com/hashicorp/go-metrics": "v0.6.0",
+        "github.com/hashicorp/go-msgpack/v2": "v2.1.5",
+        "github.com/hashicorp/go-multierror": "v1.1.1",
+        "github.com/hashicorp/go-sockaddr": "v1.0.7",
+        "github.com/hashicorp/golang-lru": "v0.5.4",
+        "github.com/hashicorp/golang-lru/v2": "v2.0.7",
+        "github.com/hashicorp/memberlist": "v0.6.0",
+        "github.com/jpillora/backoff": "v1.0.0",
+        "github.com/klauspost/compress": "v1.19.1",
+        "github.com/mdlayher/socket": "v0.6.0",
+        "github.com/mdlayher/vsock": "v1.3.0",
+        "github.com/miekg/dns": "v1.1.72",
+        "github.com/munnerz/goautoneg": "v0.0.0-20191010083416-a7dc8b61c822",
+        "github.com/mwitkow/go-conntrack": "v0.0.0-20190716064945-2f068394615f",
+        "github.com/oklog/run": "v1.2.0",
+        "github.com/oklog/ulid/v2": "v2.1.2",
+        "github.com/pierrec/lz4/v4": "v4.1.26",
+        "github.com/prometheus/alertmanager": "0.34.1",
+        "github.com/prometheus/client_golang": "v1.24.1",
+        "github.com/prometheus/client_model": "v0.6.2",
+        "github.com/prometheus/common": "v0.70.1",
+        "github.com/prometheus/exporter-toolkit": "v0.17.1",
+        "github.com/prometheus/procfs": "v0.21.1",
+        "github.com/prometheus/sigv4": "v0.4.1",
+        "github.com/sean-/seed": "v0.0.0-20170313163322-e2103e2c3529",
+        "github.com/twmb/franz-go": "v1.21.5",
+        "github.com/twmb/franz-go/pkg/kmsg": "v1.13.1",
+        "github.com/twmb/franz-go/plugin/kslog": "v1.0.0",
+        "github.com/xhit/go-str2duration/v2": "v2.1.0",
+        "github.com/xlab/treeprint": "v1.2.0",
+        "go.opentelemetry.io/auto/sdk": "v1.2.1",
+        "go.opentelemetry.io/contrib/instrumentation/net/http/httptrace/otelhttptrace": "v0.69.0",
+        "go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp": "v0.69.0",
+        "go.opentelemetry.io/otel": "v1.44.0",
+        "go.opentelemetry.io/otel/exporters/otlp/otlptrace": "v1.44.0",
+        "go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc": "v1.44.0",
+        "go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp": "v1.44.0",
+        "go.opentelemetry.io/otel/metric": "v1.44.0",
+        "go.opentelemetry.io/otel/sdk": "v1.44.0",
+        "go.opentelemetry.io/otel/trace": "v1.44.0",
+        "go.opentelemetry.io/proto/otlp": "v1.10.0",
+        "go.yaml.in/yaml/v2": "v2.4.4",
+        "go.yaml.in/yaml/v3": "v3.0.4",
+        "golang.org/x/crypto": "v0.57.0",
+        "golang.org/x/mod": "v0.41.0",
+        "golang.org/x/net": "v0.60.0",
+        "golang.org/x/oauth2": "v0.36.0",
+        "golang.org/x/sync": "v0.23.0",
+        "golang.org/x/sys": "v0.48.0",
+        "golang.org/x/text": "v0.42.0",
+        "golang.org/x/time": "v0.15.0",
+        "google.golang.org/genproto/googleapis/api": "v0.0.0-20260526163538-3dc84a4a5aaa",
+        "google.golang.org/genproto/googleapis/rpc": "v0.0.0-20260526163538-3dc84a4a5aaa",
+        "google.golang.org/grpc": "v1.83.2",
+        "google.golang.org/protobuf": "v1.36.11",
+        "gopkg.in/telebot.v3": "v3.3.8",
+        "gopkg.in/yaml.v2": "v2.4.0",
+        "stdlib": "v1.27.3",
+    },
+}
+
+
+def _historical_AM_scan_oracle() -> dict[str, Any]:
+    """Build synthetic C10-shaped scan data, not original native evidence."""
+    oracle = {"expected_modules": json.loads(json.dumps(_HISTORICAL_AM_EXPECTED_MODULES))}
+    graph = alertmanager_source._ALERT_HISTORICAL_C10["graph"]
+    oracle["subject"] = {
+        "source": alertmanager_source._ALERT_HISTORICAL_C10["source"],
+        "upstream_version": "0.34.1",
+        "manifest": graph["manifest"]["digest"],
+        "config": graph["config"]["digest"],
+        "binary_sha256": {
+            name: graph["files"]["usr/bin/" + name] for name in ("alertmanager", "amtool")
+        },
+    }
+    # Explicit synthetic C10 OS data; current CA/timezone selection is independent.
+    oracle["expected_OS"] = {
+        "OS": {"Family": "debian", "Name": "13.7"},
+        "packages": [
+            [
+                "os-pkgs",
+                "debian",
+                "base-files@13.8+deb13u7",
+                "base-files",
+                "13.8+deb13u7",
+                "amd64",
+                "base-files",
+                "13.8+deb13u7",
+                "pkg:deb/debian/base-files@13.8%2Bdeb13u7?arch=amd64&distro=debian-13.7",
+            ],
+            [
+                "os-pkgs",
+                "debian",
+                "ca-certificates@20250419",
+                "ca-certificates",
+                "20250419",
+                "all",
+                "ca-certificates",
+                "20250419",
+                "pkg:deb/debian/ca-certificates@20250419?arch=all&distro=debian-13.7",
+            ],
+            [
+                "os-pkgs",
+                "debian",
+                "media-types@13.0.0",
+                "media-types",
+                "13.0.0",
+                "all",
+                "media-types",
+                "13.0.0",
+                "pkg:deb/debian/media-types@13.0.0?arch=all&distro=debian-13.7",
+            ],
+            [
+                "os-pkgs",
+                "debian",
+                "netbase@6.5",
+                "netbase",
+                "6.5",
+                "all",
+                "netbase",
+                "6.5",
+                "pkg:deb/debian/netbase@6.5?arch=all&distro=debian-13.7",
+            ],
+            [
+                "os-pkgs",
+                "debian",
+                "tzdata-legacy@2026c-0+deb13u1",
+                "tzdata-legacy",
+                "2026c",
+                "all",
+                "tzdata",
+                "2026c",
+                "pkg:deb/debian/tzdata-legacy@2026c-0%2Bdeb13u1?arch=all&distro=debian-13.7",
+            ],
+            [
+                "os-pkgs",
+                "debian",
+                "tzdata@2026c-0+deb13u1",
+                "tzdata",
+                "2026c",
+                "all",
+                "tzdata",
+                "2026c",
+                "pkg:deb/debian/tzdata@2026c-0%2Bdeb13u1?arch=all&distro=debian-13.7",
+            ],
+        ],
+    }
+    for modules in oracle["expected_modules"].values():
+        modules["stdlib"] = "v1.27.2"
+    return oracle
+
+
+def _historical_AM_template(path: Path) -> bytes:
+    """Project only the selected image in three known historical fixture templates."""
+    assert path in (STAGING_COMPOSE_PATH, PRODUCTION_COMPOSE_PATH, SELF_HOSTED_COMPOSE_PATH)
+    raw = path.read_bytes()
+    current = yaml.safe_load(raw)["services"]["alertmanager"]["image"].encode()
+    assert raw.count(current) == 1
+    return raw.replace(current, ALERTMANAGER_RUNTIME_REF.encode(), 1)
+
+
+# Host/bundle fixtures deliberately exercise C10. Current source identity is checked separately.
+PRODUCTION_COMPOSE_TEXT = _historical_AM_template(PRODUCTION_COMPOSE_PATH).decode("utf-8")
+
+
+def _historical_AM_source() -> bytes:
+    """Keep historical data in an isolated helper copy without altering production guards."""
+    raw = (REPO_ROOT / "scripts/ci/fetch_docker_source_artifacts.py").read_bytes()
+    main_guard = b'\nif __name__ == "__main__":\n'
+    assert raw.count(main_guard) == 1
+    fixture = (
+        b"\n# Explicit synthetic historical fixture data; not production acceptance.\n"
+        b"_ALERT_ACCEPTED_CANDIDATE = _ALERT_HISTORICAL_C10\n"
+        b"_ALERT_CURRENT_SCAN_ORACLE = "
+        + repr(_historical_AM_scan_oracle()).encode("utf-8")
+        + b"\n"
+    )
+    return raw.replace(main_guard, fixture + main_guard, 1)
+
+
+def _historical_AM_helper() -> Path:
+    assert _HISTORICAL_AM_TEST_ROOT is not None
+    path = _HISTORICAL_AM_TEST_ROOT / "fetch_docker_source_artifacts.py"
+    if not path.exists():
+        path.write_bytes(_historical_AM_source())
+    return path
+
+
+def _historical_deploy_script(relative: str) -> Path:
+    assert _HISTORICAL_AM_TEST_ROOT is not None
+    path = _HISTORICAL_AM_TEST_ROOT / Path(relative).name
+    if not path.exists():
+        raw = (REPO_ROOT / relative).read_text()
+        raw = re.sub(
+            r'ALERTMANAGER_CONTRACT_HELPER_SHA256="[0-9a-f]{64}"',
+            'ALERTMANAGER_CONTRACT_HELPER_SHA256="'
+            + hashlib.sha256(_historical_AM_source()).hexdigest()
+            + '"',
+            raw,
+        )
+        path.write_text(raw)
+        path.chmod(0o755)
+    return path
+
+
+@pytest.fixture(autouse=True)
+def historical_AM_selection_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Existing deployment cases exercise explicit C10 data, never a production fallback."""
+    root = tmp_path / "historical-AM-test-source"
+    root.mkdir()
+    monkeypatch.setattr(sys.modules[__name__], "_HISTORICAL_AM_TEST_ROOT", root)
+    monkeypatch.setattr(
+        alertmanager_source,
+        "_ALERT_ACCEPTED_CANDIDATE",
+        json.loads(json.dumps(alertmanager_source._ALERT_HISTORICAL_C10)),
+    )
+    monkeypatch.setattr(
+        alertmanager_source, "_ALERT_CURRENT_SCAN_ORACLE", _historical_AM_scan_oracle()
+    )
+
+
+def _write_prometheus_helper(root: Path) -> None:
+    for name in ("prometheus_source_image.py", "fetch_docker_source_artifacts.py"):
+        target = root / "scripts/ci" / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(
+            _historical_AM_source()
+            if name == "fetch_docker_source_artifacts.py"
+            else (REPO_ROOT / "scripts/ci" / name).read_bytes()
+        )
+        target.chmod(0o644)
+
+
+DEPLOY_PYTHON_CALLERS = (
+    "scripts/deploy_production.sh",
+    "scripts/deploy.sh",
+    "scripts/QUICK_FIX_PRODUCTION.sh",
+)
+DEPLOY_PYTHON_DEFAULTS = (
+    "/usr/bin/python3",
+    "/usr/local/bin/python3",
+    "/opt/homebrew/bin/python3",
+    "/opt/homebrew/opt/python@3.14/libexec/bin/python3",
+)
+
+
+def _deploy_python_program(relative: str, candidates: list[Path]) -> str:
+    """Execute the actual finite caller seam using synthetic candidate paths."""
+    text = (REPO_ROOT / relative).read_text()
+    if relative == "scripts/deploy_production.sh":
+        start = text.index("resolve_absolute_executable() {")
+        end = text.index("\nif ! DOCKER_BIN=", start)
+        body = text[start:end] + '\nPYTHON_BIN_OVERRIDE="${PYTHON_BIN:-}"\n'
+        body += 'PYTHON_BIN="$(resolve_absolute_executable "$PYTHON_BIN_OVERRIDE" PYTHON_BIN '
+        body += " ".join(shlex.quote(str(path)) for path in candidates) + ')"\n'
+    else:
+        start = text.index("# Scoped deploy-tool interpreter input;")
+        end = text.index("\nreadonly PYTHON_BIN", start) + len("\nreadonly PYTHON_BIN")
+        body = text[start:end]
+        array_start = body.index("TRUSTED_PYTHON_CANDIDATES=(")
+        array_end = body.index("\n)", array_start) + len("\n)")
+        body = (
+            body[:array_start]
+            + "TRUSTED_PYTHON_CANDIDATES=("
+            + " ".join(shlex.quote(str(path)) for path in candidates)
+            + ")"
+            + body[array_end:]
+        )
+    touch = shutil.which("touch")
+    assert touch is not None and Path(touch).is_absolute()
+    return (
+        "set -euo pipefail\n"
+        + body
+        + '\nprintf "selected=%s\\n" "$PYTHON_BIN"\n'
+        + shlex.quote(touch)
+        + ' "$MUTATION_MARKER"\n'
+    )
+
+
+def _synthetic_python_probe(path: Path, identity: str, trace: Path, *, status: int = 0) -> None:
+    """Probe test data only; this wrapper has no interpreter-origin authority."""
+    path.write_text(
+        "#!/bin/sh\n"
+        'test "$#" -eq 4 && test "$1" = -I && test "$2" = -S && test "$3" = -c || exit 98\n'
+        "printf '%s\\n' " + shlex.quote(path.name) + " >> " + shlex.quote(str(trace)) + "\n"
+        "printf '%s' " + shlex.quote(identity) + "\n"
+        f"exit {status}\n"
+    )
+    path.chmod(0o755)
+
+
+@pytest.mark.parametrize("relative", DEPLOY_PYTHON_CALLERS)
+@pytest.mark.parametrize("version", ["3.11", "3.12", "3.13", "3.14", "actual-repo"])
+def test_deploy_tool_python_supported_explicit_override(
+    tmp_path: Path, relative: str, version: str
+) -> None:
+    trace = tmp_path / "probes"
+    override = tmp_path / "explicit-python"
+    fallback = tmp_path / "fallback-python"
+    _synthetic_python_probe(fallback, "cpython:3.14\n", trace)
+    if version == "actual-repo":
+        override = Path(sys.executable)
+    else:
+        _synthetic_python_probe(override, "cpython:" + version + "\n", trace)
+    bash = shutil.which("bash")
+    assert bash is not None
+    result = subprocess.run(
+        [bash, "-c", _deploy_python_program(relative, [fallback])],
+        env={
+            "PATH": os.defpath,
+            "PYTHON_BIN": str(override),
+            "MUTATION_MARKER": str(tmp_path / "admitted"),
+        },
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == f"selected={override}\n"
+    assert (tmp_path / "admitted").exists()
+    assert (
+        not trace.exists() if version == "actual-repo" else trace.read_text() == "explicit-python\n"
+    )
+
+
+@pytest.mark.parametrize("relative", DEPLOY_PYTHON_CALLERS)
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "3.9",
+        "3.10",
+        "3.15",
+        "non-CPython",
+        "startup-failure",
+        "empty",
+        "true",
+        "relative",
+        "not-executable",
+    ],
+)
+def test_deploy_tool_python_unsupported_explicit_never_falls_back(
+    tmp_path: Path, relative: str, fault: str
+) -> None:
+    trace = tmp_path / "probes"
+    override = tmp_path / "explicit-python"
+    fallback = tmp_path / "fallback-python"
+    _synthetic_python_probe(fallback, "cpython:3.14\n", trace)
+    identity = "pypy:3.13\n" if fault == "non-CPython" else "cpython:" + fault + "\n"
+    if fault in ("empty", "startup-failure"):
+        identity = "" if fault == "empty" else "cpython:3.14\n"
+    _synthetic_python_probe(
+        override, identity, trace, status=7 if fault == "startup-failure" else 0
+    )
+    if fault == "relative":
+        override = Path("python3")
+    elif fault == "not-executable":
+        override.chmod(0o644)
+    elif fault == "true":
+        binary = shutil.which("true")
+        assert binary is not None and Path(binary).is_absolute()
+        override = Path(binary)
+    bash = shutil.which("bash")
+    assert bash is not None
+    result = subprocess.run(
+        [bash, "-c", _deploy_python_program(relative, [fallback])],
+        env={
+            "PATH": os.defpath,
+            "PYTHON_BIN": str(override),
+            "MUTATION_MARKER": str(tmp_path / "admitted"),
+        },
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "PYTHON_BIN" in result.stderr
+    assert (
+        "absolute path" in result.stderr
+        if fault == "relative"
+        else (
+            "not executable" in result.stderr
+            if fault == "not-executable"
+            else "CPython 3.11, 3.12, 3.13 or 3.14" in result.stderr
+        )
+    )
+    assert not (tmp_path / "admitted").exists()
+    assert not trace.exists() or "fallback-python" not in trace.read_text()
+
+
+@pytest.mark.parametrize("relative", DEPLOY_PYTHON_CALLERS)
+@pytest.mark.parametrize("supported_default", [True, False])
+def test_deploy_tool_python_skips_old_default_without_PATH_discovery(
+    tmp_path: Path, relative: str, supported_default: bool
+) -> None:
+    trace = tmp_path / "probes"
+    old, missing, current = (
+        tmp_path / name for name in ("old-python", "missing", "current-python")
+    )
+    _synthetic_python_probe(old, "cpython:3.9\n", trace)
+    _synthetic_python_probe(
+        current, "cpython:3.14\n" if supported_default else "pypy:3.13\n", trace
+    )
+    injection = tmp_path / "path-bin"
+    injection.mkdir()
+    _synthetic_python_probe(injection / "python3", "cpython:3.14\n", trace)
+    bash = shutil.which("bash")
+    assert bash is not None
+    result = subprocess.run(
+        [bash, "-c", _deploy_python_program(relative, [old, missing, current])],
+        env={
+            "PATH": str(injection) + os.pathsep + os.defpath,
+            "MUTATION_MARKER": str(tmp_path / "admitted"),
+        },
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert (result.returncode == 0) is supported_default, result.stderr
+    assert (tmp_path / "admitted").exists() is supported_default
+    assert trace.read_text() == "old-python\ncurrent-python\n"
+    assert result.stdout == (f"selected={current}\n" if supported_default else "")
+
+
+def test_deploy_tool_python_default_catalogue_and_early_boundary() -> None:
+    for relative in DEPLOY_PYTHON_CALLERS:
+        text = (REPO_ROOT / relative).read_text()
+        start = text.index("TRUSTED_PYTHON_CANDIDATES=(")
+        end = text.index("\n)", start)
+        assert re.findall(r'"([^"]+)"', text[start:end]) == list(DEPLOY_PYTHON_DEFAULTS)
+        assert "command -v python" not in text
+        assert text.index("sys.implementation.name") < text.index("run_prometheus_contract() {")
+        if relative == "scripts/deploy_production.sh":
+            assert text.index("if ! PYTHON_BIN=") < text.index("run_prometheus_contract() {")
+
+
+def test_prometheus_trusted_helper_callers_bind_current_source_bytes() -> None:
+    """Caller consistency only; a hash is not independent source/trust authority."""
+    expected = hashlib.sha256(
+        (REPO_ROOT / "scripts/ci/prometheus_source_image.py").read_bytes()
+    ).hexdigest()
+    for relative in DEPLOY_PYTHON_CALLERS:
+        text = (REPO_ROOT / relative).read_text()
+        assert re.findall(r'PROMETHEUS_CONTRACT_HELPER_SHA256="([0-9a-f]{64})"', text) == [expected]
+
+
+@pytest.mark.parametrize("relative", DEPLOY_PYTHON_CALLERS)
+def test_deploy_tool_python_callers_reject_before_helper_or_mutation(
+    tmp_path: Path, relative: str
+) -> None:
+    trace = tmp_path / "probes"
+    override = tmp_path / "old-python"
+    _synthetic_python_probe(override, "cpython:3.9\n", trace)
+    if relative == "scripts/deploy.sh":
+        env, log = _staging_deploy_fixture(tmp_path)
+        project = Path(env["PROJECT_DIR"])
+        arguments = [
+            "--preflight-only",
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64,
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64,
+        ]
+    elif relative == "scripts/deploy_production.sh":
+        env, project, log, _bundle = _production_preflight_fixture(tmp_path, with_bundle=False)
+        arguments = ["--preflight-only"]
+    else:
+        project = tmp_path / "quick-production"
+        project.mkdir()
+        (project / "docker-compose.production.yaml").write_text("services: {}\n")
+        (project / ".env").write_text("unchanged=synthetic\n")
+        directory = tmp_path / "bin"
+        directory.mkdir()
+        log = tmp_path / "docker.log"
+        docker = directory / "docker"
+        docker.write_text(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> " + shlex.quote(str(log)) + "\nexit 0\n"
+        )
+        docker.chmod(0o755)
+        env = {"PATH": str(directory) + os.pathsep + os.defpath, "DEPLOY_DIR": str(project)}
+        arguments = []
+    env["PYTHON_BIN"] = str(override)
+    env_file = project / ".env"
+    before = (env_file.read_bytes(), stat.S_IMODE(env_file.stat().st_mode))
+    bash = shutil.which("bash")
+    assert bash is not None
+    result = subprocess.run(
+        [bash, str(REPO_ROOT / relative), *arguments],
+        env=env,
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "CPython 3.11, 3.12, 3.13 or 3.14" in result.stderr
+    assert trace.read_text() == "old-python\n"
+    assert (env_file.read_bytes(), stat.S_IMODE(env_file.stat().st_mode)) == before
+    assert not log.exists() or log.read_text() == "compose version\n"
+
+
+@pytest.mark.parametrize("caller", ("scripts/deploy.sh", "scripts/QUICK_FIX_PRODUCTION.sh"))
+@pytest.mark.parametrize("directory", ("dot", "subdirectory", "missing", "failed-pwd"))
+def test_deploy_relative_directory_reaches_verified_helper_without_product_mutation(
+    tmp_path: Path, caller: str, directory: str
+) -> None:
+    if caller == "scripts/deploy.sh":
+        inherited, log_file = _staging_deploy_fixture(tmp_path)
+        allowed = {
+            "PATH",
+            "PROJECT_DIR",
+            "ENV_FILE",
+            "COMPOSE_FILE",
+            "BACKUP_DIR",
+            "BACKUP_HELPER",
+            "STAGING_DEPLOY_MARKER",
+            "DOCKER_BIN",
+            "PYTHON_BIN",
+            "PYTHONPATH",
+            "CURL_BIN",
+            "STAT_BIN",
+            "STAGING_DOMAIN",
+            "GHCR_USER",
+            "GHCR_TOKEN",
+            "HEALTH_MAX_ATTEMPTS",
+            "HEALTH_SLEEP_S",
+        }
+        env = {
+            key: value
+            for key, value in inherited.items()
+            if key in allowed or key.startswith("STUB_")
+        }
+        project = Path(env["PROJECT_DIR"])
+        for key in ("ENV_FILE", "COMPOSE_FILE", "BACKUP_HELPER", "STAGING_DEPLOY_MARKER"):
+            env.pop(key)
+        key = "PROJECT_DIR"
+        arguments = [
+            "--preflight-only",
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64,
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64,
+        ]
+    else:
+        project = tmp_path / "quick-production"
+        project.mkdir()
+        _write_prometheus_helper(project)
+        (project / "prometheus").mkdir()
+        (project / "prometheus/image-manifest.json").write_text(
+            _synthetic_prometheus_manifest_text()
+        )
+        (project / "docker-compose.production.yaml").write_text("services: {}\n")
+        (project / ".env").write_text("APP_ENV=production\nAPP_ENV=duplicate\n")
+        (project / ".env").chmod(0o600)
+        directory_bin = tmp_path / "bin"
+        directory_bin.mkdir()
+        log_file = tmp_path / "docker.log"
+        _write_executable(
+            directory_bin / "docker",
+            "#!/bin/sh\nprintf '%s\n' \"$*\" >> " + shlex.quote(str(log_file)) + "\nexit 0\n",
+        )
+        env = {"PATH": str(directory_bin) + os.pathsep + os.defpath, "PYTHON_BIN": sys.executable}
+        key = "DEPLOY_DIR"
+        arguments = []
+    env["HOME"] = str(tmp_path)
+    cwd = project if directory in ("dot", "failed-pwd") else tmp_path
+    env[key] = (
+        "."
+        if directory in ("dot", "failed-pwd")
+        else ("absent-directory" if directory == "missing" else project.name)
+    )
+    if directory == "failed-pwd":
+        startup = tmp_path / "synthetic-shell-startup"
+        startup.write_text(
+            "pwd() { printf '%s\n' " + shlex.quote(str(project)) + "; return 19; }\n"
+        )
+        env["BASH_ENV"] = str(startup)
+    env_file = project / ".env"
+    before = (env_file.read_bytes(), stat.S_IMODE(env_file.stat().st_mode))
+    shell = shutil.which("bash")
+    assert shell is not None
+    result = subprocess.run(
+        [
+            shell,
+            str(
+                _historical_deploy_script(caller)
+                if caller in ("scripts/deploy.sh", "scripts/deploy_production.sh")
+                else REPO_ROOT / caller
+            ),
+            *arguments,
+        ],
+        env=env,
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    calls = log_file.read_text().splitlines() if log_file.exists() else []
+    assert (env_file.read_bytes(), stat.S_IMODE(env_file.stat().st_mode)) == before
+    assert not list(project.glob(".env.backup.*"))
+    assert not list(project.glob(".env.clean.*"))
+    if directory in ("missing", "failed-pwd"):
+        assert result.returncode != 0
+        if directory == "failed-pwd":
+            assert result.returncode == 19
+        assert calls == []
+    elif caller == "scripts/deploy.sh":
+        assert result.returncode == 0, result.stderr
+        assert all(
+            " stop " not in call and " up " not in call and not call.startswith("backup ")
+            for call in calls
+        )
+    else:
+        assert result.returncode != 0
+        assert "Duplicate required environment keys found" in result.stdout
+        assert "Invalid trusted contract helper operand" not in result.stderr
+        assert calls == ["compose version"]
+
+
+POSTGRES_RUNTIME_REF = (
+    "ghcr.io/katsiarynakavaleuskaya/pulseplate:postgres-15.19-pgvector0.8.6-alpine3.23@"
+    "sha256:d4437ad4970b4099e4cb7d05b7fa625c7e6959949d1374f1f2d4bd4149ae5fa3"
+)
+POSTGRES_PLATFORM_MANIFEST_DIGEST = (
+    "sha256:d4437ad4970b4099e4cb7d05b7fa625c7e6959949d1374f1f2d4bd4149ae5fa3"
+)
+POSTGRES_CONFIG_DIGEST = "sha256:643c5c00d70c37d83a0ab6db8b0996e4c03fb82c4769a45b03eef0cf3ee2abd5"
+POSTGRES_BASE_DIGEST = "sha256:3a241134f6d82eb6465622af948258e41806cfb4497e6c8f0f0a64ca6c4d34db"
+POSTGRES_PRIOR_PLATFORM_DIGEST = (
+    "sha256:06c914735c70f82424a2a9b1e57790590a21d0fbfe250504ff79a1cca2559380"
+)
+POSTGRES_PRIOR_CONFIG_DIGEST = (
+    "sha256:c822c68e22d0358e66cee17e06f7b3ece5d1538cb8b607c1376b59620866ceff"
+)
+POSTGRES_PRIOR_BASE_DIGEST = (
+    "sha256:d94fee7e5e98fcb5cd58db6ad96fc6aa844f1af6dd56aba1f87d9f8e57a7a16d"
+)
+POSTGRES_PRIOR_RUNTIME_REF = (
+    "ghcr.io/katsiarynakavaleuskaya/pulseplate:postgres-15.19-pgvector0.8.6-alpine3.23@"
+    + POSTGRES_PRIOR_PLATFORM_DIGEST
+)
+FAKE_PROMETHEUS_COMPOSE_JSON = json.dumps(
+    {
+        "services": {
+            "prometheus": {
+                "image": PROMETHEUS_RUNTIME_REF,
+                "platform": "linux/amd64",
+                "environment": {"PULSEPLATE_ENVIRONMENT": "production"},
+                "networks": {"observability": {}, "alerting": {}},
+            },
+            "alertmanager": {
+                "image": ALERTMANAGER_RUNTIME_REF,
+                "platform": "linux/amd64",
+                "profiles": ["alerting"],
+                "networks": {"alerting": {"gw_priority": 1}, "smtp-egress": {"gw_priority": 2}},
+                "command": [
+                    "--config.file=/etc/alertmanager/alertmanager.yml",
+                    "--storage.path=/alertmanager",
+                    "--cluster.listen-address=",
+                ],
+                "read_only": True,
+                "user": "65534:65534",
+                "cap_drop": ["ALL"],
+                "security_opt": ["no-new-privileges:true"],
+                "tmpfs": ["/alertmanager:size=16m,mode=0700,uid=65534,gid=65534,noexec,nosuid"],
+                "healthcheck": {
+                    "test": [
+                        "CMD",
+                        "/bin/wget",
+                        "-q",
+                        "-T",
+                        "5",
+                        "-O",
+                        "/dev/null",
+                        "http://127.0.0.1:9093/-/ready",
+                    ]
+                },
+                "secrets": [
+                    {
+                        "source": "alertmanager_smtp_key",
+                        "target": "/run/secrets/alertmanager_smtp_key",
+                    }
+                ],
+            },
+            "app": {"networks": {"web": {}, "observability": {}}},
+            "postgres": {
+                "image": POSTGRES_RUNTIME_REF,
+                "platform": "linux/amd64",
+                "environment": {"PGDATA": "/var/lib/postgresql/data"},
+                "volumes": [
+                    {
+                        "type": "volume",
+                        "source": "pulseplate_postgres_data",
+                        "target": "/var/lib/postgresql/data",
+                    }
+                ],
+            },
+        },
+        "volumes": {"postgres_data": {"name": "pulseplate_postgres_data"}},
+        "networks": {
+            "alerting": {"internal": True},
+            "observability": {"internal": True},
+            "smtp-egress": {"driver": "bridge"},
+        },
+        "secrets": {"alertmanager_smtp_key": {"file": "/tmp/alertmanager_smtp_key"}},
+    },
+    separators=(",", ":"),
+)
+FAKE_PROMETHEUS_IMAGE_INSPECT_JSON = json.dumps(
+    [
+        {
+            "Id": PROMETHEUS_CONFIG_DIGEST,
+            "Os": "linux",
+            "Architecture": "amd64",
+            "RepoDigests": [PROMETHEUS_RUNTIME_REF],
+            "RootFS": {
+                "Type": "layers",
+                "Layers": _synthetic_prometheus_manifest()["selection"]["diff_ids"],
+            },
+            "Config": {
+                "User": "65532:65532",
+                "Entrypoint": ["/bin/prometheus"],
+                "WorkingDir": "/prometheus",
+                "Cmd": [
+                    "--config.file=/etc/prometheus/prometheus.yml",
+                    "--storage.tsdb.path=/prometheus",
+                ],
+            },
+        }
+    ],
+    separators=(",", ":"),
+)
+FAKE_ALERTMANAGER_IMAGE_INSPECT_JSON = json.dumps(
+    [
+        {
+            "Id": alertmanager_source._ALERT_HISTORICAL_C10["graph"]["config"]["digest"],
+            "Os": "linux",
+            "Architecture": "amd64",
+            "RepoDigests": [ALERTMANAGER_RUNTIME_REF],
+            "RootFS": {"Layers": alertmanager_source._ALERT_HISTORICAL_C10["graph"]["diff_ids"]},
+        }
+    ],
+    separators=(",", ":"),
+)
+FAKE_POSTGRES_IMAGE_INSPECT_JSON = json.dumps(
+    [
+        {
+            "Id": POSTGRES_PLATFORM_MANIFEST_DIGEST,
+            "Os": "linux",
+            "Architecture": "amd64",
+            "RepoDigests": [
+                f"ghcr.io/katsiarynakavaleuskaya/pulseplate@{POSTGRES_PLATFORM_MANIFEST_DIGEST}"
+            ],
+            "Config": {
+                "User": "70",
+                "Entrypoint": ["/usr/local/bin/docker-entrypoint.sh"],
+                "Env": [
+                    "PGDATA=/var/lib/postgresql/15/data",
+                    "PG_MAJOR=15",
+                    "PG_MINOR=19",
+                ],
+                "Labels": {
+                    "com.pulseplate.pgvector.version": "0.8.6",
+                    "com.pulseplate.pgvector.source-commit": (
+                        "8ee86c96f0fd72390f890aa8a336fda6d3ab4c6c"
+                    ),
+                    "com.pulseplate.postgres.base-manifest": (
+                        "sha256:3a241134f6d82eb6465622af948258e41806cfb4497e6c8f0f0a64ca6c4d34db"
+                    ),
+                },
+            },
+        }
+    ],
+    separators=(",", ":"),
+)
+FAKE_POSTGRES_CONFIG_IMAGE_INSPECT_JSON = json.dumps(
+    [{**json.loads(FAKE_POSTGRES_IMAGE_INSPECT_JSON)[0], "Id": POSTGRES_CONFIG_DIGEST}],
+    separators=(",", ":"),
+)
+FAKE_POSTGRES_CONTAINER_INSPECT_JSON = json.dumps(
+    [
+        {
+            "Id": "a" * 64,
+            "Image": "sha256:aad6289ca337b3ce76896f2e7e61480490152886c7828120371fb28e6b779e1d",
+            "Config": {
+                "Image": "postgres:15-alpine",
+                "Env": ["PGDATA=/var/lib/postgresql/data", "PG_MAJOR=15"],
+            },
+            "State": {"Running": True, "Health": {"Status": "healthy"}},
+            "Mounts": [
+                {
+                    "Type": "volume",
+                    "Name": "pulseplate_postgres_data",
+                    "Destination": "/var/lib/postgresql/data",
+                    "RW": True,
+                }
+            ],
+        }
+    ],
+    separators=(",", ":"),
+)
+CANONICAL_MANAGED_COMPOSE = "deploy/docker-compose.production.yaml"
+CANONICAL_SELF_HOSTED_COMPOSE = "deploy/docker-compose.production.selfhosted.yaml"
+METRICS_SECRET_SENTINEL = "obs1b-test-metrics-token-12345678"  # pragma: allowlist secret
+MOUNTPOINT_LAYER_GZIP = base64.b64decode(
+    "H4sIAAAAAAAA/+yTTQrCMBBGcxRv4MtvzxNRRCioSfT80hQXlm7UplCYt/myCsm8b54x7VVjADrv"  # pragma: allowlist secret
+    "awLTrGftjTXOWe2CQoND7Xzrhw08colJwb/3TD+3EQb//eXQtAM/+A8E8b8Gb/+3ay7ndMr3fvkq"  # pragma: allowlist secret
+    "jP7H0WjCR877txgj/tdgxv8xlrhoCap/vvLfGdl/QRCEprwCAAD//8KRjiQADAAA"  # pragma: allowlist secret
+)
+
+
+CHECKPOINT_PATHS = (
+    "scripts/verify_premium_alias_telemetry.py",
+    "scripts/ops/notify_premium_alias_checkpoint_failure.py",
+    "deploy/systemd/pulseplate-premium-alias-checkpoint.service.example",
+    "deploy/systemd/pulseplate-premium-alias-checkpoint.timer.example",
+    "deploy/systemd/pulseplate-premium-alias-checkpoint-failure.service.example",
+)
+
+
+def _write_checkpoint_contract(root: Path, *, staging: bool = False) -> None:
+    for relative in CHECKPOINT_PATHS:
+        destination = root / (
+            relative.replace("deploy/systemd/", "systemd/") if staging else relative
+        )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes((REPO_ROOT / relative).read_bytes())
+        destination.chmod(0o644)
+
+
+def _write_production_host_contract(
+    project_dir: Path,
+    *,
+    compose_text: str = PRODUCTION_COMPOSE_TEXT,
+    self_hosted: bool = False,
+    include_checkpoint: bool = True,
+) -> Path:
+    if include_checkpoint:
+        _write_checkpoint_contract(project_dir)
+    _write_prometheus_helper(project_dir)
+    deploy_dir = project_dir / "deploy"
+    prometheus_dir = deploy_dir / "prometheus"
+    alertmanager_dir = deploy_dir / "alertmanager"
+    postgres_manifest_dir = deploy_dir / "postgres-pgvector"
+    secret_dir = deploy_dir / "secrets"
+    backup_dir = project_dir / "backups"
+    backup_helper_dir = project_dir / "scripts" / "ops"
+    prometheus_dir.mkdir(parents=True, exist_ok=True)
+    alertmanager_dir.mkdir(parents=True, exist_ok=True)
+    postgres_manifest_dir.mkdir(parents=True, exist_ok=True)
+    secret_dir.mkdir(parents=True, exist_ok=True)
+    if self_hosted:
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        backup_helper_dir.mkdir(parents=True, exist_ok=True)
+    secret_dir.chmod(0o700)
+    secret_file = secret_dir / "pulseplate_metrics_scrape_key"
+    secret_file.write_text(METRICS_SECRET_SENTINEL, encoding="ascii")
+    secret_file.chmod(0o444)
+    (prometheus_dir / "prometheus.yml").write_text(
+        PROMETHEUS_CONFIG_PATH.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (prometheus_dir / "alias-alerts.yml").write_text(
+        PROMETHEUS_RULES_PATH.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (prometheus_dir / "image-manifest.json").write_text(
+        _synthetic_prometheus_manifest_text(), encoding="utf-8"
+    )
+    (alertmanager_dir / "alertmanager.yml").write_text(
+        ALERTMANAGER_CONFIG_PATH.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (alertmanager_dir / "trivy-ignore.yaml").write_text(
+        ALERTMANAGER_IGNORE_PATH.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (postgres_manifest_dir / "image-manifest.json").write_text(
+        POSTGRES_MANIFEST_PATH.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    compose_name = (
+        "docker-compose.production.selfhosted.yaml"
+        if self_hosted
+        else "docker-compose.production.yaml"
+    )
+    compose_path = deploy_dir / compose_name
+    compose_path.write_text(compose_text, encoding="utf-8")
+    if self_hosted:
+        backup_helper = backup_helper_dir / "postgres_backup.sh"
+        backup_helper.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            'receipt="${BACKUP_DIR}/pulseplate_test.dump"\n'
+            'if [ -n "${STUB_DEPLOY_LOG_FILE:-}" ]; then printf "backup\\n" >> "$STUB_DEPLOY_LOG_FILE"; fi\n'
+            "printf 'synthetic-custom-dump' > \"$receipt\"\n"
+            'chmod 0600 "$receipt"\n'
+            "printf 'Backup created: %s\\n' \"$receipt\"\n",
+            encoding="utf-8",
+        )
+        backup_helper.chmod(0o755)
+    return compose_path
+
+
+def _write_shell_bundle_contract(
+    shell_bundle_dir: Path,
+    *,
+    compose_text: str = PRODUCTION_COMPOSE_TEXT,
+    compose_name: str = "docker-compose.production.yaml",
+    include_frontend: bool = True,
+    include_redeploy: bool = True,
+    include_backup_helper: bool = True,
+) -> None:
+    _write_checkpoint_contract(shell_bundle_dir)
+    _write_prometheus_helper(shell_bundle_dir)
+    deploy_dir = shell_bundle_dir / "deploy"
+    prometheus_dir = deploy_dir / "prometheus"
+    alertmanager_dir = deploy_dir / "alertmanager"
+    postgres_manifest_dir = deploy_dir / "postgres-pgvector"
+    scripts_dir = shell_bundle_dir / "scripts"
+    ops_dir = scripts_dir / "ops"
+    deploy_dir.mkdir(parents=True, exist_ok=True)
+    prometheus_dir.mkdir(parents=True, exist_ok=True)
+    alertmanager_dir.mkdir(parents=True, exist_ok=True)
+    postgres_manifest_dir.mkdir(parents=True, exist_ok=True)
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    ops_dir.mkdir(parents=True, exist_ok=True)
+    if include_frontend:
+        (shell_bundle_dir / "frontend").mkdir(parents=True, exist_ok=True)
+    (deploy_dir / "Caddyfile.production").write_text(
+        'pulseplate.test {\n    respond "ok"\n}\n', encoding="utf-8"
+    )
+    (deploy_dir / compose_name).write_text(compose_text, encoding="utf-8")
+    sibling_compose = (
+        SELF_HOSTED_COMPOSE_PATH
+        if compose_name == "docker-compose.production.yaml"
+        else PRODUCTION_COMPOSE_PATH
+    )
+    (deploy_dir / sibling_compose.name).write_text(
+        _historical_AM_template(sibling_compose).decode("utf-8"), encoding="utf-8"
+    )
+    (prometheus_dir / "prometheus.yml").write_text(
+        PROMETHEUS_CONFIG_PATH.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (prometheus_dir / "alias-alerts.yml").write_text(
+        PROMETHEUS_RULES_PATH.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (prometheus_dir / "image-manifest.json").write_text(
+        _synthetic_prometheus_manifest_text(), encoding="utf-8"
+    )
+    (alertmanager_dir / "alertmanager.yml").write_text(
+        ALERTMANAGER_CONFIG_PATH.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (alertmanager_dir / "trivy-ignore.yaml").write_text(
+        ALERTMANAGER_IGNORE_PATH.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (postgres_manifest_dir / "image-manifest.json").write_text(
+        POSTGRES_MANIFEST_PATH.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (scripts_dir / "diagnose_web.sh").write_text(
+        "#!/usr/bin/env bash\nprintf 'bundle-diagnose\\n'\n", encoding="utf-8"
+    )
+    if include_redeploy:
+        (scripts_dir / "redeploy_caddy.sh").write_text(
+            "#!/usr/bin/env bash\nprintf 'bundle-redeploy\\n'\n", encoding="utf-8"
+        )
+    if include_backup_helper:
+        backup_helper = ops_dir / "postgres_backup.sh"
+        backup_helper.write_text(
+            (REPO_ROOT / "scripts" / "ops" / "postgres_backup.sh").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        backup_helper.chmod(0o755)
+
+
+def _canonical_test_archive_path(suffix: int) -> Path:
+    return Path("/tmp") / f"pulseplate-shell-bundle-{os.getpid()}-{suffix}.tgz"
+
+
+def _write_shell_bundle_archive(
+    archive_path: Path,
+    source_dir: Path,
+    *,
+    variant: str = "valid",
+) -> None:
+    required_paths = [
+        "frontend",
+        "deploy/Caddyfile.production",
+        "deploy/docker-compose.production.yaml",
+        "deploy/docker-compose.production.selfhosted.yaml",
+        "deploy/postgres-pgvector/image-manifest.json",
+        "deploy/prometheus/prometheus.yml",
+        "deploy/prometheus/alias-alerts.yml",
+        "deploy/prometheus/image-manifest.json",
+        "deploy/alertmanager/alertmanager.yml",
+        "deploy/alertmanager/trivy-ignore.yaml",
+        "scripts/ci/prometheus_source_image.py",
+        "scripts/ci/fetch_docker_source_artifacts.py",
+        "scripts/diagnose_web.sh",
+        "scripts/ops/postgres_backup.sh",
+        "scripts/redeploy_caddy.sh",
+        *CHECKPOINT_PATHS,
+    ]
+    if archive_path.exists():
+        archive_path.unlink()
+    if variant == "oversized_archive":
+        with archive_path.open("wb") as handle:
+            handle.truncate(512 * 1024 * 1024 + 1)
+        return
+
+    with tarfile.open(archive_path, "w:gz") as archive:
+        for relative_path in required_paths:
+            if variant == "missing_manifest" and relative_path.endswith("image-manifest.json"):
+                continue
+            if variant in {"missing_rules", "rules_symlink"} and relative_path == (
+                "deploy/prometheus/alias-alerts.yml"
+            ):
+                continue
+            if (
+                variant == "missing_alert_config"
+                and relative_path == "deploy/alertmanager/alertmanager.yml"
+            ):
+                continue
+            if (
+                variant == "missing_alert_ignore"
+                and relative_path == "deploy/alertmanager/trivy-ignore.yaml"
+            ):
+                continue
+            if variant.startswith("backup_helper_") and relative_path == (
+                "scripts/ops/postgres_backup.sh"
+            ):
+                continue
+            archive.add(source_dir / relative_path, arcname=relative_path, recursive=True)
+
+        if variant == "duplicate":
+            archive.add(
+                source_dir / "deploy/Caddyfile.production",
+                arcname="deploy/Caddyfile.production",
+            )
+        elif variant in {"traversal", "absolute", "non_normalized", "unexpected"}:
+            names = {
+                "traversal": "../escape.txt",
+                "absolute": "/escape.txt",
+                "non_normalized": "frontend/../escape.txt",
+                "unexpected": "unexpected.txt",
+            }
+            payload = b"invalid\n"
+            member = tarfile.TarInfo(names[variant])
+            member.size = len(payload)
+            archive.addfile(member, io.BytesIO(payload))
+        elif variant in {"symlink", "hardlink", "fifo"}:
+            member = tarfile.TarInfo(f"frontend/{variant}")
+            if variant == "symlink":
+                member.type = tarfile.SYMTYPE
+                member.linkname = "target"
+            elif variant == "hardlink":
+                member.type = tarfile.LNKTYPE
+                member.linkname = "frontend/bundle-marker.txt"
+            else:
+                member.type = tarfile.FIFOTYPE
+            archive.addfile(member)
+        elif variant in {"backup_helper_symlink", "backup_helper_hardlink"}:
+            member = tarfile.TarInfo("scripts/ops/postgres_backup.sh")
+            if variant == "backup_helper_symlink":
+                member.type = tarfile.SYMTYPE
+                member.linkname = "../../deploy/Caddyfile.production"
+            else:
+                member.type = tarfile.LNKTYPE
+                member.linkname = "scripts/redeploy_caddy.sh"
+            archive.addfile(member)
+        elif variant == "rules_symlink":
+            member = tarfile.TarInfo("deploy/prometheus/alias-alerts.yml")
+            member.type = tarfile.SYMTYPE
+            member.linkname = "prometheus.yml"
+            archive.addfile(member)
+        elif variant == "backup_helper_wrong_mode":
+            payload = b"#!/usr/bin/env bash\nexit 0\n"
+            member = tarfile.TarInfo("scripts/ops/postgres_backup.sh")
+            member.mode = 0o775
+            member.size = len(payload)
+            archive.addfile(member, io.BytesIO(payload))
+
+
+def test_production_compose_source_of_truth_matches_split_contract() -> None:
+    compose = yaml.safe_load(PRODUCTION_COMPOSE_TEXT)
+    assert isinstance(compose, dict), "production compose must deserialize to a mapping"
+
+    services = compose.get("services")
+    assert isinstance(services, dict), "production compose must define a services mapping"
+
+    assert "postgres" not in services
+    app_service = services.get("app")
+    assert isinstance(app_service, dict), "production compose must define an app service"
+    assert app_service["image"] == "${IMAGE_REF:?IMAGE_REF is required}"
+    assert "build" not in app_service
+    app_env_file = app_service.get("env_file")
+    assert app_env_file in (".env", [".env"]), "app service must reference deploy/.env"
+
+    caddy_service = services.get("caddy")
+    assert isinstance(caddy_service, dict), "production compose must define a caddy service"
+    assert "image" not in caddy_service
+
+    caddy_build = caddy_service.get("build")
+    assert isinstance(caddy_build, dict), "caddy service must use a build-based shell contract"
+    assert caddy_build["context"] == "../frontend"
+    assert caddy_build["dockerfile"] == "Dockerfile.caddy-spa"
+
+    caddy_build_args = caddy_build.get("args")
+    assert isinstance(caddy_build_args, dict), "caddy build must define build args"
+    assert caddy_build_args["VITE_API_BASE"] == "${VITE_API_BASE:-/api/v1}"
+
+
+def test_prometheus_image_manifest_preparation_cannot_select_a_runtime() -> None:
+    observed = prometheus_source.read_image_manifest(PROMETHEUS_MANIFEST_PATH, preparation=True)
+    assert observed["schema"] == prometheus_source.IMAGE_SCHEMA
+    if observed["phase"] == "source_prepared":
+        assert observed["selection"] is None and observed["candidate"] is None
+        with pytest.raises(
+            prometheus_source.QualificationError, match="source_prepared_not_consumable"
+        ):
+            prometheus_source.read_image_manifest(PROMETHEUS_MANIFEST_PATH)
+    else:
+        prometheus_source.validate_selection(observed["selection"])
+        prometheus_source.validate_candidate_coordinates(observed["candidate"])
+
+
+def test_postgres_pgvector_manifest_binds_reproducible_image_and_scan_contract() -> None:
+    """Bind the image recipe and every deployment consumer to the same immutable subject."""
+    manifest_bytes = POSTGRES_MANIFEST_PATH.read_bytes()
+    assert hashlib.sha256(manifest_bytes).hexdigest() == (
+        "9aa310913af9799c39182428e0170b173fe2144367b302d7d2cafd87c93c03b2"  # pragma: allowlist secret
+    )
+    manifest = json.loads(manifest_bytes)
+    assert manifest["schema"] == "pulseplate.postgres_pgvector_image_manifest.v1"
+    assert manifest["repository"] == "ghcr.io/katsiarynakavaleuskaya/pulseplate"
+    assert manifest["tag"] == "postgres-15.19-pgvector0.8.6-alpine3.23"
+    assert manifest["platform"] == "linux/amd64"
+    assert manifest["platform_manifest_digest"] == POSTGRES_PLATFORM_MANIFEST_DIGEST
+    assert manifest["config_digest"] == POSTGRES_CONFIG_DIGEST
+    assert manifest["runtime_ref"] == POSTGRES_RUNTIME_REF
+    assert manifest["source_date_epoch"] == "1785349734"
+    assert manifest["postgres_version"] == "15.19"
+    assert manifest["pgvector_version"] == "0.8.6"
+    assert manifest["runtime_user"] == "70"
+    assert manifest["runtime_entrypoint"] == "/usr/local/bin/docker-entrypoint.sh"
+    assert manifest["runtime_default_pgdata"] == "/var/lib/postgresql/15/data"
+    assert manifest["compose_pgdata"] == "/var/lib/postgresql/data"
+    assert manifest["compose_volume_target"] == "/var/lib/postgresql/data"
+    assert manifest["runtime_base_platform_manifest_digest"] == (
+        "sha256:3a241134f6d82eb6465622af948258e41806cfb4497e6c8f0f0a64ca6c4d34db"
+    )
+    assert manifest["builder_base_platform_manifest_digest"] == (
+        "sha256:74cde2c2febf7d7ddacfd3d23dbc66ea0fcbc1bdb9ae4b1ed654d717d203a2a5"
+    )
+    assert manifest["legacy_platform_manifest_digest"] == (
+        "sha256:a2c20749c564b4eb73a77bfda626f8a3cde1bbfae020fb97c616a00cdc1a2181"
+    )
+    assert manifest["builder_packages"] == "build-base=0.5-r3,postgresql15-dev=15.19-r0"
+    assert manifest["builder_apk_closure_count"] == "94"
+    assert manifest["runtime_artifact_count"] == "64"
+    assert manifest["runtime_artifact_inventory_sha256"] == (
+        "sha256:a51a19ba4c626d476611205144c79c89ccdfc136acdddb9e9eb2ef5921e8ea57"
+    )
+    assert manifest["mountpoint_layer_schema"] == "pulseplate.pgvector_mountpoint_layer.v1"
+    assert manifest["mountpoint_layer_digest"] == (
+        "sha256:4c539aa857412d283fe8d55b40227fbd17b9fd6f06834f81fd98ec6796ee7396"
+    )
+    assert manifest["mountpoint_layer_size"] == "162"
+    assert manifest["mountpoint_layer_diff_id"] == (
+        "sha256:8cb1ace7e0c1f48d719bbdf5b4cfe9705ef407c74a3567ddc4369a6d6f023a23"
+    )
+    assert manifest["mountpoint_layer_entry_count"] == "4"
+    assert manifest["mountpoint_uid"] == "70"
+    assert manifest["mountpoint_gid"] == "70"
+    assert manifest["mountpoint_mode"] == "0700"
+    assert manifest["mountpoint_path"] == "/var/lib/postgresql/data"
+    assert manifest["mountpoint_leaf_empty"] == "true"
+    assert manifest["mountpoint_base_parent_metadata_equal"] == "true"
+    assert manifest["trivy_version"] == "0.74.0"
+    assert manifest["trivy_scan_contract"] == (
+        "vuln,secret;os,library;HIGH,CRITICAL;exit=1;suppressions=none"
+    )
+    assert manifest["buildkit_version"] == "0.32.2"
+    assert manifest["buildx_version"] == "0.37.0"
+    containerfile = REPO_ROOT / "deploy" / "postgres-pgvector" / "Containerfile"
+    assert (
+        "sha256:" + hashlib.sha256(containerfile.read_bytes()).hexdigest()
+        == manifest["containerfile_sha256"]
+    )
+    assert POSTGRES_RUNTIME_REF == (
+        f"{manifest['repository']}:{manifest['tag']}@{manifest['platform_manifest_digest']}"
+    )
+    staging_script = (_historical_deploy_script("scripts/deploy.sh")).read_text(encoding="utf-8")
+    assert f'if [ "$image_id" = "{manifest["config_digest"]}" ] || \\' in staging_script
+    assert 'platform_image_id="${POSTGRES_RUNTIME_REF##*@}"' in staging_script
+
+
+@pytest.mark.parametrize("compose_path", (STAGING_COMPOSE_PATH, SELF_HOSTED_COMPOSE_PATH))
+def test_local_postgres_contours_use_one_immutable_pgvector_volume_contract(
+    compose_path: Path,
+) -> None:
+    compose = yaml.safe_load(compose_path.read_text(encoding="utf-8"))
+    postgres = compose["services"]["postgres"]
+    assert postgres["image"] == POSTGRES_RUNTIME_REF
+    assert postgres["platform"] == "linux/amd64"
+    assert "PGDATA=/var/lib/postgresql/data" in postgres["environment"]
+    assert postgres["volumes"][0] == "postgres_data:/var/lib/postgresql/data"
+    assert "ports" not in postgres
+    assert postgres["networks"] == (
+        ["database"] if compose_path == STAGING_COMPOSE_PATH else ["web"]
+    )
+    if compose_path == STAGING_COMPOSE_PATH:
+        assert (
+            postgres["volumes"][1]
+            == "./postgres-pgvector/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro"
+        )
+        assert compose["networks"]["database"]["internal"] is True
+        assert "POSTGRES_PASSWORD_FILE=/run/secrets/postgres_password" in postgres["environment"]
+        for key, directory in (("postgres_data", "postgres"), ("prometheus_data", "prometheus")):
+            assert compose["volumes"][key]["name"] == "pulseplate-staging_" + key + "_v5"
+            assert compose["volumes"][key]["driver"] == "local"
+            assert compose["volumes"][key]["driver_opts"] == {
+                "type": "none",
+                "o": "bind",
+                "device": "/mnt/pulseplate-staging-data/" + directory,
+            }
+            assert "external" not in compose["volumes"][key]
+
+
+def test_managed_production_compose_remains_postgres_service_free() -> None:
+    compose = yaml.safe_load(PRODUCTION_COMPOSE_TEXT)
+    assert "postgres" not in compose["services"]
+    assert POSTGRES_RUNTIME_REF not in PRODUCTION_COMPOSE_TEXT
+
+
+def test_postgres_builder_uses_only_authenticated_offline_apk_inputs() -> None:
+    """The production recipe must not resolve transitive inputs from a live index."""
+    recipe = (POSTGRES_MANIFEST_PATH.parent / "Containerfile").read_text(encoding="utf-8")
+    builder = recipe.split("\nFROM ", 2)[1]
+    assert "RUN --network=none " in builder
+    assert "apk update" not in builder
+    assert "apk verify /tmp/builder-apks/x86_64/APKINDEX.tar.gz" in builder
+    assert "--no-network --no-cache --repositories-file /dev/null" in builder
+    assert "--repository /tmp/builder-apks" in builder
+    assert "--allow-untrusted" not in recipe
+    manifest = json.loads(POSTGRES_MANIFEST_PATH.read_bytes())
+    record = POSTGRES_MANIFEST_PATH.parent / "builder-apk-inputs.tsv"
+    index = POSTGRES_MANIFEST_PATH.parent / "builder-apk-index.tar.gz"
+    assert "sha256:" + hashlib.sha256(record.read_bytes()).hexdigest() == (
+        manifest["builder_apk_inputs_sha256"]
+    )
+    assert "sha256:" + hashlib.sha256(index.read_bytes()).hexdigest() == (
+        manifest["builder_apk_index_sha256"]
+    )
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "valid",
+        "record-digest",
+        "index-digest",
+        "duplicate",
+        "short-row",
+        "traversal",
+        "foreign-url",
+        "wrong-version",
+        "wrong-arch",
+        "bad-digest",
+        "zero-size",
+        "symlink-record",
+        "hardlink-record",
+        "symlink-index",
+        "missing-index",
+        "download-failure",
+        "download-truncated",
+        "download-altered",
+        "extra-file",
+        "wrong-count",
+        "no-newline",
+    ],
+)
+def test_postgres_apk_context_executes_exact_acquisition_program(
+    tmp_path: Path, fault: str
+) -> None:
+    """Exercise acquisition checks; native signed-index trust is separate image evidence."""
+    workflow = yaml.safe_load(CD_WORKFLOW_PATH.read_text(encoding="utf-8"))
+    step = next(
+        item
+        for item in workflow["jobs"]["postgres-pgvector-publish"]["steps"]
+        if item.get("name") == "Prepare exact verified pgvector source context"
+    )
+    program = step["run"].split("python3 - \"$context_dir\" <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+    owner = tmp_path / "deploy" / "postgres-pgvector"
+    owner.mkdir(parents=True)
+    context = tmp_path / "context"
+    context.mkdir()
+    payload = b"synthetic package bytes\n"
+    row = [
+        hashlib.sha256(payload).hexdigest(),
+        str(len(payload)),
+        "build-base-0.5-r3.apk",
+        "build-base",
+        "0.5-r3",
+        "x86_64",
+        "https://dhi.io/apk/alpine/v3.23/main/x86_64/build-base-0.5-r3.apk",
+    ]
+    if fault == "short-row":
+        row.pop()
+    elif fault == "traversal":
+        row[2] = "../outside.apk"
+    elif fault == "foreign-url":
+        row[6] = "https://example.invalid/build-base-0.5-r3.apk"
+    elif fault == "wrong-version":
+        row[4] = "0.6-r0"
+    elif fault == "wrong-arch":
+        row[5] = "aarch64"
+    elif fault == "bad-digest":
+        row[0] = "not-a-digest"
+    elif fault == "zero-size":
+        row[1] = "0"
+    record = ("\t".join(row) + "\n").encode()
+    count = 1
+    if fault == "duplicate":
+        record += record
+        count = 2
+    elif fault == "no-newline":
+        record = record.rstrip(b"\n")
+    record_path = owner / "builder-apk-inputs.tsv"
+    record_path.write_bytes(record)
+    index_path = owner / "builder-apk-index.tar.gz"
+    index = b"synthetic index, not signature evidence\n"
+    index_path.write_bytes(index)
+    manifest = {
+        "builder_apk_inputs_sha256": "sha256:" + hashlib.sha256(record).hexdigest(),
+        "builder_apk_index_sha256": "sha256:" + hashlib.sha256(index).hexdigest(),
+        "builder_apk_input_count": str(count + (fault == "wrong-count")),
+    }
+    (owner / "image-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    if fault == "record-digest":
+        record_path.write_bytes(record + b"\n")
+    elif fault == "index-digest":
+        index_path.write_bytes(index + b"altered")
+    elif fault in {"symlink-record", "hardlink-record"}:
+        external = tmp_path / "external-record"
+        record_path.rename(external)
+        if fault == "symlink-record":
+            record_path.symlink_to(external)
+        else:
+            os.link(external, record_path)
+    elif fault == "symlink-index":
+        external = tmp_path / "external-index"
+        index_path.rename(external)
+        index_path.symlink_to(external)
+    elif fault == "missing-index":
+        index_path.unlink()
+    elif fault == "extra-file":
+        # Planted by the curl fixture after acquisition creates the repository.
+        pass
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_executable(
+        bin_dir / "curl",
+        f"#!{sys.executable}\nimport os, sys\n"
+        "from pathlib import Path\n"
+        "fault = os.environ['APK_TEST_FAULT']\n"
+        "if fault == 'download-failure': sys.exit(22)\n"
+        f"payload = {payload!r}\n"
+        "if fault == 'download-truncated': payload = payload[:-1]\n"
+        "if fault == 'download-altered': payload = b'X' + payload[1:]\n"
+        "if fault == 'extra-file':\n"
+        "    Path('context/builder-apks/x86_64/unowned.apk').write_bytes(b'unowned')\n"
+        "sys.stdout.buffer.write(payload)\n",
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", program, str(context)],
+        cwd=tmp_path,
+        env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "APK_TEST_FAULT": fault},
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=20,
+    )
+    if fault == "valid":
+        assert result.returncode == 0, result.stderr
+        repository = context / "builder-apks" / "x86_64"
+        assert {path.name for path in repository.iterdir()} == {
+            "APKINDEX.tar.gz",
+            "build-base-0.5-r3.apk",
+        }
+        assert (repository / "build-base-0.5-r3.apk").read_bytes() == payload
+        assert (repository / "APKINDEX.tar.gz").read_bytes() == index
+    elif fault == "extra-file":
+        assert result.returncode != 0, result.stdout
+        assert "APK repository file set drifted" in result.stderr
+        assert "Verified 1 exact APK archives" not in result.stdout
+    else:
+        assert result.returncode != 0, result.stdout
+        assert "Verified 1 exact APK archives" not in result.stdout
+
+
+def test_postgres_containerfile_is_exact_multistage_source_build() -> None:
+    """Keep offline source compilation separate from the minimal non-root runtime image."""
+    containerfile = (REPO_ROOT / "deploy" / "postgres-pgvector" / "Containerfile").read_text(
+        encoding="utf-8"
+    )
+    assert containerfile.startswith("ARG SOURCE_DATE_EPOCH=1785349734\n")
+    assert containerfile.count("FROM dhi.io/postgres@sha256:") == 2
+    assert (
+        "FROM dhi.io/postgres@sha256:"
+        "74cde2c2febf7d7ddacfd3d23dbc66ea0fcbc1bdb9ae4b1ed654d717d203a2a5 AS builder"  # pragma: allowlist secret
+        in containerfile
+    )
+    assert (
+        "FROM dhi.io/postgres@sha256:"
+        "3a241134f6d82eb6465622af948258e41806cfb4497e6c8f0f0a64ca6c4d34db"  # pragma: allowlist secret
+        in containerfile
+    )
+    assert "--repository /tmp/builder-apks add" in containerfile
+    assert "PG_CONFIG=/usr/libexec/postgresql15/pg_config" in containerfile
+    assert "make -j1" in containerfile
+    assert 'OPTFLAGS=""' in containerfile
+    assert (
+        "install -D -o 0 -g 0 -m 0644 LICENSE "
+        "/out/usr/share/licenses/pgvector/LICENSE" in containerfile
+    )
+    assert 'touch -d "@${SOURCE_DATE_EPOCH}" /out/usr/share/licenses/pgvector/LICENSE' in (
+        containerfile
+    )
+    assert (
+        'test "$(stat -c %Y /out/usr/share/licenses/pgvector/LICENSE)" = '
+        '"$SOURCE_DATE_EPOCH"' in containerfile
+    )
+    assert "/out/usr/share/licenses/pgvector -type f" in containerfile
+    assert (
+        "COPY --from=builder --chown=0:0 /out/usr/share/licenses/pgvector/LICENSE "
+        "/usr/share/licenses/pgvector/LICENSE" in containerfile
+    )
+    assert "install -d -o 70 -g 70 -m 0700 /out/var/lib/postgresql/data" in containerfile
+    assert (
+        "COPY --from=builder --chown=70:70 --chmod=0700 "
+        "/out/var/lib/postgresql/data/ /var/lib/postgresql/data/" in containerfile
+    )
+    final_stage = containerfile.split(
+        "FROM dhi.io/postgres@sha256:"
+        "3a241134f6d82eb6465622af948258e41806cfb4497e6c8f0f0a64ca6c4d34db",  # pragma: allowlist secret
+        maxsplit=1,
+    )[1]
+    for forbidden in ("\nRUN ", "\nUSER ", "\nENV ", "\nVOLUME ", "\nENTRYPOINT ", "\nCMD "):
+        assert forbidden not in final_stage
+    assert "COPY --from=builder /out/var" not in containerfile
+    assert "COPY --from=builder --chown=70:70 --chmod=0700 /out/var/ /var/" not in containerfile
+    assert "curl " not in containerfile
+    assert "git clone" not in containerfile
+    assert "postgres:15-alpine" not in containerfile
+
+
+def test_cd_postgres_pgvector_contract_is_pr_secret_free_and_main_publish_only() -> None:
+    workflow = (REPO_ROOT / ".github" / "workflows" / "cd.yml").read_text(encoding="utf-8")
+    contract = workflow.split("\n  postgres-pgvector-contract:\n", maxsplit=1)[1].split(
+        "\n  main-push-admission:\n", maxsplit=1
+    )[0]
+    publish = workflow.split("\n  postgres-pgvector-publish:\n", maxsplit=1)[1].split(
+        "\n  build:\n", maxsplit=1
+    )[0]
+    assert "${{ secrets." not in contract
+    assert "docker" + " login" not in contract
+    assert hashlib.sha256(POSTGRES_MANIFEST_PATH.read_bytes()).hexdigest() in contract
+    workflow_triggers = workflow.split("\npermissions:\n", maxsplit=1)[0]
+    assert "pull_request" + "_target:" not in workflow_triggers
+    assert "if: github.event_name == 'push' && github.ref == 'refs/heads/main'" in publish
+    assert "DHI_USERNAME" in publish
+    assert "DHI_ACCESS_TOKEN" in publish
+    assert publish.count("--no-cache") == 1
+    assert "for build_number in 1 2" in publish
+    assert "diff -qr" in publish
+    assert "--output type=registry,rewrite-timestamp=true" in publish
+    assert "--scanners vuln,secret" in publish
+    assert "--severity CRITICAL,HIGH" in publish
+    assert "--exit-code 1" in publish
+    assert "--ignorefile" in publish
+    assert "ignore-policy" not in publish
+    assert publish.count("ignore-unfixed") == 1
+    assert publish.count('"--ignore-unfixed=false"') == 1
+    assert "0.74.0" in workflow
+    assert POSTGRES_PLATFORM_MANIFEST_DIGEST in workflow
+    assert "sha256:4c539aa857412d283fe8d55b40227fbd17b9fd6f06834f81fd98ec6796ee7396" in workflow
+    assert "sha256:8cb1ace7e0c1f48d719bbdf5b4cfe9705ef407c74a3567ddc4369a6d6f023a23" in workflow
+    assert 'stat -c "%u:%g:%a" /var/lib/postgresql/data' in publish
+    assert "test -z" in publish
+    assert (
+        "postgres:15-alpine@sha256:"
+        "a2c20749c564b4eb73a77bfda626f8a3cde1bbfae020fb97c616a00cdc1a2181" in publish
+    )
+    assert "82cde02f1b64bf198b19829fcf8169efae35fdb89fcd236bbd5b0e4faa2b8817" not in workflow
+
+
+def _copy_pgvector_material_helpers(root: Path) -> None:
+    """Copy actual stdlib helper and finite CI universe for native Git shell tests."""
+    for relative in (
+        ".github/workflows/ci.yml",
+        "scripts/ci/check_pgvector_attestations.py",
+        "scripts/ci/check_docker_provenance_attestation.py",
+    ):
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(REPO_ROOT / relative, target)
+
+
+def test_cd_postgres_pgvector_main_event_state_machine_is_closed_and_terminal() -> None:
+    workflow_text = (REPO_ROOT / ".github/workflows/cd.yml").read_text(encoding="utf-8")
+    workflow = yaml.safe_load(workflow_text)
+    jobs = workflow["jobs"]
+    classifier = jobs["postgres-pgvector-material-change"]
+    classifier_run = classifier["steps"][1]["run"]
+    assert "scripts/ci/check_pgvector_attestations.py changes" in classifier_run
+    assert '--base "$BEFORE_SHA" --head "$AFTER_SHA"' in classifier_run
+    assert 'git merge-base --is-ancestor "$BEFORE_SHA" "$AFTER_SHA"' in classifier_run
+
+    publish = jobs["postgres-pgvector-publish"]
+    publish_text = json.dumps(publish, sort_keys=True)
+    assert "needs.postgres-pgvector-material-change.outputs.changed == 'true'" in publish["if"]
+    assert "needs.postgres-pgvector-ci-admission.result == 'success'" in publish["if"]
+    assert "needs.staging-postgres-native-integration.result == 'success'" in publish["if"]
+    assert publish["needs"] == [
+        "main-push-admission",
+        "postgres-pgvector-contract",
+        "postgres-pgvector-material-change",
+        "postgres-pgvector-ci-admission",
+        "staging-postgres-native-integration",
+    ]
+    assert "DHI_USERNAME" in publish_text
+    assert "DHI_ACCESS_TOKEN" in publish_text
+    assert publish["permissions"]["packages"] == "write"
+    assert publish["environment"] == {"name": "pgvector-publish"}
+    assert publish["concurrency"] == {
+        "group": "postgres-pgvector-canonical-tag-promotion",
+        "cancel-in-progress": False,
+    }
+    assert "python -m pytest" not in publish_text
+    assert "DEVPI_CI_USER" not in publish_text
+    assert "DEVPI_CI_PASSWORD" not in publish_text
+
+    ci_admission = jobs["postgres-pgvector-ci-admission"]
+    assert ci_admission["needs"] == [
+        "main-push-admission",
+        "postgres-pgvector-material-change",
+    ]
+    assert ci_admission["permissions"] == {"contents": "read"}
+    assert ci_admission["timeout-minutes"] == 30
+    assert ci_admission["env"] == {
+        "PULSEPLATE_PYTHON_INDEX_URL": "${{ vars.PULSEPLATE_PYTHON_INDEX_URL }}",
+        "PULSEPLATE_PYTHON_TRUSTED_HOST": ("${{ vars.PULSEPLATE_PYTHON_TRUSTED_HOST }}"),
+    }
+    assert "environment" not in ci_admission
+    assert workflow.get("concurrency") is None
+    postgres_service = ci_admission["services"]["postgres"]
+    assert postgres_service["image"] == (
+        "pgvector/pgvector:0.8.6-pg15-trixie@"
+        "sha256:43904fc138a63f93611a2995cec2566e8ae883c8678cd65c60315fa44308f81f"
+    )
+    assert postgres_service["ports"] == ["5432:5432"]
+    assert len(ci_admission["steps"]) == 4
+    assert ci_admission["steps"][0]["name"] == "Checkout exact main compatibility source"
+    proxy_step = ci_admission["steps"][1]
+    assert proxy_step["name"] == "Validate credential-free compatibility package proxy"
+    proxy_run = proxy_step["run"]
+    assert "PULSEPLATE_PYTHON_INDEX_URL:?" in proxy_run
+    assert "*://*@*" in proxy_run
+    assert "must be credential-free" in proxy_run
+    assert "must be single-line values" in proxy_run
+    setup_step = ci_admission["steps"][2]
+    assert setup_step["uses"] == "./.github/actions/python-setup"
+    assert "env" not in setup_step
+    assert setup_step["with"] == {
+        "python-version": "3.13.14",
+        "requirements-profile": "ci-test",
+        "install-mode": "direct-proxy",
+    }
+    ci_admission_step = ci_admission["steps"][3]
+    assert ci_admission_step["env"] == {
+        "PGVECTOR_COMPAT_DATABASE_URL": (
+            "postgresql+psycopg://pgvector_compat:pgvector_compat_test_password@"  # pragma: allowlist secret
+            "127.0.0.1:5432/pgvector_compat"
+        ),
+        "PGVECTOR_COMPAT_REQUIRED": "1",
+    }
+    ci_admission_run = ci_admission_step["run"]
+    for required in (
+        'test "$(git rev-parse HEAD)" = "$GITHUB_SHA"',
+        "python -m pytest -q",
+    ):
+        assert required in ci_admission_run
+    ci_admission_text = json.dumps(ci_admission, sort_keys=True)
+    assert "${{ secrets." not in ci_admission_text
+    assert "DEVPI_CI_USER" not in ci_admission_text
+    assert "DEVPI_CI_PASSWORD" not in ci_admission_text
+    assert "actions/workflows/ci.yml/runs" not in ci_admission_text
+    assert "DHI_ACCESS_TOKEN" not in json.dumps(ci_admission, sort_keys=True)
+    assert "GHCR_TOKEN" not in json.dumps(ci_admission, sort_keys=True)
+
+    reuse = jobs["postgres-pgvector-reuse"]
+    reuse_text = json.dumps(reuse, sort_keys=True)
+    assert "github.event_name == 'schedule'" in reuse["if"]
+    assert "startsWith(github.ref, 'refs/tags/v')" in reuse["if"]
+    assert "needs.postgres-pgvector-material-change.outputs.changed == 'false'" in reuse["if"]
+    assert reuse["permissions"] == {
+        "attestations": "read",
+        "contents": "read",
+        "packages": "read",
+    }
+    assert "concurrency" not in reuse
+    assert reuse["timeout-minutes"] == 90
+    assert reuse["env"] == {
+        "PGVECTOR_REUSE_ADMISSION_POLL_SECONDS": "30",
+        "PGVECTOR_REUSE_ADMISSION_WAIT_SECONDS": "3600",
+    }
+    for forbidden in ("DHI_USERNAME", "DHI_ACCESS_TOKEN", '"packages": "write"', "id-token"):
+        assert forbidden not in reuse_text
+    reuse_run = reuse["steps"][1]["run"]
+    for forbidden_command in ("docker buildx build", "imagetools create", "actions/attest"):
+        assert forbidden_command not in reuse_run
+    assert "--scanners vuln,secret" in reuse_run
+    assert "--severity CRITICAL,HIGH" in reuse_run
+    assert "visibility" in reuse_run and "public" in reuse_run
+    assert reuse_run.count('docker manifest inspect "$immutable_ref"') == 2
+    assert 'immutable_ref="${REPOSITORY:?}@${PLATFORM_DIGEST:?}"' in reuse_run
+    assert 'canonical_tag_ref="${REPOSITORY}:${CANONICAL_TAG:?}"' in reuse_run
+    assert "RUNTIME_REF" not in reuse_run
+    for name, output in (
+        ("REPOSITORY", "repository"),
+        ("CANONICAL_TAG", "tag"),
+        ("PLATFORM_DIGEST", "platform_manifest_digest"),
+    ):
+        assert reuse["steps"][1]["env"][name] == (
+            "${{ needs.postgres-pgvector-contract.outputs." + output + " }}"
+        )
+    assert 'docker buildx imagetools inspect --raw "$canonical_tag_ref"' in reuse_run
+    assert "Canonical PostgreSQL tag does not select the frozen digest" in reuse_run
+    assert '"$tag_ready:$image_ready:$provenance_ready:$spdx_ready:$materials_ready"' in reuse_run
+    assert reuse_run.count('gh attestation verify "oci://${immutable_ref}"') == 3
+    assert reuse_run.count("--bundle-from-oci --deny-self-hosted-runners") == 3
+    assert "Exact PostgreSQL reuse admission did not become complete before timeout" in reuse_run
+    assert "--format spdx-json" not in reuse_run
+    assert "postgres-pgvector-reuse-current.spdx.json" not in reuse_run
+    assert "scripts/ci/check_pgvector_attestations.py verify" in reuse_run
+    assert "--sbom" not in reuse_run
+    owner_package_endpoint = (
+        'gh api "/users/${GITHUB_REPOSITORY_OWNER}/packages/container/pulseplate"'
+    )
+    assert workflow_text.count(owner_package_endpoint) == 4
+    assert "gh api /user/packages/container/pulseplate" not in workflow_text
+
+    admission = jobs["postgres-pgvector-admission"]
+    admission_run = admission["steps"][0]["run"]
+    assert "true:success:skipped | false:skipped:success" in admission_run
+    prometheus_gate = jobs["prometheus-image-security"]
+    assert prometheus_gate["needs"] == [
+        "postgres-pgvector-contract",
+        "postgres-pgvector-admission",
+        "postgres-pgvector-reuse",
+        "prometheus-image-security-pr",
+        "prometheus-image-security-trusted",
+    ]
+    assert "needs.postgres-pgvector-contract.result == 'success'" in prometheus_gate["if"]
+    assert "needs.postgres-pgvector-admission.result == 'success'" in prometheus_gate["if"]
+    assert "needs.postgres-pgvector-reuse.result == 'success'" in prometheus_gate["if"]
+    assert jobs["build"]["needs"] == [
+        "prometheus-image-security",
+        "obs2a-checkpoint-native",
+        "main-push-admission",
+        "staging-postgres-native-integration",
+    ]
+    assert jobs["production-gates"]["needs"] == "prometheus-image-security"
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "none",
+        "not_ready",
+        "tag_and_digest",
+        "mutable_tag",
+        "wrong_repository",
+        "wrong_digest",
+        "tag_drift",
+        "missing_platform",
+        "duplicate_platform",
+        "wrong_platform",
+        "provenance",
+        "materials",
+        "spdx",
+    ],
+)
+def test_cd_postgres_reuse_waits_without_evicting_pending_publisher(
+    tmp_path: Path, fault: str
+) -> None:
+    workflow = yaml.safe_load(CD_WORKFLOW_PATH.read_text(encoding="utf-8"))
+    reuse_run = workflow["jobs"]["postgres-pgvector-reuse"]["steps"][1]["run"]
+    start = reuse_run.index('if [[ ! "$PGVECTOR_REUSE_ADMISSION_WAIT_SECONDS"')
+    end = reuse_run.index('\ndocker pull --platform linux/amd64 "$immutable_ref"', start)
+    wait_program = reuse_run[start:end]
+    repository = "ghcr.io/katsiarynakavaleuskaya/pulseplate"
+    canonical_tag = POSTGRES_RUNTIME_REF.split("@", 1)[0]
+    subject = f"{repository}@{POSTGRES_PLATFORM_MANIFEST_DIGEST}"
+    rejected = {
+        "tag_and_digest": POSTGRES_RUNTIME_REF,
+        "mutable_tag": canonical_tag,
+        "wrong_repository": f"ghcr.io/other/image@{POSTGRES_PLATFORM_MANIFEST_DIGEST}",
+        "wrong_digest": f"{repository}@sha256:{'a' * 64}",
+    }
+    if fault in rejected:
+        # Mutation control: the actual legacy command must fail this native argv oracle.
+        wait_program = wait_program.replace(
+            'immutable_ref="${REPOSITORY:?}@${PLATFORM_DIGEST:?}"',
+            'immutable_ref="$REJECTED_REF"',
+        )
+    descriptor = {
+        "digest": POSTGRES_PLATFORM_MANIFEST_DIGEST,
+        "platform": {"architecture": "amd64", "os": "linux"},
+    }
+    if fault == "tag_drift":
+        descriptor["digest"] = "sha256:" + "b" * 64
+    if fault == "wrong_platform":
+        descriptor["platform"] = {"architecture": "arm64", "os": "linux"}
+    manifests = [] if fault == "missing_platform" else [descriptor]
+    if fault == "duplicate_platform":
+        manifests.append(descriptor)
+    predicates = {
+        "provenance": "https://slsa.dev/provenance/v1",
+        "materials": "https://pulseplate.app/attestations/postgres-pgvector-materials/v1",
+        "spdx": "https://spdx.dev/Document/v2.3",
+    }
+    bash = shutil.which("bash")
+    assert bash is not None
+    program = """set -euo pipefail
+    ATTEMPT=0
+    docker() {
+      if [ "$#" -eq 3 ] && [ "$1 $2" = "manifest inspect" ]; then
+        ATTEMPT=$((ATTEMPT + 1))
+        [ "$3" = "$EXPECTED_SUBJECT" ] || return 99
+        [ "$STUB_READY_AFTER" -gt 0 ] && [ "$ATTEMPT" -ge "$STUB_READY_AFTER" ]
+        return
+      fi
+      if [ "$#" -eq 5 ] && [ "$1 $2 $3 $4" = "buildx imagetools inspect --raw" ]; then
+        [ "$5" = "$EXPECTED_TAG" ] || return 99
+        printf '%s\\n' "$STUB_CANONICAL_JSON"
+        return 0
+      fi
+      return 99
+    }
+    gh() {
+      [ "$#" -eq 13 ] || return 99
+      case "$7" in
+        https://slsa.dev/provenance/v1|https://pulseplate.app/attestations/postgres-pgvector-materials/v1|https://spdx.dev/Document/v2.3) ;;
+        *) return 99 ;;
+      esac
+      [ "$*" = "attestation verify oci://${EXPECTED_SUBJECT} --repo Katsiarynakavaleuskaya/PulsePlate --predicate-type $7 --signer-workflow Katsiarynakavaleuskaya/PulsePlate/.github/workflows/cd.yml --source-ref refs/heads/main --bundle-from-oci --deny-self-hosted-runners" ] || return 99
+      printf '%s\\n' "$7" >> "$PREDICATE_RECORD"
+      [ "$7" != "$MISSING_PREDICATE" ]
+    }
+    sleep() { SECONDS=$((SECONDS + $1)); }
+    """ + wait_program + '\nprintf "ATTEMPTS=%s\\n" "$ATTEMPT"\n'
+    record = tmp_path / "predicates.txt"
+    result = subprocess.run(
+        [bash, "-c", program],
+        env={
+            **os.environ,
+            "GITHUB_REPOSITORY": "Katsiarynakavaleuskaya/PulsePlate",
+            "PGVECTOR_REUSE_ADMISSION_POLL_SECONDS": "1",
+            "PGVECTOR_REUSE_ADMISSION_WAIT_SECONDS": "3",
+            "RUNNER_TEMP": str(tmp_path),
+            "REPOSITORY": repository,
+            "CANONICAL_TAG": canonical_tag.split(":", 1)[1],
+            "PLATFORM_DIGEST": POSTGRES_PLATFORM_MANIFEST_DIGEST,
+            "EXPECTED_SUBJECT": subject,
+            "EXPECTED_TAG": canonical_tag,
+            "REJECTED_REF": rejected.get(fault, ""),
+            "STUB_READY_AFTER": "0" if fault == "not_ready" else "2",
+            "STUB_CANONICAL_JSON": json.dumps(
+                {"mediaType": "application/vnd.oci.image.index.v1+json", "manifests": manifests}
+            ),
+            "MISSING_PREDICATE": predicates.get(fault, ""),
+            "PREDICATE_RECORD": str(record),
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == (0 if fault == "none" else 1), result.stderr
+    pending = [
+        line for line in result.stdout.splitlines() if line.startswith("PostgreSQL reuse pending:")
+    ]
+    assert pending == [
+        "PostgreSQL reuse pending: tag=false image=false provenance=false spdx=false materials=false"
+    ]
+    if fault == "none":
+        assert result.stdout.splitlines()[-1] == "ATTEMPTS=2"
+        assert record.read_text().splitlines() == list(predicates.values())
+    else:
+        timeout = [line for line in result.stderr.splitlines() if "before timeout:" in line]
+        assert len(timeout) == 1 and "materials=" in timeout[0]
+        for state in ("tag=", "image=", "provenance=", "spdx="):
+            assert state in timeout[0]
+        if fault in predicates:
+            assert f"{fault}=false" in timeout[0]
+
+
+@pytest.mark.parametrize("scan_exit", [0, 1])
+def test_cd_postgres_reuse_scans_and_inspects_the_same_immutable_subject(
+    tmp_path: Path, scan_exit: int
+) -> None:
+    workflow = yaml.safe_load(CD_WORKFLOW_PATH.read_text(encoding="utf-8"))
+    run = workflow["jobs"]["postgres-pgvector-reuse"]["steps"][1]["run"]
+    program = run[
+        run.index('docker pull --platform linux/amd64 "$immutable_ref"') : run.index(
+            "# Final read-only transaction boundary."
+        )
+    ]
+    bash = shutil.which("bash")
+    assert bash is not None
+    subject = "ghcr.io/katsiarynakavaleuskaya/pulseplate@" + POSTGRES_PLATFORM_MANIFEST_DIGEST
+    scanner = tmp_path / "trivy"
+    scanner.write_text(
+        f"#!{bash}\n"
+        'test "$*" = "image --scanners vuln,secret --format table --pkg-types os,library '
+        "--severity CRITICAL,HIGH --exit-code 1 --timeout 15m --ignorefile "
+        "${STUB_INSTALL_DIR}/empty.trivyignore --cache-dir "
+        '${RUNNER_TEMP}/trivy-cache-pgvector-reuse ${EXPECTED_SUBJECT}" || exit 99\n'
+        'exit "$STUB_SCAN_EXIT"\n'
+    )
+    scanner.chmod(0o700)
+    marker = tmp_path / "verified"
+    shell = """
+    docker() {
+      if [ "$*" = "pull --platform linux/amd64 $EXPECTED_SUBJECT" ]; then return 0; fi
+      [ "$#" -eq 5 ] && [ "$1 $2" = "image inspect" ] &&
+        [ "$3" = "$EXPECTED_SUBJECT" ] && [ "$4" = --format ] || return 99
+      case "$5" in
+        '{{.Os}}/{{.Architecture}}') printf 'linux/amd64\\n' ;;
+        '{{.Config.User}}') printf '70\\n' ;;
+        '{{json .Config.Entrypoint}}') printf '["/usr/local/bin/docker-entrypoint.sh"]\\n' ;;
+        '{{index .Config.Labels "com.pulseplate.pgvector.version"}}') printf '0.8.6\\n' ;;
+        *) return 99 ;;
+      esac
+    }
+    mktemp() { printf '%s\\n' "$STUB_INSTALL_DIR"; }
+    curl() { return 0; }
+    sha256sum() { cat >/dev/null; }
+    tar() { return 0; }
+    python3() {
+      [ "$*" = "scripts/ci/check_pgvector_attestations.py verify --json-out postgres-pgvector-reuse-attestation-check.json" ] || return 99
+      printf 'called\\n' > "$VERIFIER_MARKER"
+    }
+    """
+    result = subprocess.run(
+        [bash, "-c", "set -euo pipefail\n" + shell + program],
+        env={
+            **os.environ,
+            "immutable_ref": subject,
+            "EXPECTED_SUBJECT": subject,
+            "STUB_INSTALL_DIR": str(tmp_path),
+            "RUNNER_TEMP": str(tmp_path),
+            "TRIVY_VERSION": "0.74.0",
+            "TRIVY_ARCHIVE_SHA256": "a" * 64,
+            "STUB_SCAN_EXIT": str(scan_exit),
+            "VERIFIER_MARKER": str(marker),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == scan_exit, result.stderr
+    assert marker.exists() is (scan_exit == 0)
+
+
+def test_cd_postgres_reuse_terminally_rechecks_current_main_and_canonical_tag(
+    tmp_path: Path,
+) -> None:
+    workflow = yaml.safe_load((REPO_ROOT / ".github/workflows/cd.yml").read_text(encoding="utf-8"))
+    reuse_steps = workflow["jobs"]["postgres-pgvector-reuse"]["steps"]
+    assert reuse_steps[0]["with"] == {"fetch-depth": 0, "persist-credentials": False}
+    reuse_run = reuse_steps[1]["run"]
+    marker = "# Final read-only transaction boundary."
+    terminal_program = reuse_run[reuse_run.index(marker) :]
+    assert reuse_run.index(marker) > reuse_run.index(
+        'index .Config.Labels "com.pulseplate.pgvector.version"'
+    )
+    ci_workflow = yaml.safe_load(
+        (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    )
+    filter_step = next(
+        step for step in ci_workflow["jobs"]["changes"]["steps"] if step.get("id") == "filter"
+    )
+    compatibility_paths = yaml.safe_load(filter_step["with"]["filters"])["pgvector_compat"]
+    from scripts.ci import check_pgvector_attestations as material_helper
+
+    assert set(compatibility_paths).issubset(material_helper.material_rules("HEAD"))
+    assert "scripts/ci/check_pgvector_attestations.py unchanged" in terminal_program
+
+    git_bin = shutil.which("git", path=os.defpath)
+    bash_bin = shutil.which("bash")
+    assert git_bin is not None and bash_bin is not None
+    git_environment = {
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+    }
+    remote = tmp_path / "remote.git"
+    source = tmp_path / "source"
+    runner = tmp_path / "runner"
+
+    def git(cwd: Path, *arguments: str) -> str:
+        completed = subprocess.run(
+            [git_bin, *arguments],
+            cwd=cwd,
+            env=git_environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
+        return completed.stdout.strip()
+
+    remote.mkdir()
+    git(remote, "init", "--bare", "-q")
+    source.mkdir()
+    git(source, "init", "-q")
+    git(source, "config", "user.name", "PulsePlate Test")
+    git(source, "config", "user.email", "pulseplate-test@example.invalid")
+    git(source, "checkout", "-qb", "main")
+    required_files = (
+        ".github/workflows/cd.yml",
+        ".github/workflows/ci.yml",
+        "constraints.txt",
+        "requirements-ci-lite.txt",
+        "requirements-rag-vector.in",
+        "requirements-rag-vector.txt",
+        "requirements-rag-vector-cpu.in",
+        "requirements-rag-vector-cpu.txt",
+        "requirements-test.in",
+        "requirements-test.txt",
+        "scripts/ci/emergency_python_wheels.json",
+        "scripts/ci/install_locked_python_requirements.py",
+        "scripts/deploy.sh",
+        "scripts/deploy_production.sh",
+        "deploy/docker-compose.staging.yaml",
+        "deploy/docker-compose.production.selfhosted.yaml",
+        "deploy/postgres-pgvector/Containerfile",
+        "scripts/ci/check_alembic_autogenerate_completeness.py",
+        "core/db.py",
+        "core/db_alembic_comparison.py",
+        "core/rag/vector_rag.py",
+        "core/db_rls.py",
+        "core/models.py",
+        "app/models/nested/probe.py",
+        "alembic.ini",
+        "alembic/env.py",
+        "alembic/versions/base.py",
+        "tests/test_deploy_contract_scripts.py",
+        "tests/test_alembic_autogenerate_completeness.py",
+        "tests/test_pgvector_compat.py",
+        "tests/test_pgvector_embedding_migration.py",
+        "tests/test_vector_rag.py",
+        "tests/test_db_rls.py",
+        "docs/note.md",
+    )
+    for relative_path in required_files:
+        path = source / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("base\n", encoding="utf-8")
+    _copy_pgvector_material_helpers(source)
+    git(source, "add", ".")
+    git(source, "commit", "-qm", "base")
+    base_sha = git(source, "rev-parse", "HEAD")
+    git(source, "remote", "add", "origin", str(remote))
+    git(source, "push", "-q", "-u", "origin", "main")
+    git(tmp_path, "clone", "-q", str(remote), str(runner))
+    git(runner, "checkout", "-q", "--detach", base_sha)
+
+    canonical_program = reuse_run[
+        reuse_run.index("canonical_tag_selects_expected_digest() {") : reuse_run.index(
+            "admission_deadline="
+        )
+    ]
+    subject = f"ghcr.io/katsiarynakavaleuskaya/pulseplate@{POSTGRES_PLATFORM_MANIFEST_DIGEST}"
+    canonical_tag = POSTGRES_RUNTIME_REF.split("@", 1)[0]
+    program = """set -euo pipefail
+    docker() {
+      if [ "$#" -eq 3 ] && [ "$1 $2" = "manifest inspect" ]; then
+        [ "$3" = "$EXPECTED_SUBJECT" ]; return
+      fi
+      if [ "$#" -eq 5 ] && [ "$1 $2 $3 $4" = "buildx imagetools inspect --raw" ]; then
+        [ "$5" = "$EXPECTED_TAG" ] || return 99
+        printf '%s\\n' "$STUB_CANONICAL_JSON"; return 0
+      fi
+      return 99
+    }
+    """ + canonical_program + terminal_program
+
+    def terminal_recheck(
+        tag_ready: str, image_ref: str = subject
+    ) -> subprocess.CompletedProcess[str]:
+        digest = POSTGRES_PLATFORM_MANIFEST_DIGEST if tag_ready == "1" else "sha256:" + "b" * 64
+        return subprocess.run(
+            [bash_bin, "-c", program],
+            cwd=runner,
+            env={
+                **git_environment,
+                "GITHUB_EVENT_NAME": "push",
+                "GITHUB_REF": "refs/heads/main",
+                "GITHUB_SHA": base_sha,
+                "immutable_ref": image_ref,
+                "EXPECTED_SUBJECT": subject,
+                "EXPECTED_TAG": canonical_tag,
+                "canonical_tag_ref": canonical_tag,
+                "expected_platform_digest": POSTGRES_PLATFORM_MANIFEST_DIGEST,
+                "canonical_raw": str(tmp_path / "terminal-canonical.json"),
+                "STUB_CANONICAL_JSON": json.dumps(
+                    {
+                        "mediaType": "application/vnd.oci.image.index.v1+json",
+                        "manifests": [
+                            {"digest": digest, "platform": {"architecture": "amd64", "os": "linux"}}
+                        ],
+                    }
+                ),
+            },
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    (source / "docs" / "note.md").write_text("unrelated\n", encoding="utf-8")
+    git(source, "add", ".")
+    git(source, "commit", "-qm", "unrelated main advance")
+    git(source, "push", "-q", "origin", "main")
+    unrelated = terminal_recheck("1")
+    assert unrelated.returncode == 0, unrelated.stderr
+
+    tag_drift = terminal_recheck("0")
+    assert tag_drift.returncode != 0
+    assert "tag or immutable digest drifted" in tag_drift.stderr
+
+    old_reference = terminal_recheck("1", POSTGRES_RUNTIME_REF)
+    assert old_reference.returncode != 0
+    assert "tag or immutable digest drifted" in old_reference.stderr
+
+    (source / "requirements-test.txt").write_text("superseding\n", encoding="utf-8")
+    git(source, "add", ".")
+    git(source, "commit", "-qm", "superseding compatibility material")
+    git(source, "push", "-q", "origin", "main")
+    superseded = terminal_recheck("1")
+    assert superseded.returncode != 0
+    assert "material superseded run" in superseded.stderr
+
+
+def test_cd_postgres_material_classifier_and_terminal_admission_execute_exact_programs(
+    tmp_path: Path,
+) -> None:
+    workflow = yaml.safe_load((REPO_ROOT / ".github/workflows/cd.yml").read_text(encoding="utf-8"))
+    ci_workflow = yaml.safe_load(
+        (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    )
+    jobs = workflow["jobs"]
+    classifier_program = jobs["postgres-pgvector-material-change"]["steps"][1]["run"]
+    admission_program = jobs["postgres-pgvector-admission"]["steps"][0]["run"]
+    filter_step = next(
+        step for step in ci_workflow["jobs"]["changes"]["steps"] if step.get("id") == "filter"
+    )
+    pgvector_compat_paths = yaml.safe_load(filter_step["with"]["filters"])["pgvector_compat"]
+    from scripts.ci import check_pgvector_attestations as material_helper
+
+    assert set(pgvector_compat_paths).issubset(material_helper.material_rules("HEAD"))
+    assert "scripts/ci/check_pgvector_attestations.py changes" in classifier_program
+    git_bin = shutil.which("git", path=os.defpath)
+    bash_bin = shutil.which("bash")
+    assert git_bin is not None and bash_bin is not None
+    git_environment = {
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+    }
+    fixture_root = tmp_path / "git-fixture"
+    (fixture_root / ".github" / "workflows").mkdir(parents=True)
+    (fixture_root / "deploy" / "postgres-pgvector").mkdir(parents=True)
+    (fixture_root / "docs").mkdir()
+    (fixture_root / ".github" / "workflows" / "cd.yml").write_text("v1\n", encoding="utf-8")
+    (fixture_root / "deploy" / "postgres-pgvector" / "Containerfile").write_text(
+        "FROM scratch\n", encoding="utf-8"
+    )
+    (fixture_root / "deploy" / "postgres-pgvector" / "image-manifest.json").write_text(
+        "{}\n", encoding="utf-8"
+    )
+    (fixture_root / "docs" / "note.md").write_text("base\n", encoding="utf-8")
+
+    def git(*arguments: str) -> str:
+        completed = subprocess.run(
+            [git_bin, *arguments],
+            cwd=fixture_root,
+            env=git_environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
+        return completed.stdout.strip()
+
+    _copy_pgvector_material_helpers(fixture_root)
+    git("init", "-q")
+    git("config", "user.name", "PulsePlate Test")
+    git("config", "user.email", "pulseplate-test@example.invalid")
+    git("add", ".")
+    git("commit", "-qm", "base")
+    base = git("rev-parse", "HEAD")
+
+    def classify(before: str, after: str) -> tuple[subprocess.CompletedProcess[str], str]:
+        output_path = tmp_path / f"classifier-{len(list(tmp_path.glob('classifier-*')))}.txt"
+        environment = {
+            **git_environment,
+            "GITHUB_EVENT_NAME": "push",
+            "GITHUB_REF": "refs/heads/main",
+            "BEFORE_SHA": before,
+            "AFTER_SHA": after,
+            "GITHUB_OUTPUT": str(output_path),
+        }
+        completed = subprocess.run(
+            [bash_bin, "-c", classifier_program],
+            cwd=fixture_root,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        classifier_output = output_path.read_text(encoding="utf-8") if output_path.exists() else ""
+        return completed, classifier_output
+
+    (fixture_root / ".github" / "workflows" / "cd.yml").write_text("v2\n", encoding="utf-8")
+    git("add", ".")
+    git("commit", "-qm", "policy-only")
+    policy_head = git("rev-parse", "HEAD")
+    policy_result, policy_output = classify(base, policy_head)
+    assert policy_result.returncode == 0, policy_result.stderr
+    assert policy_output == "changed=true\n"
+
+    containerfile = fixture_root / "deploy" / "postgres-pgvector" / "Containerfile"
+    containerfile.write_text("FROM scratch\nLABEL test=1\n", encoding="utf-8")
+    git("add", ".")
+    git("commit", "-qm", "image-bytes")
+    material_head = git("rev-parse", "HEAD")
+    material_result, material_output = classify(policy_head, material_head)
+    assert material_result.returncode == 0, material_result.stderr
+    assert material_output == "changed=true\n"
+
+    migration_path = fixture_root / "alembic" / "versions" / "compatibility_probe.py"
+    migration_path.parent.mkdir(parents=True)
+    migration_path.write_text("revision = 'compatibility-probe'\n", encoding="utf-8")
+    git("add", ".")
+    git("commit", "-qm", "pgvector compatibility surface")
+    compatibility_head = git("rev-parse", "HEAD")
+    compatibility_result, compatibility_output = classify(material_head, compatibility_head)
+    assert compatibility_result.returncode == 0, compatibility_result.stderr
+    assert compatibility_output == "changed=true\n"
+
+    (fixture_root / "docs" / "note.md").write_text("unrelated\n", encoding="utf-8")
+    git("add", ".")
+    git("commit", "-qm", "unrelated docs")
+    unrelated_head = git("rev-parse", "HEAD")
+    unrelated_result, unrelated_output = classify(compatibility_head, unrelated_head)
+    assert unrelated_result.returncode == 0, unrelated_result.stderr
+    assert unrelated_output == "changed=false\n"
+
+    zero_result, zero_output = classify("0" * 40, unrelated_head)
+    assert zero_result.returncode == 0
+    assert zero_output == "changed=true\n"
+    malformed_result, _ = classify("not-a-sha", material_head)
+    assert malformed_result.returncode != 0
+
+    previous_head = unrelated_head
+    for compatibility_path in pgvector_compat_paths:
+        probe_path = compatibility_path.replace("**", "nested/compatibility_probe.py")
+        target = fixture_root / probe_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if probe_path == ".github/workflows/ci.yml":
+            target.write_text(
+                target.read_text() + "\n# compatibility input change\n", encoding="utf-8"
+            )
+        else:
+            target.write_text(f"compatibility input: {probe_path}\n", encoding="utf-8")
+        git("add", probe_path)
+        git("commit", "-qm", f"compatibility member {probe_path}")
+        member_head = git("rev-parse", "HEAD")
+        member_result, member_output = classify(previous_head, member_head)
+        assert member_result.returncode == 0, (probe_path, member_result.stderr)
+        assert member_output == "changed=true\n", probe_path
+        previous_head = member_head
+
+    statuses = ("success", "failure", "cancelled", "skipped", "")
+    for changed in ("true", "false"):
+        for publish in statuses:
+            for reuse in statuses:
+                completed = subprocess.run(
+                    [bash_bin, "-c", admission_program],
+                    env={
+                        **os.environ,
+                        "MATERIAL_CHANGED": changed,
+                        "PUBLISH_RESULT": publish,
+                        "REUSE_RESULT": reuse,
+                    },
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                admitted = (changed, publish, reuse) in {
+                    ("true", "success", "skipped"),
+                    ("false", "skipped", "success"),
+                }
+                assert (completed.returncode == 0) is admitted
+
+
+@pytest.mark.parametrize(
+    ("event_name", "git_ref", "material_changed", "mode", "expected_success"),
+    (
+        ("push", "refs/heads/main", "false", "", True),
+        ("push", "refs/heads/main", "true", "", False),
+        ("schedule", "refs/heads/main", "", "", True),
+        ("schedule", "refs/heads/other", "", "", False),
+        ("workflow_dispatch", "refs/heads/main", "", "reuse", True),
+        ("workflow_dispatch", "refs/heads/main", "", "disabled", False),
+        ("workflow_dispatch", "refs/heads/other", "", "reuse", False),
+        ("push", "refs/tags/v1.2.3", "", "", True),
+        ("push", "refs/tags/v-not-semver", "", "", False),
+        ("push", "refs/tags/not-semver", "", "", False),
+        ("push", "refs/heads/feature", "false", "", False),
+        ("pull_request", "refs/pull/1/merge", "", "", False),
+    ),
+)
+def test_cd_postgres_reuse_event_admission_executes_exact_prefix(
+    event_name: str,
+    git_ref: str,
+    material_changed: str,
+    mode: str,
+    expected_success: bool,
+) -> None:
+    workflow = yaml.safe_load((REPO_ROOT / ".github/workflows/cd.yml").read_text(encoding="utf-8"))
+    run = workflow["jobs"]["postgres-pgvector-reuse"]["steps"][1]["run"]
+    admission_prefix = run.split('credential_dir="$(mktemp', maxsplit=1)[0]
+    bash_bin = shutil.which("bash")
+    assert bash_bin is not None
+    completed = subprocess.run(
+        [bash_bin, "-c", admission_prefix],
+        env={
+            **os.environ,
+            "GITHUB_REPOSITORY": "Katsiarynakavaleuskaya/PulsePlate",
+            "GITHUB_EVENT_NAME": event_name,
+            "GITHUB_REF": git_ref,
+            "MATERIAL_CHANGED": material_changed,
+            "PGVECTOR_MANUAL_MODE": mode,
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert (completed.returncode == 0) is expected_success, completed.stderr
+
+
+def test_cd_postgres_candidate_is_verified_before_canonical_promotion() -> None:
+    """Require candidate verification before the provisional canonical tag write."""
+    workflow = yaml.safe_load((REPO_ROOT / ".github/workflows/cd.yml").read_text(encoding="utf-8"))
+    steps = workflow["jobs"]["postgres-pgvector-publish"]["steps"]
+    names = [step.get("name") for step in steps]
+
+    def position(name: str) -> int:
+        return names.index(name)
+
+    initial_auth = position("Authenticate DHI read and GHCR publication rails")
+    scan = position("Scan exact bases, post-APK builder, and final image without suppressions")
+    runtime_oracle = position("Prove PostgreSQL 15 pgvector 0.8.6 and same-volume continuity")
+    package_identity = position(
+        "Verify existing public GHCR package identity before candidate write"
+    )
+    candidate = position("Publish reproduced manifest under one unadmitted candidate tag")
+    provenance = position("Attest actual PostgreSQL pgvector build provenance")
+    spdx = position("Attest PostgreSQL pgvector SPDX SBOM")
+    verify = position("Verify candidate pullback, material provenance, SBOM, and runtime identity")
+    inspect = position("Inspect the exact PostgreSQL platform manifest with native Docker")
+    native = position("Execute real isolated PostgreSQL TLS crash restart and restore checks")
+    visibility = position("Recheck public GHCR package identity after candidate admission")
+    promote = position("Promote verified candidate digest to canonical tag without rebuild")
+    canonical = position("Verify canonical pullback and unchanged public package visibility")
+    assert (
+        initial_auth
+        < scan
+        < runtime_oracle
+        < package_identity
+        < candidate
+        < provenance
+        < spdx
+        < verify
+        < inspect
+        < native
+        < visibility
+        < promote
+        < canonical
+    )
+
+    initial_auth_step = steps[initial_auth]
+    assert set(initial_auth_step["env"]) == {
+        "BUILDX_SHA256",
+        "BUILDX_VERSION",
+        "BUILDKIT_DIGEST",
+        "BUILDKIT_VERSION",
+        "DHI_USER",
+        "DHI_TOKEN",
+        "GHCR_USER",
+        "GHCR_TOKEN_VALUE",
+    }
+    assert "docker login dhi.io" in initial_auth_step["run"]
+    assert "docker login ghcr.io" in initial_auth_step["run"]
+
+    candidate_run = steps[candidate]["run"]
+    assert "candidate-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" in candidate_run
+    assert '--tag "$candidate_tag_ref"' in candidate_run
+    assert '--tag "$canonical_tag_ref"' not in candidate_run
+    promote_run = steps[promote]["run"]
+    promote_env = steps[promote]["env"]
+    assert promote_env["EXPECTED_RUNTIME_REF"] == (
+        "${{ needs.postgres-pgvector-contract.outputs.runtime_ref }}"
+    )
+    assert 'test "$canonical_runtime_ref" = "$EXPECTED_RUNTIME_REF"' in promote_run
+    assert "${{ needs.postgres-pgvector-contract.outputs.runtime_ref }}" not in promote_run
+    material_check = '--base "$GITHUB_SHA" --head "$current_main_sha"'
+    assert material_check in promote_run
+    assert promote_run.index(material_check) < promote_run.index("docker buildx imagetools create")
+    post_promotion_check = '--base "$GITHUB_SHA" --head "$post_promotion_main_sha"'
+    assert post_promotion_check in promote_run
+    assert promote_run.index("docker buildx imagetools create") < promote_run.index(
+        post_promotion_check
+    )
+    assert promote_run.index(post_promotion_check) < promote_run.index(
+        "docker buildx imagetools inspect"
+    )
+    assert "scripts/ci/check_pgvector_attestations.py unchanged" in promote_run
+    assert "docker buildx imagetools create" in promote_run
+    assert '"$CANDIDATE_RUNTIME_REF"' in promote_run
+    assert "docker buildx build" not in promote_run
+    job_text = json.dumps(workflow["jobs"]["postgres-pgvector-publish"], sort_keys=True)
+    assert job_text.count("actions/attest@") == 2
+    assert job_text.count("actions/attest-build-provenance@") == 1
+    assert "python -m pytest" not in job_text
+    assert "DEVPI_CI_USER" not in job_text
+    assert "DEVPI_CI_PASSWORD" not in job_text
+    verify_step = steps[verify]
+    assert (
+        verify_step["env"]["ATTESTATION_MODE"]
+        == "${{ steps.pgvector-attestation-inventory.outputs.mode }}"
+    )
+    verify_run = verify_step["run"]
+    assert '--source-sha "$ORIGINAL_SOURCE_SHA"' in verify_run
+    assert '--run-invocation-uri "$ORIGINAL_RUN_INVOCATION_URI"' in verify_run
+    assert "--sbom postgres-pgvector-image-sbom.spdx.json" in verify_run
+    assert "scripts/ci/check_pgvector_attestations.py verify" in verify_run
+    normalized_verify_run = " ".join(verify_run.replace("\\\n", " ").split())
+    assert (
+        "docker run --rm --platform linux/amd64 --entrypoint /usr/bin/postgres "
+        "\"$RUNTIME_REF\" --version | grep -Fx 'postgres (PostgreSQL) 15.19'"
+        in normalized_verify_run
+    )
+    assert '"$RUNTIME_REF" postgres --version' not in normalized_verify_run
+    for forbidden_version_probe_workaround in (
+        "POSTGRES_PASSWORD",
+        "POSTGRES_PASSWORD_FILE",
+        "POSTGRES_HOST_AUTH_METHOD",
+        "PGDATA",
+        "docker-entrypoint.sh",
+        "initdb",
+    ):
+        assert forbidden_version_probe_workaround not in verify_run
+
+    runtime_step = next(
+        step
+        for step in steps
+        if step.get("name") == "Prove PostgreSQL 15 pgvector 0.8.6 and same-volume continuity"
+    )["run"]
+    assert "pytest" not in runtime_step
+    assert "--publish 127.0.0.1:5432:5432" in runtime_step
+    for forbidden_host in ("@localhost:5432/pgvector_compat", "0.0.0.0:5432", "::1:5432"):
+        assert forbidden_host not in runtime_step
+    reproduce_step = next(
+        step for step in steps if step.get("name") == "Reproduce the exact platform manifest twice"
+    )["run"]
+    assert "{{.Id}}" in reproduce_step
+    assert '"$EXPECTED_CONFIG_DIGEST"' in reproduce_step
+    assert "{{json .RootFS.Layers}}" in reproduce_step
+    assert "EXPECTED_MOUNTPOINT_LAYER_DIFF_ID" in reproduce_step
+    assert position("Reproduce the exact platform manifest twice") < position(
+        "Prove PostgreSQL 15 pgvector 0.8.6 and same-volume continuity"
+    )
+    assert position("Prove PostgreSQL 15 pgvector 0.8.6 and same-volume continuity") < candidate
+
+
+@pytest.mark.parametrize(
+    "prior_state,fault,expected_exit",
+    [
+        ("first_absent", "none", 0),
+        ("failed_candidate_unchanged_manifest", "none", 0),
+        ("lost_object", "missing_oci", 42),
+        ("already_available", "none", 0),
+        ("first_absent", "manifest", 43),
+        ("first_absent", "runtime", 44),
+    ],
+)
+def test_candidate_runtime_proof_precedes_actual_promotion(
+    tmp_path: Path, prior_state: str, fault: str, expected_exit: int
+) -> None:
+    """Execute actual step bodies; simulated registry state is not native publication proof."""
+    jobs = yaml.safe_load(CD_WORKFLOW_PATH.read_text())["jobs"]
+    predecessor = jobs["staging-postgres-native-integration"]
+    configure = next(
+        step for step in predecessor["steps"] if "--configure-only" in step.get("run", "")
+    )
+    steps = jobs["postgres-pgvector-publish"]["steps"]
+    names = [step["name"] for step in steps]
+    selected = [
+        "Publish reproduced manifest under one unadmitted candidate tag",
+        "Verify candidate pullback, material provenance, SBOM, and runtime identity",
+        "Inspect the exact PostgreSQL platform manifest with native Docker",
+        "Execute real isolated PostgreSQL TLS crash restart and restore checks",
+        "Promote verified candidate digest to canonical tag without rebuild",
+    ]
+    assert [names.index(name) for name in selected] == sorted(
+        names.index(name) for name in selected
+    )
+    by_name = {step["name"]: step for step in steps}
+    for name in selected:
+        assert "if" not in by_name[name] and "continue-on-error" not in by_name[name]
+    full = by_name[selected[3]]
+    assert "--configure-only" not in full["run"] and "env" not in full
+    assert CD_WORKFLOW_PATH.read_text().count("python3 - <<'PY_COMPOSE_VERSION'") == 1
+    upload = by_name["Upload PostgreSQL pgvector admission evidence"]["with"]["path"].splitlines()
+    assert upload.count("staging-postgres-native-result.json") == 1
+    assert "staging-postgres-configuration-result.json" not in upload
+    bash = shutil.which("bash")
+    assert bash is not None
+    binary_dir = tmp_path / "bin"
+    binary_dir.mkdir()
+    events = tmp_path / "events"
+    exists = tmp_path / "candidate-exists"
+    if prior_state == "already_available":
+        exists.touch()
+    docker = binary_dir / "docker"
+    docker.write_text(f"#!{sys.executable}\n" + """import json, os, sys
+from pathlib import Path
+a = sys.argv[1:]
+subject = os.environ["REPOSITORY"] + "@" + os.environ["PLATFORM_DIGEST"]
+exists = Path(os.environ["CANDIDATE_EXISTS"])
+def event(value):
+    with open(os.environ["EVENTS"], "a") as f: f.write(value + "\\n")
+if a == ["--version"]: print("Docker oracle"); sys.exit(0)
+if a == ["compose", "version", "--short"]: print("2.35.0"); sys.exit(0)
+if a[:2] == ["buildx", "build"]:
+    assert "--tag" in a and "--output" in a and a[a.index("--output")+1] == "type=registry,rewrite-timestamp=true"
+    assert "-candidate-" in a[a.index("--tag")+1]
+    event("candidate-write"); exists.touch(); sys.exit(0)
+if a[:3] == ["buildx", "imagetools", "inspect"]:
+    assert a[3] == "--raw" and len(a) == 5 and exists.exists()
+    print(json.dumps({"mediaType":"application/vnd.oci.image.index.v1+json", "manifests":[{"digest":os.environ["PLATFORM_DIGEST"], "platform":{"architecture":"amd64","os":"linux"}}]})); sys.exit(0)
+if a[:3] == ["pull", "--platform", "linux/amd64"]:
+    assert len(a) == 4 and exists.exists(); sys.exit(0)
+if a[:2] == ["manifest", "inspect"]:
+    assert a == ["manifest", "inspect", subject] and exists.exists()
+    event("manifest"); sys.exit(43 if os.environ["FAULT"] == "manifest" else 0)
+if a[:2] == ["image", "inspect"]:
+    assert len(a) == 5 and a[3] == "--format" and exists.exists()
+    values = {'{{join .RepoDigests "\\\\n"}}':subject, '{{.Os}}/{{.Architecture}}':'linux/amd64', '{{.Config.User}}':'70'}
+    assert a[4] in values; print(values[a[4]]); sys.exit(0)
+if a[:2] == ["run", "--rm"]:
+    assert a[-1] == "--version" and "/usr/bin/postgres" in a
+    print("postgres (PostgreSQL) 15.19"); sys.exit(0)
+if a[:3] == ["buildx", "imagetools", "create"]:
+    assert a == ["buildx", "imagetools", "create", "--tag", os.environ["CANONICAL_TAG_REF"], os.environ["CANDIDATE_RUNTIME_REF"]]
+    event("canonical-promotion"); sys.exit(0)
+raise SystemExit(99)
+""")
+    docker.chmod(0o700)
+    repository = "ghcr.io/katsiarynakavaleuskaya/pulseplate"
+    tag = "postgres-15.19-pgvector0.8.6-alpine3.23"
+    sha = "a" * 40
+    candidate = f"{repository}:{tag}-candidate-{sha}-1-1@{POSTGRES_PLATFORM_MANIFEST_DIGEST}"
+    oracle = """python3() {
+      if [ "$1" = - ]; then "$REAL_PYTHON" "$@"; return; fi
+      case "$*" in
+        '-m scripts.ci.check_staging_postgres_runtime --configure-only --json-out staging-postgres-configuration-result.json') printf 'configuration\\n' >> "$EVENTS" ;;
+        '-m scripts.ci.check_staging_postgres_runtime --json-out staging-postgres-native-result.json')
+          printf 'runtime\\n' >> "$EVENTS"
+          [ "$FAULT" != runtime ] || return 44 ;;
+        'scripts/ci/check_pgvector_attestations.py verify '*)
+          printf 'three-proof-verification\\n' >> "$EVENTS"
+          [ "$FAULT" != missing_oci ] || return 42 ;;
+        'scripts/ci/check_pgvector_attestations.py unchanged '*) ;;
+        *) return 99 ;;
+      esac
+    }
+    git() {
+      case "$1" in
+        fetch) return 0 ;;
+        rev-parse) printf '%s\\n' "$GITHUB_SHA" ;;
+        *) return 99 ;;
+      esac
+    }
+    """
+    program = (
+        oracle + configure["run"] + "\n" + "\n".join(by_name[name]["run"] for name in selected)
+    )
+    result = subprocess.run(
+        [bash, "-c", program],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "PATH": str(binary_dir) + os.pathsep + os.environ["PATH"],
+            "REAL_PYTHON": sys.executable,
+            "EVENTS": str(events),
+            "CANDIDATE_EXISTS": str(exists),
+            "FAULT": fault,
+            "REPOSITORY": repository,
+            "PLATFORM_DIGEST": POSTGRES_PLATFORM_MANIFEST_DIGEST,
+            "IMAGE_REPOSITORY": repository,
+            "IMAGE_TAG": tag,
+            "EXPECTED_PLATFORM_DIGEST": POSTGRES_PLATFORM_MANIFEST_DIGEST,
+            "RUNNER_TEMP": str(tmp_path),
+            "PGVECTOR_CONTEXT_DIR": str(tmp_path),
+            "SOURCE_DATE_EPOCH": "1",
+            "GITHUB_SHA": sha,
+            "GITHUB_RUN_ID": "1",
+            "GITHUB_RUN_ATTEMPT": "1",
+            "GITHUB_OUTPUT": str(tmp_path / "output"),
+            "RUNTIME_REF": candidate,
+            "ATTESTATION_MODE": "reuse" if prior_state == "lost_object" else "create",
+            "ORIGINAL_SOURCE_SHA": sha,
+            "ORIGINAL_RUN_INVOCATION_URI": "https://github.com/example/run/1",
+            "CANONICAL_TAG_REF": f"{repository}:{tag}",
+            "CANDIDATE_RUNTIME_REF": candidate,
+            "EXPECTED_RUNTIME_REF": f"{repository}:{tag}@{POSTGRES_PLATFORM_MANIFEST_DIGEST}",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == expected_exit, result.stderr
+    observed = events.read_text().splitlines()
+    assert observed[:3] == ["configuration", "candidate-write", "three-proof-verification"]
+    assert ("canonical-promotion" in observed) is (expected_exit == 0)
+    if expected_exit == 0:
+        assert observed == [
+            "configuration",
+            "candidate-write",
+            "three-proof-verification",
+            "manifest",
+            "runtime",
+            "canonical-promotion",
+        ]
+    if fault == "missing_oci":
+        assert "manifest" not in observed and "runtime" not in observed
+
+
+def test_cd_postgres_canonical_promotion_executes_current_main_material_freshness(
+    tmp_path: Path,
+) -> None:
+    """Reject superseded build inputs while allowing unrelated main changes."""
+    workflow = yaml.safe_load((REPO_ROOT / ".github/workflows/cd.yml").read_text(encoding="utf-8"))
+    steps = workflow["jobs"]["postgres-pgvector-publish"]["steps"]
+    promote = next(
+        step
+        for step in steps
+        if step.get("name") == "Promote verified candidate digest to canonical tag without rebuild"
+    )
+    freshness_program = promote["run"].split("docker buildx imagetools create", maxsplit=1)[0]
+    git_bin = shutil.which("git", path=os.defpath)
+    bash_bin = shutil.which("bash")
+    assert git_bin is not None and bash_bin is not None
+    git_environment = {
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+    }
+    remote = tmp_path / "remote.git"
+    source = tmp_path / "source"
+    runner = tmp_path / "runner"
+
+    def git(cwd: Path, *arguments: str) -> str:
+        completed = subprocess.run(
+            [git_bin, *arguments],
+            cwd=cwd,
+            env=git_environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
+        return completed.stdout.strip()
+
+    remote.mkdir()
+    git(remote, "init", "--bare", "-q")
+    source.mkdir()
+    git(source, "init", "-q")
+    git(source, "config", "user.name", "PulsePlate Test")
+    git(source, "config", "user.email", "pulseplate-test@example.invalid")
+    git(source, "checkout", "-qb", "main")
+    (source / ".github" / "workflows").mkdir(parents=True)
+    (source / "deploy" / "postgres-pgvector").mkdir(parents=True)
+    (source / "docs").mkdir()
+    (source / ".github" / "workflows" / "cd.yml").write_text("name: base\n", encoding="utf-8")
+    (source / "deploy" / "postgres-pgvector" / "Containerfile").write_text(
+        "FROM scratch\n", encoding="utf-8"
+    )
+    (source / "deploy" / "postgres-pgvector" / "image-manifest.json").write_text(
+        "{}\n", encoding="utf-8"
+    )
+    for name in ("builder-apk-inputs.tsv", "builder-apk-index.tar.gz"):
+        (source / "deploy" / "postgres-pgvector" / name).write_bytes(b"frozen input")
+    (source / "docs" / "note.md").write_text("base\n", encoding="utf-8")
+    _copy_pgvector_material_helpers(source)
+    git(source, "add", ".")
+    git(source, "commit", "-qm", "base")
+    base_sha = git(source, "rev-parse", "HEAD")
+    git(source, "remote", "add", "origin", str(remote))
+    git(source, "push", "-q", "-u", "origin", "main")
+    git(tmp_path, "clone", "-q", str(remote), str(runner))
+    git(runner, "checkout", "-q", "--detach", base_sha)
+
+    (source / "docs" / "note.md").write_text("unrelated\n", encoding="utf-8")
+    git(source, "add", ".")
+    git(source, "commit", "-qm", "unrelated")
+    git(source, "push", "-q", "origin", "main")
+    environment = {**git_environment, "GITHUB_SHA": base_sha}
+    same_material = subprocess.run(
+        [bash_bin, "-c", freshness_program],
+        cwd=runner,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert same_material.returncode == 0, same_material.stderr
+
+    (source / ".github" / "workflows" / "cd.yml").write_text(
+        "name: superseding-policy\n", encoding="utf-8"
+    )
+    git(source, "add", ".")
+    git(source, "commit", "-qm", "supersede publication policy")
+    git(source, "push", "-q", "origin", "main")
+    superseded_policy = subprocess.run(
+        [bash_bin, "-c", freshness_program],
+        cwd=runner,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert superseded_policy.returncode != 0
+    assert "material superseded run" in superseded_policy.stderr
+
+    (source / ".github" / "workflows" / "cd.yml").write_text("name: base\n", encoding="utf-8")
+    (source / "deploy" / "postgres-pgvector" / "Containerfile").write_text(
+        "FROM scratch\nLABEL newer=1\n", encoding="utf-8"
+    )
+    git(source, "add", ".")
+    git(source, "commit", "-qm", "new image material")
+    git(source, "push", "-q", "origin", "main")
+    superseded = subprocess.run(
+        [bash_bin, "-c", freshness_program],
+        cwd=runner,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert superseded.returncode != 0
+    assert "material superseded run" in superseded.stderr
+
+
+def test_pgvector_promotion_fails_when_main_material_advances_after_tag_mutation(
+    tmp_path: Path,
+) -> None:
+    """A superseded provisional tag write must not emit downstream admission."""
+    workflow = yaml.safe_load((REPO_ROOT / ".github/workflows/cd.yml").read_text(encoding="utf-8"))
+    steps = workflow["jobs"]["postgres-pgvector-publish"]["steps"]
+    publish = workflow["jobs"]["postgres-pgvector-publish"]
+    assert publish["concurrency"] == {
+        "group": "postgres-pgvector-canonical-tag-promotion",
+        "cancel-in-progress": False,
+    }
+    promote_program = next(
+        step["run"]
+        for step in steps
+        if step.get("name") == "Promote verified candidate digest to canonical tag without rebuild"
+    )
+    git_bin = shutil.which("git", path=os.defpath)
+    bash_bin = shutil.which("bash")
+    assert git_bin is not None and bash_bin is not None
+    git_environment = {
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+    }
+    remote = tmp_path / "remote.git"
+    source = tmp_path / "source"
+    runner = tmp_path / "runner"
+    bin_dir = tmp_path / "bin"
+    docker_log = tmp_path / "docker.log"
+    output_path = tmp_path / "github-output.txt"
+
+    def git(cwd: Path, *arguments: str) -> str:
+        completed = subprocess.run(
+            [git_bin, *arguments],
+            cwd=cwd,
+            env=git_environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
+        return completed.stdout.strip()
+
+    remote.mkdir()
+    git(remote, "init", "--bare", "-q")
+    source.mkdir()
+    git(source, "init", "-q")
+    git(source, "config", "user.name", "PulsePlate Test")
+    git(source, "config", "user.email", "pulseplate-test@example.invalid")
+    git(source, "checkout", "-qb", "main")
+    (source / ".github" / "workflows").mkdir(parents=True)
+    (source / "deploy" / "postgres-pgvector").mkdir(parents=True)
+    (source / ".github" / "workflows" / "cd.yml").write_text("name: admitted\n", encoding="utf-8")
+    (source / "deploy" / "postgres-pgvector" / "Containerfile").write_text(
+        "FROM scratch\n", encoding="utf-8"
+    )
+    (source / "deploy" / "postgres-pgvector" / "image-manifest.json").write_text(
+        "{}\n", encoding="utf-8"
+    )
+    for name in ("builder-apk-inputs.tsv", "builder-apk-index.tar.gz"):
+        (source / "deploy" / "postgres-pgvector" / name).write_bytes(b"frozen input")
+    _copy_pgvector_material_helpers(source)
+    git(source, "add", ".")
+    git(source, "commit", "-qm", "admitted material")
+    admitted_sha = git(source, "rev-parse", "HEAD")
+    git(source, "remote", "add", "origin", str(remote))
+    git(source, "push", "-q", "-u", "origin", "main")
+    git(tmp_path, "clone", "-q", str(remote), str(runner))
+    git(runner, "checkout", "-q", "--detach", admitted_sha)
+
+    bin_dir.mkdir()
+    docker_stub = bin_dir / "docker"
+    docker_stub.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        'printf "docker %s\\n" "$*" >> "$DOCKER_LOG"\n'
+        'if [[ "$*" == buildx\\ imagetools\\ create\\ * ]]; then\n'
+        '  printf "name: superseding-after-promotion\\n" > '
+        '"$SOURCE_REPO/.github/workflows/cd.yml"\n'
+        '  "$GIT_BIN" -C "$SOURCE_REPO" add .github/workflows/cd.yml\n'
+        '  "$GIT_BIN" -C "$SOURCE_REPO" commit -qm "supersede after promotion"\n'
+        '  "$GIT_BIN" -C "$SOURCE_REPO" push -q origin main\n'
+        "  exit 0\n"
+        "fi\n"
+        'if [[ "$*" == buildx\\ imagetools\\ inspect\\ * ]]; then exit 91; fi\n'
+        "exit 92\n",
+        encoding="utf-8",
+    )
+    docker_stub.chmod(0o755)
+    platform_digest = "sha256:" + "a" * 64
+    canonical_tag = "ghcr.io/katsiarynakavaleuskaya/pulseplate:postgres-pgvector"
+    completed = subprocess.run(
+        [bash_bin, "-c", promote_program],
+        cwd=runner,
+        env={
+            **git_environment,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "GITHUB_SHA": admitted_sha,
+            "GITHUB_OUTPUT": str(output_path),
+            "RUNNER_TEMP": str(tmp_path),
+            "CANDIDATE_RUNTIME_REF": (
+                "ghcr.io/katsiarynakavaleuskaya/pulseplate:" f"candidate@{platform_digest}"
+            ),
+            "CANONICAL_TAG_REF": canonical_tag,
+            "EXPECTED_PLATFORM_DIGEST": platform_digest,
+            "EXPECTED_RUNTIME_REF": f"{canonical_tag}@{platform_digest}",
+            "DOCKER_LOG": str(docker_log),
+            "GIT_BIN": git_bin,
+            "SOURCE_REPO": str(source),
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "material superseded run" in completed.stderr
+    log_lines = docker_log.read_text(encoding="utf-8").splitlines()
+    assert sum("buildx imagetools create" in line for line in log_lines) == 1
+    assert all("buildx imagetools inspect" not in line for line in log_lines)
+    assert not output_path.exists() or "runtime_ref=" not in output_path.read_text(encoding="utf-8")
+    assert git(source, "rev-parse", "HEAD") != admitted_sha
+
+
+def test_cd_postgres_pins_scout_and_binds_exact_dhi_source_subjects() -> None:
+    """Preserve pinned Scout execution and independent exact source-subject checks."""
+    workflow = yaml.safe_load((REPO_ROOT / ".github/workflows/cd.yml").read_text(encoding="utf-8"))
+    steps = workflow["jobs"]["postgres-pgvector-publish"]["steps"]
+    install = next(
+        step for step in steps if step.get("name") == "Install exact Docker Scout 1.24.0 CLI"
+    )
+    assert install["env"] == {
+        "SCOUT_VERSION": "1.24.0",
+        "SCOUT_ARCHIVE_SHA256": (
+            "f4e2814bd61040365153d5b964b144cb2dc6ee536a68b5bac4cadf00fc0ec34b"  # pragma: allowlist secret
+        ),
+        "SCOUT_BUILD_COMMIT": "b1c9331b2166aef7ec690aa16fd655b8798ea4c6",  # pragma: allowlist secret
+    }
+    install_run = install["run"]
+    assert "github.com/docker/scout-cli/releases/download/v${SCOUT_VERSION}" in install_run
+    assert "sha256sum --check -" in install_run
+    assert "version: v${SCOUT_VERSION} (go1.26.3 - linux/amd64)" in install_run
+    assert "git commit: ${SCOUT_BUILD_COMMIT}" in install_run
+
+    verify = next(
+        step
+        for step in steps
+        if step.get("name") == "Verify exact DHI source provenance separately"
+    )
+    assert verify["env"] == {
+        "SCOUT_BIN": "${{ steps.docker-scout.outputs.path }}",
+        "DOCKER_SCOUT_HUB_USER": "${{ secrets.DHI_USERNAME }}",
+        "DOCKER_SCOUT_HUB_PASSWORD": "${{ secrets.DHI_ACCESS_TOKEN }}",
+    }
+    verify_run = verify["run"]
+    assert "docker scout" not in verify_run
+    assert '"$SCOUT_BIN" attestation get' in verify_run
+    assert "--verify" in verify_run and "--skip-tlog" in verify_run
+    for exact_subject in (
+        "pkg:docker/dhi/postgres@15-alpine3.23&platform=linux/amd64",
+        "3a241134f6d82eb6465622af948258e41806cfb4497e6c8f0f0a64ca6c4d34db",  # pragma: allowlist secret
+        "pkg:docker/dhi/postgres@15-alpine3.23-dev&platform=linux/amd64",
+        "74cde2c2febf7d7ddacfd3d23dbc66ea0fcbc1bdb9ae4b1ed654d717d203a2a5",  # pragma: allowlist secret
+        "https://slsa.dev/provenance/v1",
+    ):
+        assert exact_subject in verify_run
+
+    cleanup = next(
+        step
+        for step in steps
+        if step.get("name") == "Remove synthetic resources and temporary registry credentials"
+    )
+    assert cleanup["env"] == {"PRIMARY_JOB_STATUS": "${{ job.status }}"}
+    assert "PGVECTOR_SCOUT_DIR" in cleanup["run"]
+    assert "preserving primary ${PRIMARY_JOB_STATUS} result" in cleanup["run"]
+    docs = (REPO_ROOT / "docs/deploy/OPERATIONAL_SIGNALS.md").read_text(encoding="utf-8")
+    assert "verification without transparency-log proof" in docs
+    assert "not a Trivy suppression" in docs
+
+
+@pytest.mark.parametrize("missing", ["user", "password", "neither"])
+def test_postgres_scout_authentication_fails_before_provenance_consumers(
+    tmp_path: Path, missing: str
+) -> None:
+    """Run the real step; a rejected first authentication cannot reach later consumers."""
+    workflow = yaml.safe_load(CD_WORKFLOW_PATH.read_text(encoding="utf-8"))
+    program = next(
+        step["run"]
+        for step in workflow["jobs"]["postgres-pgvector-publish"]["steps"]
+        if step.get("name") == "Verify exact DHI source provenance separately"
+    )
+    bash = shutil.which("bash")
+    assert bash is not None
+    scout = tmp_path / "scout"
+    calls = tmp_path / "calls"
+    _write_executable(
+        scout,
+        '#!/bin/sh\nprintf "called\\n" >> "$SCOUT_CALLS"\n'
+        'printf "Docker Scout authentication rejected\\n" >&2\nexit 43\n',
+    )
+    secret = "synthetic-scout-test-credential"  # pragma: allowlist secret
+    env = {
+        "PATH": os.defpath,
+        "SCOUT_BIN": str(scout),
+        "SCOUT_CALLS": str(calls),
+        "DOCKER_SCOUT_HUB_USER": "" if missing == "user" else "synthetic-user",
+        "DOCKER_SCOUT_HUB_PASSWORD": "" if missing == "password" else secret,
+    }
+    result = subprocess.run(
+        [bash, "-c", program],
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert secret not in result.stdout + result.stderr
+    if missing == "neither":
+        assert result.returncode == 43
+        assert calls.read_text().splitlines() == ["called"]
+        assert "authentication rejected" in result.stderr
+    else:
+        assert not calls.exists()
+        assert "is required" in result.stderr
+    assert not list(tmp_path.glob("dhi-postgres-*-provenance.json"))
+
+
+@pytest.mark.parametrize("source", ["runtime", "builder"])
+@pytest.mark.parametrize(
+    ("fault", "diagnostic"),
+    [
+        ("valid", ""),
+        ("statement-v1", "not the pinned DHI in-toto v0.1 statement"),
+        ("statement-missing", "not the pinned DHI in-toto v0.1 statement"),
+        ("statement-scalar", "not the pinned DHI in-toto v0.1 statement"),
+        ("predicate-version", "predicate type drifted"),
+        ("subject-name", "exact DHI platform subject drifted"),
+        ("subject-digest", "exact DHI platform subject drifted"),
+        ("subject-extra", "exact DHI platform subject drifted"),
+        ("subject-missing", "exact DHI platform subject drifted"),
+        ("predicate-empty", "provenance predicate is malformed"),
+        ("predicate-list", "provenance predicate is malformed"),
+        ("predicate-null", "provenance predicate is malformed"),
+        ("root-list", "not the pinned DHI in-toto v0.1 statement"),
+        ("root-null", "not the pinned DHI in-toto v0.1 statement"),
+        ("malformed-json", "JSONDecodeError"),
+        ("missing-file", ""),
+        ("empty-file", ""),
+        ("symlink-file", ""),
+        ("scout-failure", "synthetic Scout verification failure"),
+    ],
+)
+def test_postgres_scout_source_statement_consumer(
+    tmp_path: Path, source: str, fault: str, diagnostic: str
+) -> None:
+    """Exercise the whole step; recorded Scout output is not signature verification.
+
+    The output shape follows native artifact 10124696818 from CD run 34403818948.
+    Current digest substitutions are synthetic; that archive verified predecessor subjects.
+    Statement/v0.1 and SLSA predicate/v1 are independent schema identifiers.
+    """
+    identities = {
+        "runtime": (
+            "pkg:docker/dhi/postgres@15-alpine3.23&platform=linux/amd64",
+            "3a241134f6d82eb6465622af948258e41806cfb4497e6c8f0f0a64ca6c4d34db",  # pragma: allowlist secret
+        ),
+        "builder": (
+            "pkg:docker/dhi/postgres@15-alpine3.23-dev&platform=linux/amd64",
+            "74cde2c2febf7d7ddacfd3d23dbc66ea0fcbc1bdb9ae4b1ed654d717d203a2a5",  # pragma: allowlist secret
+        ),
+    }
+    fixtures = tmp_path / "fixtures"
+    fixtures.mkdir()
+    for key, (name, digest) in identities.items():
+        payload = {
+            "_type": "https://in-toto.io/Statement/v0.1",
+            "predicateType": "https://slsa.dev/provenance/v1",
+            "subject": [{"name": name, "digest": {"sha256": digest}}],
+            "predicate": {"buildDefinition": {}, "runDetails": {}},
+        }
+        if key == source:
+            if fault == "statement-v1":
+                payload["_type"] = "https://in-toto.io/Statement/v1"
+            elif fault == "statement-missing":
+                payload.pop("_type")
+            elif fault == "statement-scalar":
+                payload["_type"] = 1
+            elif fault == "predicate-version":
+                payload["predicateType"] = "https://slsa.dev/provenance/v0.2"
+            elif fault == "subject-name":
+                payload["subject"] = [{"name": "other-platform", "digest": {"sha256": digest}}]
+            elif fault == "subject-digest":
+                payload["subject"] = [{"name": name, "digest": {"sha256": "0" * 64}}]
+            elif fault == "subject-extra":
+                payload["subject"] *= 2
+            elif fault == "subject-missing":
+                payload["subject"] = []
+            elif fault.startswith("predicate-"):
+                payload["predicate"] = {
+                    "predicate-empty": {},
+                    "predicate-list": [],
+                    "predicate-null": None,
+                }[fault]
+        encoded = json.dumps(payload)
+        if key == source:
+            encoded = {"root-list": "[]", "root-null": "null", "malformed-json": "{"}.get(
+                fault, encoded
+            )
+        (fixtures / f"{key}.json").write_text(encoded, encoding="utf-8")
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "python3").symlink_to(sys.executable)
+    scout = bin_dir / "scout"
+    calls = tmp_path / "calls"
+    _write_executable(
+        scout,
+        f"#!{sys.executable}\n"
+        "import json, os, sys\nfrom pathlib import Path\n"
+        "args = sys.argv[1:]\n"
+        "assert args[:6] == ['attestation', 'get', '--predicate-type', "
+        "'https://slsa.dev/provenance/v1', '--verify', '--skip-tlog']\n"
+        "assert len(args) == 9 and args[6] == '--output'\n"
+        "key = {'dhi-postgres-runtime-provenance.json': 'runtime', "
+        "'dhi-postgres-builder-provenance.json': 'builder'}[args[7]]\n"
+        f"identities = {identities!r}\n"
+        "assert args[8] == 'registry://dhi.io/postgres@sha256:' + identities[key][1]\n"
+        "with open(os.environ['SCOUT_CALLS'], 'a') as stream: stream.write(key + '\\n')\n"
+        "fault = os.environ['SCOUT_FAULT'] if key == os.environ['SCOUT_SOURCE'] else 'valid'\n"
+        "output = Path(args[7]); fixture = Path(os.environ['SCOUT_FIXTURES']) / (key + '.json')\n"
+        "if fault == 'symlink-file': output.symlink_to(fixture)\n"
+        "elif fault != 'missing-file': output.write_bytes(b'' if fault == 'empty-file' "
+        "else fixture.read_bytes())\n"
+        "if fault == 'scout-failure':\n"
+        "    print('synthetic Scout verification failure', file=sys.stderr)\n"
+        "    sys.exit(43)\n",
+    )
+    workflow = yaml.safe_load(CD_WORKFLOW_PATH.read_text(encoding="utf-8"))
+    program = next(
+        step["run"]
+        for step in workflow["jobs"]["postgres-pgvector-publish"]["steps"]
+        if step.get("name") == "Verify exact DHI source provenance separately"
+    )
+    bash = shutil.which("bash")
+    assert bash is not None
+    secret = "synthetic-scout-consumer-credential"  # pragma: allowlist secret
+    result = subprocess.run(
+        [bash, "-c", program],
+        cwd=tmp_path,
+        env={
+            "PATH": str(bin_dir) + os.pathsep + os.defpath,
+            "SCOUT_BIN": str(scout),
+            "SCOUT_CALLS": str(calls),
+            "SCOUT_FIXTURES": str(fixtures),
+            "SCOUT_SOURCE": source,
+            "SCOUT_FAULT": fault,
+            "DOCKER_SCOUT_HUB_USER": "synthetic-user",
+            "DOCKER_SCOUT_HUB_PASSWORD": secret,
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert (result.returncode == 0) is (fault == "valid"), result.stderr
+    assert secret not in result.stdout + result.stderr
+    assert diagnostic in result.stderr
+    expected_calls = (
+        ["runtime"] if source == "runtime" and fault == "scout-failure" else ["runtime", "builder"]
+    )
+    assert calls.read_text().splitlines() == expected_calls
+    if fault == "scout-failure":
+        assert result.returncode == 43
+
+
+def _postgres_publish_cleanup_program() -> str:
+    workflow = yaml.safe_load((REPO_ROOT / ".github/workflows/cd.yml").read_text(encoding="utf-8"))
+    steps = workflow["jobs"]["postgres-pgvector-publish"]["steps"]
+    step = next(
+        item
+        for item in steps
+        if item.get("name") == "Remove synthetic resources and temporary registry credentials"
+    )
+    return step["run"]
+
+
+def _postgres_setup_program() -> str:
+    workflow = yaml.safe_load(CD_WORKFLOW_PATH.read_text(encoding="utf-8"))
+    return next(
+        step["run"]
+        for step in workflow["jobs"]["postgres-pgvector-publish"]["steps"]
+        if step.get("name") == "Authenticate DHI read and GHCR publication rails"
+    )
+
+
+def _isolated_pgvector_credentials(root: Path, directory: Path | None = None) -> dict[str, str]:
+    """Execute the first-party adapter without repository or real HOME access."""
+    modules = root / "scripts" / "ci"
+    modules.mkdir(parents=True)
+    for filename in (
+        "ghcr_attestation_credentials.py",
+        "check_pgvector_attestations.py",
+        "check_docker_provenance_attestation.py",
+    ):
+        shutil.copyfile(REPO_ROOT / "scripts" / "ci" / filename, modules / filename)
+    home = root / "home"
+    default = home / ".docker"
+    default.mkdir(parents=True, mode=0o700)
+    (default / "config.json").write_bytes(b"unchanged default credentials\n")
+    (default / "config.json").chmod(0o600)
+    environment = {"HOME": str(home), "PYTHONPATH": "", "RUNNER_TEMP": str(root)}
+    if directory is not None:
+        directory.chmod(0o700)
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "scripts.ci.ghcr_attestation_credentials",
+                "capture",
+                "--directory",
+                str(directory),
+            ],
+            cwd=root,
+            env={**os.environ, **environment},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
+    return environment
+
+
+@pytest.mark.parametrize(
+    "fail_command",
+    (
+        "",
+        "buildx-download",
+        "buildx-checksum",
+        "buildx-version-mismatch",
+        "buildx-version-missing",
+        "buildx-version-malformed",
+        "login:dhi.io",
+        "login:ghcr.io",
+        "buildx:create",
+        "buildx:inspect",
+    ),
+)
+def test_postgres_setup_propagates_owned_context_between_processes(
+    tmp_path: Path, fail_command: str
+) -> None:
+    """GITHUB_ENV reaches the next process but must not mask first-step export."""
+    bash = shutil.which("bash")
+    assert bash is not None
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    isolated_environment = _isolated_pgvector_credentials(tmp_path)
+    default_config = Path(isolated_environment["HOME"]) / ".docker"
+    sentinel = default_config / "config.json"
+    original_bytes, original_mode = sentinel.read_bytes(), stat.S_IMODE(sentinel.stat().st_mode)
+    command_log = tmp_path / "docker.log"
+    fixture_client = b"synthetic Buildx client bytes\n"
+    _write_executable(
+        bin_dir / "curl",
+        f"#!{sys.executable}\nimport os, sys\nfrom pathlib import Path\n"
+        "if os.environ['FAIL_COMMAND'] == 'buildx-download': sys.exit(22)\n"
+        f"data = {fixture_client!r}\n"
+        "if os.environ['FAIL_COMMAND'] == 'buildx-checksum': data += b'changed'\n"
+        "Path(sys.argv[sys.argv.index('--output') + 1]).write_bytes(data)\n",
+    )
+    docker = bin_dir / "docker"
+    _write_executable(
+        docker,
+        "#!/usr/bin/env bash\nset -euo pipefail\n"
+        'config="${DOCKER_CONFIG:-$DEFAULT_CONFIG}"\n'
+        'printf "%s|%s\\n" "$config" "$*" >> "$COMMAND_LOG"\n'
+        'if [ "$1" = login ]; then cat >/dev/null; printf synthetic > "$config/config.json"; fi\n'
+        'if [ "$1:${2:-}" = buildx:create ]; then touch "$config/builder"; fi\n'
+        'if [ "$FAIL_COMMAND" = "$1:${2:-}" ]; then exit 73; fi\n'
+        'if [ "$1:${2:-}" = buildx:version ]; then '
+        'echo "github.com/docker/buildx v0.37.0 '
+        'ac30b249211430b85fb8f37b6e7154b5c47ba0b6"; fi\n'
+        'if [ "$1:${2:-}" = buildx:inspect ]; then echo "BuildKit version:      v0.32.2"; fi\n'
+        'if [ "$1:${2:-}" = buildx:ls ] && [ -f "$config/builder" ]; then echo pulseplate-pgvector-builder-1234-2; fi\n'
+        'if [ "$1:${2:-}" = buildx:rm ]; then rm "$config/builder"; fi\n',
+    )
+    env_file = tmp_path / "github-env"
+    env_file.touch()
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in {"DOCKER_CONFIG", "PGVECTOR_DOCKER_CONFIG", "PGVECTOR_BUILDX_BUILDER"}
+    }
+    environment.update(
+        PATH=f"{bin_dir}:{os.environ['PATH']}",
+        RUNNER_TEMP=str(tmp_path),
+        GITHUB_ENV=str(env_file),
+        GITHUB_RUN_ID="1234",
+        GITHUB_RUN_ATTEMPT="2",
+        DHI_USER="synthetic-dhi-user",
+        DHI_TOKEN="synthetic-dhi-token",
+        GHCR_USER="synthetic-ghcr-user",
+        GHCR_TOKEN_VALUE="synthetic-ghcr-token",
+        DEFAULT_CONFIG=str(default_config),
+        COMMAND_LOG=str(command_log),
+        FAIL_COMMAND=fail_command,
+        BUILDX_VERSION={
+            "buildx-version-mismatch": "0.38.0",
+            "buildx-version-missing": "",
+            "buildx-version-malformed": "0.37.0/other",
+        }.get(fail_command, "0.37.0"),
+        BUILDX_SHA256=hashlib.sha256(fixture_client).hexdigest(),
+        BUILDKIT_DIGEST=json.loads(POSTGRES_MANIFEST_PATH.read_bytes())[
+            "buildkit_platform_manifest_digest"
+        ],
+        BUILDKIT_VERSION=json.loads(POSTGRES_MANIFEST_PATH.read_bytes())["buildkit_version"],
+    )
+    environment.update(isolated_environment)
+    first = subprocess.run(
+        [bash, "-c", _postgres_setup_program()],
+        env=environment,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    expected_exit = {
+        "": 0,
+        "buildx-download": 22,
+        "buildx-checksum": 1,
+        "buildx-version-mismatch": 1,
+        "buildx-version-missing": 1,
+        "buildx-version-malformed": 1,
+    }.get(fail_command, 73)
+    assert first.returncode == expected_exit, first.stderr
+    emitted = dict(line.split("=", 1) for line in env_file.read_text().splitlines())
+    selected = emitted["DOCKER_CONFIG"]
+    assert stat.S_IMODE(Path(selected).stat().st_mode) == 0o700
+    second = subprocess.run(
+        [bash, "-c", _postgres_publish_cleanup_program()],
+        env={
+            **environment,
+            **emitted,
+            "FAIL_COMMAND": "",
+            "PRIMARY_JOB_STATUS": "failure" if fail_command else "success",
+        },
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert second.returncode == 0, second.stderr
+    assert emitted["PGVECTOR_DOCKER_CONFIG"] == selected
+    assert Path(selected).parent == tmp_path
+    assert Path(selected).name.startswith("pulseplate-pgvector-docker-config.")
+    assert all(line.split("|", 1)[0] == selected for line in command_log.read_text().splitlines())
+    assert sentinel.read_bytes() == original_bytes
+    assert stat.S_IMODE(sentinel.stat().st_mode) == original_mode
+    assert not Path(selected).exists()
+    for secret in (environment["DHI_TOKEN"], environment["GHCR_TOKEN_VALUE"]):
+        assert (
+            secret
+            not in first.stdout
+            + first.stderr
+            + second.stdout
+            + second.stderr
+            + command_log.read_text()
+        )
+        assert secret not in env_file.read_text()
+
+
+def test_postgres_scout_directory_is_inside_its_cleanup_slot() -> None:
+    workflow = yaml.safe_load(CD_WORKFLOW_PATH.read_text(encoding="utf-8"))
+    install = next(
+        step
+        for step in workflow["jobs"]["postgres-pgvector-publish"]["steps"]
+        if step.get("name") == "Install exact Docker Scout 1.24.0 CLI"
+    )
+    assert "${RUNNER_TEMP}/pulseplate-pgvector-scout.XXXXXX" in install["run"]
+
+
+@pytest.mark.parametrize(
+    ("primary_status", "cleanup_status", "expected_status"),
+    (
+        ("success", "0", 0),
+        ("success", "71", 1),
+        ("failure", "0", 0),
+        ("failure", "71", 0),
+        ("cancelled", "71", 0),
+    ),
+)
+def test_cd_postgres_publish_cleanup_executes_primary_secondary_state_machine(
+    tmp_path: Path,
+    primary_status: str,
+    cleanup_status: str,
+    expected_status: int,
+) -> None:
+    bash_bin = shutil.which("bash")
+    assert bash_bin is not None
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    docker_stub = bin_dir / "docker"
+    docker_stub.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        'if [ "${1:-}" = logout ]; then exit "${STUB_LOGOUT_STATUS:-0}"; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    docker_stub.chmod(0o700)
+    credential_dir = tmp_path / "pulseplate-pgvector-docker-config.test"
+    credential_dir.mkdir()
+    isolated_environment = _isolated_pgvector_credentials(tmp_path, credential_dir)
+    completed = subprocess.run(
+        [bash_bin, "-c", _postgres_publish_cleanup_program()],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            **isolated_environment,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "PRIMARY_JOB_STATUS": primary_status,
+            "STUB_LOGOUT_STATUS": cleanup_status,
+            "RUNNER_TEMP": str(tmp_path),
+            "PGVECTOR_RESOURCE_PREFIX": "",
+            "PGVECTOR_BUILDX_BUILDER": "",
+            "PGVECTOR_CONTEXT_DIR": "",
+            "PGVECTOR_OCI_OUTPUT_DIR": "",
+            "PGVECTOR_TRIVY_DIR": "",
+            "PGVECTOR_SCOUT_DIR": "",
+            "PGVECTOR_DOCKER_CONFIG": str(credential_dir),
+            "DOCKER_CONFIG": str(credential_dir),
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == expected_status
+    assert not credential_dir.exists()
+    assert (
+        Path(isolated_environment["HOME"]) / ".docker/config.json"
+    ).read_bytes() == b"unchanged default credentials\n"
+    if primary_status != "success" and cleanup_status != "0":
+        assert f"preserving primary {primary_status} result" in completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("primary_status", "expected_status"),
+    (("success", 1), ("failure", 0), ("cancelled", 0)),
+)
+def test_cd_postgres_publish_cleanup_accounts_for_bounded_rm_failure(
+    tmp_path: Path,
+    primary_status: str,
+    expected_status: int,
+) -> None:
+    bash_bin = shutil.which("bash")
+    assert bash_bin is not None
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    docker_stub = bin_dir / "docker"
+    docker_stub.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    docker_stub.chmod(0o700)
+    rm_stub = bin_dir / "rm"
+    rm_stub.write_text(
+        "#!/usr/bin/env bash\necho 'synthetic rm failure' >&2\nexit 72\n",
+        encoding="utf-8",
+    )
+    rm_stub.chmod(0o700)
+    credential_dir = tmp_path / "pulseplate-pgvector-docker-config.test"
+    credential_dir.mkdir()
+    isolated_environment = _isolated_pgvector_credentials(tmp_path, credential_dir)
+    context_dir = tmp_path / "pulseplate-pgvector-context.test"
+    context_dir.mkdir()
+    completed = subprocess.run(
+        [bash_bin, "-c", _postgres_publish_cleanup_program()],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            **isolated_environment,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "PRIMARY_JOB_STATUS": primary_status,
+            "RUNNER_TEMP": str(tmp_path),
+            "PGVECTOR_RESOURCE_PREFIX": "",
+            "PGVECTOR_BUILDX_BUILDER": "",
+            "PGVECTOR_CONTEXT_DIR": str(context_dir),
+            "PGVECTOR_OCI_OUTPUT_DIR": "",
+            "PGVECTOR_TRIVY_DIR": "",
+            "PGVECTOR_SCOUT_DIR": "",
+            "PGVECTOR_DOCKER_CONFIG": str(credential_dir),
+            "DOCKER_CONFIG": str(credential_dir),
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == expected_status
+    assert context_dir.is_dir()
+    assert not credential_dir.exists()
+    if primary_status != "success":
+        assert f"preserving primary {primary_status} result" in completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("inventory_status", "present", "primary_status", "expected"),
+    (
+        (0, False, "success", 0),
+        (0, True, "success", 0),
+        (73, False, "success", 1),
+        (73, False, "failure", 0),
+    ),
+)
+def test_postgres_cleanup_distinguishes_inventory_failure_from_absence(
+    tmp_path: Path, inventory_status: int, present: bool, primary_status: str, expected: int
+) -> None:
+    bash = shutil.which("bash")
+    assert bash is not None
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log = tmp_path / "commands"
+    config = tmp_path / "pulseplate-pgvector-docker-config.test"
+    config.mkdir()
+    isolated_environment = _isolated_pgvector_credentials(tmp_path, config)
+    scout = tmp_path / "pulseplate-pgvector-scout.test"
+    scout.mkdir()
+    _write_executable(
+        bin_dir / "docker",
+        "#!/usr/bin/env bash\nset -euo pipefail\n"
+        'printf "%s|%s\\n" "$DOCKER_CONFIG" "$*" >> "$COMMAND_LOG"\n'
+        'if [ "${2:-}" = ls ]; then\n'
+        '  if [ "$INVENTORY_STATUS" != 0 ]; then exit "$INVENTORY_STATUS"; fi\n'
+        '  if [ "$PRESENT" = yes ]; then\n'
+        '    case "$1" in\n'
+        '      container) printf "%s\\n" pulseplate-pgvector-1234-2-postgres;;\n'
+        '      volume) printf "%s\\n" pulseplate-pgvector-1234-2-data;;\n'
+        '      image) printf "%s\\n" pulseplate-pgvector-1234-2-final:latest;;\n'
+        '      buildx) printf "%s\\n" pulseplate-pgvector-builder-1234-2;;\n'
+        "    esac\n  fi\nfi\n",
+    )
+    completed = subprocess.run(
+        [bash, "-c", _postgres_publish_cleanup_program()],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            **isolated_environment,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "COMMAND_LOG": str(log),
+            "INVENTORY_STATUS": str(inventory_status),
+            "PRESENT": "yes" if present else "no",
+            "DOCKER_CONFIG": str(config),
+            "PGVECTOR_DOCKER_CONFIG": str(config),
+            "RUNNER_TEMP": str(tmp_path),
+            "GITHUB_RUN_ID": "1234",
+            "GITHUB_RUN_ATTEMPT": "2",
+            "PGVECTOR_RESOURCE_PREFIX": "pulseplate-pgvector-1234-2",
+            "PGVECTOR_BUILDX_BUILDER": "pulseplate-pgvector-builder-1234-2",
+            "PGVECTOR_CONTEXT_DIR": "",
+            "PGVECTOR_OCI_OUTPUT_DIR": "",
+            "PGVECTOR_TRIVY_DIR": "",
+            "PGVECTOR_SCOUT_DIR": str(scout),
+            "PRIMARY_JOB_STATUS": primary_status,
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+    assert completed.returncode == expected, completed.stderr
+    commands = log.read_text().splitlines()
+    assert all(line.split("|", 1)[0] == str(config) for line in commands)
+    assert not config.exists() and not scout.exists()
+    removed = [line for line in commands if " rm " in line or "|rm " in line]
+    assert bool(removed) == present
+    if inventory_status:
+        assert "inventory query failed" in completed.stderr
+        if primary_status == "failure":
+            assert "preserving primary failure" in completed.stderr
+
+
+@pytest.mark.parametrize("unsafe_kind", ("foreign-slot", "nested", "traversal", "symlink"))
+def test_postgres_cleanup_refuses_foreign_directory_but_cleans_owned_scout(
+    tmp_path: Path, unsafe_kind: str
+) -> None:
+    bash = shutil.which("bash")
+    assert bash is not None
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log = tmp_path / "commands"
+    _write_executable(bin_dir / "docker", f'#!/bin/sh\necho "$*" >> "{log}"\n')
+    outside = tmp_path / "keep"
+    outside.mkdir()
+    sentinel = outside / "sentinel"
+    sentinel.write_text("keep", encoding="utf-8")
+    if unsafe_kind == "foreign-slot":
+        unsafe = tmp_path / "pulseplate-pgvector-trivy.keep"
+        unsafe.mkdir()
+    elif unsafe_kind == "nested":
+        parent = tmp_path / "pulseplate-pgvector-context.test"
+        parent.mkdir()
+        unsafe = parent / "child"
+        unsafe.mkdir()
+    elif unsafe_kind == "traversal":
+        parent = tmp_path / "pulseplate-pgvector-context.test"
+        parent.mkdir()
+        unsafe = parent / ".." / "keep"
+    else:
+        unsafe = tmp_path / "pulseplate-pgvector-context.test"
+        unsafe.symlink_to(outside, target_is_directory=True)
+    scout = tmp_path / "pulseplate-pgvector-scout.test"
+    scout.mkdir()
+    completed = subprocess.run(
+        [bash, "-c", _postgres_publish_cleanup_program()],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "RUNNER_TEMP": str(tmp_path),
+            "PRIMARY_JOB_STATUS": "success",
+            "PGVECTOR_DOCKER_CONFIG": "",
+            "PGVECTOR_RESOURCE_PREFIX": "",
+            "PGVECTOR_BUILDX_BUILDER": "",
+            "PGVECTOR_CONTEXT_DIR": str(unsafe),
+            "PGVECTOR_OCI_OUTPUT_DIR": "",
+            "PGVECTOR_TRIVY_DIR": "",
+            "PGVECTOR_SCOUT_DIR": str(scout),
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+    assert completed.returncode == 1
+    assert "Refusing cleanup" in completed.stderr
+    assert unsafe.exists() and sentinel.read_text() == "keep"
+    assert not scout.exists()
+    assert not log.exists(), "no setup means no Docker/logout calls into default context"
+
+
+def _workflow_trap_prefix(step_name: str, *, suffix: str) -> str:
+    workflow = yaml.safe_load((REPO_ROOT / ".github/workflows/cd.yml").read_text(encoding="utf-8"))
+    jobs = workflow["jobs"]
+    step = next(
+        step
+        for job in jobs.values()
+        for step in job.get("steps", [])
+        if isinstance(step, dict) and step.get("name") == step_name
+    )
+    prefix = step["run"].split("trap cleanup EXIT", maxsplit=1)[0]
+    return prefix + "trap cleanup EXIT\n" + suffix
+
+
+def _staging_cleanup_program() -> str:
+    script = (_historical_deploy_script("scripts/deploy.sh")).read_text(encoding="utf-8")
+    start = script.index("cleanup() {\n")
+    end = script.index("\n}\ntrap cleanup EXIT", start) + len("\n}\n")
+    return script[start:end] + 'trap cleanup EXIT\nexit "$TEST_PRIMARY_STATUS"\n'
+
+
+@pytest.mark.parametrize(
+    ("surface", "primary_status", "rm_status", "expected_status"),
+    (
+        ("prometheus", "0", "0", 0),
+        ("prometheus", "0", "72", 1),
+        ("prometheus", "33", "72", 33),
+        ("reuse", "0", "0", 0),
+        ("reuse", "0", "72", 1),
+        ("reuse", "33", "72", 33),
+        ("staging", "0", "0", 0),
+        ("staging", "0", "72", 1),
+        ("staging", "33", "72", 33),
+    ),
+)
+def test_other_bounded_cleanup_traps_preserve_primary_and_account_for_rm(
+    tmp_path: Path,
+    surface: str,
+    primary_status: str,
+    rm_status: str,
+    expected_status: int,
+) -> None:
+    bash_bin = shutil.which("bash")
+    real_rm = shutil.which("rm")
+    assert bash_bin is not None and real_rm is not None
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    docker_stub = bin_dir / "docker"
+    docker_stub.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [ "${1:-}" = logout ]; then exit 0; fi\n'
+        'if [ "${1:-}" = container ] || [ "${1:-}" = volume ]; then exit 1; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    docker_stub.chmod(0o700)
+    rm_stub = bin_dir / "rm"
+    rm_stub.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [ "${STUB_RM_STATUS:-0}" -ne 0 ]; then exit "$STUB_RM_STATUS"; fi\n'
+        'exec "$REAL_RM" "$@"\n',
+        encoding="utf-8",
+    )
+    rm_stub.chmod(0o700)
+    environment = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "REAL_RM": real_rm,
+        "STUB_RM_STATUS": rm_status,
+        "RUNNER_TEMP": str(tmp_path),
+        "TMPDIR": str(tmp_path),
+        "GITHUB_RUN_ID": "123",
+        "GITHUB_RUN_ATTEMPT": "1",
+        "GITHUB_REPOSITORY": "Katsiarynakavaleuskaya/PulsePlate",
+        "GITHUB_EVENT_NAME": "push",
+        "GITHUB_REF": "refs/heads/main",
+        "MATERIAL_CHANGED": "false",
+        "TEST_PRIMARY_STATUS": primary_status,
+    }
+    if surface == "prometheus":
+        program = _workflow_trap_prefix(
+            "Prove synthetic non-root header and named-volume runtime",
+            suffix='exit "$TEST_PRIMARY_STATUS"\n',
+        )
+        expected_dir_prefix = "pulseplate-obs1b-ci-123-1."
+    elif surface == "reuse":
+        program = _workflow_trap_prefix(
+            "Read-only admit the existing exact PostgreSQL digest",
+            suffix='exit "$TEST_PRIMARY_STATUS"\n',
+        )
+        expected_dir_prefix = "pulseplate-pgvector-reuse-docker."
+    else:
+        credential_dir = tmp_path / "pulseplate-docker-config.test"
+        credential_dir.mkdir()
+        environment["DOCKER_CONFIG"] = str(credential_dir)
+        program = _staging_cleanup_program()
+        expected_dir_prefix = credential_dir.name
+    completed = subprocess.run(
+        [bash_bin, "-c", program],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == expected_status, completed.stderr
+    matching_dirs = [
+        path for path in tmp_path.iterdir() if path.name.startswith(expected_dir_prefix)
+    ]
+    if rm_status == "0":
+        assert matching_dirs == []
+    else:
+        assert matching_dirs
+        if primary_status != "0":
+            assert "preserving primary exit 33" in completed.stderr
+
+
+@pytest.mark.parametrize("failure_target", ("config", "directory"))
+def test_production_credential_cleanup_rejects_rm_failure_without_false_success(
+    tmp_path: Path,
+    failure_target: str,
+) -> None:
+    script = (_historical_deploy_script("scripts/deploy_production.sh")).read_text(encoding="utf-8")
+    start = script.index("cleanup_ghcr_credentials() {\n")
+    end = script.index("\n}\n\nvalidate_regular_non_symlink_file", start) + len("\n}\n")
+    function_source = script[start:end]
+    bash_bin = shutil.which("bash")
+    real_rm = shutil.which("rm")
+    assert bash_bin is not None and real_rm is not None
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    docker_stub = bin_dir / "docker"
+    docker_stub.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    docker_stub.chmod(0o700)
+    rm_stub = bin_dir / "rm"
+    rm_stub.write_text(
+        "#!/usr/bin/env bash\n"
+        'target="${*: -1}"\n'
+        'if [ "${STUB_FAIL_TARGET:-}" = config ] && [[ "$target" = */config.json ]]; then exit 72; fi\n'
+        'if [ "${STUB_FAIL_TARGET:-}" = directory ] && [[ "$target" = /tmp/pulseplate-production-docker-config.* ]]; then exit 72; fi\n'
+        'exec "$REAL_RM" "$@"\n',
+        encoding="utf-8",
+    )
+    rm_stub.chmod(0o700)
+    credential_dir = (
+        Path("/tmp") / f"pulseplate-production-docker-config.test-{os.getpid()}-{failure_target}"
+    )
+    credential_dir.mkdir(exist_ok=False)
+    (credential_dir / "config.json").write_text("{}\n", encoding="utf-8")
+    try:
+        program = (
+            function_source
+            + "\nif cleanup_ghcr_credentials; then echo FALSE_SUCCESS; exit 0; "
+            + 'else status=$?; printf "RETAINED=%s\\n" "$GHCR_DOCKER_CONFIG"; exit "$status"; fi\n'
+        )
+        completed = subprocess.run(
+            [bash_bin, "-c", program],
+            env={
+                **os.environ,
+                "PATH": f"{bin_dir}:{os.environ['PATH']}",
+                "REAL_RM": real_rm,
+                "STUB_FAIL_TARGET": failure_target,
+                "DOCKER_BIN": str(docker_stub),
+                "DOCKER_CONFIG": str(credential_dir),
+                "GHCR_DOCKER_CONFIG": str(credential_dir),
+            },
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert completed.returncode != 0
+        assert "FALSE_SUCCESS" not in completed.stdout
+        assert f"RETAINED={credential_dir}" in completed.stdout
+    finally:
+        config_path = credential_dir / "config.json"
+        if config_path.exists():
+            config_path.unlink()
+        if credential_dir.exists():
+            credential_dir.rmdir()
+
+
+@pytest.mark.parametrize(
+    ("validation_status", "rm_status", "expected_status"),
+    (("0", "0", 0), ("0", "72", 1), ("33", "72", 33)),
+)
+def test_production_shell_bundle_validation_cleanup_preserves_primary_status(
+    tmp_path: Path,
+    validation_status: str,
+    rm_status: str,
+    expected_status: int,
+) -> None:
+    script = (_historical_deploy_script("scripts/deploy_production.sh")).read_text(encoding="utf-8")
+    start = script.index("validate_shell_bundle_archive() {\n")
+    end = script.index("\n}\n\nextract_shell_bundle_archive", start) + len("\n}\n")
+    function_source = script[start:end]
+    bash_bin = shutil.which("bash")
+    real_rm = shutil.which("rm")
+    assert bash_bin is not None and real_rm is not None
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    rm_stub = bin_dir / "rm"
+    rm_stub.write_text(
+        "#!/usr/bin/env bash\n"
+        'printf \'%s\\n\' "${*: -1}" > "$STUB_RM_LOG"\n'
+        'if [ "${STUB_RM_STATUS:-0}" -ne 0 ]; then exit "$STUB_RM_STATUS"; fi\n'
+        'exec "$REAL_RM" "$@"\n',
+        encoding="utf-8",
+    )
+    rm_stub.chmod(0o700)
+    rm_log = tmp_path / "rm-target.txt"
+    program = (
+        "set -euo pipefail\n"
+        'process_shell_bundle_archive() { return "$STUB_VALIDATION_STATUS"; }\n'
+        "validate_shell_bundle_contract() { return 0; }\n"
+        + function_source
+        + '\nif validate_shell_bundle_archive; then exit 0; else exit "$?"; fi\n'
+    )
+    completed = subprocess.run(
+        [bash_bin, "-c", program],
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "REAL_RM": real_rm,
+            "STUB_RM_LOG": str(rm_log),
+            "STUB_RM_STATUS": rm_status,
+            "STUB_VALIDATION_STATUS": validation_status,
+            "SHELL_BUNDLE_ARCHIVE": "/tmp/pulseplate-shell-bundle-1-1.tgz",
+            "SHELL_BUNDLE_DIR": "",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == expected_status
+    validation_root = Path(rm_log.read_text(encoding="utf-8").strip())
+    if rm_status == "0":
+        assert not validation_root.exists()
+    else:
+        assert validation_root.is_dir()
+        validation_root.rmdir()
+    if validation_status != "0" and rm_status != "0":
+        assert "preserving primary exit 33" in completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("variant", "expected_returncode"),
+    (("exact", 0), ("content-drift", 1), ("hardlink", 1), ("writable", 1)),
+)
+def test_published_backup_helper_binding_rejects_post_publication_drift(
+    tmp_path: Path,
+    variant: str,
+    expected_returncode: int,
+) -> None:
+    script = (_historical_deploy_script("scripts/deploy_production.sh")).read_text(encoding="utf-8")
+    start = script.index("validate_published_backup_helper_binding() {\n")
+    end = script.index("\n}\n\nvalidate_production_database_contract", start) + len("\n}\n")
+    function_source = script[start:end]
+    bash_bin = shutil.which("bash")
+    assert bash_bin is not None
+
+    shell_bundle_dir = tmp_path / "shell-bundle"
+    source_ops_dir = shell_bundle_dir / "scripts" / "ops"
+    destination_ops_dir = tmp_path / "production" / "scripts" / "ops"
+    source_ops_dir.mkdir(parents=True)
+    destination_ops_dir.mkdir(parents=True)
+    source_helper = source_ops_dir / "postgres_backup.sh"
+    destination_helper = destination_ops_dir / "postgres_backup.sh"
+    reviewed_bytes = b"#!/usr/bin/env bash\nprintf 'reviewed-helper\\n'\n"
+    source_helper.write_bytes(reviewed_bytes)
+    source_helper.chmod(0o755)
+    destination_helper.write_bytes(reviewed_bytes)
+    destination_helper.chmod(0o755)
+
+    if variant == "content-drift":
+        destination_helper.write_bytes(b"#!/usr/bin/env bash\nprintf 'drifted-helper\\n'\n")
+        destination_helper.chmod(0o755)
+    elif variant == "hardlink":
+        destination_helper.unlink()
+        external = tmp_path / "hardlinked-helper"
+        external.write_bytes(reviewed_bytes)
+        external.chmod(0o755)
+        os.link(external, destination_helper)
+    elif variant == "writable":
+        destination_helper.chmod(0o775)
+
+    program = (
+        "set -euo pipefail\n"
+        "validate_contract_destinations_safely() { :; }\n"
+        + function_source
+        + "\nvalidate_published_backup_helper_binding\n"
+    )
+    completed = subprocess.run(
+        [bash_bin, "-c", program],
+        env={
+            **os.environ,
+            "PYTHON_BIN": sys.executable,
+            "SHELL_BUNDLE_DIR": str(shell_bundle_dir),
+            "BACKUP_HELPER": str(destination_helper),
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == expected_returncode, completed.stderr
+    if expected_returncode != 0:
+        assert "backup-helper" in completed.stderr or "backup helper" in completed.stderr
+
+
+def test_cd_postgres_material_helper_is_shared_by_producer_and_consumers() -> None:
+    workflow = yaml.safe_load(CD_WORKFLOW_PATH.read_text(encoding="utf-8"))
+    publish = workflow["jobs"]["postgres-pgvector-publish"]["steps"]
+    generator = next(
+        step
+        for step in publish
+        if step.get("name") == "Generate exact PostgreSQL material predicate"
+    )
+    assert "scripts/ci/check_pgvector_attestations.py generate" in generator["run"]
+    candidate = next(
+        step
+        for step in publish
+        if step.get("name")
+        == "Verify candidate pullback, material provenance, SBOM, and runtime identity"
+    )
+    assert "scripts/ci/check_pgvector_attestations.py verify" in candidate["run"]
+    reuse = workflow["jobs"]["postgres-pgvector-reuse"]["steps"][1]
+    assert "scripts/ci/check_pgvector_attestations.py verify" in reuse["run"]
+    helper = (REPO_ROOT / "scripts/ci/check_pgvector_attestations.py").read_text()
+    assert '"recipe": copy.deepcopy(manifest)' in helper
+    assert "material_dependencies(manifest)" in helper
+
+
+def test_postgres_final_scanner_consumes_the_verified_oci_layout() -> None:
+    """Trivy 0.74 accepts an OCI directory; its Docker-tar input is a different format."""
+    workflow = yaml.safe_load(CD_WORKFLOW_PATH.read_text(encoding="utf-8"))
+    steps = workflow["jobs"]["postgres-pgvector-publish"]["steps"]
+    scan = next(
+        step["run"]
+        for step in steps
+        if step.get("name")
+        == "Scan exact bases, post-APK builder, and final image without suppressions"
+    )
+    assert '["--input", str(Path(os.environ["PGVECTOR_OCI_OUTPUT_DIR"]) / "oci-1")]' in scan
+    assert "image-1.oci.tar" not in scan
+    assert '"--exit-code", "1"' in scan
+    assert '"--scanners", "vuln,secret"' in scan
+
+
+def _postgres_oci_verifier_program() -> str:
+    workflow = yaml.safe_load((REPO_ROOT / ".github/workflows/cd.yml").read_text(encoding="utf-8"))
+    steps = workflow["jobs"]["postgres-pgvector-publish"]["steps"]
+    step = next(
+        item for item in steps if item.get("name") == "Reproduce the exact platform manifest twice"
+    )
+    run = step["run"]
+    marker = "python3 - \"$output_dir/oci-1\" <<'PY'\n"
+    assert run.count(marker) == 1
+    program, remainder = run.split(marker, maxsplit=1)[1].split("\nPY\n", maxsplit=1)
+    assert "docker buildx build" in remainder
+    return program
+
+
+def _generated_mountpoint_layer(
+    *,
+    uid: int = 70,
+    mode: int = 0o700,
+    mtime: int = 1_785_349_734,
+    extra_file: bool = False,
+    parent_fault: str = "",
+) -> tuple[bytes, str]:
+    payload = io.BytesIO()
+    with tarfile.open(fileobj=payload, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+        for path, owner, member_mode in (
+            ("var", 0, 0o755),
+            ("var/lib", 0, 0o755),
+            ("var/lib/postgresql", 70, 0o750),
+            ("var/lib/postgresql/data", 70, 0o700),
+        ):
+            member = tarfile.TarInfo(path)
+            member.type = tarfile.DIRTYPE
+            member.uid = owner if uid == 70 else uid
+            member.gid = owner
+            member.mode = member_mode if mode == 0o700 else mode
+            member.mtime = mtime
+            if path == "var" and parent_fault == "owner":
+                member.uid = 70
+            if path == "var/lib/postgresql" and parent_fault == "mode":
+                member.mode = 0o700
+            archive.addfile(member)
+        if extra_file:
+            member = tarfile.TarInfo("var/lib/postgresql/data/unexpected")
+            member.type = tarfile.REGTYPE
+            member.uid = 70
+            member.gid = 70
+            member.mode = 0o600
+            member.mtime = mtime
+            member.size = 1
+            archive.addfile(member, io.BytesIO(b"x"))
+    tar_bytes = payload.getvalue()
+    return gzip.compress(tar_bytes, compresslevel=9, mtime=mtime), (
+        "sha256:" + hashlib.sha256(tar_bytes).hexdigest()
+    )
+
+
+def _write_postgres_oci_verifier_fixture(
+    tmp_path: Path, variant: str
+) -> tuple[Path, dict[str, str]]:
+    fixture_root = tmp_path / variant
+    blobs = fixture_root / "blobs" / "sha256"
+    blobs.mkdir(parents=True)
+    if variant in {"valid", "arm64", "manifest-bytes"}:
+        layer_bytes = MOUNTPOINT_LAYER_GZIP
+        layer_diff_id = "sha256:8cb1ace7e0c1f48d719bbdf5b4cfe9705ef407c74a3567ddc4369a6d6f023a23"
+    else:
+        layer_bytes, layer_diff_id = _generated_mountpoint_layer(
+            uid=0 if variant == "uid" else 70,
+            mode=0o755 if variant == "mode" else 0o700,
+            mtime=1_785_349_735 if variant == "mtime" else 1_785_349_734,
+            extra_file=variant == "extra",
+            parent_fault={"parent-owner": "owner", "parent-mode": "mode"}.get(variant, ""),
+        )
+    layer_digest = "sha256:" + hashlib.sha256(layer_bytes).hexdigest()
+    (blobs / layer_digest.removeprefix("sha256:")).write_bytes(layer_bytes)
+    config = {
+        "architecture": "amd64",
+        "os": "linux",
+        "config": {
+            "User": "70",
+            "Entrypoint": ["/usr/local/bin/docker-entrypoint.sh"],
+            "Env": [
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "PGDATA=/var/lib/postgresql/15/data",
+                "PG_MAJOR=15",
+                "PG_MINOR=19",
+            ],
+        },
+        "rootfs": {
+            "type": "layers",
+            "diff_ids": ["sha256:" + "0" * 64] * 15
+            + ["sha256:" + "f" * 64 if variant == "diff-id" else layer_diff_id],
+        },
+    }
+    config_bytes = json.dumps(config, sort_keys=True, separators=(",", ":")).encode()
+    config_digest = "sha256:" + hashlib.sha256(config_bytes).hexdigest()
+    (blobs / config_digest.removeprefix("sha256:")).write_bytes(config_bytes)
+    dummy_layer = {
+        "digest": "sha256:" + "0" * 64,
+        "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+        "size": 0,
+    }
+    manifest = {
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "digest": config_digest,
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "size": len(config_bytes),
+        },
+        "layers": [dummy_layer] * 15
+        + [
+            {
+                "annotations": {"buildkit/rewritten-timestamp": "1785349734"},
+                "digest": layer_digest,
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "size": len(layer_bytes),
+            }
+        ],
+    }
+    manifest_bytes = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+    manifest_digest = "sha256:" + hashlib.sha256(manifest_bytes).hexdigest()
+    (blobs / manifest_digest.removeprefix("sha256:")).write_bytes(
+        manifest_bytes + (b" " if variant == "manifest-bytes" else b"")
+    )
+    index = {
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [
+            {
+                "digest": manifest_digest,
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "size": len(manifest_bytes),
+                "platform": {
+                    "architecture": "arm64" if variant == "arm64" else "amd64",
+                    "os": "linux",
+                },
+            }
+        ],
+    }
+    (fixture_root / "index.json").write_text(
+        json.dumps(index, sort_keys=True, separators=(",", ":")), encoding="utf-8"
+    )
+    environment = {
+        **os.environ,
+        "EXPECTED_PLATFORM_DIGEST": manifest_digest,
+        "EXPECTED_CONFIG_DIGEST": config_digest,
+        "EXPECTED_MOUNTPOINT_LAYER_DIGEST": layer_digest,
+        "EXPECTED_MOUNTPOINT_LAYER_SIZE": str(len(layer_bytes)),
+        "EXPECTED_MOUNTPOINT_LAYER_DIFF_ID": layer_diff_id,
+        "EXPECTED_MOUNTPOINT_LAYER_ENTRY_COUNT": "4",
+        "EXPECTED_MOUNTPOINT_UID": "70",
+        "EXPECTED_MOUNTPOINT_GID": "70",
+        "EXPECTED_MOUNTPOINT_MODE": "0700",
+        "EXPECTED_MOUNTPOINT_PATH": "/var/lib/postgresql/data",
+        "SOURCE_DATE_EPOCH": "1785349734",
+    }
+    return fixture_root, environment
+
+
+def test_cd_postgres_oci_verifier_executes_the_exact_valid_workflow_program(
+    tmp_path: Path,
+) -> None:
+    fixture_root, environment = _write_postgres_oci_verifier_fixture(tmp_path, "valid")
+    completed = subprocess.run(
+        [sys.executable, "-c", _postgres_oci_verifier_program(), str(fixture_root)],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("variant", "message"),
+    (
+        ("arm64", "platform descriptor"),
+        ("manifest-bytes", "manifest bytes"),
+        ("extra", "path inventory"),
+        ("uid", "metadata"),
+        ("mode", "metadata"),
+        ("parent-owner", "metadata"),
+        ("parent-mode", "metadata"),
+        ("mtime", "metadata"),
+        ("diff-id", "diff ID"),
+    ),
+)
+def test_cd_postgres_oci_verifier_rejects_exact_invalid_fixtures(
+    tmp_path: Path,
+    variant: str,
+    message: str,
+) -> None:
+    fixture_root, environment = _write_postgres_oci_verifier_fixture(tmp_path, variant)
+    completed = subprocess.run(
+        [sys.executable, "-c", _postgres_oci_verifier_program(), str(fixture_root)],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode != 0
+    assert message in completed.stderr
+
+
+def test_prometheus_cd_uses_authenticated_finite_consumer_and_retains_strict_scan() -> None:
+    workflow = yaml.safe_load(CD_WORKFLOW_PATH.read_text(encoding="utf-8"))
+    job = workflow["jobs"]["prometheus-image-security-pr"]
+    steps = {step["name"]: step for step in job["steps"]}
+    consumer = steps["Admit retained PR candidate or published immutable subject"]
+    assert "scripts.ci.prometheus_source_image --operation consume" in consumer["run"]
+    assert 'trusted["consume_image"](work, material' in consumer["run"]
+    assert "python3 -I -S" in consumer["run"]
+    fixed = steps["Checkout fixed trusted Prometheus control"]
+    assert re.fullmatch(r"[0-9a-f]{40}", fixed["with"]["ref"])
+    assert fixed["with"] == {
+        "ref": fixed["with"]["ref"],
+        "persist-credentials": False,
+        "path": "artifacts/orchestration/prometheus-control",
+        "sparse-checkout": "scripts/ci/prometheus_source_image.py",
+        "sparse-checkout-cone-mode": False,
+    }
+    assert consumer["id"] == "prometheus-image"
+    names = [step["name"] for step in job["steps"]]
+    initial = steps["Checkout immutable PR head Prometheus contracts"]
+    classifier = steps["Classify the fixed regular Prometheus source blobs"]
+    cleanup = steps["Remove fixed trusted Prometheus control checkout"]
+    assert initial["with"] == {
+        "persist-credentials": False,
+        "fetch-depth": 0,
+        "ref": "${{ github.event.pull_request.head.sha }}",
+    }
+    assert fixed["if"] == "${{ success() && github.event_name == 'pull_request' }}"
+    assert classifier["env"] == {
+        "PROMETHEUS_EVENT_HEAD": "${{ steps.prometheus-event.outputs.head }}",
+        "PROMETHEUS_EVENT_BASE": "${{ steps.prometheus-event.outputs.base }}",
+    }
+    assert 'trusted["classify_source_change"](previous, current)' in classifier["run"]
+    selector = steps["Select authenticated Prometheus PR evidence"]
+    assert selector["if"] == fixed["if"]
+    assert selector["id"] == "prometheus-evidence"
+    assert selector["env"] == {
+        "GH_TOKEN": "${{ secrets.GITHUB_TOKEN }}",
+        "GITHUB_TOKEN": "${{ secrets.GITHUB_TOKEN }}",
+        "PROMETHEUS_SELECT_SECONDS": "60",
+        "PROMETHEUS_ROUTE_HEAD": "${{ steps.prometheus-route.outputs.head }}",
+        "PROMETHEUS_ROUTE_BASE": "${{ steps.prometheus-route.outputs.base }}",
+        "PROMETHEUS_CLASSIFIED_MODE": "${{ steps.prometheus-route.outputs.mode }}",
+    }
+    assert "secrets." not in str(classifier)
+    assert "Require the trusted base published consumer capability" not in names
+    assert "Bind the unchanged PR admission after trusted cleanup" not in names
+    assert cleanup["if"] == (
+        "${{ always() && github.event_name == 'pull_request' && "
+        "(steps.prometheus-control-checkout.outcome == 'success' || "
+        "steps.prometheus-control-checkout.outcome == 'failure') }}"
+    )
+    ordered_names = [
+        initial["name"],
+        fixed["name"],
+        classifier["name"],
+        "Select authenticated Prometheus PR evidence",
+        consumer["name"],
+        cleanup["name"],
+        "Check canonical Prometheus config with exact-image promtool",
+    ]
+    assert [names.index(name) for name in ordered_names] == sorted(
+        names.index(name) for name in ordered_names
+    )
+    control_bytes = pinned_prometheus_control_bytes(REPO_ROOT, fixed["with"]["ref"])
+    control_blob = hashlib.sha1(
+        b"blob " + str(len(control_bytes)).encode("ascii") + b"\0" + control_bytes,
+        usedforsecurity=False,
+    ).hexdigest()
+    control_object = f"100644 blob {control_blob}\\tscripts/ci/prometheus_source_image.py\\0"
+    for program in (
+        classifier["run"],
+        steps["Select authenticated Prometheus PR evidence"]["run"],
+        consumer["run"],
+    ):
+        assert str(len(control_bytes)) in program
+        assert control_object in program
+        assert hashlib.sha256(control_bytes).hexdigest() in program
+        assert "Prometheus_control_interface_HOLD" in program
+    assert "historical_pr_candidate" in consumer["run"]
+    assert 'trusted["one_object"](raw).get("admission")' in consumer["run"]
+    assert job["permissions"] == {
+        "contents": "read",
+        "actions": "read",
+        "packages": "read",
+        "pull-requests": "read",
+    }
+    assert "environment" not in job
+    assert job["env"] == {
+        "PROMETHEUS_CONSUME_SECONDS": "900",
+        "PROMETHEUS_CLEANUP_SECONDS": "120",
+        "ALERTMANAGER_JOB_TIMEOUT_MINUTES": "${{ fromJSON(vars.ALERTMANAGER_CD_PR_JOB_TIMEOUT_MINUTES || '170') }}",
+        "ALERTMANAGER_CALLER_KIND": "shared-pr",
+    }
+    assert consumer["env"] == {
+        "GH_TOKEN": "${{ secrets.GITHUB_TOKEN }}",
+        "GITHUB_TOKEN": "${{ secrets.GITHUB_TOKEN }}",
+        "GHCR_READ_TOKEN": "${{ github.event_name == 'pull_request' && steps.prometheus-evidence.outcome == 'success' && steps.prometheus-evidence.outputs.mode == 'unchanged_pr_published' && secrets.GITHUB_TOKEN || github.event_name != 'pull_request' && steps.prometheus-route.outputs.mode == 'trusted_published' && secrets.GHCR_READ_TOKEN || '' }}",
+        "PROMETHEUS_CREDENTIAL_ROUTE": "${{ github.event_name == 'pull_request' && steps.prometheus-evidence.outputs.mode || github.event_name != 'pull_request' && steps.prometheus-route.outputs.mode || '' }}",
+        "PROMETHEUS_ROUTE_HEAD": "${{ steps.prometheus-evidence.outputs.head }}",
+        "PROMETHEUS_ROUTE_BASE": "${{ steps.prometheus-evidence.outputs.base }}",
+    }
+    assert not any(
+        step.get("uses", "").startswith("docker/login-action@")
+        or "docker login" in step.get("run", "")
+        or "DOCKER_CONFIG" in step.get("env", {})
+        for step in job["steps"]
+    )
+    scan = steps["Scan exact Prometheus image without suppressions"]
+    for required in (
+        "--scanners vuln,secret",
+        "--severity CRITICAL,HIGH",
+        "--exit-code 1",
+        '--ignorefile "$TRIVY_IGNORE_FILE"',
+        '"$PROMETHEUS_RUNTIME_REF"',
+    ):
+        assert required in scan["run"]
+    assert "continue-on-error" not in str(job)
+    for step in job["steps"]:
+        if "docker run" in step.get("run", ""):
+            assert "GHCR_READ_TOKEN" not in step.get("env", {})
+            assert "GITHUB_TOKEN" not in step.get("env", {})
+            assert "DOCKER_CONFIG" not in step.get("env", {})
+
+
+def _prometheus_cd_python(step: dict[str, object]) -> str:
+    run = str(step["run"])
+    return run.split("<<'PY'\n", 1)[1].split("\nPY", 1)[0]
+
+
+# Synthetic transport and historical producer inputs for the separately pinned control.
+# The real classification, publication observer, selector and fresh consume binding execute.
+_PROMETHEUS_SELECTOR_API_FIXTURE = """
+def read_image_manifest(path):
+    producer = {"pr_number": 2477, "source_head": "1"*40, "source_ref": "synthetic"}
+    inputs = {"source": {"derived_locks": XNET060_INCUMBENT_LOCKS}}
+    return {"candidate": {"producer": producer}, "inputs": inputs}
+def authenticate_pr_source(*args): return {}
+def authenticate_producer_inputs(*args): pass
+def _historical_selected_files(api, manifest, base, head, current):
+    return "3"*40, current
+class GitHubRead(GitHubRead):
+    def __init__(self, private, evidence, deadline, cleanup):
+        self.private, self.deadline = private, deadline
+        self.selecting = private.name == "GitHub-private"
+        self.outcome = os.environ["SYNTHETIC_OUTCOME"]
+        self.event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_bytes())
+        if self.selecting:
+            assert os.environ["GH_TOKEN"] == os.environ["GITHUB_TOKEN"] == "synthetic.ephemeral.reader"
+            assert not os.environ.get("GHCR_READ_TOKEN")
+            assert cleanup == 120 and 0 < deadline-time.monotonic() <= 60
+            private.mkdir()
+            with Path(os.environ["SYNTHETIC_TRACE"]).open("a") as stream: print(json.dumps("CONTROL-select"), file=stream)
+    def source_files(self, ref, names):
+        env = {"PATH": "/usr/bin:/bin", "GIT_NO_REPLACE_OBJECTS": "1"}
+        return {name: subprocess.check_output(["/usr/bin/git", "show", ref+":"+name], env=env) for name in names}
+    def json(self, endpoint):
+        pr = self.event["pull_request"]
+        if endpoint.endswith("/pulls/2477"):
+            if self.outcome in {"selector-api-error", "selector-api-and-cleanup-error"}: raise QualificationError("synthetic_selector_api")
+            live = {"state": "open", **pr}
+            if self.outcome == "selector-base-retarget": live["base"] = {**pr["base"], "ref": "release"}
+            if self.outcome == "selector-head-drift": live["head"] = {**pr["head"], "sha": "e"*40}
+            return live
+        base = pr["base"]["sha"]
+        state = {"status": "completed", "conclusion": "success"}
+        run = {"id": 12, "run_attempt": 1, "workflow_id": 42, "head_sha": base,
+               "head_branch": "main", "event": "push", "path": ".github/workflows/build.yml",
+               "repository": {"id": 1043311030}, "head_repository": {"id": 1043311030}, **state}
+        empty = self.outcome == "unchanged-candidate" or self.outcome == "selector-consumer-drift" and self.selecting
+        if "/workflows/build.yml/runs?" in endpoint:
+            if self.outcome == "selector-malformed": return {"total_count": "1"}
+            return {"total_count": 0 if empty else 1, "workflow_runs": [] if empty else [run]}
+        if "/jobs?" in endpoint:
+            job = {"id": 121, "run_id": 12, "run_attempt": 1, "head_sha": base,
+                   "name": "prometheus-publish", **state}
+            jobs = [job, {**job, "id": 122}] if self.outcome == "selector-ambiguous" else [job]
+            return {"total_count": len(jobs), "jobs": jobs}
+        assert endpoint.endswith("/runs/12")
+        return run
+    def close(self):
+        if self.selecting:
+            with Path(os.environ["SYNTHETIC_TRACE"]).open("a") as stream: print(json.dumps("CONTROL-selector-close"), file=stream)
+            if self.outcome in {"selector-cleanup-error", "selector-api-and-cleanup-error"}: raise QualificationError("synthetic_selector_cleanup")
+            if self.outcome != "selector-private-remains": self.private.rmdir()
+"""
+
+
+def _synthetic_fixed_prometheus_control(
+    repository: Path, environment: dict[str, str], programs: tuple[str, ...], *, revision: str
+) -> tuple[str, ...]:
+    """Run the real canonical classifier; substitute only image/API work and fixed coordinates.
+
+    Actual workflow Git/control checks still run. This synthetic consumer grants
+    no native image, original-producer, publisher or authenticated API proof.
+    """
+    production_bytes = pinned_prometheus_control_bytes(REPO_ROOT, revision)
+    production_blob = hashlib.sha1(
+        b"blob " + str(len(production_bytes)).encode("ascii") + b"\0" + production_bytes,
+        usedforsecurity=False,
+    ).hexdigest()
+    production_object = f"100644 blob {production_blob}\\tscripts/ci/prometheus_source_image.py\\0"
+    for program in programs:
+        assert program.count(revision) == 1
+        assert program.count(production_object) == 1
+        assert str(len(production_bytes)) in program
+        assert hashlib.sha256(production_bytes).hexdigest() in program
+    object_failure = environment["SYNTHETIC_OUTCOME"] in {
+        "changed-control-object",
+        "changed-consumer-control-object",
+        "changed-selector-control-object",
+    }
+    import_marker = (
+        "with Path(os.environ['SYNTHETIC_TRACE']).with_name('control-imports').open('a') as stream: stream.write('import\\n')\n"
+        if object_failure
+        else ""
+    )
+    control = repository / "artifacts/orchestration/prometheus-control"
+    helper = control / "scripts/ci/prometheus_source_image.py"
+    helper.parent.mkdir(parents=True)
+    helper.write_bytes(
+        production_bytes
+        + b"\n"
+        + _PROMETHEUS_SELECTOR_API_FIXTURE.encode()
+        + (
+            import_marker + "_fixture_real_classifier=classify_source_change\n"
+            "def classify_source_change(base, head):\n"
+            " if os.environ.get('GH_TOKEN'): return _fixture_real_classifier(base, head)\n"
+            " assert not any(os.environ.get(key) for key in ('GH_TOKEN','GITHUB_TOKEN','GHCR_READ_TOKEN','GHCR_TOKEN','GH_ENTERPRISE_TOKEN','GITHUB_ENTERPRISE_TOKEN','DOCKER_CONFIG','DOCKER_AUTH_CONFIG'))\n"
+            " with Path(os.environ['SYNTHETIC_TRACE']).open('a') as stream: stream.write(json.dumps('CONTROL-classify')+'\\n')\n"
+            " return _fixture_real_classifier(base, head)\n"
+            "def consume_image(work, material, seconds, cleanup):\n"
+            " assert material==Path(os.environ['GITHUB_WORKSPACE'])\n"
+            " assert seconds==900 and cleanup==120\n"
+            " assert os.environ['GH_TOKEN']=='synthetic.ephemeral.reader'\n"
+            " route=os.environ['PROMETHEUS_CREDENTIAL_ROUTE']\n"
+            " assert route in ('changed_pr_candidate','historical_pr_candidate','unchanged_pr_published')\n"
+            " assert bool(os.environ.get('GHCR_READ_TOKEN'))==(route=='unchanged_pr_published')\n"
+            " trace=Path(os.environ['SYNTHETIC_TRACE'])\n"
+            " def record(value):\n"
+            "  with trace.open('a') as stream: stream.write(json.dumps(value)+'\\n')\n"
+            " event=json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_bytes())\n"
+            " api=GitHubRead(work/'private',work/'evidence',time.monotonic()+60,cleanup)\n"
+            " try:\n"
+            "  fresh=event_admission(api,material,event,'pull_request',event['pull_request']['head']['sha'])\n"
+            "  _bind_consumer_route(event,'pull_request',event['pull_request']['head']['sha'],fresh)\n"
+            "  _require_consumer_current(api,event,'pull_request',event['pull_request']['head']['sha'])\n"
+            " finally: api.close()\n"
+            " record('CONTROL-consume')\n"
+            " outcome=os.environ['SYNTHETIC_OUTCOME']\n"
+            " if outcome in ('changed-api-failure','historical-api-failure'): raise QualificationError('synthetic_API_failed')\n"
+            " if outcome in ('changed-cleanup-failure','historical-cleanup-failure'): raise QualificationError('synthetic_cleanup_failed')\n"
+            " private=Path(os.environ['RUNNER_TEMP'])/'synthetic-registry-state'\n"
+            " if route=='unchanged_pr_published': private.write_text('synthetic config placeholder')\n"
+            " if outcome=='cleanup-failure': raise QualificationError('synthetic_owned_cleanup_failed')\n"
+            " if private.exists(): private.unlink()\n"
+            " record('CONTROL-cleanup')\n"
+            " if outcome=='consume-failure': raise QualificationError('synthetic_original_consumer_failed')\n"
+            " event=json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_bytes())\n"
+            " mode='unchanged_published' if route=='unchanged_pr_published' else route\n"
+            " admission={'mode':mode,'head':event['pull_request']['head']['sha'],'publisher_head':event['pull_request']['base']['sha'] if route=='unchanged_pr_published' else None}\n"
+            " selection={'manifest_digest':'sha256:'+ '1'*64,'config_digest':'sha256:'+ '2'*64,'source_revision':'3'*40,'runtime_ref':'synthetic@sha256:'+ '1'*64}\n"
+            " result={'admission':dict(admission),'selection':selection}\n"
+            " if outcome=='head-drift': admission['head']='f'*40\n"
+            " if outcome=='base-drift': admission['publisher_head']='f'*40\n"
+            " if outcome=='mode-drift': admission['mode']='changed_pr_candidate'\n"
+            " (work/'evidence').mkdir(parents=True)\n"
+            " raw=json.dumps({'admission':admission})\n"
+            " if outcome=='malformed-result': raw='{invalid'\n"
+            " if outcome!='missing-result': (work/'evidence/consumer.json').write_text(raw)\n"
+            " return result\n"
+            + (
+                "classify_source_change=None\n"
+                if environment["SYNTHETIC_OUTCOME"] == "unsupported-control"
+                else ""
+            )
+        ).encode()
+    )
+    helper.chmod(0o644)
+
+    def git(*args: str) -> str:
+        """Bind the synthetic fixed checkout through real isolated Git objects."""
+        completed = subprocess.run(
+            ["/usr/bin/git", *safe_git_config_args(), *args],
+            cwd=control,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return completed.stdout.strip()
+
+    git("init", "--template=", "-q")
+    git("config", "--local", "maintenance.auto", "false")
+    git("config", "--local", "gc.auto", "0")
+    git("add", "scripts/ci/prometheus_source_image.py")
+    git("commit", "-qm", "synthetic fixed control")
+    fixture_revision = git("rev-parse", "HEAD")
+    blob = git("rev-parse", "HEAD:scripts/ci/prometheus_source_image.py")
+    raw = helper.read_bytes()
+    rebound = tuple(
+        program.replace(revision, fixture_revision)
+        .replace(production_blob, blob)
+        .replace(str(len(production_bytes)), str(len(raw)))
+        .replace(
+            hashlib.sha256(production_bytes).hexdigest(),
+            hashlib.sha256(raw).hexdigest(),
+        )
+        for program in programs
+    )
+    variant = environment["SYNTHETIC_OUTCOME"]
+    if object_failure:
+        target = {
+            "changed-control-object": 0,
+            "changed-selector-control-object": 1,
+            "changed-consumer-control-object": 2,
+        }[variant]
+        native_object = f"100644 blob {blob}\\tscripts/ci/prometheus_source_image.py\\0"
+        assert rebound[target].count(native_object) == 1
+        rebound = tuple(
+            (
+                program.replace(native_object, native_object.replace(blob, "0" * 40))
+                if index == target
+                else program
+            )
+            for index, program in enumerate(rebound)
+        )
+    if variant.endswith("control-bytes"):
+        helper.write_text("raise SystemExit('malicious control must not execute')\n")
+    elif variant.endswith("control-mode"):
+        helper.chmod(0o755)
+    elif variant.endswith("control-symlink"):
+        original = helper.with_suffix(".saved")
+        helper.rename(original)
+        helper.symlink_to(original)
+    elif variant.endswith("control-ref"):
+        (control / "different.txt").write_text("different revision\n")
+        git("add", "different.txt")
+        git("commit", "-qm", "wrong control revision")
+    return rebound
+
+
+def _prometheus_cd_route_fixture(tmp_path: Path, variant: str) -> tuple[Path, dict[str, str]]:
+    """Real finite B/H Git data, with a separate ordinary PR startup canary."""
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    command_directory = tmp_path / "synthetic-bin"
+    command_directory.mkdir()
+    docker = command_directory / "docker"
+    docker.write_text(
+        f"#!{sys.executable}\n"
+        "import json,os,sys\nfrom pathlib import Path\n"
+        "commands={\n"
+        " ('version','--format','client={{json .Client.Version}} server={{json .Server.Version}}'):'DOCKER-version',\n"
+        " ('info','--format','driver={{json .Driver}} driver_status={{json .DriverStatus}} os={{json .OSType}} arch={{json .Architecture}}'):'DOCKER-info',\n"
+        "}\n"
+        "command=commands.get(tuple(sys.argv[1:]))\n"
+        "if command is None: raise SystemExit('unexpected_synthetic_docker_command')\n"
+        "with Path(os.environ['SYNTHETIC_TRACE']).open('a') as stream: stream.write(json.dumps(command)+'\\n')\n"
+        "if os.environ['SYNTHETIC_OUTCOME']=='metadata-failure': raise SystemExit('synthetic_docker_metadata_failed')\n"
+        "print('synthetic Docker metadata')\n"
+    )
+    docker.chmod(0o755)
+    environment = git_env_without_parent_state()
+    for key in (
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GHCR_READ_TOKEN",
+        "GHCR_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+        "DOCKER_CONFIG",
+        "DOCKER_AUTH_CONFIG",
+    ):
+        environment.pop(key, None)
+    environment.update(
+        {
+            "PATH": os.pathsep.join(
+                (str(command_directory), str(Path(sys.executable).parent), os.defpath)
+            ),
+            "HOME": str(tmp_path),
+            "LANG": "C",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_COUNT": "0",
+            "GIT_AUTHOR_NAME": "Synthetic Fixture",
+            "GIT_COMMITTER_NAME": "Synthetic Fixture",
+            "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
+            "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
+            "GITHUB_REPOSITORY": "Katsiarynakavaleuskaya/PulsePlate",
+            "GITHUB_EVENT_NAME": "pull_request",
+            "GITHUB_REF": "refs/pull/2477/merge",
+            "GITHUB_RUN_ID": "123",
+            "GITHUB_RUN_ATTEMPT": "1",
+            "RUNNER_TEMP": str(tmp_path),
+            "PROMETHEUS_CONSUME_SECONDS": "900",
+            "PROMETHEUS_CLEANUP_SECONDS": "120",
+            "SYNTHETIC_TRACE": str(tmp_path / "trace.jsonl"),
+            "SYNTHETIC_OUTCOME": variant,
+        }
+    )
+
+    def git(*arguments: str) -> str:
+        """Create only this fixture's bounded native B/H repository history."""
+        result = subprocess.run(
+            ["/usr/bin/git", *safe_git_config_args(), *arguments],
+            cwd=repository,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout.strip()
+
+    git("init", "--template=", "-q")
+    git("config", "--local", "maintenance.auto", "false")
+    git("config", "--local", "gc.auto", "0")
+    raw_paths = (*prometheus_source.PRODUCER_FILES, prometheus_source.MANIFEST_PATH)
+    files = {
+        raw_paths[0]: b"# synthetic unchanged material helper; never a credentialed executable\n",
+        raw_paths[1]: b"name: synthetic fixed producer recipe\n",
+        raw_paths[2]: b"# synthetic fixed Containerfile data\n",
+        raw_paths[3]: b'{"synthetic": "published"}',
+    }
+    for relative, raw in files.items():
+        path = repository / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(raw)
+        path.chmod(0o644)
+    (repository / "scripts/__init__.py").write_text("")
+    (repository / "scripts/ci/__init__.py").write_text("")
+    source_fault = re.fullmatch(r"(base|head)-source-([0-3])-(missing|mode|empty)", variant)
+
+    def source_fault_at(side: str) -> None:
+        """Keep each invalid native file attached to its intended B or H seam."""
+        if source_fault is None or source_fault[1] != side:
+            return
+        target = repository / raw_paths[int(source_fault[2])]
+        if source_fault[3] == "missing":
+            target.unlink()
+        elif source_fault[3] == "mode":
+            target.chmod(0o755)
+        else:
+            target.write_bytes(b"")
+
+    helper = repository / raw_paths[0]
+    manifest = repository / raw_paths[3]
+    if variant == "missing-helper":
+        helper.unlink()
+    if variant == "base-wrong-mode":
+        manifest.unlink()
+        manifest.symlink_to("untrusted-manifest")
+    source_fault_at("base")
+    git("add", ".")
+    git("commit", "-qm", "synthetic base")
+    base = git("rev-parse", "HEAD")
+    # Restore valid H prerequisites for every independent B-file negative.
+    for relative, raw in files.items():
+        path = repository / relative
+        if path.is_symlink():
+            path.unlink()
+        path.write_bytes(raw)
+        path.chmod(0o644)
+    changed = variant in {"changed", "wrong-mode", "manifest-and-helper"} or variant.startswith(
+        "changed-"
+    )
+    historical = variant.startswith("historical") or variant == "helper-recipe-drift"
+    if changed:
+        manifest.write_text('{"synthetic": "candidate"}')
+    if historical or variant == "manifest-and-helper":
+        helper.write_text(
+            "import json,os\nfrom pathlib import Path\n"
+            "with Path(os.environ['SYNTHETIC_TRACE']).open('a') as stream: stream.write(json.dumps('PR-helper-import')+'\\n')\n"
+            "if any(os.environ.get(key) for key in ('GH_TOKEN','GITHUB_TOKEN','GHCR_READ_TOKEN')): raise SystemExit('PR_credential_overlap')\n"
+        )
+    if variant in {"helper-recipe-drift", "recipe-only"}:
+        (repository / raw_paths[1]).write_text("name: synthetic changed recipe\n")
+    if variant == "wrong-mode":
+        manifest.unlink()
+        manifest.symlink_to("untrusted-manifest")
+    if variant == "executable-manifest":
+        manifest.chmod(0o755)
+    if variant == "missing-manifest":
+        manifest.unlink()
+    (repository / "scripts/__init__.py").write_text(
+        "import json,os\nfrom pathlib import Path\n"
+        "with Path(os.environ['SYNTHETIC_TRACE']).open('a') as stream: stream.write(json.dumps('PR-import')+'\\n')\n"
+        "if any(os.environ.get(key) for key in ('GH_TOKEN','GITHUB_TOKEN','GHCR_READ_TOKEN')): raise SystemExit('PR_credential_overlap')\n"
+    )
+    if variant != "unselected":
+        selected = repository / "deploy/systemd/synthetic-selected.txt"
+        selected.parent.mkdir(parents=True)
+        selected.write_text("synthetic selected OBS2A surface\n")
+    source_fault_at("head")
+    git("add", ".")
+    if variant == "submodule-manifest":
+        git("update-index", "--cacheinfo", "160000," + base + "," + raw_paths[3])
+    git("commit", "-qm", "synthetic PR")
+    head = git("rev-parse", "HEAD")
+    identity = {"id": 1043311030, "full_name": "Katsiarynakavaleuskaya/PulsePlate"}
+    event = {
+        "repository": identity,
+        "number": 2477,
+        "pull_request": {
+            "head": {"sha": head, "repo": dict(identity)},
+            "base": {"sha": base, "ref": "main", "repo": dict(identity)},
+        },
+    }
+    if variant == "fork":
+        event["pull_request"]["head"]["repo"]["id"] = 999
+    if variant == "bad-sha":
+        event["pull_request"]["base"]["sha"] = ""
+    if variant == "missing-object":
+        event["pull_request"]["head"]["sha"] = "f" * 40
+    event_file = tmp_path / "event.json"
+    event_file.write_text(json.dumps(event))
+    environment.update(
+        GITHUB_EVENT_PATH=str(event_file),
+        GITHUB_SHA="a" * 40,
+        GITHUB_WORKSPACE=str(repository),
+        OBS2A_BASE_SHA=base,
+        OBS2A_HEAD_SHA=head,
+    )
+    git("checkout", "--detach", "-q", base if variant == "wrong-checkout" else head)
+    return repository, environment
+
+
+def _run_prometheus_pr_selector(
+    repository: Path,
+    environment: dict[str, str],
+    step: dict[str, Any],
+    output: Path,
+    *,
+    budget: int,
+) -> subprocess.CompletedProcess[str]:
+    classified = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    environment.update(
+        PROMETHEUS_ROUTE_HEAD=classified["head"],
+        PROMETHEUS_ROUTE_BASE=classified["base"],
+        PROMETHEUS_CLASSIFIED_MODE=classified["mode"],
+        PROMETHEUS_SELECT_SECONDS="60",
+        ALERTMANAGER_JOB_TIMEOUT_MINUTES=str(budget),
+        ALERTMANAGER_GENERIC_NATIVE_MINUTES="40",
+        ALERTMANAGER_LINT_CHECK_MINUTES="60",
+    )
+    env = {
+        **environment,
+        "GH_TOKEN": "synthetic.ephemeral.reader",
+        "GITHUB_TOKEN": "synthetic.ephemeral.reader",
+    }
+    outcome = env["SYNTHETIC_OUTCOME"]
+    if outcome == "selector-registry-env":
+        env["GHCR_READ_TOKEN"] = "synthetic.registry.reader"
+    elif outcome == "selector-missing-api":
+        env.pop("GH_TOKEN")
+    elif outcome == "selector-small-budget":
+        env["ALERTMANAGER_JOB_TIMEOUT_MINUTES"] = "166"
+    elif outcome == "selector-coordinate-drift":
+        env["PROMETHEUS_ROUTE_BASE"] = "e" * 40
+    output.write_text("")
+    result = subprocess.run(
+        [sys.executable, "-I", "-S", "-c", _prometheus_cd_python(step)],
+        cwd=repository,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+    if result.returncode:
+        assert not output.read_bytes()
+    else:
+        admitted = dict(line.split("=", 1) for line in output.read_text().splitlines())
+        assert admitted["head"] == classified["head"] and admitted["base"] == classified["base"]
+        assert not (
+            Path(env["RUNNER_TEMP"]) / "prometheus-pr-selection-123-1/GitHub-private"
+        ).exists()
+        environment.update(
+            PROMETHEUS_ROUTE_HEAD=admitted["head"], PROMETHEUS_ROUTE_BASE=admitted["base"]
+        )
+    return result
+
+
+@pytest.mark.parametrize(
+    "variant,diagnostic",
+    [
+        ("changed", None),
+        ("unchanged", None),
+        ("historical", None),
+        ("manifest-and-helper", None),
+        ("recipe-only", None),
+        ("unchanged-candidate", None),
+        ("selector-consumer-drift", "consumer_route_binding"),
+        ("selector-base-retarget", "consumer_actual_open_PR"),
+        ("selector-head-drift", "consumer_actual_open_PR"),
+        ("selector-malformed", "GitHub_finite_page_count"),
+        ("selector-ambiguous", "publication_predecessor_publisher_ambiguous"),
+        ("selector-registry-env", "Prometheus_selection_credentials_HOLD"),
+        ("selector-coordinate-drift", "Prometheus_material_revision_HOLD"),
+        ("selector-api-error", "synthetic_selector_api"),
+        ("selector-api-and-cleanup-error", "synthetic_selector_api,synthetic_selector_cleanup"),
+        ("selector-missing-api", "Prometheus_selection_API_credential_HOLD"),
+        ("selector-cleanup-error", "synthetic_selector_cleanup"),
+        ("selector-private-remains", "Prometheus_selection_cleanup_HOLD"),
+        ("selector-small-budget", "Prometheus_selection_enclosing_budget_HOLD"),
+        ("changed-selector-control-object", "Prometheus_control_object_HOLD"),
+        ("metadata-failure", "synthetic_docker_metadata_failed"),
+        ("changed-control-bytes", "Prometheus_control_bytes_HOLD"),
+        ("changed-control-mode", "Prometheus_control_mode_HOLD"),
+        ("changed-control-symlink", "Prometheus_control_path_HOLD"),
+        ("changed-control-ref", "Prometheus_control_revision_HOLD"),
+        ("changed-control-object", "Prometheus_control_object_HOLD"),
+        ("changed-consumer-control-object", "Prometheus_control_object_HOLD"),
+        ("unsupported-control", "Prometheus_control_interface_HOLD"),
+        ("changed-api-failure", "synthetic_API_failed"),
+        ("changed-cleanup-failure", "synthetic_cleanup_failed"),
+        ("historical-api-failure", "synthetic_API_failed"),
+        ("historical-cleanup-failure", "synthetic_cleanup_failed"),
+        ("historical-registry-token", "Prometheus_candidate_registry_HOLD"),
+        ("classification-token", "Prometheus_classification_credential_HOLD"),
+        ("helper-recipe-drift", "source_change_recipe_drift"),
+        ("fork", "Prometheus_event_identity_HOLD"),
+        ("bad-sha", "Prometheus_event_identity_HOLD"),
+        ("missing-object", "Prometheus_git_object_HOLD"),
+        ("wrong-mode", "Prometheus_regular_blob_HOLD"),
+        ("executable-manifest", "Prometheus_regular_blob_HOLD"),
+        ("missing-manifest", "Prometheus_regular_blob_HOLD"),
+        ("submodule-manifest", "Prometheus_regular_blob_HOLD"),
+        ("base-wrong-mode", "Prometheus_regular_blob_HOLD"),
+        ("wrong-checkout", "Prometheus_checkout_binding_HOLD"),
+        ("missing-helper", "Prometheus_regular_blob_HOLD"),
+        ("unknown-mode", "Prometheus credential route HOLD"),
+        ("head-drift", "Prometheus_unchanged_admission_HOLD"),
+        ("base-drift", "Prometheus_unchanged_admission_HOLD"),
+        ("mode-drift", "Prometheus_unchanged_admission_HOLD"),
+        ("missing-result", "Prometheus_unchanged_result_HOLD"),
+        ("malformed-result", "JSONDecodeError"),
+        ("consume-failure", "synthetic_original_consumer_failed"),
+        ("cleanup-failure", "synthetic_owned_cleanup_failed"),
+        *[
+            (f"{side}-source-{index}-{fault}", "Prometheus_regular_blob_HOLD")
+            for side in ("base", "head")
+            for index in range(4)
+            for fault in ("missing", "mode")
+        ],
+        *[
+            (
+                f"{side}-source-{index}-empty",
+                "Prometheus_manifest_size_HOLD" if index == 3 else "Prometheus_source_size_HOLD",
+            )
+            for side in ("base", "head")
+            for index in range(4)
+        ],
+    ],
+)
+def test_prometheus_cd_classifies_before_pr_code_and_binds_trusted_handoff(
+    tmp_path: Path, variant: str, diagnostic: str | None
+) -> None:
+    """Actual isolated workflow/Git checks and canonical classifier; image consumer synthetic."""
+    repository, environment = _prometheus_cd_route_fixture(tmp_path, variant)
+    steps = {
+        step["name"]: step
+        for step in yaml.safe_load(CD_WORKFLOW_PATH.read_text())["jobs"][
+            "prometheus-image-security-pr"
+        ]["steps"]
+    }
+    output_file = tmp_path / "outputs"
+
+    def python_step(name: str) -> subprocess.CompletedProcess[str]:
+        """Execute the actual isolated workflow adapter with synthetic environment."""
+        output_file.write_text("")
+        environment["GITHUB_OUTPUT"] = str(output_file)
+        return subprocess.run(
+            [sys.executable, "-I", "-S", "-c", _prometheus_cd_python(steps[name])],
+            cwd=repository,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    result = python_step("Validate exact Prometheus checkout revisions")
+    mode: str | None = None
+    control_created = False
+    if result.returncode == 0:
+        event_outputs = dict(line.split("=", 1) for line in output_file.read_text().splitlines())
+        event = json.loads(Path(environment["GITHUB_EVENT_PATH"]).read_bytes())
+        assert event_outputs == {
+            "head": event["pull_request"]["head"]["sha"],
+            "base": event["pull_request"]["base"]["sha"],
+        }
+        environment.update(
+            PROMETHEUS_EVENT_HEAD=event_outputs["head"], PROMETHEUS_EVENT_BASE=event_outputs["base"]
+        )
+        classification = steps["Classify the fixed regular Prometheus source blobs"]
+        consumer = steps["Admit retained PR candidate or published immutable subject"]
+        selector = steps["Select authenticated Prometheus PR evidence"]
+        classification["run"], selector["run"], consumer["run"] = (
+            _synthetic_fixed_prometheus_control(
+                repository,
+                environment,
+                (classification["run"], selector["run"], consumer["run"]),
+                revision=steps["Checkout fixed trusted Prometheus control"]["with"]["ref"],
+            )
+        )
+        control_created = True
+        if variant == "classification-token":
+            environment["GH_TOKEN"] = "synthetic.forbidden.classifier.token"
+        result = python_step("Classify the fixed regular Prometheus source blobs")
+        environment.pop("GH_TOKEN", None)
+    if result.returncode == 0:
+        result = _run_prometheus_pr_selector(
+            repository, environment, selector, output_file, budget=170
+        )
+    if result.returncode == 0:
+        route = dict(line.split("=", 1) for line in output_file.read_text().splitlines())
+        mode = "unknown" if variant == "unknown-mode" else route["mode"]
+        if variant in {"changed", "manifest-and-helper"}:
+            assert mode == "changed_pr_candidate"
+        elif variant in {"historical", "unchanged-candidate", "selector-consumer-drift"}:
+            assert mode == "historical_pr_candidate"
+        elif variant == "unchanged":
+            assert mode == "unchanged_pr_published"
+        consumer_env = dict(
+            environment,
+            GH_TOKEN="synthetic.ephemeral.reader",
+            GITHUB_TOKEN="synthetic.ephemeral.reader",
+            GHCR_READ_TOKEN=(
+                "synthetic.registry.reader"
+                if mode == "unchanged_pr_published" or variant == "historical-registry-token"
+                else ""
+            ),
+            PROMETHEUS_CREDENTIAL_ROUTE=mode,
+        )
+        output_file.write_text("")
+        result = subprocess.run(
+            [
+                "/bin/bash",
+                "-c",
+                steps["Admit retained PR candidate or published immutable subject"]["run"],
+            ],
+            cwd=repository,
+            env=consumer_env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    if control_created:
+        cleanup = subprocess.run(
+            ["/bin/bash", "-c", steps["Remove fixed trusted Prometheus control checkout"]["run"]],
+            cwd=repository,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert cleanup.returncode == 0, cleanup.stderr
+        assert not (repository / "artifacts/orchestration/prometheus-control").exists()
+    trace = tmp_path / "trace.jsonl"
+    observed = (
+        [json.loads(line) for line in trace.read_text().splitlines()] if trace.exists() else []
+    )
+    assert "PR-import" not in observed and "PR-helper-import" not in observed
+    assert "synthetic.registry.reader" not in result.stdout + result.stderr
+    if variant in {
+        "changed-control-object",
+        "changed-selector-control-object",
+        "changed-consumer-control-object",
+    }:
+        marker = tmp_path / "control-imports"
+        imports = marker.read_text() if marker.exists() else ""
+        assert imports == (
+            "import\n"
+            * {
+                "changed-control-object": 0,
+                "changed-selector-control-object": 1,
+                "changed-consumer-control-object": 2,
+            }[variant]
+        )
+    if variant == "metadata-failure":
+        assert observed == [
+            "CONTROL-classify",
+            "CONTROL-select",
+            "CONTROL-selector-close",
+            "DOCKER-version",
+        ]
+        assert not (tmp_path / "synthetic-registry-state").exists()
+    if diagnostic is not None:
+        assert result.returncode != 0 and diagnostic in result.stderr
+        return
+    assert result.returncode == 0, result.stderr
+    assert observed == [
+        "CONTROL-classify",
+        "CONTROL-select",
+        "CONTROL-selector-close",
+        "DOCKER-version",
+        "DOCKER-info",
+        "CONTROL-consume",
+        "CONTROL-cleanup",
+    ]
+    values = dict(line.split("=", 1) for line in output_file.read_text().splitlines())
+    assert {"manifest_digest", "config_digest", "source_revision", "runtime_ref"} <= values.keys()
+    assert not (tmp_path / "synthetic-registry-state").exists()
+    startup = subprocess.run(
+        [sys.executable, "-c", "import scripts.ci.prometheus_source_image"],
+        cwd=repository,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert startup.returncode == 0, startup.stderr
+    observed = [json.loads(line) for line in trace.read_text().splitlines()]
+    assert observed.index("CONTROL-cleanup") < observed.index("PR-import")
+
+
+@pytest.mark.parametrize(
+    "variant,diagnostic",
+    [
+        ("changed", None),
+        ("unchanged", None),
+        ("historical", None),
+        ("manifest-and-helper", None),
+        ("recipe-only", None),
+        ("unchanged-candidate", None),
+        ("selector-consumer-drift", "consumer_route_binding"),
+        ("selector-base-retarget", "consumer_actual_open_PR"),
+        ("selector-head-drift", "consumer_actual_open_PR"),
+        ("selector-malformed", "GitHub_finite_page_count"),
+        ("selector-ambiguous", "publication_predecessor_publisher_ambiguous"),
+        ("selector-registry-env", "Prometheus_selection_credentials_HOLD"),
+        ("selector-coordinate-drift", "Prometheus_material_revision_HOLD"),
+        ("selector-api-error", "synthetic_selector_api"),
+        ("selector-api-and-cleanup-error", "synthetic_selector_api,synthetic_selector_cleanup"),
+        ("selector-missing-api", "Prometheus_selection_API_credential_HOLD"),
+        ("selector-cleanup-error", "synthetic_selector_cleanup"),
+        ("selector-private-remains", "Prometheus_selection_cleanup_HOLD"),
+        ("selector-small-budget", "Prometheus_selection_enclosing_budget_HOLD"),
+        ("changed-selector-control-object", "Prometheus_control_object_HOLD"),
+        ("unselected", None),
+        ("changed-control-bytes", "Prometheus_control_bytes_HOLD"),
+        ("changed-control-mode", "Prometheus_control_mode_HOLD"),
+        ("changed-control-symlink", "Prometheus_control_path_HOLD"),
+        ("changed-control-ref", "Prometheus_control_revision_HOLD"),
+        ("changed-control-object", "Prometheus_control_object_HOLD"),
+        ("changed-consumer-control-object", "Prometheus_control_object_HOLD"),
+        ("unsupported-control", "Prometheus_control_interface_HOLD"),
+        ("changed-api-failure", "synthetic_API_failed"),
+        ("changed-cleanup-failure", "synthetic_cleanup_failed"),
+        ("historical-api-failure", "synthetic_API_failed"),
+        ("historical-cleanup-failure", "synthetic_cleanup_failed"),
+        ("historical-registry-token", "Prometheus_candidate_registry_HOLD"),
+        ("classification-token", "Prometheus_classification_credential_HOLD"),
+        ("unknown-mode", "Prometheus_credential_route_HOLD"),
+        ("head-drift", "Prometheus_unchanged_admission_HOLD"),
+        ("base-drift", "Prometheus_unchanged_admission_HOLD"),
+        ("mode-drift", "Prometheus_unchanged_admission_HOLD"),
+        ("missing-result", "Prometheus_unchanged_result_HOLD"),
+        ("malformed-result", "JSONDecodeError"),
+        ("material-head-drift", "Prometheus_material_revision_HOLD"),
+        ("wrong-event", "Prometheus_material_revision_HOLD"),
+        ("classification-wrong-event", "Prometheus_event_identity_HOLD"),
+    ],
+)
+def test_prometheus_ci_trusted_control_precedes_first_pr_import(
+    tmp_path: Path, variant: str, diagnostic: str | None
+) -> None:
+    repository, environment = _prometheus_cd_route_fixture(tmp_path, variant)
+    event = json.loads(Path(environment["GITHUB_EVENT_PATH"]).read_bytes())
+    steps = {
+        step["name"]: step
+        for step in yaml.safe_load((REPO_ROOT / ".github/workflows/ci.yml").read_text())["jobs"][
+            "lint"
+        ]["steps"]
+        if "name" in step
+    }
+    output = tmp_path / "outputs"
+    environment.update(
+        GITHUB_OUTPUT=str(output),
+        PROMETHEUS_EVENT_HEAD=event["pull_request"]["head"]["sha"],
+        PROMETHEUS_EVENT_BASE=event["pull_request"]["base"]["sha"],
+    )
+    output.write_text("")
+    selected = subprocess.run(
+        ["/bin/bash", "-c", steps["Select native OBS2A material before PR startup"]["run"]],
+        cwd=repository,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert selected.returncode == 0, selected.stderr
+    assert output.read_text() == (
+        "selected=false\n" if variant == "unselected" else "selected=true\n"
+    )
+    if variant == "unselected":
+        assert not (repository / "artifacts/orchestration/prometheus-control").exists()
+        return
+    classification = steps["Classify the fixed regular Prometheus source blobs"]
+    consumer = steps["Consume exact Prometheus subject before PR startup"]
+    selector = steps["Select authenticated Prometheus PR evidence"]
+    classification["run"], selector["run"], consumer["run"] = _synthetic_fixed_prometheus_control(
+        repository,
+        environment,
+        (classification["run"], selector["run"], consumer["run"]),
+        revision=steps["Checkout fixed trusted Prometheus control"]["with"]["ref"],
+    )
+    output.write_text("")
+    if variant == "classification-token":
+        environment["GH_TOKEN"] = "synthetic.forbidden.classifier.token"
+    if variant == "classification-wrong-event":
+        environment["GITHUB_EVENT_NAME"] = "push"
+    result = subprocess.run(
+        ["/bin/bash", "-c", classification["run"]],
+        cwd=repository,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    environment.pop("GH_TOKEN", None)
+    if result.returncode == 0:
+        result = _run_prometheus_pr_selector(repository, environment, selector, output, budget=190)
+    if result.returncode == 0:
+        route = dict(line.split("=", 1) for line in output.read_text().splitlines())["mode"]
+        expected = (
+            "historical_pr_candidate"
+            if variant.startswith("historical")
+            or variant in {"unchanged-candidate", "selector-consumer-drift"}
+            else (
+                "changed_pr_candidate"
+                if variant in {"changed", "manifest-and-helper"} or variant.startswith("changed-")
+                else "unchanged_pr_published"
+            )
+        )
+        assert route == expected
+        if variant == "unknown-mode":
+            route = "unknown"
+        if variant == "material-head-drift":
+            subprocess.run(
+                [
+                    "/usr/bin/git",
+                    *safe_git_config_args(),
+                    "checkout",
+                    "--detach",
+                    "-q",
+                    event["pull_request"]["base"]["sha"],
+                ],
+                cwd=repository,
+                env=environment,
+                capture_output=True,
+                check=True,
+            )
+        if variant == "wrong-event":
+            environment["GITHUB_EVENT_NAME"] = "push"
+        credentials = dict(
+            environment,
+            GH_TOKEN="synthetic.ephemeral.reader",
+            GITHUB_TOKEN="synthetic.ephemeral.reader",
+            GHCR_READ_TOKEN=(
+                "synthetic.registry.reader"
+                if route == "unchanged_pr_published" or variant == "historical-registry-token"
+                else ""
+            ),
+            PROMETHEUS_CREDENTIAL_ROUTE=route,
+        )
+        output.write_text("")
+        result = subprocess.run(
+            ["/bin/bash", "-c", consumer["run"]],
+            cwd=repository,
+            env=credentials,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    cleanup = subprocess.run(
+        ["/bin/bash", "-c", steps["Remove fixed trusted Prometheus control checkout"]["run"]],
+        cwd=repository,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert cleanup.returncode == 0, cleanup.stderr
+    assert not (repository / "artifacts/orchestration/prometheus-control").exists()
+    trace = tmp_path / "trace.jsonl"
+    observed = (
+        [json.loads(line) for line in trace.read_text().splitlines()] if trace.exists() else []
+    )
+    assert "PR-import" not in observed and "PR-helper-import" not in observed
+    assert "synthetic.ephemeral.reader" not in result.stdout + result.stderr
+    if variant in {
+        "changed-control-object",
+        "changed-selector-control-object",
+        "changed-consumer-control-object",
+    }:
+        marker = tmp_path / "control-imports"
+        imports = marker.read_text() if marker.exists() else ""
+        assert imports == (
+            "import\n"
+            * {
+                "changed-control-object": 0,
+                "changed-selector-control-object": 1,
+                "changed-consumer-control-object": 2,
+            }[variant]
+        )
+    if diagnostic is not None:
+        assert result.returncode != 0 and diagnostic in result.stderr
+        return
+    assert result.returncode == 0, result.stderr
+    assert observed == [
+        "CONTROL-classify",
+        "CONTROL-select",
+        "CONTROL-selector-close",
+        "CONTROL-consume",
+        "CONTROL-cleanup",
+    ]
+    names = list(steps)
+    assert (
+        names.index("Remove fixed trusted Prometheus control checkout")
+        < names.index("Restore lint workflow revision")
+        < names.index("Verify lint workflow revision")
+        < names.index("Setup Python environment")
+    )
+    assert steps["Restore lint workflow revision"]["with"] == {
+        "ref": "${{ github.sha }}",
+        "fetch-depth": 0,
+        "persist-credentials": False,
+        "clean": False,
+    }
+    assert 'test "$restored_sha" = "$GITHUB_SHA"' in steps["Verify lint workflow revision"]["run"]
+    startup = subprocess.run(
+        [sys.executable, "-c", "import scripts.ci.prometheus_source_image"],
+        cwd=repository,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert startup.returncode == 0, startup.stderr
+    observed = [json.loads(line) for line in trace.read_text().splitlines()]
+    assert observed.index("CONTROL-cleanup") < observed.index("PR-import")
+
+
+def test_prometheus_cd_git_fixture_preserves_separate_inherited_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "synthetic-parent"
+    parent.mkdir()
+    environment = git_env_without_parent_state()
+    environment.update(
+        HOME=str(tmp_path),
+        GIT_AUTHOR_NAME="Synthetic Parent",
+        GIT_COMMITTER_NAME="Synthetic Parent",
+        GIT_AUTHOR_EMAIL="parent@example.invalid",
+        GIT_COMMITTER_EMAIL="parent@example.invalid",
+    )
+
+    def git(*arguments: str) -> bytes:
+        return subprocess.run(
+            ["/usr/bin/git", *safe_git_config_args(), *arguments],
+            cwd=parent,
+            env=environment,
+            capture_output=True,
+            check=True,
+        ).stdout
+
+    git("init", "-q")
+    (parent / "kept.txt").write_text("synthetic parent must remain unchanged")
+    git("add", "kept.txt")
+    git("commit", "-qm", "synthetic parent")
+    git("config", "--local", "fixture.sentinel", "keep-parent-config")
+    protected = {
+        name: (parent / ".git" / name).read_bytes() for name in ("HEAD", "config", "index")
+    }
+    head = git("rev-parse", "HEAD")
+    for key, value in {
+        "GIT_DIR": str(parent / ".git"),
+        "GIT_WORK_TREE": str(parent),
+        "GIT_INDEX_FILE": str(parent / ".git" / "index"),
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "core.hooksPath",
+        "GIT_CONFIG_VALUE_0": str(parent / "synthetic-unreachable-hooks"),
+    }.items():
+        monkeypatch.setenv(key, value)
+    child = tmp_path / "synthetic-child"
+    child.mkdir()
+    test_prometheus_cd_classifies_before_pr_code_and_binds_trusted_handoff(child, "unchanged", None)
+    assert git("rev-parse", "HEAD") == head
+    assert {name: (parent / ".git" / name).read_bytes() for name in protected} == protected
+
+
+@pytest.mark.parametrize(
+    "event_name,reference,admitted",
+    [
+        ("push", "refs/heads/main", True),
+        ("push", "refs/tags/v1.2.3", True),
+        ("schedule", "refs/heads/main", True),
+        ("workflow_dispatch", "refs/heads/main", False),
+        ("push", "refs/heads/foreign", False),
+        ("schedule", "refs/tags/v1.2.3", False),
+    ],
+)
+def test_prometheus_cd_preserves_closed_non_pr_checkout_events(
+    tmp_path: Path, event_name: str, reference: str, admitted: bool
+) -> None:
+    """The shared non-PR classifier never dereferences a PR-only fixed checkout."""
+    steps = yaml.safe_load(CD_WORKFLOW_PATH.read_text())["jobs"]["prometheus-image-security-pr"][
+        "steps"
+    ]
+    validator = next(
+        item for item in steps if item["name"] == "Validate exact Prometheus checkout revisions"
+    )
+    classifier = next(
+        item
+        for item in steps
+        if item["name"] == "Classify the fixed regular Prometheus source blobs"
+    )
+    environment = git_env_without_parent_state()
+    for key in (
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GHCR_READ_TOKEN",
+        "GHCR_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+        "DOCKER_CONFIG",
+        "DOCKER_AUTH_CONFIG",
+    ):
+        environment.pop(key, None)
+    environment.update(
+        {
+            "HOME": str(tmp_path),
+            "PATH": os.defpath,
+            "LANG": "C",
+            "GIT_AUTHOR_NAME": "Synthetic Fixture",
+            "GIT_COMMITTER_NAME": "Synthetic Fixture",
+            "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
+            "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
+        }
+    )
+
+    def git(*arguments: str) -> str:
+        """Supply a real trusted event commit without any PR-only control files."""
+        completed = subprocess.run(
+            ["/usr/bin/git", *safe_git_config_args(), *arguments],
+            cwd=tmp_path,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return completed.stdout.strip()
+
+    git("init", "--template=", "-q")
+    git("config", "--local", "maintenance.auto", "false")
+    git("config", "--local", "gc.auto", "0")
+    (tmp_path / "material.txt").write_text("synthetic trusted published material")
+    git("add", "material.txt")
+    git("commit", "-qm", "synthetic trusted event")
+    head = git("rev-parse", "HEAD")
+    event_file, output = tmp_path / "event.json", tmp_path / "outputs"
+    output.write_text("")
+    event_file.write_text(
+        json.dumps(
+            {
+                "repository": {"id": 1043311030, "full_name": "Katsiarynakavaleuskaya/PulsePlate"},
+                "ref": reference,
+            }
+        )
+    )
+    environment.update(
+        GITHUB_REPOSITORY="Katsiarynakavaleuskaya/PulsePlate",
+        GITHUB_EVENT_PATH=str(event_file),
+        GITHUB_EVENT_NAME=event_name,
+        GITHUB_REF=reference,
+        GITHUB_SHA=head,
+        GITHUB_OUTPUT=str(output),
+        GITHUB_WORKSPACE=str(tmp_path),
+    )
+    result = subprocess.run(
+        [sys.executable, "-I", "-S", "-c", _prometheus_cd_python(validator)],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if admitted:
+        assert result.returncode == 0, result.stderr
+        assert dict(line.split("=", 1) for line in output.read_text().splitlines()) == {
+            "head": head,
+            "base": head,
+        }
+        environment.update(PROMETHEUS_EVENT_HEAD=head, PROMETHEUS_EVENT_BASE=head)
+        output.write_text("")
+        result = subprocess.run(
+            [sys.executable, "-I", "-S", "-c", _prometheus_cd_python(classifier)],
+            cwd=tmp_path,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        assert dict(line.split("=", 1) for line in output.read_text().splitlines()) == {
+            "mode": "trusted_published",
+            "head": head,
+            "base": head,
+        }
+        assert not (tmp_path / "artifacts/orchestration/prometheus-control").exists()
+    else:
+        assert result.returncode != 0 and "Prometheus_event_identity_HOLD" in result.stderr
+        assert output.read_bytes() == b""
+
+
+@pytest.mark.parametrize(
+    "fault",
+    (
+        "none",
+        "extra",
+        "missing",
+        "duplicate",
+        "wrong-purl",
+        "wrong-target",
+        "wrong-severity",
+        "secret",
+    ),
+)
+def test_alertmanager_cd_consumes_unsuppressed_inventory_without_extra_findings(
+    tmp_path: Path, fault: str
+) -> None:
+    admitted = (
+        ("CVE-2026-84445", "pkg:golang/google.golang.org/grpc@v1.83.1"),
+        ("CVE-2026-78669", "pkg:golang/golang.org/x/net@v0.58.0"),
+        ("CVE-2026-78669", "pkg:golang/stdlib@v1.26.8"),
+        ("CVE-2026-78667", "pkg:golang/stdlib@v1.26.8"),
+        ("CVE-2026-97031", "pkg:golang/stdlib@v1.26.8"),
+    )
+    results = [
+        {
+            "Target": target,
+            "Vulnerabilities": [
+                {"VulnerabilityID": cve, "PkgIdentifier": {"PURL": purl}, "Severity": "HIGH"}
+                for cve, purl in admitted
+            ],
+        }
+        for target in ("bin/alertmanager", "bin/amtool")
+    ]
+    if fault == "extra":
+        results[0]["Vulnerabilities"].append(
+            {
+                "VulnerabilityID": "CVE-2026-99999",
+                "PkgIdentifier": {"PURL": "pkg:golang/example@v1"},
+                "Severity": "HIGH",
+            }
+        )
+    elif fault == "missing":
+        results[0]["Vulnerabilities"].pop()
+    elif fault == "duplicate":
+        results[0]["Vulnerabilities"].append(results[0]["Vulnerabilities"][0].copy())
+    elif fault == "wrong-purl":
+        results[0]["Vulnerabilities"][0]["PkgIdentifier"] = {
+            "PURL": "pkg:golang/google.golang.org/grpc@v1.83.0"
+        }
+    elif fault == "wrong-target":
+        results[0]["Target"] = "bin/unadmitted"
+    elif fault == "wrong-severity":
+        results[0]["Vulnerabilities"][0]["Severity"] = "CRITICAL"
+    elif fault == "secret":
+        results[0]["Secrets"] = [{"Match": "synthetic-sensitive-body"}]
+    del tmp_path
+    for row in results:
+        row.update(
+            {
+                "Class": "lang-pkgs",
+                "Type": "gobinary",
+                "Packages": [{"Name": "synthetic", "Version": "1"}],
+            }
+        )
+    report = {
+        "ArtifactType": "container_image",
+        "Metadata": {"ImageID": alertmanager_source._ALERT_OLD_RUNTIME_CONFIG},
+        "Results": results,
+    }
+    if fault == "none":
+        observed = alertmanager_source._alertmanager_vulnerability_control(
+            report, alertmanager_source._ALERT_OLD_RUNTIME_CONFIG
+        )
+        assert observed["known_HIGH_occurrences"] == 10
+    else:
+        with pytest.raises(
+            RuntimeError,
+            match="AM_(vulnerable_control_result|known_vulnerable_control_inventory_changed_HOLD)",
+        ) as observed:
+            alertmanager_source._alertmanager_vulnerability_control(
+                report, alertmanager_source._ALERT_OLD_RUNTIME_CONFIG
+            )
+        assert "synthetic-sensitive-body" not in str(observed.value)
+
+
+def test_prometheus_config_has_one_private_exact_target() -> None:
+    config = yaml.safe_load(PROMETHEUS_CONFIG_PATH.read_text(encoding="utf-8"))
+    assert config == {
+        "global": {
+            "scrape_interval": "30s",
+            "scrape_timeout": "10s",
+            "evaluation_interval": "30s",
+            "external_labels": {"environment": "${PULSEPLATE_ENVIRONMENT}"},
+        },
+        "alerting": {"alertmanagers": [{"static_configs": [{"targets": ["alertmanager:9093"]}]}]},
+        "rule_files": ["/etc/prometheus/alias-alerts.yml"],
+        "scrape_configs": [
+            {
+                "job_name": "pulseplate-api",
+                "scheme": "http",
+                "metrics_path": "/metrics",
+                "http_headers": {
+                    "X-API-Key": {"files": ["/run/secrets/pulseplate_metrics_scrape_key"]}
+                },
+                "static_configs": [{"targets": ["app:8000"]}],
+                "metric_relabel_configs": [{"action": "labeldrop", "regex": "^environment$"}],
+            }
+        ],
+    }
+    config_text = PROMETHEUS_CONFIG_PATH.read_text(encoding="utf-8")
+    for forbidden in (
+        "remote_write",
+        "remote_read",
+        "storage.tsdb.retention",
+        "web.enable-lifecycle",
+        "web.enable-admin-api",
+        "otlp",
+    ):
+        assert forbidden not in config_text
+
+
+def test_alias_alert_rules_bind_the_exact_target_and_closed_routes() -> None:
+    payload = yaml.safe_load(PROMETHEUS_RULES_PATH.read_text(encoding="utf-8"))
+    groups = payload["groups"]
+    assert len(groups) == 1
+    rules = groups[0]["rules"]
+    assert [rule["alert"] for rule in rules] == [
+        "PulsePlateMetricsTargetMissing",
+        "PulsePlateMetricsTargetDown",
+        "PulsePlateAliasBmrSeedMissing",
+        "PulsePlateAliasTargetsSeedMissing",
+        "PulsePlateAliasPlateSeedMissing",
+        "PulsePlateAliasGapsSeedMissing",
+        "PulsePlateAliasRecentPost",
+    ]
+    for rule in rules:
+        assert 'job="pulseplate-api",instance="app:8000"' in rule["expr"]
+    assert [rule["for"] for rule in rules[:6]] == ["2m", "2m", "5m", "5m", "5m", "5m"]
+    assert "for" not in rules[6]
+    for rule, route in zip(rules[2:6], ("bmr", "targets", "plate", "gaps")):
+        assert f'route="/api/v1/premium/{route}",status="200"' in rule["expr"]
+        assert 'up{job="pulseplate-api",instance="app:8000"} == 1' in rule["expr"]
+    recent = rules[6]["expr"]
+    assert 'route=~"/api/v1/premium/(bmr|targets|plate|gaps)"' in recent
+    assert "increase(" in recent and "offset 15m" in recent
+    assert recent.count("max_over_time(") == 1
+    assert "max_over_time(http_requests_total{" in recent
+    assert "}[15m]) > 0)\n  unless" in recent
+
+
+def test_cd_alias_rules_use_native_promtool_and_both_staging_hash_passes() -> None:
+    workflow_text = CD_WORKFLOW_PATH.read_text(encoding="utf-8")
+    workflow = yaml.safe_load(workflow_text)
+    security_steps = workflow["jobs"]["prometheus-image-security-pr"]["steps"]
+    config_step = next(
+        step
+        for step in security_steps
+        if step.get("name") == "Check canonical Prometheus config with exact-image promtool"
+    )
+    promtool_runs = config_step["run"].split("docker run --rm")
+    assert len(promtool_runs) == 4
+    tmpfs = "--tmpfs /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777"
+    assert tmpfs not in promtool_runs[1]
+    assert tmpfs not in promtool_runs[2]
+    assert tmpfs in promtool_runs[3]
+    for required in (
+        "--user 65532:65532",
+        "--network none",
+        "--read-only",
+        "--cap-drop ALL",
+        "--security-opt no-new-privileges:true",
+        "test rules /etc/prometheus/alias-alerts.test.yml",
+    ):
+        assert required in promtool_runs[3]
+    assert "check config /etc/prometheus/prometheus.yml" in workflow_text
+    assert "check rules /etc/prometheus/alias-alerts.yml" in workflow_text
+    assert "test rules /etc/prometheus/alias-alerts.test.yml" in workflow_text
+    assert "check config --syntax-only" not in workflow_text
+    assert "prometheus_rules_sha256=$(sha256sum deploy/prometheus/alias-alerts.yml" in workflow_text
+    assert (
+        workflow_text.count(
+            "PROMETHEUS_RULES_SHA256: ${{ steps.staging-contract.outputs.prometheus_rules_sha256 }}"
+        )
+        == 2
+    )
+    assert workflow_text.count("[ ! -L ./prometheus/alias-alerts.yml ]") == 2
+    assert workflow_text.count('= "$PROMETHEUS_RULES_SHA256" ]') == 2
+    members = (
+        "deploy/postgres-pgvector/image-manifest.json",
+        "deploy/prometheus/alias-alerts.yml",
+        "deploy/alertmanager/alertmanager.yml",
+        "deploy/alertmanager/trivy-ignore.yaml",
+        *CHECKPOINT_PATHS,
+    )
+    expected_archive = "".join("            " + member + " \\\n" for member in members[:-1])
+    expected_archive += "            " + members[-1] + "\n"
+    assert expected_archive in workflow_text
+
+
+@pytest.mark.parametrize(
+    ("variant", "expected"),
+    (
+        ("crossed-environment", "Prometheus environment must be one literal contour value"),
+        ("duplicate-environment", "Prometheus environment must be one literal contour value"),
+        ("missing-labeldrop", "Prometheus configuration differs from the admitted complete file"),
+        ("rule-shadow", "Prometheus rules differ from the admitted complete file"),
+        ("wrong-image", "Raw Alertmanager image must use the admitted platform digest"),
+        (
+            "extra-recipient",
+            "Alertmanager route and sole recipient are not the exact reviewed config",
+        ),
+        (
+            "extra-webhook",
+            "Alertmanager route and sole recipient are not the exact reviewed config",
+        ),
+        (
+            "inline-password",
+            "Alertmanager route and sole recipient are not the exact reviewed config",
+        ),
+        (
+            "config-line-drift",
+            "Alertmanager route and sole recipient are not the exact reviewed config",
+        ),
+    ),
+)
+def test_staging_alertmanager_admission_rejects_forged_contract_before_product_mutation(
+    tmp_path: Path, variant: str, expected: str
+) -> None:
+    env, log_file = _staging_deploy_fixture(tmp_path)
+    project = Path(env["PROJECT_DIR"])
+    compose = project / "docker-compose.staging.yaml"
+    if variant in {"crossed-environment", "duplicate-environment", "wrong-image"}:
+        text = compose.read_text(encoding="utf-8")
+        if variant == "crossed-environment":
+            text = text.replace(
+                "PULSEPLATE_ENVIRONMENT=staging", "PULSEPLATE_ENVIRONMENT=production"
+            )
+        elif variant == "duplicate-environment":
+            text = text.replace(
+                "- PULSEPLATE_ENVIRONMENT=staging",
+                "- PULSEPLATE_ENVIRONMENT=staging\n      - PULSEPLATE_ENVIRONMENT=staging",
+            )
+        else:
+            text = text.replace(ALERTMANAGER_RUNTIME_REF, "prom/alertmanager:latest")
+        compose.write_text(text, encoding="utf-8")
+    elif variant == "missing-labeldrop":
+        config = project / "prometheus/prometheus.yml"
+        config.write_text(
+            config.read_text(encoding="utf-8").replace(
+                "    metric_relabel_configs:\n      - action: labeldrop\n        regex: ^environment$\n",
+                "",
+            ),
+            encoding="utf-8",
+        )
+    elif variant == "rule-shadow":
+        rules = project / "prometheus/alias-alerts.yml"
+        rules.write_text(
+            rules.read_text(encoding="utf-8") + "\n      environment: attacker\n",
+            encoding="utf-8",
+        )
+    else:
+        config = project / "alertmanager/alertmanager.yml"
+        config_text = config.read_text(encoding="utf-8")
+        if variant == "inline-password":
+            config_text = config_text.replace(
+                "  smtp_auth_password_file: /run/secrets/alertmanager_smtp_key\n",
+                "  smtp_auth_password_file: /run/secrets/alertmanager_smtp_key\n"
+                "  smtp_auth_password: synthetic-only\n",
+            )
+        elif variant == "config-line-drift":
+            config_text = config_text.replace(
+                "PulsePlate alert {{ .CommonLabels.alertname }}",
+                "PulsePlate changed alert {{ .CommonLabels.alertname }}",
+            )
+        else:
+            config_text += {
+                "extra-recipient": "\n      - to: attacker@example.invalid\n",
+                "extra-webhook": "\n    webhook_configs:\n      - url: https://attacker.example.invalid/notify\n",
+            }[variant]
+        config.write_text(config_text, encoding="utf-8")
+    result = subprocess.run(
+        [
+            str(_historical_deploy_script("scripts/deploy.sh")),
+            "--preflight-only",
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64,
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64,
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert expected in result.stderr
+    if log_file.exists():
+        assert all(
+            " pull " not in line and " stop " not in line and " up " not in line
+            for line in log_file.read_text(encoding="utf-8").splitlines()
+        )
+
+
+def test_staging_alertmanager_off_profile_needs_no_smtp_file(tmp_path: Path) -> None:
+    env, _log_file = _staging_deploy_fixture(tmp_path)
+    env.pop("COMPOSE_PROFILES", None)
+    assert not (Path(env["PROJECT_DIR"]) / "secrets/alertmanager_smtp_key").exists()
+    result = subprocess.run(
+        [
+            str(_historical_deploy_script("scripts/deploy.sh")),
+            "--preflight-only",
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64,
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64,
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("profiles", ["alerting", "scheduler-external, alerting", " alerting"])
+def test_staging_selected_alertmanager_requires_smtp_metadata(
+    tmp_path: Path, profiles: str
+) -> None:
+    env, log_file = _staging_deploy_fixture(tmp_path)
+    env["COMPOSE_PROFILES"] = profiles
+    result = subprocess.run(
+        [
+            str(_historical_deploy_script("scripts/deploy.sh")),
+            "--preflight-only",
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64,
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64,
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "Selected Alertmanager requires a regular non-symlink SMTP key" in result.stderr
+    if log_file.exists():
+        assert all(
+            " pull " not in line and " stop " not in line
+            for line in log_file.read_text().splitlines()
+        )
+
+
+@pytest.mark.parametrize("profiles", ["alerting", "scheduler-external, alerting", " alerting"])
+def test_staging_selected_alertmanager_accepts_compose_owned_readable_file(
+    tmp_path: Path, profiles: str
+) -> None:
+    env, _log_file = _staging_deploy_fixture(tmp_path)
+    key = Path(env["PROJECT_DIR"]) / "secrets/alertmanager_smtp_key"
+    key.write_text("synthetic-only", encoding="ascii")
+    key.chmod(0o444)
+    env["COMPOSE_PROFILES"] = profiles
+    result = subprocess.run(
+        [
+            str(_historical_deploy_script("scripts/deploy.sh")),
+            "--preflight-only",
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64,
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64,
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "old", "new", "expected"),
+    (
+        (
+            "prometheus/prometheus.yml",
+            "alertmanager:9093",
+            "alertmanager:9094",
+            "Prometheus configuration differs from the admitted complete file",
+        ),
+        (
+            "prometheus/prometheus.yml",
+            "metric_relabel_configs:",
+            "metric_relabel_configs:\n      - action: labeldrop\n        regex: ^other$",
+            "Prometheus configuration differs from the admitted complete file",
+        ),
+        (
+            "prometheus/alias-alerts.yml",
+            "      labels:",
+            "      labels:\n        environment: attacker",
+            "Prometheus rules differ from the admitted complete file",
+        ),
+        (
+            "alertmanager/trivy-ignore.yaml",
+            "vulnerabilities: []",
+            "vulnerabilities: [{id: CVE-2099-00000}]",
+            "Alertmanager Trivy policy differs from the admitted complete file",
+        ),
+        (
+            "alertmanager/trivy-ignore.yaml",
+            "vulnerabilities: []",
+            "vulnerabilities: []\nunknown: true",
+            "Alertmanager Trivy policy differs from the admitted complete file",
+        ),
+    ),
+)
+def test_staging_alertmanager_complete_file_admission_rejects_drift_before_pull(
+    tmp_path: Path, relative_path: str, old: str, new: str, expected: str
+) -> None:
+    env, log_file = _staging_deploy_fixture(tmp_path)
+    path = Path(env["PROJECT_DIR"]) / relative_path
+    original = path.read_text(encoding="utf-8")
+    assert old in original
+    path.write_text(original.replace(old, new, 1), encoding="utf-8")
+    completed = subprocess.run(
+        [
+            str(_historical_deploy_script("scripts/deploy.sh")),
+            "--preflight-only",
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64,
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64,
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode != 0
+    assert expected in completed.stderr
+    assert all(
+        " pull " not in line and " up " not in line for line in log_file.read_text().splitlines()
+    )
+
+
+@pytest.mark.parametrize(
+    ("service_name", "fault", "expected"),
+    (
+        ("worker", "egress", "SMTP egress leaked to another service"),
+        ("unreviewed", "egress", "SMTP egress leaked to another service"),
+        ("unreviewed", "secret", "SMTP secret leaked to another service"),
+        ("unreviewed", "alias-secret", "SMTP secret leaked to another service"),
+        ("worker", "network-mode", "Another service may not share Alertmanager network namespace"),
+        ("worker", "bind-source", "SMTP key bind mount leaked to another service"),
+        ("worker", "bind-target", "SMTP key bind mount leaked to another service"),
+        (
+            "alertmanager",
+            "internal-egress",
+            "SMTP egress must be a non-internal, non-external bridge",
+        ),
+        (
+            "alertmanager",
+            "external-egress",
+            "SMTP egress must be a non-internal, non-external bridge",
+        ),
+    ),
+)
+def test_staging_all_profile_alertmanager_security_denies_forged_service_or_network(
+    tmp_path: Path, service_name: str, fault: str, expected: str
+) -> None:
+    env, log_file = _staging_deploy_fixture(tmp_path)
+    payload = json.loads(env["STUB_PROMETHEUS_COMPOSE_JSON"])
+    if fault == "internal-egress":
+        payload["networks"]["smtp-egress"]["internal"] = True
+    elif fault == "external-egress":
+        payload["networks"]["smtp-egress"]["external"] = True
+    else:
+        service = payload["services"].setdefault(service_name, {})
+        if fault == "egress":
+            service["networks"] = {"smtp-egress": {}}
+        elif fault == "network-mode":
+            service.pop("networks", None)
+            service["network_mode"] = "service:alertmanager"
+        elif fault in {"bind-source", "bind-target"}:
+            service["volumes"] = [
+                {
+                    "type": "bind",
+                    "source": (
+                        str(Path(env["PROJECT_DIR"]) / "secrets/alertmanager_smtp_key")
+                        if fault == "bind-source"
+                        else str(tmp_path / "unrelated")
+                    ),
+                    "target": (
+                        "/run/secrets/alertmanager_smtp_key"
+                        if fault == "bind-target"
+                        else "/run/secrets/other"
+                    ),
+                    "read_only": True,
+                }
+            ]
+        elif fault == "alias-secret":
+            payload["secrets"]["alias"] = {
+                "file": str(Path(env["PROJECT_DIR"]) / "secrets/alertmanager_smtp_key")
+            }
+            service["secrets"] = [{"source": "alias", "target": "/run/secrets/alias"}]
+        else:
+            service["secrets"] = [{"source": "alertmanager_smtp_key"}]
+    env["STUB_PROMETHEUS_COMPOSE_JSON"] = json.dumps(payload)
+    completed = subprocess.run(
+        [
+            str(_historical_deploy_script("scripts/deploy.sh")),
+            "--preflight-only",
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64,
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64,
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode != 0
+    assert expected in completed.stderr
+    log = log_file.read_text().splitlines()
+    assert any(line.endswith("--profile * config --format json") for line in log)
+    assert all(" pull " not in line and " up " not in line for line in log)
+
+
+@pytest.mark.parametrize("profiles", ["alerting", "scheduler-external, alerting", " alerting"])
+def test_staging_selected_alertmanager_key_must_be_nonempty(tmp_path: Path, profiles: str) -> None:
+    env, log_file = _staging_deploy_fixture(tmp_path)
+    key = Path(env["PROJECT_DIR"]) / "secrets/alertmanager_smtp_key"
+    key.touch()
+    key.chmod(0o444)
+    env["COMPOSE_PROFILES"] = profiles
+    completed = subprocess.run(
+        [
+            str(_historical_deploy_script("scripts/deploy.sh")),
+            "--preflight-only",
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64,
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64,
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode != 0
+    assert "nonempty regular SMTP key" in completed.stderr
+    assert all(
+        " pull " not in line and " up " not in line for line in log_file.read_text().splitlines()
+    )
+
+
+@pytest.mark.parametrize("profiles", ["alerting", "scheduler-external, alerting", " alerting"])
+def test_staging_selected_alertmanager_missing_image_fails_before_product_mutation(
+    tmp_path: Path,
+    profiles: str,
+) -> None:
+    env, log_file = _staging_deploy_fixture(tmp_path)
+    key = Path(env["PROJECT_DIR"]) / "secrets/alertmanager_smtp_key"
+    key.write_text("synthetic-only", encoding="ascii")
+    key.chmod(0o444)
+    env["COMPOSE_PROFILES"] = profiles
+    env["STUB_ALERTMANAGER_IMAGE_ABSENT"] = "1"
+    completed = subprocess.run(
+        [
+            str(_historical_deploy_script("scripts/deploy.sh")),
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64,
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64,
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 91, completed.stderr
+    log = log_file.read_text().splitlines()
+    assert any("pull alertmanager" in line for line in log)
+    assert all(" stop " not in line and " up " not in line for line in log)
+
+
+@pytest.mark.parametrize(
+    "compose_path",
+    (STAGING_COMPOSE_PATH, PRODUCTION_COMPOSE_PATH, SELF_HOSTED_COMPOSE_PATH),
+)
+def test_three_compose_contours_normalize_to_one_private_prometheus_contract(
+    compose_path: Path,
+) -> None:
+    docker_bin = shutil.which("docker")
+    assert docker_bin is not None, "docker compose is required for normalized contract validation"
+    completed = subprocess.run(
+        [
+            docker_bin,
+            "compose",
+            "-f",
+            str(compose_path),
+            "config",
+            "--no-interpolate",
+            "--format",
+            "json",
+        ],
+        cwd=str(REPO_ROOT),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    normalized = json.loads(completed.stdout)
+    services = normalized["services"]
+    prometheus = services["prometheus"]
+
+    assert normalized["networks"]["observability"]["internal"] is True
+    assert set(services["app"]["networks"]) == (
+        {"web", "observability", "database"}
+        if compose_path == STAGING_COMPOSE_PATH
+        else {"web", "observability"}
+    )
+    assert set(prometheus["networks"]) == {"observability", "alerting"}
+    assert prometheus["environment"] == [
+        "PULSEPLATE_ENVIRONMENT="
+        + ("staging" if compose_path == STAGING_COMPOSE_PATH else "production")
+    ]
+    assert (
+        prometheus["image"]
+        == "${PROMETHEUS_RUNTIME_REF:?Set the canonical manifest-derived Prometheus immutable subject}"
+    )
+    assert prometheus["platform"] == "linux/amd64"
+    assert prometheus["user"] == "65532:65532"
+    assert prometheus["restart"] == "unless-stopped"
+    assert prometheus["cap_drop"] == ["ALL"]
+    assert prometheus["security_opt"] == ["no-new-privileges:true"]
+    assert prometheus["command"] == [
+        "--config.file=/etc/prometheus/prometheus.yml",
+        "--storage.tsdb.path=/prometheus",
+        "--storage.tsdb.retention.time=45d",
+    ]
+    assert prometheus["depends_on"] == {"app": {"condition": "service_healthy", "required": True}}
+    assert prometheus["healthcheck"]["test"] == [
+        "CMD",
+        "/bin/promtool",
+        "check",
+        "ready",
+        "--url=http://localhost:9090",
+    ]
+    assert "ports" not in prometheus
+
+    volume_projection = {
+        (item["type"], item["target"], item.get("source"), item.get("read_only", False))
+        for item in prometheus["volumes"]
+    }
+    assert ("bind", "/etc/prometheus/prometheus.yml", str(PROMETHEUS_CONFIG_PATH), True) in (
+        volume_projection
+    )
+    assert (
+        "bind",
+        "/etc/prometheus/alias-alerts.yml",
+        str(REPO_ROOT / "deploy/prometheus/alias-alerts.yml"),
+        True,
+    ) in volume_projection
+    assert ("volume", "/prometheus", "prometheus_data", False) in volume_projection
+    assert prometheus["secrets"] == [
+        {
+            "source": "pulseplate_metrics_scrape_key",
+            "target": "/run/secrets/pulseplate_metrics_scrape_key",
+        }
+    ]
+    assert prometheus["secrets"][0] in services["app"]["secrets"]
+    assert "prometheus" not in services["app"].get("depends_on", {})
+    alertmanager = services["alertmanager"]
+    from tests.test_notify_premium_alias_checkpoint_failure import ALERTMANAGER_IMAGE
+
+    # Declared intermediate templates are not admission while current selection is held.
+    assert alertmanager["image"] == ALERTMANAGER_IMAGE
+    assert alertmanager["profiles"] == ["alerting"]
+    assert alertmanager["platform"] == "linux/amd64"
+    assert alertmanager["user"] == "65534:65534"
+    assert alertmanager["read_only"] is True
+    assert alertmanager["cap_drop"] == ["ALL"]
+    assert alertmanager["security_opt"] == ["no-new-privileges:true"]
+    assert alertmanager["networks"] == {
+        "alerting": {"gw_priority": 1},
+        "smtp-egress": {"gw_priority": 2},
+    }
+    assert normalized["networks"]["alerting"]["internal"] is True
+    assert normalized["networks"]["smtp-egress"].get("internal", False) is False
+    assert "ports" not in alertmanager
+    assert "--cluster.listen-address=" in alertmanager["command"]
+    assert alertmanager["healthcheck"]["test"] == [
+        "CMD",
+        "/bin/wget",
+        "-q",
+        "-T",
+        "5",
+        "-O",
+        "/dev/null",
+        "http://127.0.0.1:9093/-/ready",
+    ]
+    assert alertmanager["secrets"] == [
+        {"source": "alertmanager_smtp_key", "target": "/run/secrets/alertmanager_smtp_key"}
+    ]
+    assert "alertmanager" not in services["app"].get("depends_on", {})
+    for service_name in ("caddy", "worker", "postgres"):
+        service = services.get(service_name)
+        if isinstance(service, dict):
+            assert "observability" not in service.get("networks", {})
+            if compose_path != STAGING_COMPOSE_PATH or service_name == "caddy":
+                assert "secrets" not in service
+    assert "prometheus_data" in normalized["volumes"]
+
+
+@pytest.mark.parametrize(
+    "compose_path",
+    (STAGING_COMPOSE_PATH, PRODUCTION_COMPOSE_PATH, SELF_HOSTED_COMPOSE_PATH),
+)
+def test_three_compose_contours_preserve_smtp_default_gateway_in_normal_config(
+    compose_path: Path,
+    tmp_path: Path,
+) -> None:
+    docker_bin = shutil.which("docker")
+    assert docker_bin is not None, "native Docker Compose is required for gateway admission"
+    native_env = os.environ.copy()
+    source = compose_path.read_text(encoding="utf-8")
+    native_compose = tmp_path / compose_path.name
+    native_compose.write_bytes(compose_path.read_bytes())
+    assert native_compose.read_bytes() == compose_path.read_bytes()
+    required_names = set(re.findall(r"\$\{([A-Z][A-Z0-9_]*)(?::[^}]*)?\}", source))
+    native_env.update({name: "synthetic" for name in required_names})
+    staging_env_file = tmp_path / ".env"
+    staging_env_file.write_text("", encoding="utf-8")
+    native_env["STAGING_ENV_FILE"] = str(staging_env_file)
+    native_env["COMPOSE_PROFILES"] = ""
+    for image_name in ("IMAGE_REF", "STAGING_IMAGE_REF", "STAGING_CADDY_IMAGE_REF"):
+        native_env[image_name] = "ghcr.io/example/pulseplate@sha256:" + "a" * 64
+    completed = subprocess.run(
+        [
+            docker_bin,
+            "compose",
+            "--project-directory",
+            str(tmp_path),
+            "--env-file",
+            str(staging_env_file),
+            "-f",
+            str(native_compose),
+            "--profile",
+            "*",
+            "config",
+            "--no-env-resolution",
+            "--format",
+            "json",
+        ],
+        cwd=REPO_ROOT,
+        env=native_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout)["services"]["alertmanager"]["networks"] == {
+        "alerting": {"gw_priority": 1},
+        "smtp-egress": {"gw_priority": 2},
+    }
+
+
+@pytest.mark.parametrize("contour", ("staging", "production"))
+@pytest.mark.parametrize(
+    "fault",
+    (
+        "missing-alerting",
+        "missing-smtp",
+        "equal",
+        "reversed",
+        "bool",
+        "string",
+        "extra-network",
+    ),
+)
+def test_alertmanager_gateway_priority_admission_fails_closed(
+    tmp_path: Path, contour: str, fault: str
+) -> None:
+    env, argv, log_file, _project = _alertmanager_dependency_fixture(tmp_path, contour)
+    payload = json.loads(env["STUB_PROMETHEUS_COMPOSE_JSON"])
+    attachments = payload["services"]["alertmanager"]["networks"]
+    if fault == "missing-alerting":
+        attachments["alerting"].pop("gw_priority")
+    elif fault == "missing-smtp":
+        attachments["smtp-egress"].pop("gw_priority")
+    elif fault == "equal":
+        attachments["smtp-egress"]["gw_priority"] = 1
+    elif fault == "reversed":
+        attachments["smtp-egress"]["gw_priority"] = 0
+    elif fault == "bool":
+        attachments["smtp-egress"]["gw_priority"] = True
+    elif fault == "string":
+        attachments["smtp-egress"]["gw_priority"] = "2"
+    else:
+        attachments["other"] = {"gw_priority": 3}
+    env["STUB_PROMETHEUS_COMPOSE_JSON"] = json.dumps(payload)
+    completed = subprocess.run(
+        argv, cwd=REPO_ROOT, env=env, capture_output=True, text=True, check=False
+    )
+    assert completed.returncode != 0
+    assert (
+        "Alertmanager networks are not canonical"
+        if fault == "extra-network"
+        else "Alertmanager SMTP egress must be the explicit highest-priority gateway"
+    ) in completed.stderr
+    _assert_dependency_admission_has_no_product_effect(log_file)
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    (
+        "deploy/PRODUCTION.md",
+        "deploy/WORKFLOW.md",
+        "scripts/QUICK_DIAGNOSTIC.md",
+    ),
+)
+def test_manual_shell_sync_docs_are_merged_truth_only(relative_path: str) -> None:
+    content = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+
+    rsync_command = "rsync -az --delete frontend/"
+    rsync_indexes = [
+        index for index in range(len(content)) if content.startswith(rsync_command, index)
+    ]
+    assert rsync_indexes, f"Expected rsync command not found in {relative_path}"
+
+    for rsync_index in rsync_indexes:
+        provenance_window = content[max(0, rsync_index - 1000) : rsync_index]
+        has_git_release_truth = (
+            "git fetch origin main" in provenance_window
+            and "git switch --detach origin/main" in provenance_window
+        )
+        has_bundle_release_truth = (
+            "CI-produced release bundle" in provenance_window
+            or "unpacked CI-produced release bundle" in provenance_window
+        )
+
+        assert "merged" in provenance_window or "release bundle" in provenance_window
+        assert has_git_release_truth or has_bundle_release_truth
+        assert "dirty" in provenance_window or "unmerged" in provenance_window
+
+
+def _install_unused_preflight_curl(bin_dir: Path) -> tuple[Path, Path]:
+    """Prove that the instrumented curl detects a call, then arm it for preflight."""
+    curl = bin_dir / "curl"
+    marker = bin_dir / "curl.called"
+    _write_executable(curl, '#!/bin/sh\nprintf "called\\n" > "$0.called"\nexit 97\n')
+    witness = subprocess.run(
+        [str(curl)], cwd=bin_dir, env={"PATH": os.defpath}, timeout=5, check=False
+    )
+    assert witness.returncode == 97 and marker.read_bytes() == b"called\n"
+    marker.unlink()
+    return curl, marker
+
+
+def test_deploy_production_rejects_shell_bundle_without_redeploy_helper(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "production"
+    shell_bundle_dir = tmp_path / "shell-bundle"
+    bin_dir = tmp_path / "bin"
+    log_file = tmp_path / "docker.log"
+    project_dir.mkdir()
+    shell_bundle_dir.mkdir()
+    bin_dir.mkdir()
+    _write_production_host_contract(project_dir, include_checkpoint=False)
+    (project_dir / ".env").write_text(
+        "DATABASE_URL=postgresql+psycopg://pulseplate:secret@db.example.com:25060/pulseplate\n",  # pragma: allowlist secret
+        encoding="utf-8",
+    )
+    _write_shell_bundle_contract(shell_bundle_dir, include_redeploy=False)
+
+    docker_stub = f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'docker %s\\n' "$*" >> "{log_file}"
+"""
+    _write_executable(bin_dir / "docker", docker_stub)
+
+    curl, curl_marker = _install_unused_preflight_curl(bin_dir)
+    env = os.environ.copy()
+    env["CURL_BIN"] = str(curl)
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["DOCKER_BIN"] = str(bin_dir / "docker")
+    env["PYTHON_BIN"] = sys.executable
+    env["DEPLOY_DIR"] = str(project_dir)
+    env["ENV_FILE"] = str(project_dir / ".env")
+    env["COMPOSE_FILE"] = CANONICAL_MANAGED_COMPOSE
+    env["IMAGE_REF"] = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:test"
+    env["TAG"] = "prod-vtest"
+    env["PRODUCTION_DOMAIN"] = "pulseplate.test"
+    env["SHELL_BUNDLE_DIR"] = str(shell_bundle_dir)
+
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh"))],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert not curl_marker.exists(), "preflight unexpectedly invoked curl"
+    assert completed.returncode == 1
+    assert "SHELL_BUNDLE_DIR is missing scripts/redeploy_caddy.sh" in completed.stderr
+    assert not log_file.exists()
+
+
+def test_deploy_production_rejects_shell_bundle_without_reviewed_backup_helper(
+    tmp_path: Path,
+) -> None:
+    env, _project_dir, log_file, shell_bundle_dir = _production_preflight_fixture(
+        tmp_path,
+        with_bundle=True,
+    )
+    assert shell_bundle_dir is not None
+    (shell_bundle_dir / "scripts" / "ops" / "postgres_backup.sh").unlink()
+
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh")), "--preflight-only"],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "Incoming PostgreSQL backup helper" in completed.stderr
+    assert not log_file.exists()
+
+
+def test_deploy_production_preflight_rejects_shell_bundle_without_frontend(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "production"
+    shell_bundle_dir = tmp_path / "shell-bundle"
+    bin_dir = tmp_path / "bin"
+    log_file = tmp_path / "docker.log"
+    project_dir.mkdir()
+    shell_bundle_dir.mkdir()
+    bin_dir.mkdir()
+    _write_production_host_contract(project_dir, include_checkpoint=False)
+    (project_dir / ".env").write_text(
+        "DATABASE_URL=postgresql+psycopg://pulseplate:secret@db.example.com:25060/pulseplate\n",  # pragma: allowlist secret
+        encoding="utf-8",
+    )
+    _write_shell_bundle_contract(shell_bundle_dir, include_frontend=False)
+
+    docker_stub = f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'docker %s\\n' "$*" >> "{log_file}"
+"""
+    _write_executable(bin_dir / "docker", docker_stub)
+
+    curl, curl_marker = _install_unused_preflight_curl(bin_dir)
+    env = os.environ.copy()
+    env["CURL_BIN"] = str(curl)
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["DOCKER_BIN"] = str(bin_dir / "docker")
+    env["PYTHON_BIN"] = sys.executable
+    env["DEPLOY_DIR"] = str(project_dir)
+    env["ENV_FILE"] = str(project_dir / ".env")
+    env["COMPOSE_FILE"] = CANONICAL_MANAGED_COMPOSE
+    env["DATABASE_URL"] = (
+        "postgresql+psycopg://pulseplate:secret@db.example.com:25060/pulseplate"  # pragma: allowlist secret
+    )
+    env["PRODUCTION_DOMAIN"] = "pulseplate.test"
+    env["SHELL_BUNDLE_DIR"] = str(shell_bundle_dir)
+
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh")), "--preflight-only"],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert not curl_marker.exists(), "preflight unexpectedly invoked curl"
+    assert completed.returncode == 1
+    assert "SHELL_BUNDLE_DIR is missing frontend/" in completed.stderr
+    assert not log_file.exists()
+
+
+@pytest.mark.parametrize("phase", ("preflight", "deploy"))
+@pytest.mark.parametrize("fault", (None, "sudo_denied", "sudo_missing", "required_env_missing"))
+def test_staging_remote_deploy_uses_noninteractive_sudo_closed_environment(
+    tmp_path: Path, phase: str, fault: str | None
+) -> None:
+    workflow = yaml.safe_load(CD_WORKFLOW_PATH.read_text())
+    steps = workflow["jobs"]["build"]["steps"]
+    name = "Deploy to staging over SSH" if phase == "deploy" else None
+    step = next(
+        item
+        for item in steps
+        if (item.get("name") == name if name else item.get("id") == "staging-contract-preflight")
+    )
+    script = step["with"]["script"]
+    invocation = script[script.index("sudo -n ") :]
+    expected_names = (
+        "GHCR_USER,GHCR_TOKEN,STAGING_DOMAIN" if phase == "deploy" else "STAGING_DOMAIN"
+    )
+    assert invocation.startswith(
+        "sudo -n --preserve-env="
+        + expected_names
+        + " -- /bin/bash /srv/pulseplate-staging/deploy.sh"
+    )
+    assert (
+        "--preflight-only" in invocation
+        if phase == "preflight"
+        else "--preflight-only" not in invocation
+    )
+    assert '"$STAGING_IMAGE_REF" "$STAGING_CADDY_IMAGE_REF"' in invocation
+    assert script.index("grep -Fqx") < script.index("sudo -n ")
+    assert script.index('[ "$(sha256sum ./deploy.sh') < script.index("sudo -n ")
+    assert "--preserve-env " not in invocation and "sudo -E" not in invocation
+    assert "GHCR_TOKEN=" not in invocation
+    binary_dir = tmp_path / "bin"
+    binary_dir.mkdir()
+    record = tmp_path / "sudo-invocation.json"
+    if fault != "sudo_missing":
+        _write_executable(
+            binary_dir / "sudo",
+            f"#!{sys.executable}\n" + """import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+if os.environ["SUDO_DENIED"] == "true": sys.exit(1)
+assert args[0] == "-n" and args[1].startswith("--preserve-env=") and args[2] == "--"
+names = args[1].split("=", 1)[1].split(",")
+child_env = {name: os.environ[name] for name in names if name in os.environ}
+if set(child_env) != set(names): sys.exit(1)
+assert "unrelated-private-value" not in child_env.values()
+assert "synthetic-ghcr-secret" not in args
+Path(os.environ["SUDO_RECORD"]).write_text(json.dumps({"argv":args, "preserved": sorted(child_env),
+    "token_delivered": child_env.get("GHCR_TOKEN") == "synthetic-ghcr-secret"}))
+""",
+        )
+    environment = {
+        "PATH": str(binary_dir),
+        "STAGING_DOMAIN": "staging.example.com",
+        "STAGING_IMAGE_REF": "ghcr.io/owner/image@sha256:" + "a" * 64,
+        "STAGING_CADDY_IMAGE_REF": "ghcr.io/owner/image@sha256:" + "b" * 64,
+        "GHCR_USER": "synthetic-owner",
+        "GHCR_TOKEN": "synthetic-ghcr-secret",
+        "UNRELATED_SETTING": "unrelated-private-value",
+        "SUDO_RECORD": str(record),
+        "SUDO_DENIED": str(fault == "sudo_denied").lower(),
+    }
+    if fault == "required_env_missing":
+        environment.pop("STAGING_DOMAIN")
+    completed = subprocess.run(
+        ["/bin/bash", "-c", "set -euo pipefail\n" + invocation],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode != 0 if fault else completed.returncode == 0
+    assert "synthetic-ghcr-secret" not in completed.stdout + completed.stderr
+    if fault:
+        assert not record.exists()
+    else:
+        observed = json.loads(record.read_text())
+        assert observed["preserved"] == sorted(expected_names.split(","))
+        assert observed["token_delivered"] == (phase == "deploy")
+        assert observed["argv"][3:] == [
+            "/bin/bash",
+            "/srv/pulseplate-staging/deploy.sh",
+            *(["--preflight-only"] if phase == "preflight" else []),
+            environment["STAGING_IMAGE_REF"],
+            environment["STAGING_CADDY_IMAGE_REF"],
+        ]
+
+
+def _staging_compose_fixture_json(project_dir: Path = Path("/srv/pulseplate-staging")) -> str:
+    from scripts.ops.check_staging_security import POSTGRES_COMMAND, STORAGE_ROOT
+
+    payload = json.loads(FAKE_PROMETHEUS_COMPOSE_JSON)
+    payload["name"] = project_dir.name
+
+    payload["services"]["postgres"]["environment"].update(
+        {
+            "POSTGRES_DB": "pulseplate",
+            "POSTGRES_USER": "pulseplate",
+            "POSTGRES_PASSWORD_FILE": "/run/secrets/postgres_password",
+        }
+    )
+    payload["services"]["prometheus"]["environment"]["PULSEPLATE_ENVIRONMENT"] = "staging"
+    payload["services"]["alertmanager"]["volumes"] = [
+        {
+            "type": "bind",
+            "source": str(project_dir / "alertmanager/alertmanager.yml"),
+            "target": "/etc/alertmanager/alertmanager.yml",
+            "read_only": True,
+        }
+    ]
+    local_database_url = "postgresql+psycopg://pulseplate@postgres:5432/pulseplate?sslmode=verify-full&sslrootcert=/run/secrets/postgres_ca&passfile=/run/secrets/postgres_pgpass"
+    for name in ("app", "worker"):
+        payload["services"][name] = {
+            "environment": {
+                "DATABASE_URL": local_database_url,
+                "PGSSLMODE": "verify-full",
+                "PGPASSFILE": "/run/secrets/postgres_pgpass",
+            }
+        }
+    payload["services"]["app"]["networks"] = {"web": {}, "observability": {}, "database": {}}
+    payload["services"]["postgres"]["command"] = POSTGRES_COMMAND
+    payload["services"]["postgres"]["networks"] = {"database": {}}
+    payload["networks"]["database"] = {"internal": True}
+    for name, directory in (("postgres_data", "postgres"), ("prometheus_data", "prometheus")):
+        payload["volumes"].setdefault(name, {})
+        payload["volumes"][name].update(
+            {
+                "driver": "local",
+                "driver_opts": {
+                    "type": "none",
+                    "o": "bind",
+                    "device": f"{STORAGE_ROOT}/{directory}",
+                },
+            }
+        )
+    payload["secrets"] = {
+        name: {"file": str(project_dir / "secrets" / name)}
+        for name in (
+            "postgres_ca",
+            "postgres_server_crt",
+            "postgres_server_key",
+            "postgres_password",
+            "postgres_pgpass",
+            "pulseplate_metrics_scrape_key",
+            "alertmanager_smtp_key",
+        )
+    }
+    return json.dumps(payload, separators=(",", ":"))
+
+
+FAKE_STAGING_COMPOSE_JSON = _staging_compose_fixture_json()
+
+
+def _write_executable(path: Path, content: str) -> None:
+    if path.name == "docker":
+        model_code = f"""import json, os, re
+from pathlib import Path
+default = ({FAKE_STAGING_COMPOSE_JSON!r} if "docker-compose.staging.yaml" in os.environ["STUB_COMPOSE_ARGS"]
+           else {FAKE_PROMETHEUS_COMPOSE_JSON!r})
+raw = os.environ.get("STUB_PROMETHEUS_COMPOSE_JSON", default)
+try:
+    payload = json.loads(raw)
+except json.JSONDecodeError:
+    print(raw)
+    raise SystemExit(0)
+if "STUB_PROMETHEUS_COMPOSE_JSON" not in os.environ and isinstance(payload, dict):
+    match = re.search(r"-f\\s+(\\S+)", os.environ["STUB_COMPOSE_ARGS"])
+    if match:
+        compose = Path(match.group(1))
+        project_match = re.search(r"--project-directory\\s+(\\S+)", os.environ["STUB_COMPOSE_ARGS"])
+        project = Path(project_match.group(1)) if project_match else compose.parent
+        payload["name"] = project.name
+        if os.environ.get("STUB_INSTALLED_NO_ALERTMANAGER") == str(compose.resolve()):
+            payload["services"].pop("alertmanager", None)
+            payload["name"] = os.environ.get("STUB_INSTALLED_PROJECT_NAME", payload["name"])
+        else:
+            payload["services"]["alertmanager"]["volumes"] = [{{
+                "type": "bind", "source": str(project / "alertmanager/alertmanager.yml"),
+                "target": "/etc/alertmanager/alertmanager.yml", "read_only": True
+            }}]
+        payload["secrets"]["alertmanager_smtp_key"]["file"] = str(
+            project / "secrets/alertmanager_smtp_key"
+        )
+if "STUB_COMPOSE_PROJECT_NAME" in os.environ and isinstance(payload, dict):
+    payload["name"] = os.environ["STUB_COMPOSE_PROJECT_NAME"]
+if os.environ["STUB_ALL_PROFILES"] != "true" and isinstance(payload, dict):
+    services = payload.get("services")
+    if isinstance(services, dict): services.pop("worker", None)
+print(json.dumps(payload))
+"""
+        contract_responses = f"""case \"$*\" in
+  *pg_restore\\ --list*)
+    if [ "${{STUB_PG_RESTORE_LIST_STATUS:-0}}" -ne 0 ]; then exit "${{STUB_PG_RESTORE_LIST_STATUS}}"; fi
+    printf '%s\\n' "${{STUB_ARCHIVE_LIST:-214; 1259 16387 TABLE public items user}}"
+    ;;
+  *pg_restore\\ --file=/dev/null*)
+    if [ "${{STUB_PG_RESTORE_BODY_STATUS:-0}}" -ne 0 ]; then exit "${{STUB_PG_RESTORE_BODY_STATUS}}"; fi
+    cat >/dev/null
+    ;;
+  *pg_catalog.pg_tables*) printf '1\\n' ;;
+  run\\ --rm\\ --network\\ none\\ --entrypoint\\ python\\ *) printf '%s\\n' "${{STUB_BACKEND_IDS:-1000:1000}}" ;;
+  *\"config --format json\"*)
+    if [ \"${{STUB_COMPOSE_CONFIG_STATUS:-0}}\" -ne 0 ]; then
+      exit \"${{STUB_COMPOSE_CONFIG_STATUS}}\"
+    fi
+    all_profiles=false
+    previous=""
+    for argument in "$@"; do
+      if [ "$previous" = --profile ] && [ "$argument" = '*' ]; then all_profiles=true; fi
+      previous="$argument"
+    done
+    STUB_ALL_PROFILES="$all_profiles" STUB_COMPOSE_ARGS="$*" {shlex.quote(sys.executable)} -c {shlex.quote(model_code)}
+    ;;
+  *"ps --all --quiet alertmanager"*)
+    printf '%s\\n' 'no such service: alertmanager' >&2
+    exit 97
+    ;;
+  *"ps --all --no-trunc --quiet --filter label=com.docker.compose.project="*"--filter label=com.docker.compose.service=alertmanager"*)
+    if [ -n "${{STUB_CENSUS_LOG:-}}" ]; then
+      printf 'docker %s\\n' "$*" >> "$STUB_CENSUS_LOG"
+    fi
+    if [ "${{STUB_ALERTMANAGER_PS_STATUS:-0}}" -ne 0 ]; then
+      exit "${{STUB_ALERTMANAGER_PS_STATUS}}"
+    fi
+    printf '%s' "${{STUB_ALERTMANAGER_PS_IDS:-}}"
+    exit 0
+    ;;
+  inspect\\ {'e' * 64}*)
+    if [ -n "${{STUB_CENSUS_LOG:-}}" ]; then
+      printf 'docker %s\\n' "$*" >> "$STUB_CENSUS_LOG"
+    fi
+    if [ "${{STUB_ALERTMANAGER_INSPECT_STATUS:-0}}" -ne 0 ]; then
+      exit "${{STUB_ALERTMANAGER_INSPECT_STATUS}}"
+    fi
+    printf '%s\\n' "${{STUB_ALERTMANAGER_INSPECT_JSON:-invalid-inspect-json}}"
+    exit 0
+    ;;
+  run\\ --rm\\ --platform\\ linux/amd64\\ --user\\ 70:70\\ *)
+    if [ "${{STUB_POSTGRES_MOUNTPOINT_STATUS:-0}}" -ne 0 ]; then
+      exit "${{STUB_POSTGRES_MOUNTPOINT_STATUS}}"
+    fi
+    ;;
+  inspect\\ --format\\ *worker_v1*)
+    printf 'worker-gate-inspect\\n' >> "$STUB_DEPLOY_LOG_FILE"
+    if [ -n "${{STUB_WORKER_INSPECT_DRIFT_FILE:-}}" ]; then
+      drift_count=0
+      if [ -f "$STUB_WORKER_INSPECT_DRIFT_FILE" ]; then
+        drift_count="$(cat "$STUB_WORKER_INSPECT_DRIFT_FILE")"
+      fi
+      drift_count=$((drift_count + 1))
+      printf '%s' "$drift_count" > "$STUB_WORKER_INSPECT_DRIFT_FILE"
+      if [ "$drift_count" -ge 3 ]; then
+        cat "$STUB_WORKER_INSPECT_AFTER_FILE"
+        exit 0
+      fi
+    fi
+    cat "$STUB_WORKER_INSPECT_FILE"
+    exit 0
+    ;;
+  inspect\\ --format\\ *State.Running*)
+    printf '%s\\n' "${{STUB_CONTAINER_RUNNING:-true}}"
+    exit 0
+    ;;
+  inspect\\ aaaaaaaaaaaa*)
+    if [ "${{STUB_POSTGRES_CONTAINER_INSPECT_STATUS:-0}}" -ne 0 ]; then
+      exit "${{STUB_POSTGRES_CONTAINER_INSPECT_STATUS}}"
+    fi
+    if [ -n "${{STUB_POSTGRES_INSPECT_DRIFT_FILE:-}}" ] && \
+       [ -f "$STUB_POSTGRES_INSPECT_DRIFT_FILE" ]; then
+      printf '%s\\n' "$STUB_POSTGRES_CONTAINER_INSPECT_JSON_AFTER_FIRST"
+    elif [ -n "${{STUB_POSTGRES_CONTAINER_INSPECT_JSON+x}}" ]; then
+      if [ -n "${{STUB_POSTGRES_INSPECT_DRIFT_FILE:-}}" ]; then
+        : > "$STUB_POSTGRES_INSPECT_DRIFT_FILE"
+      fi
+      printf '%s\\n' "$STUB_POSTGRES_CONTAINER_INSPECT_JSON"
+    else
+      printf '%s\\n' '{FAKE_POSTGRES_CONTAINER_INSPECT_JSON}'
+    fi
+    ;;
+  exec\\ aaaaaaaaaaaa*\\ sh\\ -ec*)
+    if [ "${{STUB_POSTGRES_RUNTIME_STATUS:-0}}" -ne 0 ]; then
+      exit "${{STUB_POSTGRES_RUNTIME_STATUS}}"
+    fi
+    printf '70\\t150019\\t/var/lib/postgresql/data\\n'
+    exit 0
+    ;;
+  exec\\ -i\\ aaaaaaaaaaaa*\\ pg_restore\\ --list*)
+    cat >/dev/null
+    exit "${{STUB_PG_RESTORE_LIST_STATUS:-0}}"
+    ;;
+  volume\\ ls\\ --quiet)
+    volume_list_status="${{STUB_POSTGRES_VOLUME_LIST_STATUS:-0}}"
+    volume_list_output="${{STUB_POSTGRES_VOLUME_LIST_OUTPUT:-}}"
+    if [ -n "${{STUB_POSTGRES_VOLUME_LIST_COUNTER_FILE:-}}" ]; then
+      volume_list_count=0
+      if [ -f "$STUB_POSTGRES_VOLUME_LIST_COUNTER_FILE" ]; then
+        IFS= read -r volume_list_count < "$STUB_POSTGRES_VOLUME_LIST_COUNTER_FILE"
+      fi
+      case "$volume_list_count" in
+        ''|*[!0-9]*) exit 98 ;;
+      esac
+      volume_list_count=$((volume_list_count + 1))
+      printf '%s\\n' "$volume_list_count" > "$STUB_POSTGRES_VOLUME_LIST_COUNTER_FILE"
+      if [ "$volume_list_count" -gt 1 ]; then
+        volume_list_status="${{STUB_POSTGRES_VOLUME_LIST_STATUS_AFTER_FIRST:-$volume_list_status}}"
+        volume_list_output="${{STUB_POSTGRES_VOLUME_LIST_OUTPUT_AFTER_FIRST:-$volume_list_output}}"
+      fi
+    fi
+    if [ "$volume_list_status" -ne 0 ]; then
+      exit "$volume_list_status"
+    fi
+    printf '%s' "$volume_list_output"
+    ;;
+  image\\ inspect\\ *postgres-15.19-pgvector0.8.6-alpine3.23*)
+    if [ -n "${{STUB_POSTGRES_IMAGE_INSPECT_COUNTER_FILE:-}}" ]; then
+      inspect_count=0
+      if [ -f "$STUB_POSTGRES_IMAGE_INSPECT_COUNTER_FILE" ]; then
+        IFS= read -r inspect_count < "$STUB_POSTGRES_IMAGE_INSPECT_COUNTER_FILE"
+      fi
+      inspect_count=$((inspect_count + 1))
+      printf '%s\\n' "$inspect_count" > "$STUB_POSTGRES_IMAGE_INSPECT_COUNTER_FILE"
+      if [ "$inspect_count" -gt 1 ]; then
+        printf 'docker %s\\n' "$*" >> "$STUB_DEPLOY_LOG_FILE"
+        case "${{STUB_POSTGRES_EXISTING_IMAGE_FORM:-config}}" in
+          config)
+            if [ -n "${{STUB_POSTGRES_EXISTING_CONFIG_IMAGE_INSPECT_TRACE:-}}" ]; then
+              printf '%s\\n' "$*" >> "$STUB_POSTGRES_EXISTING_CONFIG_IMAGE_INSPECT_TRACE"
+            fi
+            if [ -n "${{STUB_POSTGRES_EXISTING_CONFIG_IMAGE_INSPECT_STDERR:-}}" ]; then
+              printf '%s\\n' "$STUB_POSTGRES_EXISTING_CONFIG_IMAGE_INSPECT_STDERR" >&2
+            fi
+            if [ "${{STUB_POSTGRES_EXISTING_CONFIG_IMAGE_INSPECT_STATUS:-0}}" -ne 0 ]; then
+              exit "$STUB_POSTGRES_EXISTING_CONFIG_IMAGE_INSPECT_STATUS"
+            fi
+            if [ -n "${{STUB_POSTGRES_EXISTING_CONFIG_IMAGE_INSPECT_JSON+x}}" ]; then
+              printf '%s\\n' "$STUB_POSTGRES_EXISTING_CONFIG_IMAGE_INSPECT_JSON"
+            else
+              printf '%s\\n' '{FAKE_POSTGRES_CONFIG_IMAGE_INSPECT_JSON}'
+            fi
+            ;;
+          platform)
+            if [ -n "${{STUB_POSTGRES_EXISTING_PLATFORM_IMAGE_INSPECT_STDERR:-}}" ]; then
+              printf '%s\\n' "$STUB_POSTGRES_EXISTING_PLATFORM_IMAGE_INSPECT_STDERR" >&2
+            fi
+            if [ "${{STUB_POSTGRES_EXISTING_PLATFORM_IMAGE_INSPECT_STATUS:-0}}" -ne 0 ]; then
+              exit "$STUB_POSTGRES_EXISTING_PLATFORM_IMAGE_INSPECT_STATUS"
+            fi
+            if [ -n "${{STUB_POSTGRES_EXISTING_PLATFORM_IMAGE_INSPECT_FILE:-}}" ]; then
+              cat "$STUB_POSTGRES_EXISTING_PLATFORM_IMAGE_INSPECT_FILE"
+            elif [ -n "${{STUB_POSTGRES_EXISTING_PLATFORM_IMAGE_INSPECT_JSON+x}}" ]; then
+              printf '%s\\n' "$STUB_POSTGRES_EXISTING_PLATFORM_IMAGE_INSPECT_JSON"
+            else
+              printf '%s\\n' '{FAKE_POSTGRES_IMAGE_INSPECT_JSON}'
+            fi
+            ;;
+          *) exit 93 ;;
+        esac
+        exit 0
+      fi
+    fi
+    if [ "${{STUB_IMAGE_INSPECT_STATUS:-0}}" -ne 0 ]; then
+      exit "${{STUB_IMAGE_INSPECT_STATUS}}"
+    fi
+    if [ -n "${{STUB_POSTGRES_IMAGE_INSPECT_JSON+x}}" ]; then
+      printf '%s\\n' "$STUB_POSTGRES_IMAGE_INSPECT_JSON"
+    else
+      printf '%s\\n' '{FAKE_POSTGRES_IMAGE_INSPECT_JSON}'
+    fi
+    ;;
+  image\\ inspect\\ {ALERTMANAGER_RUNTIME_REF}|image\\ inspect\\ {alertmanager_source._alertmanager_contract_subject()[1]})
+    if [ "${{STUB_ALERTMANAGER_IMAGE_ABSENT:-0}}" = 1 ]; then exit 91; fi
+    printf '%s\\n' '{FAKE_ALERTMANAGER_IMAGE_INSPECT_JSON}'
+    ;;
+  image\\ inspect\\ {alertmanager_source._ALERT_OLD_RUNTIME_CONFIG})
+    printf '%s\\n' '{json.dumps([{"Id": alertmanager_source._ALERT_OLD_RUNTIME_CONFIG, "Os": "linux", "Architecture": "amd64", "RepoDigests": [alertmanager_source._ALERT_OLD_RUNTIME_REF]}])}'
+    ;;
+  image\\ inspect\\ {POSTGRES_CONFIG_DIGEST})
+    printf '%s\\n' 'unexpected bare-ID image inspect' >&2
+    exit 92 ;;
+  image\\ inspect\\ {POSTGRES_PLATFORM_MANIFEST_DIGEST})
+    printf '%s\\n' 'unexpected bare-ID image inspect' >&2
+    exit 92 ;;
+  image\\ inspect\\ {PROMETHEUS_RUNTIME_REF})
+    if [ \"${{STUB_IMAGE_INSPECT_STATUS:-0}}\" -ne 0 ]; then
+      exit \"${{STUB_IMAGE_INSPECT_STATUS}}\"
+    fi
+    if [ -n \"${{STUB_PROMETHEUS_IMAGE_INSPECT_JSON+x}}\" ]; then
+      printf '%s\\n' \"$STUB_PROMETHEUS_IMAGE_INSPECT_JSON\"
+    else
+      printf '%s\\n' '{FAKE_PROMETHEUS_IMAGE_INSPECT_JSON}'
+    fi
+    ;;
+  image\\ inspect\\ ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:*)
+    if [ "${{STUB_BACKEND_IMAGE_INSPECT_HANG:-0}}" = "1" ]; then
+      printf '%s' "$$" > "$STUB_HUNG_PID_FILE"
+      exec /bin/sleep 60
+    fi
+    if [ "${{STUB_BACKEND_IMAGE_PIPE_CHILD:-0}}" = "1" ]; then
+      /bin/sleep 60 &
+      printf '%s' "$!" > "$STUB_HUNG_PID_FILE"
+      exit 0
+    fi
+    if [ -n "${{STUB_BACKEND_IMAGE_INSPECT_FILE:-}}" ]; then
+      cat "$STUB_BACKEND_IMAGE_INSPECT_FILE"
+      exit 0
+    else
+      exit 94
+    fi
+    ;;
+
+esac
+"""
+        marker = "set -euo pipefail\n"
+        if marker in content:
+            content = content.replace(marker, marker + contract_responses, 1)
+        else:
+            content = content.replace("\n", "\n" + contract_responses, 1)
+    path.write_text(content, encoding="utf-8")
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+
+def _assert_log_index(
+    log_lines: list[str],
+    *,
+    predicate: Callable[[str], bool],
+    message: str,
+) -> int:
+    index = next((position for position, line in enumerate(log_lines) if predicate(line)), None)
+    assert index is not None, message
+    return index
+
+
+def _write_prometheus_manifest_variant(path: Path, variant: str) -> None:
+    canonical = json.loads(_synthetic_prometheus_manifest_text())
+    if variant == "malformed":
+        path.write_text("{", encoding="utf-8")
+        return
+    if variant == "duplicate":
+        canonical_text = json.dumps(canonical, separators=(",", ":"))
+        path.write_text(
+            '{"schema":"pulseplate.prometheus_image_manifest.v2",' + canonical_text[1:],
+            encoding="utf-8",
+        )
+        return
+    if variant == "missing":
+        canonical["selection"].pop("manifest_digest")
+    elif variant == "extra":
+        canonical["unexpected"] = "forbidden"
+    elif variant == "wrong-platform-digest":
+        canonical["selection"]["manifest_digest"] = "sha256:" + "b" * 64
+    elif variant == "wrong-source-revision":
+        canonical["selection"]["source_revision"] = "A" * 40
+    elif variant == "wrong-runtime-ref":
+        canonical["selection"]["runtime_ref"] = (
+            "prom/prometheus:main-distroless@" + PROMETHEUS_PLATFORM_MANIFEST_DIGEST
+        )
+    elif variant == "index-digest-runtime-ref":
+        canonical["selection"]["runtime_ref"] = f"prom/prometheus@{PROMETHEUS_INDEX_DIGEST}"
+    elif variant == "wrong-type":
+        canonical["selection"]["source_revision"] = 314
+    else:
+        raise AssertionError(f"unsupported manifest variant: {variant}")
+    path.write_text(json.dumps(canonical), encoding="utf-8")
+
+
+def _write_postgres_manifest_variant(path: Path, variant: str) -> None:
+    canonical = json.loads(POSTGRES_MANIFEST_PATH.read_text(encoding="utf-8"))
+    if variant == "malformed":
+        path.write_text("{", encoding="utf-8")
+        return
+    if variant == "duplicate":
+        canonical_text = json.dumps(canonical, separators=(",", ":"))
+        path.write_text(
+            '{"schema":"pulseplate.postgres_pgvector_image_manifest.v1",' + canonical_text[1:],
+            encoding="utf-8",
+        )
+        return
+    if variant == "missing":
+        canonical.pop("runtime_base_platform_manifest_digest")
+    elif variant == "extra":
+        canonical["unexpected"] = "forbidden"
+    elif variant == "wrong-platform-digest":
+        canonical["platform_manifest_digest"] = "sha256:" + "b" * 64
+    elif variant == "wrong-runtime-ref":
+        canonical["runtime_ref"] = canonical["runtime_ref"].replace("ca0968c5", "ba0968c5")
+    elif variant == "wrong-type":
+        canonical["postgres_major"] = 15
+    else:
+        raise AssertionError(f"unsupported PostgreSQL manifest variant: {variant}")
+    path.write_text(json.dumps(canonical), encoding="utf-8")
+
+
+def _production_preflight_fixture(
+    tmp_path: Path,
+    *,
+    with_bundle: bool,
+) -> tuple[dict[str, str], Path, Path, Path | None]:
+    project_dir = tmp_path / "production"
+    shell_bundle_dir = tmp_path / "shell-bundle" if with_bundle else None
+    bin_dir = tmp_path / "bin"
+    log_file = tmp_path / "docker.log"
+    project_dir.mkdir()
+    bin_dir.mkdir()
+    _write_production_host_contract(
+        project_dir, compose_text=PRODUCTION_COMPOSE_TEXT, include_checkpoint=not with_bundle
+    )
+    (project_dir / ".env").write_text(
+        "DATABASE_URL=postgresql+psycopg://pulseplate:secret@db.example.com:25060/pulseplate\n",  # pragma: allowlist secret
+        encoding="utf-8",
+    )
+    if shell_bundle_dir is not None:
+        shell_bundle_dir.mkdir()
+        _write_shell_bundle_contract(shell_bundle_dir)
+        (shell_bundle_dir / "frontend" / "bundle-marker.txt").write_text(
+            "bounded-frontend\n", encoding="utf-8"
+        )
+    _write_executable(
+        bin_dir / "docker",
+        f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'docker %s\\n' "$*" >> "{log_file}"
+case "$*" in
+  *"config --services"*) printf 'app\\nworker\\ncaddy\\nprometheus\\n' ;;
+esac
+""",
+    )
+    _write_executable(bin_dir / "curl", "#!/usr/bin/env bash\nset -euo pipefail\n")
+    env = os.environ.copy()
+    env.update(
+        {
+            "DOCKER_BIN": str(bin_dir / "docker"),
+            "PYTHON_BIN": sys.executable,
+            "CURL_BIN": str(bin_dir / "curl"),
+            "DEPLOY_DIR": str(project_dir),
+            "ENV_FILE": str(project_dir / ".env"),
+            "COMPOSE_FILE": CANONICAL_MANAGED_COMPOSE,
+            "PRODUCTION_DOMAIN": "pulseplate.test",
+        }
+    )
+    if shell_bundle_dir is not None:
+        env["SHELL_BUNDLE_DIR"] = str(shell_bundle_dir)
+    return env, project_dir, log_file, shell_bundle_dir
+
+
+@pytest.mark.parametrize("invalid_rules", ("missing", "symlink"))
+def test_production_shell_bundle_rejects_invalid_rules_before_docker(
+    tmp_path: Path, invalid_rules: str
+) -> None:
+    env, _project_dir, log_file, shell_bundle_dir = _production_preflight_fixture(
+        tmp_path, with_bundle=True
+    )
+    assert shell_bundle_dir is not None
+    rules_path = shell_bundle_dir / "deploy/prometheus/alias-alerts.yml"
+    if invalid_rules == "missing":
+        rules_path.unlink()
+    else:
+        target = rules_path.with_suffix(".real")
+        rules_path.rename(target)
+        rules_path.symlink_to(target)
+
+    result = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh")), "--preflight-only"],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "Incoming Prometheus rules" in result.stderr
+    assert not log_file.exists()
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "label", "variant"),
+    (
+        ("alertmanager.yml", "Incoming Alertmanager configuration", "missing"),
+        ("alertmanager.yml", "Incoming Alertmanager configuration", "symlink"),
+        ("trivy-ignore.yaml", "Incoming Alertmanager Trivy exception", "missing"),
+        ("trivy-ignore.yaml", "Incoming Alertmanager Trivy exception", "symlink"),
+    ),
+)
+def test_production_bundle_rejects_invalid_alertmanager_source_before_docker(
+    tmp_path: Path, relative_path: str, label: str, variant: str
+) -> None:
+    env, _project_dir, log_file, shell_bundle_dir = _production_preflight_fixture(
+        tmp_path, with_bundle=True
+    )
+    assert shell_bundle_dir is not None
+    source = shell_bundle_dir / "deploy/alertmanager" / relative_path
+    if variant == "missing":
+        source.unlink()
+    else:
+        target = source.with_suffix(source.suffix + ".real")
+        source.rename(target)
+        source.symlink_to(target)
+    result = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh")), "--preflight-only"],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert label in result.stderr
+    assert not log_file.exists()
+
+
+@pytest.mark.parametrize("profiles", ["alerting", "scheduler-external, alerting", " alerting"])
+def test_production_selected_alertmanager_requires_smtp_key_before_docker(
+    tmp_path: Path, profiles: str
+) -> None:
+    env, _project_dir, log_file, _bundle = _production_preflight_fixture(
+        tmp_path, with_bundle=False
+    )
+    env["COMPOSE_PROFILES"] = profiles
+    result = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh")), "--preflight-only"],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "Selected Alertmanager requires a regular non-symlink SMTP key" in result.stderr
+    assert all(
+        " pull " not in line and " up " not in line and " stop " not in line
+        for line in log_file.read_text().splitlines()
+    )
+
+
+@pytest.mark.parametrize("mode", (0o444, 0o600))
+def test_production_selected_alertmanager_secret_metadata(tmp_path: Path, mode: int) -> None:
+    env, project_dir, _log_file, _bundle = _production_preflight_fixture(
+        tmp_path, with_bundle=False
+    )
+    key = project_dir / "deploy/secrets/alertmanager_smtp_key"
+    key.write_text("synthetic-only", encoding="ascii")
+    key.chmod(mode)
+    env["COMPOSE_PROFILES"] = "alerting"
+    result = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh")), "--preflight-only"],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert (result.returncode == 0) is (mode == 0o444), result.stderr
+    if mode != 0o444:
+        assert "Compose account with mode 0444" in result.stderr
+
+
+@pytest.mark.parametrize("profiles", ["alerting", "scheduler-external, alerting", " alerting"])
+def test_production_selected_alertmanager_key_must_be_nonempty(
+    tmp_path: Path, profiles: str
+) -> None:
+    env, project_dir, log_file, _bundle = _production_preflight_fixture(tmp_path, with_bundle=False)
+    key = project_dir / "deploy/secrets/alertmanager_smtp_key"
+    key.touch()
+    key.chmod(0o444)
+    env["COMPOSE_PROFILES"] = profiles
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh")), "--preflight-only"],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode != 0
+    assert "nonempty regular SMTP key" in completed.stderr
+    if log_file.exists():
+        assert all(
+            " pull " not in line and " up " not in line
+            for line in log_file.read_text().splitlines()
+        )
+
+
+@pytest.mark.parametrize("with_bundle", [False, True])
+@pytest.mark.parametrize(
+    ("relative_path", "old", "new", "expected"),
+    (
+        (
+            "prometheus/prometheus.yml",
+            "alertmanager:9093",
+            "alertmanager:9094",
+            "Prometheus configuration differs from the admitted complete file",
+        ),
+        (
+            "prometheus/alias-alerts.yml",
+            "      labels:",
+            "      labels:\n        environment: attacker",
+            "Prometheus rules differ from the admitted complete file",
+        ),
+        (
+            "alertmanager/trivy-ignore.yaml",
+            "vulnerabilities: []",
+            "vulnerabilities: [{id: CVE-2099-00000}]",
+            "Alertmanager Trivy policy differs from the admitted complete file",
+        ),
+    ),
+)
+def test_production_alertmanager_complete_file_admission_rejects_drift_before_pull(
+    tmp_path: Path, with_bundle: bool, relative_path: str, old: str, new: str, expected: str
+) -> None:
+    env, project_dir, log_file, bundle = _production_preflight_fixture(
+        tmp_path, with_bundle=with_bundle
+    )
+    source_dir = bundle if bundle is not None else project_dir
+    path = source_dir / "deploy" / relative_path
+    original = path.read_text(encoding="utf-8")
+    assert old in original
+    path.write_text(original.replace(old, new, 1), encoding="utf-8")
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh")), "--preflight-only"],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode != 0
+    assert expected in completed.stderr
+    if log_file.exists():
+        assert all(
+            " pull " not in line and " up " not in line
+            for line in log_file.read_text().splitlines()
+        )
+
+
+@pytest.mark.parametrize(
+    ("service_name", "fault", "expected"),
+    (
+        ("worker", "egress", "SMTP egress leaked to another service"),
+        ("unreviewed", "secret", "SMTP secret leaked to another service"),
+        ("unreviewed", "alias-secret", "SMTP secret leaked to another service"),
+        ("worker", "network-mode", "Another service may not share Alertmanager network namespace"),
+        ("worker", "bind-source", "SMTP key bind mount leaked to another service"),
+        ("worker", "bind-target", "SMTP key bind mount leaked to another service"),
+        (
+            "alertmanager",
+            "internal-egress",
+            "SMTP egress must be a non-internal, non-external bridge",
+        ),
+    ),
+)
+def test_production_all_profile_alertmanager_security_denies_forged_service_or_network(
+    tmp_path: Path, service_name: str, fault: str, expected: str
+) -> None:
+    env, project_dir, log_file, _bundle = _production_preflight_fixture(tmp_path, with_bundle=False)
+    payload = json.loads(FAKE_PROMETHEUS_COMPOSE_JSON)
+    payload["services"]["alertmanager"]["volumes"] = [
+        {
+            "type": "bind",
+            "source": str(project_dir / "deploy/alertmanager/alertmanager.yml"),
+            "target": "/etc/alertmanager/alertmanager.yml",
+            "read_only": True,
+        }
+    ]
+    payload["secrets"]["alertmanager_smtp_key"]["file"] = str(
+        project_dir / "deploy/secrets/alertmanager_smtp_key"
+    )
+    if fault == "internal-egress":
+        payload["networks"]["smtp-egress"]["internal"] = True
+    else:
+        service = payload["services"].setdefault(service_name, {})
+        if fault == "egress":
+            service["networks"] = {"smtp-egress": {}}
+        elif fault == "network-mode":
+            service.pop("networks", None)
+            service["network_mode"] = "service:alertmanager"
+        elif fault in {"bind-source", "bind-target"}:
+            service["volumes"] = [
+                {
+                    "type": "bind",
+                    "source": (
+                        str(project_dir / "deploy/secrets/alertmanager_smtp_key")
+                        if fault == "bind-source"
+                        else str(tmp_path / "unrelated")
+                    ),
+                    "target": (
+                        "/run/secrets/alertmanager_smtp_key"
+                        if fault == "bind-target"
+                        else "/run/secrets/other"
+                    ),
+                    "read_only": True,
+                }
+            ]
+        elif fault == "alias-secret":
+            payload["secrets"]["alias"] = {
+                "file": str(project_dir / "deploy/secrets/alertmanager_smtp_key")
+            }
+            service["secrets"] = [{"source": "alias", "target": "/run/secrets/alias"}]
+        else:
+            service["secrets"] = [{"source": "alertmanager_smtp_key"}]
+    env["STUB_PROMETHEUS_COMPOSE_JSON"] = json.dumps(payload)
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh")), "--preflight-only"],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode != 0
+    assert expected in completed.stderr
+    log = log_file.read_text().splitlines()
+    assert any(line.endswith("--profile * config --format json") for line in log)
+    assert all(" pull " not in line and " up " not in line for line in log)
+
+
+@pytest.mark.parametrize("contour", ["staging", "production"])
+@pytest.mark.parametrize(
+    "utc_instant",
+    [
+        "2026-10-20T23:59:59+00:00",
+        "2026-10-21T00:00:00+00:00",
+        "2026-10-21T00:00:01+00:00",
+    ],
+)
+def test_selected_accepted_alertmanager_is_date_independent_and_off_profile_independent(
+    tmp_path: Path, contour: str, utc_instant: str
+) -> None:
+    if contour == "staging":
+        env, log_file = _staging_deploy_fixture(tmp_path)
+        key = Path(env["PROJECT_DIR"]) / "secrets/alertmanager_smtp_key"
+        source = _historical_deploy_script("scripts/deploy.sh")
+        args = [
+            "--preflight-only",
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64,
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64,
+        ]
+    else:
+        env, project_dir, log_file, _bundle = _production_preflight_fixture(
+            tmp_path, with_bundle=False
+        )
+        key = project_dir / "deploy/secrets/alertmanager_smtp_key"
+        source = _historical_deploy_script("scripts/deploy_production.sh")
+        args = ["--preflight-only"]
+    observed_date_script = _alertmanager_clock_bound_deploy(tmp_path, env, source, utc_instant)
+    key.write_text("synthetic-only", encoding="ascii")
+    key.chmod(0o444)
+    env["COMPOSE_PROFILES"] = "scheduler-external, alerting"
+    selected = subprocess.run(
+        [str(observed_date_script), *args],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert selected.returncode == 0, selected.stderr
+    key.unlink()
+    env.pop("COMPOSE_PROFILES", None)
+    off = subprocess.run(
+        [str(observed_date_script), *args],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert off.returncode == 0, off.stderr
+    if log_file.exists():
+        assert all(
+            " pull " not in line and " up " not in line
+            for line in log_file.read_text().splitlines()
+        )
+
+
+def _alertmanager_dependency_fixture(
+    tmp_path: Path, contour: str
+) -> tuple[dict[str, str], list[str], Path, Path]:
+    if contour == "staging":
+        env, log_file = _staging_deploy_fixture(tmp_path)
+        project_dir = Path(env["PROJECT_DIR"])
+        argv = [
+            str(_historical_deploy_script("scripts/deploy.sh")),
+            "--preflight-only",
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64,
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64,
+        ]
+    else:
+        env, project_dir, log_file, _bundle = _production_preflight_fixture(
+            tmp_path, with_bundle=False
+        )
+        payload = json.loads(FAKE_PROMETHEUS_COMPOSE_JSON)
+        payload["name"] = "production"
+        payload["services"]["alertmanager"]["volumes"] = [
+            {
+                "type": "bind",
+                "source": str(project_dir / "deploy/alertmanager/alertmanager.yml"),
+                "target": "/etc/alertmanager/alertmanager.yml",
+                "read_only": True,
+            }
+        ]
+        payload["secrets"]["alertmanager_smtp_key"]["file"] = str(
+            project_dir / "deploy/secrets/alertmanager_smtp_key"
+        )
+        env["STUB_PROMETHEUS_COMPOSE_JSON"] = json.dumps(payload)
+        argv = [str(_historical_deploy_script("scripts/deploy_production.sh")), "--preflight-only"]
+    env["COMPOSE_PROFILES"] = ""
+    return env, argv, log_file, project_dir
+
+
+def _assert_dependency_admission_has_no_product_effect(log_file: Path) -> None:
+    calls = log_file.read_text(encoding="utf-8").splitlines()
+    assert any(call.endswith("--profile * config --format json") for call in calls)
+    assert not any(
+        token in call
+        for call in calls
+        for token in (
+            " login ",
+            " pull ",
+            " run ",
+            " stop ",
+            " start ",
+            " up ",
+            "alembic",
+            "postgres_backup",
+        )
+    )
+
+
+def _alertmanager_email_drift(data: bytes, variant: str) -> bytes:
+    """Change one admitted email contract or byte spelling in a synthetic source."""
+    runbook = (
+        b"https://github.com/Katsiarynakavaleuskaya/PulsePlate/blob/main/"
+        b"docs/deploy/OPERATIONAL_SIGNALS.md#daily-checkpoint"
+    )
+    anchor = b'<a href="' + runbook + b'">'
+    assert data.count(anchor) == 1
+    if variant == "old-text-only":
+        prefix, marker, _tail = data.partition(b"        text: |\n")
+        assert marker
+        return prefix + (
+            b"        text: PulsePlate alert {{ .CommonLabels.alertname }} "
+            b"({{ .CommonLabels.environment }}).\n"
+        )
+    if variant == "missing-html":
+        prefix, marker, _tail = data.partition(b"        html: |\n")
+        assert marker
+        return prefix
+    if variant == "default-html":
+        prefix, marker, _tail = data.partition(b"        html: |\n")
+        assert marker
+        return prefix + b"        html: '{{ template \"email.default.html\" . }}'\n"
+    if variant == "extra-href":
+        return data + b'          <a href="http://private-container:9093">extra</a>\n'
+    if variant == "crlf":
+        return data.replace(b"\n", b"\r\n")
+    if variant == "unicode-separator":
+        return data.replace(b"\n          <p>", b"\xe2\x80\xa8          <p>", 1)
+    if variant == "missing-terminal-lf":
+        assert data.endswith(b"\n")
+        return data[:-1]
+    if variant == "extra-blank-line":
+        return data + b"\n"
+    if variant == "invalid-utf8":
+        return data.replace(b"Open PulsePlate monitoring runbook", b"Open \xff runbook", 1)
+    replacements = {
+        "private-href": (anchor, b'<a href="http://private-container:9093">'),
+        "external-href": (anchor, b'<a href="{{ .ExternalURL }}">'),
+        "generator-href": (anchor, b'<a href="{{ (index .Alerts 0).GeneratorURL }}">'),
+        "label-href": (anchor, b'<a href="{{ .CommonLabels.environment }}">'),
+        "recipient": (b"      - to: pulseplate@pm.me", b"      - to: other@example.invalid"),
+        "smtp": (b"smtp.resend.com:2465", b"other.example.invalid:2465"),
+        "tls": (b"  smtp_require_tls: true", b"  smtp_require_tls: false"),
+        "copy": (b"PulsePlate alert {{", b"Changed alert {{"),
+    }
+    old, new = replacements[variant]
+    assert old in data
+    return data.replace(old, new, 1)
+
+
+ALERTMANAGER_EMAIL_DRIFT = (
+    "old-text-only",
+    "missing-html",
+    "default-html",
+    "extra-href",
+    "private-href",
+    "external-href",
+    "generator-href",
+    "label-href",
+    "recipient",
+    "smtp",
+    "tls",
+    "copy",
+    "crlf",
+    "unicode-separator",
+    "missing-terminal-lf",
+    "extra-blank-line",
+    "invalid-utf8",
+)
+
+
+@pytest.mark.parametrize("contour", ["staging", "production-installed", "production-bundle"])
+def test_alertmanager_email_canonical_bytes_pass_both_deploy_readers(
+    tmp_path: Path, contour: str
+) -> None:
+    """The actual shell admissions accept the complete new source in every source mode."""
+    if contour == "staging":
+        env, argv, _log_file, project = _alertmanager_dependency_fixture(tmp_path, "staging")
+        source = project / "alertmanager/alertmanager.yml"
+    else:
+        env, project, _log_file, bundle = _production_preflight_fixture(
+            tmp_path, with_bundle=contour == "production-bundle"
+        )
+        env["COMPOSE_PROFILES"] = ""
+        source = (bundle or project) / "deploy/alertmanager/alertmanager.yml"
+        argv = [str(_historical_deploy_script("scripts/deploy_production.sh")), "--preflight-only"]
+    assert source.read_bytes() == ALERTMANAGER_CONFIG_PATH.read_bytes()
+    completed = subprocess.run(
+        argv, cwd=REPO_ROOT, env=env, capture_output=True, text=True, check=False
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.parametrize("contour", ["staging", "production-installed", "production-bundle"])
+@pytest.mark.parametrize("variant", ALERTMANAGER_EMAIL_DRIFT)
+def test_alertmanager_email_noncanonical_bytes_reject_before_product_effects(
+    tmp_path: Path, contour: str, variant: str
+) -> None:
+    """Both full deploy paths refuse drift before login, publication or product mutation."""
+    if contour == "staging":
+        env, argv, log_file, project = _alertmanager_dependency_fixture(tmp_path, "staging")
+        source = project / "alertmanager/alertmanager.yml"
+        argv.remove("--preflight-only")
+        installed_paths = (
+            "docker-compose.staging.yaml",
+            "prometheus/prometheus.yml",
+            "alertmanager/alertmanager.yml",
+        )
+    else:
+        env, project, log_file, bundle = _production_preflight_fixture(
+            tmp_path, with_bundle=contour == "production-bundle"
+        )
+        env.update(
+            {
+                "COMPOSE_PROFILES": "",
+                "IMAGE_REF": "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64,
+                "TAG": "prod-vtest",
+            }
+        )
+        source = (bundle or project) / "deploy/alertmanager/alertmanager.yml"
+        argv = [str(_historical_deploy_script("scripts/deploy_production.sh"))]
+        installed_paths = (
+            "deploy/docker-compose.production.yaml",
+            "deploy/prometheus/prometheus.yml",
+            "deploy/alertmanager/alertmanager.yml",
+        )
+    faulty = _alertmanager_email_drift(source.read_bytes(), variant)
+    source.write_bytes(faulty)
+    installed = {name: (project / name).read_bytes() for name in installed_paths}
+    completed = subprocess.run(
+        argv, cwd=REPO_ROOT, env=env, capture_output=True, text=True, check=False
+    )
+    assert completed.returncode != 0
+    assert "Alertmanager" in completed.stderr or (
+        "AM_contract_HOLD:" in completed.stderr and "utf-8" in completed.stderr
+    )
+    _assert_dependency_admission_has_no_product_effect(log_file)
+    assert source.read_bytes() == faulty
+    assert {name: (project / name).read_bytes() for name in installed_paths} == installed
+    assert not list(project.rglob(".pulseplate-*.tmp-*"))
+
+
+@pytest.mark.parametrize("contour", ["staging", "production"])
+@pytest.mark.parametrize(
+    ("service_name", "condition", "required", "restart", "indirect"),
+    [
+        ("app", "service_started", True, False, False),
+        ("app", "service_healthy", True, True, False),
+        ("app", "service_completed_successfully", True, False, False),
+        ("app", "service_started", False, False, False),
+        ("app", "service_healthy", False, True, False),
+        ("app", "service_completed_successfully", False, False, False),
+        ("prometheus", "service_healthy", True, False, False),
+        ("worker", "service_started", False, True, False),
+        ("inactive-helper", "service_started", False, False, False),
+        ("inactive-helper", "service_started", False, False, True),
+    ],
+)
+def test_alertmanager_dependency_admission_rejects_every_incoming_edge(
+    tmp_path: Path,
+    contour: str,
+    service_name: str,
+    condition: str,
+    required: bool,
+    restart: bool,
+    indirect: bool,
+) -> None:
+    env, argv, log_file, _project = _alertmanager_dependency_fixture(tmp_path, contour)
+    payload = json.loads(env["STUB_PROMETHEUS_COMPOSE_JSON"])
+    service = payload["services"].setdefault(service_name, {})
+    if service_name == "inactive-helper":
+        service["profiles"] = ["unselected"]
+    service["depends_on"] = {
+        "alertmanager": {"condition": condition, "required": required, "restart": restart}
+    }
+    if indirect:
+        payload["services"]["app"]["depends_on"] = {
+            service_name: {"condition": "service_started", "required": True}
+        }
+    env["STUB_PROMETHEUS_COMPOSE_JSON"] = json.dumps(payload)
+    completed = subprocess.run(
+        argv, cwd=REPO_ROOT, env=env, capture_output=True, text=True, check=False
+    )
+    assert completed.returncode != 0
+    assert "Another service may not depend on Alertmanager" in completed.stderr
+    _assert_dependency_admission_has_no_product_effect(log_file)
+
+
+@pytest.mark.parametrize("contour", ["staging", "production"])
+@pytest.mark.parametrize("bad_value", [None, [], "", 0, False])
+@pytest.mark.parametrize("shape", ["map", "edge"])
+def test_alertmanager_dependency_admission_rejects_malformed_normalized_graph(
+    tmp_path: Path, contour: str, bad_value: object, shape: str
+) -> None:
+    env, argv, log_file, _project = _alertmanager_dependency_fixture(tmp_path, contour)
+    payload = json.loads(env["STUB_PROMETHEUS_COMPOSE_JSON"])
+    payload["services"]["app"]["depends_on"] = (
+        bad_value if shape == "map" else {"postgres": bad_value}
+    )
+    env["STUB_PROMETHEUS_COMPOSE_JSON"] = json.dumps(payload)
+    completed = subprocess.run(
+        argv, cwd=REPO_ROOT, env=env, capture_output=True, text=True, check=False
+    )
+    assert completed.returncode != 0
+    assert "Rendered Compose dependency map is malformed" in completed.stderr
+    _assert_dependency_admission_has_no_product_effect(log_file)
+
+
+@pytest.mark.parametrize("contour", ["staging", "production"])
+def test_alertmanager_dependency_admission_rejects_empty_incoming_edge_record(
+    tmp_path: Path, contour: str
+) -> None:
+    env, argv, log_file, _project = _alertmanager_dependency_fixture(tmp_path, contour)
+    payload = json.loads(env["STUB_PROMETHEUS_COMPOSE_JSON"])
+    payload["services"]["app"]["depends_on"] = {"alertmanager": {}}
+    env["STUB_PROMETHEUS_COMPOSE_JSON"] = json.dumps(payload)
+    completed = subprocess.run(
+        argv, cwd=REPO_ROOT, env=env, capture_output=True, text=True, check=False
+    )
+    assert completed.returncode != 0
+    assert "Another service may not depend on Alertmanager" in completed.stderr
+    _assert_dependency_admission_has_no_product_effect(log_file)
+
+
+@pytest.mark.parametrize("contour", ["staging", "production"])
+@pytest.mark.parametrize("bad_value", [None, [], "", 0, False])
+def test_alertmanager_dependency_admission_rejects_false_like_outgoing_map(
+    tmp_path: Path, contour: str, bad_value: object
+) -> None:
+    env, argv, log_file, _project = _alertmanager_dependency_fixture(tmp_path, contour)
+    payload = json.loads(env["STUB_PROMETHEUS_COMPOSE_JSON"])
+    payload["services"]["alertmanager"]["depends_on"] = bad_value
+    env["STUB_PROMETHEUS_COMPOSE_JSON"] = json.dumps(payload)
+    completed = subprocess.run(
+        argv, cwd=REPO_ROOT, env=env, capture_output=True, text=True, check=False
+    )
+    assert completed.returncode != 0
+    assert "Rendered Compose dependency map is malformed" in completed.stderr
+    _assert_dependency_admission_has_no_product_effect(log_file)
+
+
+@pytest.mark.parametrize("contour", ["staging", "production"])
+@pytest.mark.parametrize("selected", [False, True])
+@pytest.mark.parametrize("dependencies", ["absent", "empty", "product"])
+def test_alertmanager_dependency_admission_preserves_legitimate_product_edges_and_profiles(
+    tmp_path: Path, contour: str, selected: bool, dependencies: str
+) -> None:
+    env, argv, log_file, project = _alertmanager_dependency_fixture(tmp_path, contour)
+    payload = json.loads(env["STUB_PROMETHEUS_COMPOSE_JSON"])
+    for service in payload["services"].values():
+        service.pop("depends_on", None)
+    if dependencies == "empty":
+        for service in payload["services"].values():
+            service["depends_on"] = {}
+    elif dependencies == "product":
+        payload["services"]["app"]["depends_on"] = {
+            "postgres": {"condition": "service_healthy", "required": True}
+        }
+        payload["services"]["prometheus"]["depends_on"] = {
+            "app": {"condition": "service_started", "required": False, "restart": True}
+        }
+    env["STUB_PROMETHEUS_COMPOSE_JSON"] = json.dumps(payload)
+    secret_dir = project / ("secrets" if contour == "staging" else "deploy/secrets")
+    key = secret_dir / "alertmanager_smtp_key"
+    if selected:
+        key.write_text("synthetic-only", encoding="ascii")
+        key.chmod(0o444)
+        env["COMPOSE_PROFILES"] = "alerting"
+    else:
+        assert not key.exists()
+    completed = subprocess.run(
+        argv, cwd=REPO_ROOT, env=env, capture_output=True, text=True, check=False
+    )
+    assert completed.returncode == 0, completed.stderr
+    _assert_dependency_admission_has_no_product_effect(log_file)
+
+
+@pytest.mark.parametrize("contour", ("staging", "production"))
+@pytest.mark.parametrize(
+    ("carrier", "field"),
+    (
+        ("ipc", "ipc: service:alertmanager"),
+        ("pid", "pid: service:alertmanager"),
+        ("volumes_from", "volumes_from: [alertmanager]"),
+        ("links", "links: [alertmanager]"),
+        ("network_mode", "network_mode: service:alertmanager"),
+    ),
+)
+def test_native_compose_service_references_reject_via_normalized_dependency(
+    tmp_path: Path, contour: str, carrier: str, field: str
+) -> None:
+    docker_bin = shutil.which("docker")
+    assert docker_bin is not None, "native Docker Compose is required for reference admission"
+    compose_path = tmp_path / "native-reference.yaml"
+    compose_path.write_text(
+        "services:\n"
+        "  alertmanager:\n"
+        "    image: busybox:latest\n"
+        "    profiles: [alerting]\n"
+        "  app:\n"
+        "    image: busybox:latest\n"
+        f"    {field}\n",
+        encoding="utf-8",
+    )
+    native = subprocess.run(
+        [
+            docker_bin,
+            "compose",
+            "-f",
+            str(compose_path),
+            "--profile",
+            "*",
+            "config",
+            "--format",
+            "json",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert native.returncode == 0, native.stderr
+    projected = json.loads(native.stdout)["services"]["app"]
+    assert "alertmanager" in projected["depends_on"], (carrier, projected)
+    assert carrier in projected
+
+    env, argv, log_file, _project = _alertmanager_dependency_fixture(tmp_path, contour)
+    payload = json.loads(env["STUB_PROMETHEUS_COMPOSE_JSON"])
+    payload["services"]["app"]["depends_on"] = projected["depends_on"]
+    payload["services"]["app"][carrier] = projected[carrier]
+    env["STUB_PROMETHEUS_COMPOSE_JSON"] = json.dumps(payload)
+    assert not env.get("COMPOSE_PROFILES")
+    completed = subprocess.run(
+        argv, cwd=REPO_ROOT, env=env, capture_output=True, text=True, check=False
+    )
+    assert completed.returncode != 0
+    assert "Another service may not depend on Alertmanager" in completed.stderr
+    _assert_dependency_admission_has_no_product_effect(log_file)
+
+
+@pytest.mark.parametrize("source_kind", ["directory", "archive"])
+def test_production_incoming_alertmanager_dependency_rejects_before_contract_publication(
+    tmp_path: Path, source_kind: str
+) -> None:
+    env, project, log_file, bundle = _production_preflight_fixture(tmp_path, with_bundle=True)
+    assert bundle is not None
+    source_compose = bundle / "deploy/docker-compose.production.yaml"
+    source = yaml.safe_load(source_compose.read_text(encoding="utf-8"))
+    source["services"]["app"]["depends_on"] = {
+        "alertmanager": {"condition": "service_healthy", "required": True}
+    }
+    source_compose.write_text(yaml.safe_dump(source, sort_keys=False), encoding="utf-8")
+    docker_stub = Path(env["DOCKER_BIN"])
+    stub_text = docker_stub.read_text(encoding="utf-8")
+    assert stub_text.count("print(json.dumps(payload))") == 1
+    docker_stub.write_text(
+        stub_text.replace(
+            "print(json.dumps(payload))",
+            "import yaml\n"
+            'source = yaml.safe_load(compose.read_text(encoding="utf-8"))\n'
+            'payload["services"]["app"]["depends_on"] = '
+            'source["services"]["app"].get("depends_on", {})\n'
+            "print(json.dumps(payload))",
+        ),
+        encoding="utf-8",
+    )
+    env.pop("STUB_PROMETHEUS_COMPOSE_JSON", None)
+    env["COMPOSE_PROFILES"] = ""
+    env["IMAGE_REF"] = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64
+    env["TAG"] = "prod-vtest"
+    previous_backup = project / "scripts/ops/postgres_backup.sh"
+    previous_backup.parent.mkdir(parents=True)
+    previous_backup.write_text("#!/usr/bin/env bash\nexit 71\n", encoding="utf-8")
+    previous_backup.chmod(0o755)
+    installed_paths = [
+        "deploy/docker-compose.production.yaml",
+        "deploy/prometheus/prometheus.yml",
+        "deploy/prometheus/alias-alerts.yml",
+        "deploy/prometheus/image-manifest.json",
+        "deploy/alertmanager/alertmanager.yml",
+        "deploy/alertmanager/trivy-ignore.yaml",
+        "deploy/postgres-pgvector/image-manifest.json",
+        "scripts/ops/postgres_backup.sh",
+    ]
+    installed = {relative: (project / relative).read_bytes() for relative in installed_paths}
+    archive = _canonical_test_archive_path(9447)
+    if source_kind == "archive":
+        _write_shell_bundle_archive(archive, bundle)
+        env.pop("SHELL_BUNDLE_DIR", None)
+        env["SHELL_BUNDLE_ARCHIVE"] = str(archive)
+    else:
+        env.pop("SHELL_BUNDLE_ARCHIVE", None)
+    try:
+        completed = subprocess.run(
+            [str(_historical_deploy_script("scripts/deploy_production.sh"))],
+            cwd=REPO_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert completed.returncode != 0
+        assert "Another service may not depend on Alertmanager" in completed.stderr
+        _assert_dependency_admission_has_no_product_effect(log_file)
+        assert {relative: (project / relative).read_bytes() for relative in installed_paths} == (
+            installed
+        )
+        assert not list(project.rglob(".pulseplate-*.tmp-*"))
+    finally:
+        if source_kind == "archive":
+            archive.unlink(missing_ok=True)
+
+
+def _alertmanager_clock_bound_deploy(
+    tmp_path: Path, env: dict[str, str], source: Path, instant: str
+) -> Path:
+    """Freeze the actual same-owner clock in a separately bound test helper, never a runtime override."""
+    root = Path(env.get("PROJECT_DIR", env.get("DEPLOY_DIR", "")))
+    helper = root / "scripts/ci/fetch_docker_source_artifacts.py"
+    raw = helper.read_text()
+    clock = "datetime.now(timezone.utc) < datetime(2026, 10, 21"
+    assert raw.count(clock) == 1
+    helper.write_text(
+        raw.replace(clock, 'datetime.fromisoformat("' + instant + '") < datetime(2026, 10, 21')
+    )
+    script = tmp_path / (source.stem + "-test-clock.sh")
+    text, replacements = re.subn(
+        r'ALERTMANAGER_CONTRACT_HELPER_SHA256="[0-9a-f]{64}"',
+        'ALERTMANAGER_CONTRACT_HELPER_SHA256="'
+        + hashlib.sha256(helper.read_bytes()).hexdigest()
+        + '"',
+        source.read_text(),
+    )
+    assert replacements == 1
+    script.write_text(text)
+    script.chmod(0o755)
+    return script
+
+
+def _alertmanager_census_inspect_record(
+    *,
+    status: str = "running",
+    project: str = "deploy",
+    service: str = "alertmanager",
+    full_id: str = "e" * 64,
+) -> dict[str, object]:
+    return {
+        "Id": full_id,
+        "Image": alertmanager_source._ALERT_OLD_RUNTIME_CONFIG,
+        "Config": {
+            "Labels": {
+                "com.docker.compose.project": project,
+                "com.docker.compose.service": service,
+            }
+        },
+        "State": {
+            "Status": status,
+            "Running": status == "running",
+            "Restarting": status == "restarting",
+            "Paused": False,
+            "Dead": False,
+        },
+    }
+
+
+@pytest.mark.parametrize("source_kind", ("directory", "archive"))
+def test_production_first_bundle_censuses_old_project_without_installed_alertmanager(
+    tmp_path: Path, source_kind: str
+) -> None:
+    env, project, log_file, bundle = _production_preflight_fixture(tmp_path, with_bundle=True)
+    assert bundle is not None
+    installed_compose = project / "deploy/docker-compose.production.yaml"
+    old_source = yaml.safe_load(installed_compose.read_text(encoding="utf-8"))
+    old_source["services"].pop("alertmanager")
+    old_source["secrets"].pop("alertmanager_smtp_key")
+    old_source["networks"].pop("alerting")
+    old_source["networks"].pop("smtp-egress")
+    old_source["services"]["prometheus"]["networks"] = ["observability"]
+    installed_compose.write_text(yaml.safe_dump(old_source, sort_keys=False), encoding="utf-8")
+    installed_alertmanager = project / "deploy/alertmanager"
+    for leaf in ("alertmanager.yml", "trivy-ignore.yaml"):
+        (installed_alertmanager / leaf).unlink()
+    installed_alertmanager.rmdir()
+    assert (bundle / "deploy/alertmanager/alertmanager.yml").is_file()
+    assert (bundle / "deploy/alertmanager/trivy-ignore.yaml").is_file()
+    assert "alertmanager" not in yaml.safe_load(installed_compose.read_text())["services"]
+    env["STUB_INSTALLED_NO_ALERTMANAGER"] = str(installed_compose)
+    env["STUB_CENSUS_LOG"] = str(log_file)
+    env.pop("COMPOSE_PROFILES", None)
+    archive: Path | None = None
+    if source_kind == "archive":
+        archive = _canonical_test_archive_path(9448)
+        _write_shell_bundle_archive(archive, bundle)
+        env.pop("SHELL_BUNDLE_DIR", None)
+        env["SHELL_BUNDLE_ARCHIVE"] = str(archive)
+    try:
+        completed = subprocess.run(
+            [str(_historical_deploy_script("scripts/deploy_production.sh")), "--preflight-only"],
+            cwd=REPO_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
+        log = log_file.read_text(encoding="utf-8").splitlines()
+        assert any(
+            "ps --all --no-trunc --quiet" in line
+            and "label=com.docker.compose.project=deploy" in line
+            and "label=com.docker.compose.service=alertmanager" in line
+            for line in log
+        ), log
+        assert all("ps --all --quiet alertmanager" not in line for line in log)
+        assert all(
+            " pull " not in line and " up " not in line and " stop " not in line for line in log
+        )
+        assert not installed_alertmanager.exists()
+    finally:
+        if archive is not None:
+            archive.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize(
+    ("presence", "utc_instant", "allowed"),
+    (
+        ("absent", "2026-10-21T00:00:01+00:00", True),
+        ("stopped", "2026-10-21T00:00:01+00:00", True),
+        ("running", "2026-10-20T23:59:59+00:00", True),
+        ("running", "2026-10-21T00:00:00+00:00", False),
+        ("running", "2026-10-21T00:00:01+00:00", False),
+    ),
+)
+def test_production_off_profile_census_only_running_alertmanager_enforces_expiry(
+    tmp_path: Path, presence: str, utc_instant: str, allowed: bool
+) -> None:
+    env, _project_dir, log_file, _bundle = _production_preflight_fixture(
+        tmp_path, with_bundle=False
+    )
+    env.pop("COMPOSE_PROFILES", None)
+    env["STUB_CENSUS_LOG"] = str(log_file)
+    script = _alertmanager_clock_bound_deploy(
+        tmp_path, env, _historical_deploy_script("scripts/deploy_production.sh"), utc_instant
+    )
+    if presence != "absent":
+        env["STUB_ALERTMANAGER_PS_IDS"] = "e" * 64
+        status = "running" if presence == "running" else "exited"
+        env["STUB_ALERTMANAGER_INSPECT_JSON"] = json.dumps(
+            [_alertmanager_census_inspect_record(status=status)]
+        )
+    completed = subprocess.run(
+        [str(script), "--preflight-only"],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert (completed.returncode == 0) is allowed, completed.stderr
+    if not allowed:
+        assert "running Alertmanager Trivy exception has expired" in completed.stderr
+    log = log_file.read_text().splitlines()
+    assert any(
+        "ps --all --no-trunc --quiet --filter label=com.docker.compose.project=" in line
+        and "--filter label=com.docker.compose.service=alertmanager" in line
+        for line in log
+    )
+    assert bool([line for line in log if line.startswith("docker inspect " + "e" * 64)]) is (
+        presence != "absent"
+    )
+    assert all(" pull " not in line and " up " not in line and " stop " not in line for line in log)
+
+
+@pytest.mark.parametrize(
+    ("fault", "expected"),
+    (
+        ("ps-error", "AM_contract_native_exit:census"),
+        ("multiple", "AM_contract_census_full_ID"),
+        ("duplicate", "AM_contract_census_full_ID"),
+        ("short-id", "AM_contract_census_full_ID"),
+        ("malformed-id", "AM_contract_census_full_ID"),
+        ("inspect-error", "AM_contract_native_exit:container"),
+        ("restarting", "AM_contract_runtime_state"),
+        ("unknown-state", "AM_contract_runtime_state"),
+        ("paused", "AM_contract_runtime_state"),
+        ("wrong-project-label", "AM_contract_container_identity"),
+        ("wrong-service-label", "AM_contract_container_identity"),
+        ("wrong-id", "AM_contract_container_identity"),
+        ("wrong-project-name", "AM_contract_installed_project_identity"),
+    ),
+)
+def test_production_off_profile_census_fails_closed_before_product_mutation(
+    tmp_path: Path, fault: str, expected: str
+) -> None:
+    env, _project_dir, log_file, _bundle = _production_preflight_fixture(
+        tmp_path, with_bundle=False
+    )
+    env.pop("COMPOSE_PROFILES", None)
+    env["STUB_CENSUS_LOG"] = str(log_file)
+    env["STUB_ALERTMANAGER_PS_IDS"] = "e" * 64
+    record = _alertmanager_census_inspect_record()
+    if fault == "ps-error":
+        env["STUB_ALERTMANAGER_PS_STATUS"] = "37"
+    elif fault == "multiple":
+        env["STUB_ALERTMANAGER_PS_IDS"] += "\n" + "f" * 64
+    elif fault == "duplicate":
+        env["STUB_ALERTMANAGER_PS_IDS"] += "\n" + "e" * 64
+    elif fault == "short-id":
+        env["STUB_ALERTMANAGER_PS_IDS"] = "e" * 12
+    elif fault == "malformed-id":
+        env["STUB_ALERTMANAGER_PS_IDS"] = "not-a-container-id"
+    elif fault == "inspect-error":
+        env["STUB_ALERTMANAGER_INSPECT_STATUS"] = "47"
+    elif fault == "restarting":
+        record["State"] = {
+            "Status": "restarting",
+            "Running": True,
+            "Restarting": True,
+            "Paused": False,
+            "Dead": False,
+        }
+    elif fault == "unknown-state":
+        record["State"] = {
+            "Status": "removing",
+            "Running": False,
+            "Restarting": False,
+            "Paused": False,
+            "Dead": False,
+        }
+    elif fault == "paused":
+        state = record["State"]
+        assert isinstance(state, dict)
+        state["Paused"] = True
+    elif fault == "wrong-project-label":
+        config = record["Config"]
+        assert isinstance(config, dict)
+        labels = config["Labels"]
+        assert isinstance(labels, dict)
+        labels["com.docker.compose.project"] = "foreign"
+    elif fault == "wrong-service-label":
+        config = record["Config"]
+        assert isinstance(config, dict)
+        labels = config["Labels"]
+        assert isinstance(labels, dict)
+        labels["com.docker.compose.service"] = "worker"
+    elif fault == "wrong-id":
+        record["Id"] = "f" * 64
+    elif fault == "wrong-project-name":
+        env["STUB_COMPOSE_PROJECT_NAME"] = "Bad Name"
+    env["STUB_ALERTMANAGER_INSPECT_JSON"] = json.dumps([record])
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh")), "--preflight-only"],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode != 0
+    assert expected in completed.stderr
+    log = log_file.read_text().splitlines()
+    assert any(
+        "ps --all --no-trunc --quiet --filter label=com.docker.compose.project=" in line
+        for line in log
+    ) is (fault != "wrong-project-name")
+    assert all(" pull " not in line and " up " not in line and " stop " not in line for line in log)
+
+
+@pytest.mark.parametrize(
+    ("project_name", "allowed"),
+    ((None, True), ("", False), ("Bad Name", False)),
+)
+def test_production_empty_alertmanager_census_requires_canonical_project_identity(
+    tmp_path: Path, project_name: str | None, allowed: bool
+) -> None:
+    env, _project_dir, log_file, _bundle = _production_preflight_fixture(
+        tmp_path, with_bundle=False
+    )
+    env.pop("COMPOSE_PROFILES", None)
+    env["STUB_CENSUS_LOG"] = str(log_file)
+    env["STUB_ALERTMANAGER_PS_IDS"] = ""
+    if project_name is not None:
+        env["STUB_COMPOSE_PROJECT_NAME"] = project_name
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh")), "--preflight-only"],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert (completed.returncode == 0) is allowed, completed.stderr
+    if not allowed:
+        assert "AM_contract_installed_project_identity" in completed.stderr
+    log = log_file.read_text().splitlines()
+    assert any("--profile * config --format json" in line for line in log)
+    assert (
+        any(
+            "ps --all --no-trunc --quiet --filter label=com.docker.compose.project=" in line
+            for line in log
+        )
+        is allowed
+    )
+    assert all(" pull " not in line and " up " not in line and " stop " not in line for line in log)
+
+
+def _capture_compose_profile_environment(env: dict[str, str], tmp_path: Path) -> Path:
+    original_docker = Path(env["DOCKER_BIN"])
+    observed = tmp_path / "compose-profiles.log"
+    wrapper = tmp_path / "docker-profile-wrapper"
+    _write_executable(
+        wrapper,
+        "#!/usr/bin/env bash\nset -euo pipefail\n"
+        "printf 'present=%s value=%s\\n' "
+        '"${COMPOSE_PROFILES+x}" "${COMPOSE_PROFILES-}" '
+        f">> {shlex.quote(str(observed))}\n"
+        f'exec {shlex.quote(str(original_docker))} "$@"\n',
+    )
+    env["DOCKER_BIN"] = str(wrapper)
+    return observed
+
+
+@pytest.mark.parametrize(
+    ("caller_profile", "env_assignment", "allowed"),
+    (
+        (None, None, True),
+        ("", None, True),
+        ("scheduler-external", None, True),
+        ("alerting", None, True),
+        ("scheduler-external, alerting", None, True),
+        (None, "COMPOSE_PROFILES=alerting", False),
+        (None, "export COMPOSE_PROFILES=alerting", False),
+        ("", "export COMPOSE_PROFILES=alerting", False),
+        ("alerting", "unset COMPOSE_PROFILES", False),
+        (None, "unset COMPOSE_PROFILES", True),
+    ),
+)
+def test_production_compose_profiles_remain_caller_owned_across_sourced_env(
+    tmp_path: Path, caller_profile: str | None, env_assignment: str | None, allowed: bool
+) -> None:
+    env, project_dir, log_file, _bundle = _production_preflight_fixture(tmp_path, with_bundle=False)
+    env.pop("COMPOSE_PROFILES", None)
+    if caller_profile is not None:
+        env["COMPOSE_PROFILES"] = caller_profile
+    if env_assignment is not None:
+        with Path(env["ENV_FILE"]).open("a", encoding="utf-8") as handle:
+            handle.write(env_assignment + "\n")
+    if caller_profile is not None and "alerting" in caller_profile:
+        key = project_dir / "deploy/secrets/alertmanager_smtp_key"
+        key.write_text("synthetic-only", encoding="ascii")
+        key.chmod(0o444)
+    observed = _capture_compose_profile_environment(env, tmp_path)
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh")), "--preflight-only"],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert (completed.returncode == 0) is allowed, completed.stderr
+    if allowed:
+        profile_lines = observed.read_text().splitlines()
+        assert profile_lines
+        assert all(line == f"present=x value={caller_profile or ''}" for line in profile_lines)
+    else:
+        assert "env file changed caller-owned COMPOSE_PROFILES" in completed.stderr
+        assert not observed.exists()
+        assert not log_file.exists()
+
+
+@pytest.mark.parametrize(
+    ("caller_profile", "env_assignment", "allowed"),
+    (
+        (None, None, True),
+        ("", None, True),
+        ("scheduler-external", None, True),
+        ("alerting", None, True),
+        ("scheduler-external, alerting", None, True),
+        (None, "COMPOSE_PROFILES=alerting", False),
+        (None, "export COMPOSE_PROFILES=alerting", True),
+    ),
+)
+def test_staging_compose_profiles_export_caller_choice_before_compose(
+    tmp_path: Path, caller_profile: str | None, env_assignment: str | None, allowed: bool
+) -> None:
+    env, log_file = _staging_deploy_fixture(tmp_path)
+    env.pop("COMPOSE_PROFILES", None)
+    if caller_profile is not None:
+        env["COMPOSE_PROFILES"] = caller_profile
+    if env_assignment is not None:
+        with Path(env["ENV_FILE"]).open("a", encoding="utf-8") as handle:
+            handle.write(env_assignment + "\n")
+    if caller_profile is not None and "alerting" in caller_profile:
+        key = Path(env["PROJECT_DIR"]) / "secrets/alertmanager_smtp_key"
+        key.write_text("synthetic-only", encoding="ascii")
+        key.chmod(0o444)
+    observed = _capture_compose_profile_environment(env, tmp_path)
+    completed = subprocess.run(
+        [
+            str(_historical_deploy_script("scripts/deploy.sh")),
+            "--preflight-only",
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64,
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64,
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert (completed.returncode == 0) is allowed, completed.stderr
+    profile_lines = observed.read_text().splitlines()
+    assert profile_lines
+    assert all(line == f"present=x value={caller_profile or ''}" for line in profile_lines)
+    if not allowed:
+        assert "COMPOSE_PROFILES must be selected by the operator" in completed.stderr
+        assert all(
+            " pull " not in line and " up " not in line
+            for line in log_file.read_text().splitlines()
+        )
+
+
+def test_production_alertmanager_rejects_extra_recipient_before_product_mutation(
+    tmp_path: Path,
+) -> None:
+    env, project_dir, log_file, _bundle = _production_preflight_fixture(tmp_path, with_bundle=False)
+    config = project_dir / "deploy/alertmanager/alertmanager.yml"
+    config.write_text(
+        config.read_text(encoding="utf-8") + "\n      - to: attacker@example.invalid\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh")), "--preflight-only"],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "sole recipient" in result.stderr
+    if log_file.exists():
+        assert all(
+            " pull " not in line and " up " not in line and " stop " not in line
+            for line in log_file.read_text(encoding="utf-8").splitlines()
+        )
+
+
+@pytest.mark.parametrize("partial_leaf", ("alertmanager.yml", "trivy-ignore.yaml"))
+def test_production_partial_alertmanager_publication_holds_then_readmits_exact_bundle(
+    tmp_path: Path, partial_leaf: str
+) -> None:
+    env, project_dir, log_file, _bundle = _production_preflight_fixture(tmp_path, with_bundle=False)
+    installed = project_dir / "deploy/alertmanager" / partial_leaf
+    installed.write_text("older-partial-publication\n", encoding="utf-8")
+    app_sentinel = project_dir / "app-state-sentinel"
+    tsdb_sentinel = project_dir / "prometheus_data" / "sentinel"
+    app_sentinel.write_text("keep-app\n", encoding="utf-8")
+    tsdb_sentinel.parent.mkdir()
+    tsdb_sentinel.write_text("keep-tsdb\n", encoding="utf-8")
+    rejected = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh")), "--preflight-only"],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert rejected.returncode != 0
+    assert "Alertmanager" in rejected.stderr
+    if log_file.exists():
+        assert all(
+            " pull " not in line and " up " not in line and " stop " not in line
+            for line in log_file.read_text(encoding="utf-8").splitlines()
+        )
+    assert installed.read_text(encoding="utf-8") == "older-partial-publication\n"
+    assert app_sentinel.read_text(encoding="utf-8") == "keep-app\n"
+    assert tsdb_sentinel.read_text(encoding="utf-8") == "keep-tsdb\n"
+
+    source = tmp_path / "readmitted-bundle"
+    source.mkdir()
+    _write_shell_bundle_contract(source)
+    script = (_historical_deploy_script("scripts/deploy_production.sh")).read_text(encoding="utf-8")
+    start = script.index("contract_destination_transaction() {")
+    end = script.index("\n}\n\nvalidate_contract_destinations_safely() {", start) + len("\n}\n")
+    transaction = script[start:end]
+    program = transaction + "\n" + """contract_destination_transaction publish-contracts \\
+  "$SOURCE_COMPOSE" "$SOURCE_PROMETHEUS_CONFIG" "$SOURCE_PROMETHEUS_RULES" \\
+  "$SOURCE_PROMETHEUS_MANIFEST" "$SOURCE_ALERTMANAGER_CONFIG" "$SOURCE_ALERTMANAGER_IGNORE" \\
+  "$SOURCE_POSTGRES_MANIFEST" "" "" "" "" "$SOURCE_BACKUP_HELPER"\n"""
+    publication_env = {
+        **env,
+        "PYTHON_BIN": sys.executable,
+        "REQUESTED_DEPLOY_DIR": str(project_dir),
+        "COMPOSE_RELATIVE_IDENTITY": "deploy/docker-compose.production.yaml",
+        "SOURCE_COMPOSE": str(source / "deploy/docker-compose.production.yaml"),
+        "SOURCE_PROMETHEUS_CONFIG": str(source / "deploy/prometheus/prometheus.yml"),
+        "SOURCE_PROMETHEUS_RULES": str(source / "deploy/prometheus/alias-alerts.yml"),
+        "SOURCE_PROMETHEUS_MANIFEST": str(source / "deploy/prometheus/image-manifest.json"),
+        "SOURCE_ALERTMANAGER_CONFIG": str(source / "deploy/alertmanager/alertmanager.yml"),
+        "SOURCE_ALERTMANAGER_IGNORE": str(source / "deploy/alertmanager/trivy-ignore.yaml"),
+        "SOURCE_POSTGRES_MANIFEST": str(source / "deploy/postgres-pgvector/image-manifest.json"),
+        "SOURCE_BACKUP_HELPER": str(source / "scripts/ops/postgres_backup.sh"),
+        "PROMETHEUS_CONTRACT_HELPER_SHA256": hashlib.sha256(
+            (REPO_ROOT / "scripts/ci/prometheus_source_image.py").read_bytes()
+        ).hexdigest(),
+        "ALERTMANAGER_CONTRACT_HELPER_SHA256": hashlib.sha256(
+            (_historical_AM_helper()).read_bytes()
+        ).hexdigest(),
+    }
+    published = subprocess.run(
+        ["/bin/bash", "-euc", program],
+        cwd=str(REPO_ROOT),
+        env=publication_env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert published.returncode == 0, published.stderr
+    assert (
+        project_dir / "deploy/alertmanager/alertmanager.yml"
+    ).read_bytes() == ALERTMANAGER_CONFIG_PATH.read_bytes()
+    assert (
+        project_dir / "deploy/alertmanager/trivy-ignore.yaml"
+    ).read_bytes() == ALERTMANAGER_IGNORE_PATH.read_bytes()
+    assert list(project_dir.rglob(".pulseplate-*.tmp-*")) == []
+    readmitted = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh")), "--preflight-only"],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert readmitted.returncode == 0, readmitted.stderr
+    assert app_sentinel.read_text(encoding="utf-8") == "keep-app\n"
+    assert tsdb_sentinel.read_text(encoding="utf-8") == "keep-tsdb\n"
+
+
+@pytest.mark.parametrize("leaf", ("alertmanager.yml", "trivy-ignore.yaml"))
+def test_production_rejects_alertmanager_destination_symlink_before_publication(
+    tmp_path: Path, leaf: str
+) -> None:
+    env, project_dir, log_file, _bundle = _production_preflight_fixture(tmp_path, with_bundle=True)
+    destination = project_dir / "deploy/alertmanager" / leaf
+    outside = tmp_path / f"outside-{leaf}"
+    outside.write_text("unrelated-owner-content\n", encoding="utf-8")
+    destination.unlink()
+    destination.symlink_to(outside)
+    result = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh")), "--preflight-only"],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "destination" in result.stderr
+    assert outside.read_text(encoding="utf-8") == "unrelated-owner-content\n"
+    assert not log_file.exists()
+
+
+@pytest.mark.parametrize(
+    "variant",
+    (
+        "malformed",
+        "duplicate",
+        "missing",
+        "extra",
+        "wrong-platform-digest",
+        "wrong-source-revision",
+        "wrong-runtime-ref",
+        "index-digest-runtime-ref",
+        "wrong-type",
+    ),
+)
+def test_staging_deploy_rejects_noncanonical_prometheus_manifest_before_docker(
+    tmp_path: Path,
+    variant: str,
+) -> None:
+    env, log_file = _staging_deploy_fixture(tmp_path)
+    manifest_path = Path(env["PROJECT_DIR"]) / "prometheus" / "image-manifest.json"
+    _write_prometheus_manifest_variant(manifest_path, variant)
+    backend_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64
+    caddy_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64
+
+    completed = subprocess.run(
+        [
+            str(_historical_deploy_script("scripts/deploy.sh")),
+            "--preflight-only",
+            backend_ref,
+            caddy_ref,
+        ],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert (
+        completed.stderr
+        == "Prometheus qualification failed: " + PROMETHEUS_MANIFEST_ERRORS[variant] + "\n"
+    )
+    assert not log_file.exists()
+
+
+@pytest.mark.parametrize(
+    "variant",
+    (
+        "malformed",
+        "duplicate",
+        "missing",
+        "extra",
+        "wrong-platform-digest",
+        "wrong-runtime-ref",
+        "wrong-type",
+    ),
+)
+def test_staging_deploy_rejects_noncanonical_postgres_manifest_before_docker(
+    tmp_path: Path,
+    variant: str,
+) -> None:
+    env, log_file = _staging_deploy_fixture(tmp_path)
+    manifest_path = Path(env["PROJECT_DIR"]) / "postgres-pgvector" / "image-manifest.json"
+    _write_postgres_manifest_variant(manifest_path, variant)
+    backend_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64
+    caddy_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64
+
+    completed = subprocess.run(
+        [
+            str(_historical_deploy_script("scripts/deploy.sh")),
+            "--preflight-only",
+            backend_ref,
+            caddy_ref,
+        ],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "PostgreSQL image manifest" in completed.stderr
+    assert not log_file.exists()
+
+
+@pytest.mark.parametrize(
+    "variant",
+    (
+        "malformed",
+        "duplicate",
+        "missing",
+        "extra",
+        "wrong-platform-digest",
+        "wrong-runtime-ref",
+        "wrong-type",
+    ),
+)
+def test_production_deploy_rejects_noncanonical_prometheus_manifest_before_docker(
+    tmp_path: Path,
+    variant: str,
+) -> None:
+    env, project_dir, log_file, _bundle = _production_preflight_fixture(
+        tmp_path,
+        with_bundle=False,
+    )
+    _write_prometheus_manifest_variant(
+        project_dir / "deploy" / "prometheus" / "image-manifest.json",
+        variant,
+    )
+
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh")), "--preflight-only"],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert (
+        completed.stderr
+        == "Prometheus qualification failed: " + PROMETHEUS_MANIFEST_ERRORS[variant] + "\n"
+    )
+    assert not log_file.exists()
+
+
+@pytest.mark.parametrize(
+    "rendered_compose",
+    (
+        "{",
+        "{}",
+        json.dumps(
+            {
+                "services": {
+                    "prometheus": {
+                        "image": "prom/prometheus:latest",
+                        "platform": "linux/amd64",
+                    }
+                }
+            }
+        ),
+        json.dumps(
+            {
+                "services": {
+                    "prometheus": {
+                        "image": PROMETHEUS_RUNTIME_REF,
+                        "platform": "linux/arm64",
+                    }
+                }
+            }
+        ),
+    ),
+)
+def test_staging_deploy_rejects_rendered_prometheus_identity_drift_before_pull(
+    tmp_path: Path,
+    rendered_compose: str,
+) -> None:
+    env, log_file = _staging_deploy_fixture(tmp_path)
+    env["STUB_PROMETHEUS_COMPOSE_JSON"] = rendered_compose
+    backend_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64
+    caddy_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64
+
+    completed = subprocess.run(
+        [
+            str(_historical_deploy_script("scripts/deploy.sh")),
+            "--preflight-only",
+            backend_ref,
+            caddy_ref,
+        ],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    log_lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert any("config --format json" in line for line in log_lines)
+    assert all(
+        " login " not in line and " pull " not in line and " up " not in line for line in log_lines
+    )
+
+
+@pytest.mark.parametrize(
+    "variant",
+    (
+        "missing",
+        "wrong-image",
+        "wrong-platform",
+        "wrong-pgdata",
+        "wrong-volume",
+        "ports",
+        "missing-app",
+        "missing-worker",
+        "app-external-dsn",
+        "worker-dsn-drift",
+    ),
+)
+def test_staging_deploy_rejects_rendered_postgres_identity_drift_before_pull(
+    tmp_path: Path,
+    variant: str,
+) -> None:
+    env, log_file = _staging_deploy_fixture(tmp_path)
+    rendered = json.loads(_staging_compose_fixture_json(Path(env["PROJECT_DIR"])))
+    postgres = rendered["services"]["postgres"]
+    if variant == "missing":
+        del rendered["services"]["postgres"]
+    elif variant == "wrong-image":
+        postgres["image"] = "postgres:15-alpine"
+    elif variant == "wrong-platform":
+        postgres["platform"] = "linux/arm64"
+    elif variant == "wrong-pgdata":
+        postgres["environment"]["PGDATA"] = "/var/lib/postgresql/15/data"
+    elif variant == "wrong-volume":
+        postgres["volumes"][0]["target"] = "/var/lib/postgresql/15/data"
+    elif variant == "ports":
+        postgres["ports"] = [{"target": 5432, "published": "5432"}]
+    elif variant == "missing-app":
+        del rendered["services"]["app"]
+    elif variant == "missing-worker":
+        del rendered["services"]["worker"]
+    elif variant == "app-external-dsn":
+        rendered["services"]["app"]["environment"][
+            "DATABASE_URL"
+        ] = "postgresql+psycopg://pulseplate:test-only@db.example.com/pulseplate"  # pragma: allowlist secret
+    elif variant == "worker-dsn-drift":
+        rendered["services"]["worker"]["environment"][
+            "DATABASE_URL"
+        ] = "postgresql+psycopg://pulseplate:test-only@postgres/other"  # pragma: allowlist secret
+    else:
+        raise AssertionError(f"unsupported rendered PostgreSQL variant: {variant}")
+    env["STUB_PROMETHEUS_COMPOSE_JSON"] = json.dumps(rendered)
+    backend_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64
+    caddy_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64
+
+    completed = subprocess.run(
+        [
+            str(_historical_deploy_script("scripts/deploy.sh")),
+            "--preflight-only",
+            backend_ref,
+            caddy_ref,
+        ],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    expected_surface = (
+        "app"
+        if variant in ("missing-app", "app-external-dsn")
+        else ("worker" if variant in ("missing-worker", "worker-dsn-drift") else "PostgreSQL")
+    )
+    assert expected_surface in completed.stderr
+    log_lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert any("config --format json" in line for line in log_lines)
+    assert all(
+        " login " not in line and " pull " not in line and " up " not in line for line in log_lines
+    )
+
+
+@pytest.mark.parametrize(
+    "rendered_compose",
+    (
+        "{",
+        "{}",
+        json.dumps(
+            {
+                "services": {
+                    "prometheus": {
+                        "image": "prom/prometheus:latest",
+                        "platform": "linux/amd64",
+                    }
+                }
+            }
+        ),
+        json.dumps(
+            {
+                "services": {
+                    "prometheus": {
+                        "image": PROMETHEUS_RUNTIME_REF,
+                        "platform": "linux/arm64",
+                    }
+                }
+            }
+        ),
+    ),
+)
+def test_production_deploy_rejects_rendered_prometheus_identity_drift_before_pull(
+    tmp_path: Path,
+    rendered_compose: str,
+) -> None:
+    env, _project_dir, log_file, _bundle = _production_preflight_fixture(
+        tmp_path,
+        with_bundle=False,
+    )
+    env["STUB_PROMETHEUS_COMPOSE_JSON"] = rendered_compose
+
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh")), "--preflight-only"],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    log_lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert any("config --format json" in line for line in log_lines)
+    assert all(
+        " login " not in line and " pull " not in line and " up " not in line for line in log_lines
+    )
+
+
+def _prometheus_image_inspect_variant(variant: str) -> str:
+    payload = json.loads(FAKE_PROMETHEUS_IMAGE_INSPECT_JSON)
+    record = payload[0]
+    if variant == "multiple":
+        payload.append(dict(record))
+    elif variant == "wrong-os":
+        record["Os"] = "windows"
+    elif variant == "wrong-platform":
+        record["Architecture"] = "arm64"
+    elif variant == "missing-repository":
+        record["RepoDigests"] = []
+    elif variant == "index-digest":
+        record["RepoDigests"] = [prometheus_source.IMAGE_REPOSITORY + "@" + PROMETHEUS_INDEX_DIGEST]
+    elif variant == "foreign-repository":
+        record["RepoDigests"] = [
+            "example.invalid/prometheus@" + PROMETHEUS_PLATFORM_MANIFEST_DIGEST
+        ]
+    else:
+        raise AssertionError("Unknown synthetic Prometheus inspect variant")
+    return json.dumps(payload)
+
+
+IMAGE_INSPECT_REJECTIONS = (
+    "{",
+    "[]",
+    *(
+        _prometheus_image_inspect_variant(variant)
+        for variant in (
+            "multiple",
+            "wrong-os",
+            "wrong-platform",
+            "missing-repository",
+            "index-digest",
+            "foreign-repository",
+        )
+    ),
+)
+
+
+def _postgres_image_inspect_variant(variant: str) -> str:
+    payload = json.loads(FAKE_POSTGRES_IMAGE_INSPECT_JSON)
+    record = payload[0]
+    config = record["Config"]
+    if variant == "duplicate-key":
+        return json.dumps(payload).replace('"Os":', '"Os":"linux","Os":', 1)
+    if variant == "foreign-id":
+        record["Id"] = "sha256:" + "e" * 64
+    elif variant == "missing-id":
+        del record["Id"]
+    elif variant == "malformed-id":
+        record["Id"] = 7
+    elif variant == "wrong-platform":
+        record["Architecture"] = "arm64"
+    elif variant == "wrong-user":
+        config["User"] = "0"
+    elif variant == "wrong-entrypoint":
+        config["Entrypoint"] = ["/bin/sh"]
+    elif variant == "wrong-environment":
+        config["Env"] = ["PGDATA=/var/lib/postgresql/data", "PG_MAJOR=15", "PG_MINOR=19"]
+    elif variant == "wrong-label":
+        config["Labels"]["com.pulseplate.pgvector.version"] = "0.8.5"
+    elif variant == "wrong-repository-digest":
+        record["RepoDigests"] = [f"example.invalid/pulseplate@{POSTGRES_PLATFORM_MANIFEST_DIGEST}"]
+    elif variant == "malformed-repository-digests":
+        record["RepoDigests"].append(None)
+    else:
+        raise AssertionError(f"unsupported pulled PostgreSQL variant: {variant}")
+    return json.dumps(payload)
+
+
+POSTGRES_IMAGE_INSPECT_REJECTIONS = (
+    "{",
+    "[]",
+    *(
+        _postgres_image_inspect_variant(variant)
+        for variant in (
+            "wrong-platform",
+            "wrong-user",
+            "wrong-entrypoint",
+            "wrong-environment",
+            "wrong-label",
+            "wrong-repository-digest",
+            "malformed-repository-digests",
+            "duplicate-key",
+            "foreign-id",
+            "missing-id",
+            "malformed-id",
+        )
+    ),
+)
+
+
+@pytest.mark.parametrize("inspect_payload", IMAGE_INSPECT_REJECTIONS)
+def test_staging_deploy_rejects_pulled_prometheus_identity_before_product_mutation(
+    tmp_path: Path,
+    inspect_payload: str,
+) -> None:
+    env, log_file = _staging_deploy_fixture(tmp_path)
+    env["STUB_PROMETHEUS_IMAGE_INSPECT_JSON"] = inspect_payload
+    backend_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64
+    caddy_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64
+
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy.sh")), backend_ref, caddy_ref],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    log_lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert any(" pull app caddy postgres prometheus" in line for line in log_lines)
+    assert any("image inspect" in line for line in log_lines)
+    assert all("promtool" not in line for line in log_lines)
+    assert all("assert_production_runtime_invariants" not in line for line in log_lines)
+    assert all(" stop " not in line and " up " not in line for line in log_lines)
+
+
+@pytest.mark.parametrize("inspect_payload", POSTGRES_IMAGE_INSPECT_REJECTIONS)
+def test_staging_deploy_rejects_pulled_postgres_identity_before_product_mutation(
+    tmp_path: Path,
+    inspect_payload: str,
+) -> None:
+    env, log_file = _staging_deploy_fixture(tmp_path)
+    env["STUB_POSTGRES_IMAGE_INSPECT_JSON"] = inspect_payload
+    backend_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64
+    caddy_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64
+
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy.sh")), backend_ref, caddy_ref],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "Pulled PostgreSQL image metadata is not the frozen candidate" in completed.stderr
+    assert "PostgreSQL image" in completed.stderr
+    log_lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert any(" pull app caddy postgres prometheus" in line for line in log_lines)
+    assert sum("image inspect" in line for line in log_lines) >= 2
+    assert all("promtool" not in line for line in log_lines)
+    assert all("assert_production_runtime_invariants" not in line for line in log_lines)
+    assert all(" stop " not in line and " up " not in line for line in log_lines)
+    assert all(not line.startswith("backup ") for line in log_lines)
+    assert all("alembic upgrade head" not in line for line in log_lines)
+
+
+def test_staging_deploy_rejects_postgres_mountpoint_drift_before_product_mutation(
+    tmp_path: Path,
+) -> None:
+    env, log_file = _staging_deploy_fixture(tmp_path)
+    env["STUB_POSTGRES_MOUNTPOINT_STATUS"] = "17"
+    backend_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64
+    caddy_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64
+
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy.sh")), backend_ref, caddy_ref],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 17
+    log_lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert sum("image inspect" in line for line in log_lines) >= 2
+    assert all("promtool" not in line for line in log_lines)
+    assert all("assert_production_runtime_invariants" not in line for line in log_lines)
+    assert all(" stop " not in line and " up " not in line for line in log_lines)
+
+
+@pytest.mark.parametrize("inspect_payload", IMAGE_INSPECT_REJECTIONS)
+def test_production_deploy_rejects_pulled_prometheus_identity_before_product_mutation(
+    tmp_path: Path,
+    inspect_payload: str,
+) -> None:
+    env, _project_dir, log_file, _bundle = _production_preflight_fixture(
+        tmp_path,
+        with_bundle=False,
+    )
+    env.update(
+        {
+            "IMAGE_REF": "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:test",
+            "TAG": "prod-vtest",
+            "STUB_PROMETHEUS_IMAGE_INSPECT_JSON": inspect_payload,
+        }
+    )
+
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh"))],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    log_lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert any(" pull prometheus" in line for line in log_lines)
+    assert any("image inspect" in line for line in log_lines)
+    assert all("promtool" not in line for line in log_lines)
+    assert all("assert_production_runtime_invariants" not in line for line in log_lines)
+    assert all(" stop " not in line and " up " not in line for line in log_lines)
+
+
+def test_production_env_cannot_override_manifest_derived_prometheus_digest(
+    tmp_path: Path,
+) -> None:
+    env, project_dir, log_file, _bundle = _production_preflight_fixture(
+        tmp_path,
+        with_bundle=False,
+    )
+    conflicting_digest = "sha256:" + "b" * 64
+    with (project_dir / ".env").open("a", encoding="utf-8") as env_file:
+        env_file.write(f"PROMETHEUS_PLATFORM_MANIFEST_DIGEST={conflicting_digest}\n")
+    env.update(
+        {
+            "IMAGE_REF": "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:test",
+            "TAG": "prod-vtest",
+            "STUB_PROMETHEUS_IMAGE_INSPECT_JSON": json.dumps(
+                [
+                    {
+                        **json.loads(FAKE_PROMETHEUS_IMAGE_INSPECT_JSON)[0],
+                        "RepoDigests": [
+                            prometheus_source.IMAGE_REPOSITORY + "@" + conflicting_digest
+                        ],
+                    }
+                ]
+            ),
+        }
+    )
+
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh"))],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "QualificationError:consumer_published_immutable_subject" in completed.stderr
+    log_lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert any("image inspect" in line for line in log_lines)
+    assert all("promtool" not in line for line in log_lines)
+    assert all("assert_production_runtime_invariants" not in line for line in log_lines)
+
+
+@pytest.mark.parametrize(
+    "destination_variant",
+    (
+        "frontend-directory-symlink",
+        "caddy-leaf-symlink",
+        "scripts-directory-symlink",
+        "redeploy-leaf-symlink",
+        "ops-directory-symlink",
+        "backup-helper-leaf-symlink",
+        "backup-helper-leaf-hardlink",
+    ),
+)
+def test_production_full_bundle_rejects_hostile_destination_before_docker(
+    tmp_path: Path,
+    destination_variant: str,
+) -> None:
+    env, project_dir, log_file, _bundle = _production_preflight_fixture(
+        tmp_path,
+        with_bundle=True,
+    )
+    external = tmp_path / f"external-{destination_variant}"
+    if destination_variant == "frontend-directory-symlink":
+        external.mkdir()
+        (external / "sentinel").write_text("external-frontend\n", encoding="utf-8")
+        hostile = project_dir / "frontend"
+        hostile.symlink_to(external, target_is_directory=True)
+        expected = (external / "sentinel").read_bytes()
+    elif destination_variant == "caddy-leaf-symlink":
+        external.write_text("external-caddy\n", encoding="utf-8")
+        hostile = project_dir / "deploy" / "Caddyfile.production"
+        hostile.symlink_to(external)
+        expected = external.read_bytes()
+    elif destination_variant == "scripts-directory-symlink":
+        external.mkdir()
+        (external / "sentinel").write_text("external-scripts\n", encoding="utf-8")
+        hostile = project_dir / "scripts"
+        shutil.rmtree(
+            hostile
+        )  # Exact synthetic installed-data directory; trusted T stays separate.
+        env["PROMETHEUS_CONTRACT_HELPER"] = str(REPO_ROOT / "scripts/ci/prometheus_source_image.py")
+        hostile.symlink_to(external, target_is_directory=True)
+        expected = (external / "sentinel").read_bytes()
+    elif destination_variant == "redeploy-leaf-symlink":
+        scripts_dir = project_dir / "scripts"
+        scripts_dir.mkdir(exist_ok=True)
+        external.write_text("external-helper\n", encoding="utf-8")
+        hostile = scripts_dir / "redeploy_caddy.sh"
+        hostile.symlink_to(external)
+        expected = external.read_bytes()
+    elif destination_variant == "ops-directory-symlink":
+        scripts_dir = project_dir / "scripts"
+        scripts_dir.mkdir(exist_ok=True)
+        external.mkdir()
+        (external / "sentinel").write_text("external-ops\n", encoding="utf-8")
+        hostile = scripts_dir / "ops"
+        hostile.symlink_to(external, target_is_directory=True)
+        expected = (external / "sentinel").read_bytes()
+    else:
+        ops_dir = project_dir / "scripts" / "ops"
+        ops_dir.mkdir(parents=True)
+        external.write_text("external-backup-helper\n", encoding="utf-8")
+        hostile = ops_dir / "postgres_backup.sh"
+        if destination_variant == "backup-helper-leaf-symlink":
+            hostile.symlink_to(external)
+        else:
+            os.link(external, hostile)
+        expected = external.read_bytes()
+
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh")), "--preflight-only"],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    if destination_variant == "backup-helper-leaf-hardlink":
+        assert not hostile.is_symlink()
+        assert hostile.stat().st_nlink == 2
+    else:
+        assert hostile.is_symlink()
+    assert not log_file.exists()
+    if external.is_dir():
+        assert (external / "sentinel").read_bytes() == expected
+    else:
+        assert external.read_bytes() == expected
+    assert list(project_dir.rglob(".pulseplate-*.tmp-*")) == []
+    assert list(project_dir.rglob(".pulseplate-*.old-*")) == []
+
+
+@pytest.mark.parametrize(
+    "source_variant",
+    (
+        "bundle-parent-symlink",
+        "frontend-nested-symlink",
+        "frontend-nested-hardlink",
+        "caddy-source-symlink",
+        "redeploy-source-symlink",
+        "backup-source-symlink",
+        "backup-source-hardlink",
+        "backup-source-nonexec",
+        "backup-source-writable",
+    ),
+)
+def test_production_full_bundle_rejects_hostile_source_before_runtime_mutation(
+    tmp_path: Path,
+    source_variant: str,
+) -> None:
+    env, project_dir, log_file, shell_bundle_dir = _production_preflight_fixture(
+        tmp_path,
+        with_bundle=True,
+    )
+    assert shell_bundle_dir is not None
+    external = tmp_path / f"external-{source_variant}"
+    if source_variant == "bundle-parent-symlink":
+        real_bundle = tmp_path / "real-shell-bundle"
+        shell_bundle_dir.rename(real_bundle)
+        shell_bundle_dir.symlink_to(real_bundle, target_is_directory=True)
+        expected_path = real_bundle / "frontend" / "bundle-marker.txt"
+    elif source_variant == "frontend-nested-symlink":
+        external.write_text("external-frontend\n", encoding="utf-8")
+        (shell_bundle_dir / "frontend" / "hostile-link").symlink_to(external)
+        expected_path = external
+    elif source_variant == "frontend-nested-hardlink":
+        external.write_text("external-hardlink\n", encoding="utf-8")
+        os.link(external, shell_bundle_dir / "frontend" / "hostile-hardlink")
+        expected_path = external
+    elif source_variant == "caddy-source-symlink":
+        caddy = shell_bundle_dir / "deploy" / "Caddyfile.production"
+        caddy.rename(external)
+        caddy.symlink_to(external)
+        expected_path = external
+    elif source_variant == "redeploy-source-symlink":
+        redeploy = shell_bundle_dir / "scripts" / "redeploy_caddy.sh"
+        redeploy.rename(external)
+        redeploy.symlink_to(external)
+        expected_path = external
+    else:
+        backup_helper = shell_bundle_dir / "scripts" / "ops" / "postgres_backup.sh"
+        if source_variant == "backup-source-symlink":
+            backup_helper.rename(external)
+            backup_helper.symlink_to(external)
+            expected_path = external
+        elif source_variant == "backup-source-hardlink":
+            backup_helper.unlink()
+            external.write_text("hardlinked-backup-helper\n", encoding="utf-8")
+            os.link(external, backup_helper)
+            expected_path = external
+        else:
+            backup_helper.chmod(0o644 if source_variant == "backup-source-nonexec" else 0o775)
+            expected_path = backup_helper
+    expected = expected_path.read_bytes()
+
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh")), "--preflight-only"],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert expected_path.read_bytes() == expected
+    if log_file.exists():
+        log_lines = log_file.read_text(encoding="utf-8").splitlines()
+        assert all(
+            " login " not in line
+            and " pull " not in line
+            and " stop " not in line
+            and " up " not in line
+            for line in log_lines
+        )
+    assert list(project_dir.rglob(".pulseplate-*.tmp-*")) == []
+    assert list(project_dir.rglob(".pulseplate-*.old-*")) == []
+
+
+@pytest.mark.parametrize(
+    ("variant", "suffix", "expected_returncode"),
+    (
+        ("valid", 1, 0),
+        ("valid-selfhosted", 17, 0),
+        ("traversal", 2, 1),
+        ("absolute", 3, 1),
+        ("non_normalized", 4, 1),
+        ("duplicate", 5, 1),
+        ("symlink", 6, 1),
+        ("hardlink", 7, 1),
+        ("fifo", 8, 1),
+        ("unexpected", 9, 1),
+        ("missing_manifest", 10, 1),
+        ("missing_rules", 17, 1),
+        ("missing_alert_config", 19, 1),
+        ("missing_alert_ignore", 20, 1),
+        ("rules_symlink", 18, 1),
+        ("oversized_archive", 11, 1),
+        ("backup_helper_missing", 13, 1),
+        ("backup_helper_symlink", 14, 1),
+        ("backup_helper_hardlink", 15, 1),
+        ("backup_helper_wrong_mode", 16, 1),
+    ),
+)
+def test_production_archive_preflight_is_bounded_and_extracts_nothing(
+    tmp_path: Path,
+    variant: str,
+    suffix: int,
+    expected_returncode: int,
+) -> None:
+    project_dir = tmp_path / "production"
+    shell_bundle_dir = tmp_path / "bundle-source"
+    bin_dir = tmp_path / "bin"
+    log_file = tmp_path / "docker.log"
+    project_dir.mkdir()
+    shell_bundle_dir.mkdir()
+    bin_dir.mkdir()
+    self_hosted = variant == "valid-selfhosted"
+    selected_compose_text = (
+        _historical_AM_template(SELF_HOSTED_COMPOSE_PATH).decode("utf-8")
+        if self_hosted
+        else PRODUCTION_COMPOSE_TEXT
+    )
+    selected_compose_name = (
+        "docker-compose.production.selfhosted.yaml"
+        if self_hosted
+        else "docker-compose.production.yaml"
+    )
+    _write_production_host_contract(
+        project_dir,
+        compose_text=selected_compose_text,
+        self_hosted=self_hosted,
+    )
+    _write_shell_bundle_contract(
+        shell_bundle_dir,
+        compose_text=selected_compose_text,
+        compose_name=selected_compose_name,
+    )
+    (project_dir / ".env").write_text(
+        "DATABASE_URL=postgresql+psycopg://pulseplate:secret@db.example.com:25060/pulseplate\n",  # pragma: allowlist secret
+        encoding="utf-8",
+    )
+
+    archive_path = _canonical_test_archive_path(suffix)
+    _write_shell_bundle_archive(archive_path, shell_bundle_dir, variant=variant)
+    service_list = (
+        "app\\ncaddy\\npostgres\\nprometheus\\nworker\\n"
+        if self_hosted
+        else "app\\ncaddy\\nprometheus\\nworker\\n"
+    )
+    _write_executable(
+        bin_dir / "docker",
+        f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'docker %s\n' "$*" >> "{log_file}"
+case "$*" in
+  *"config --services"*) printf '{service_list}' ;;
+esac
+""",
+    )
+    _write_executable(bin_dir / "curl", "#!/usr/bin/env bash\nset -euo pipefail\n")
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "DOCKER_BIN": str(bin_dir / "docker"),
+            "PYTHON_BIN": sys.executable,
+            "CURL_BIN": str(bin_dir / "curl"),
+            "DEPLOY_DIR": str(project_dir),
+            "ENV_FILE": str(project_dir / ".env"),
+            "COMPOSE_FILE": (
+                CANONICAL_SELF_HOSTED_COMPOSE if self_hosted else CANONICAL_MANAGED_COMPOSE
+            ),
+            "PRODUCTION_DOMAIN": "pulseplate.test",
+            "SHELL_BUNDLE_ARCHIVE": str(archive_path),
+        }
+    )
+    if self_hosted:
+        env.update(
+            {
+                "PROD_DEPLOY_MODE": "self-hosted",
+                "POSTGRES_DB": "pulseplate",
+                "POSTGRES_USER": "pulseplate",
+                "POSTGRES_PASSWORD": "test-only",  # pragma: allowlist secret
+            }
+        )
+    try:
+        completed = subprocess.run(
+            [str(_historical_deploy_script("scripts/deploy_production.sh")), "--preflight-only"],
+            cwd=str(REPO_ROOT),
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert completed.returncode == expected_returncode, completed.stderr
+        assert not (project_dir / "frontend").exists()
+        if expected_returncode == 0:
+            assert log_file.is_file()
+            assert "Production deploy preflight passed" in completed.stdout
+        else:
+            assert not log_file.exists()
+            assert "archive" in completed.stderr.lower()
+    finally:
+        if archive_path.exists():
+            archive_path.unlink()
+
+
+@pytest.mark.parametrize(
+    "destination_variant",
+    (
+        "compose-leaf-symlink",
+        "prometheus-directory-symlink",
+        "config-leaf-symlink",
+        "rules-leaf-symlink",
+        "manifest-leaf-symlink",
+    ),
+)
+def test_production_contract_publication_rejects_destination_symlinks_before_docker(
+    tmp_path: Path,
+    destination_variant: str,
+) -> None:
+    project_dir = tmp_path / "production"
+    shell_bundle_dir = tmp_path / "bundle-source"
+    bin_dir = tmp_path / "bin"
+    log_file = tmp_path / "docker.log"
+    project_dir.mkdir()
+    shell_bundle_dir.mkdir()
+    bin_dir.mkdir()
+    _write_production_host_contract(project_dir, include_checkpoint=False)
+    _write_shell_bundle_contract(shell_bundle_dir)
+    (project_dir / ".env").write_text(
+        "DATABASE_URL=postgresql+psycopg://pulseplate:secret@db.example.com:25060/pulseplate\n",  # pragma: allowlist secret
+        encoding="utf-8",
+    )
+
+    deploy_dir = project_dir / "deploy"
+    compose_path = deploy_dir / "docker-compose.production.yaml"
+    prometheus_dir = deploy_dir / "prometheus"
+    config_path = prometheus_dir / "prometheus.yml"
+    rules_path = prometheus_dir / "alias-alerts.yml"
+    manifest_path = prometheus_dir / "image-manifest.json"
+    external_referent = tmp_path / f"external-{destination_variant}"
+    expected_external_files: dict[str, bytes] = {}
+
+    if destination_variant == "compose-leaf-symlink":
+        compose_path.rename(external_referent)
+        expected_external_files[external_referent.name] = external_referent.read_bytes()
+        compose_path.symlink_to(external_referent)
+        symlink_path = compose_path
+    elif destination_variant == "prometheus-directory-symlink":
+        prometheus_dir.rename(external_referent)
+        expected_external_files["prometheus.yml"] = (
+            external_referent / "prometheus.yml"
+        ).read_bytes()
+        expected_external_files["alias-alerts.yml"] = (
+            external_referent / "alias-alerts.yml"
+        ).read_bytes()
+        expected_external_files["image-manifest.json"] = (
+            external_referent / "image-manifest.json"
+        ).read_bytes()
+        prometheus_dir.symlink_to(external_referent, target_is_directory=True)
+        symlink_path = prometheus_dir
+    elif destination_variant == "config-leaf-symlink":
+        config_path.rename(external_referent)
+        expected_external_files[external_referent.name] = external_referent.read_bytes()
+        config_path.symlink_to(external_referent)
+        symlink_path = config_path
+    elif destination_variant == "rules-leaf-symlink":
+        rules_path.rename(external_referent)
+        expected_external_files[external_referent.name] = external_referent.read_bytes()
+        rules_path.symlink_to(external_referent)
+        symlink_path = rules_path
+    else:
+        manifest_path.rename(external_referent)
+        expected_external_files[external_referent.name] = external_referent.read_bytes()
+        manifest_path.symlink_to(external_referent)
+        symlink_path = manifest_path
+
+    _write_executable(
+        bin_dir / "docker",
+        f'#!/usr/bin/env bash\nprintf \'docker %s\\n\' "$*" >> "{log_file}"\n',
+    )
+    _write_executable(bin_dir / "curl", "#!/usr/bin/env bash\nset -euo pipefail\n")
+    env = os.environ.copy()
+    env.update(
+        {
+            "DOCKER_BIN": str(bin_dir / "docker"),
+            "CURL_BIN": str(bin_dir / "curl"),
+            "DEPLOY_DIR": str(project_dir),
+            "ENV_FILE": str(project_dir / ".env"),
+            "COMPOSE_FILE": CANONICAL_MANAGED_COMPOSE,
+            "PRODUCTION_DOMAIN": "pulseplate.test",
+            "SHELL_BUNDLE_DIR": str(shell_bundle_dir),
+        }
+    )
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh")), "--preflight-only"],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode != 0
+    assert "destination" in completed.stderr or "Prometheus contract directory" in completed.stderr
+    assert symlink_path.is_symlink()
+    assert not log_file.exists()
+    if external_referent.is_dir():
+        for name, expected_bytes in expected_external_files.items():
+            assert (external_referent / name).read_bytes() == expected_bytes
+    else:
+        assert external_referent.read_bytes() == expected_external_files[external_referent.name]
+    assert list(deploy_dir.rglob(".pulseplate-*.tmp-*")) == []
+
+
+@pytest.mark.parametrize("alerting_selected", [False, True])
+def test_production_archive_full_deploy_preserves_server_local_state_and_orders_prometheus_last(
+    tmp_path: Path,
+    alerting_selected: bool,
+) -> None:
+    project_dir = tmp_path / "production"
+    shell_bundle_dir = tmp_path / "bundle-source"
+    bin_dir = tmp_path / "bin"
+    log_file = tmp_path / "deploy.log"
+    project_dir.mkdir()
+    shell_bundle_dir.mkdir()
+    bin_dir.mkdir()
+    _write_production_host_contract(project_dir, include_checkpoint=False)
+    _write_shell_bundle_contract(shell_bundle_dir)
+    (shell_bundle_dir / "frontend" / "bundle-marker.txt").write_text(
+        "archive-shell\n", encoding="utf-8"
+    )
+    (project_dir / ".env").write_text(
+        "DATABASE_URL=postgresql+psycopg://pulseplate:secret@db.example.com:25060/pulseplate\n",  # pragma: allowlist secret
+        encoding="utf-8",
+    )
+    evidence_file = project_dir / "evidence" / "receipt.json"
+    backup_file = project_dir / "backups" / "backup.dump"
+    tsdb_sentinel = project_dir / "prometheus_data" / "sentinel"
+    for path, value in (
+        (evidence_file, "evidence\n"),
+        (backup_file, "backup\n"),
+        (tsdb_sentinel, "tsdb\n"),
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(value, encoding="utf-8")
+    secret_file = project_dir / "deploy" / "secrets" / "pulseplate_metrics_scrape_key"
+    original_secret = secret_file.read_bytes()
+    if alerting_selected:
+        smtp_key = project_dir / "deploy" / "secrets" / "alertmanager_smtp_key"
+        smtp_key.write_text("synthetic-only", encoding="ascii")
+        smtp_key.chmod(0o444)
+
+    archive_path = _canonical_test_archive_path(12)
+    _write_shell_bundle_archive(archive_path, shell_bundle_dir)
+    docker_stub = f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'docker %s\n' "$*" >> "{log_file}"
+if [ "${{STUB_ALERTMANAGER_IMAGE_ABSENT:-0}}" = 1 ]; then
+  case "$*" in
+    *"pull alertmanager"*|*"image inspect {ALERTMANAGER_RUNTIME_REF}"*|*"--entrypoint /bin/amtool"*) exit 91 ;;
+  esac
+fi
+case "$*" in
+  *"ps -q app"*) printf 'app-id\n' ;;
+esac
+"""
+    curl_stub = f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'curl %s\n' "$*" >> "{log_file}"
+"""
+    _write_executable(bin_dir / "docker", docker_stub)
+    _write_executable(bin_dir / "curl", curl_stub)
+    _write_executable(bin_dir / "sleep", "#!/usr/bin/env bash\nset -euo pipefail\n")
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{bin_dir}:{env['PATH']}",
+            "DOCKER_BIN": str(bin_dir / "docker"),
+            "PYTHON_BIN": sys.executable,
+            "CURL_BIN": str(bin_dir / "curl"),
+            "DEPLOY_DIR": str(project_dir),
+            "ENV_FILE": str(project_dir / ".env"),
+            "COMPOSE_FILE": CANONICAL_MANAGED_COMPOSE,
+            "IMAGE_REF": "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:test",
+            "TAG": "prod-vtest",
+            "PRODUCTION_DOMAIN": "pulseplate.test",
+            "SHELL_BUNDLE_ARCHIVE": str(archive_path),
+            "HEALTH_MAX_ATTEMPTS": "1",
+            "HEALTH_SLEEP_S": "0",
+        }
+    )
+    env.pop("COMPOSE_PROFILES", None)
+    if alerting_selected:
+        env["COMPOSE_PROFILES"] = "scheduler-external, alerting"
+    else:
+        env["STUB_ALERTMANAGER_IMAGE_ABSENT"] = "1"
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh"))],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert METRICS_SECRET_SENTINEL not in completed.stdout
+    assert METRICS_SECRET_SENTINEL not in completed.stderr
+    assert not archive_path.exists()
+    assert secret_file.read_bytes() == original_secret
+    assert evidence_file.read_text(encoding="utf-8") == "evidence\n"
+    assert backup_file.read_text(encoding="utf-8") == "backup\n"
+    assert tsdb_sentinel.read_text(encoding="utf-8") == "tsdb\n"
+    assert (project_dir / "frontend" / "bundle-marker.txt").read_text(
+        encoding="utf-8"
+    ) == "archive-shell\n"
+    published_backup_helper = project_dir / "scripts" / "ops" / "postgres_backup.sh"
+    assert (
+        published_backup_helper.read_bytes()
+        == (shell_bundle_dir / "scripts" / "ops" / "postgres_backup.sh").read_bytes()
+    )
+    assert stat.S_IMODE(published_backup_helper.stat().st_mode) == 0o755
+
+    log_lines = log_file.read_text(encoding="utf-8").splitlines()
+    alertmanager_commands = [
+        (index, line)
+        for index, line in enumerate(log_lines)
+        if "pull alertmanager" in line
+        or f"image inspect {ALERTMANAGER_RUNTIME_REF}" in line
+        or "--entrypoint /bin/amtool" in line
+    ]
+    assert bool(alertmanager_commands) is alerting_selected
+    if alerting_selected:
+        assert len(alertmanager_commands) == 3
+        guard_index = _assert_log_index(
+            log_lines,
+            predicate=lambda line: "assert_production_runtime_invariants(app=app)" in line,
+            message="product invariant missing",
+        )
+        assert all(index < guard_index for index, _ in alertmanager_commands)
+    assert all(METRICS_SECRET_SENTINEL not in line for line in log_lines)
+    prometheus_pull_index = _assert_log_index(
+        log_lines,
+        predicate=lambda line: " pull prometheus" in line,
+        message="exact Prometheus pull missing",
+    )
+    image_inspect_index = _assert_log_index(
+        log_lines,
+        predicate=lambda line: line.startswith("docker image inspect "),
+        message="pulled Prometheus identity validation missing",
+    )
+    promtool_index = _assert_log_index(
+        log_lines,
+        predicate=lambda line: "promtool prometheus" in line,
+        message="Prometheus config validation missing",
+    )
+    guard_index = _assert_log_index(
+        log_lines,
+        predicate=lambda line: "assert_production_runtime_invariants(app=app)" in line,
+        message="canonical app.main production invariant was not invoked",
+    )
+    migration_index = _assert_log_index(
+        log_lines,
+        predicate=lambda line: "app alembic upgrade head" in line,
+        message="migration command missing",
+    )
+    caddy_index = _assert_log_index(
+        log_lines,
+        predicate=lambda line: "up -d --remove-orphans caddy" in line,
+        message="Caddy start missing",
+    )
+    prometheus_index = _assert_log_index(
+        log_lines,
+        predicate=lambda line: "up -d --pull never prometheus" in line,
+        message="Prometheus start missing",
+    )
+    assert (
+        prometheus_pull_index
+        < image_inspect_index
+        < promtool_index
+        < guard_index
+        < migration_index
+        < caddy_index
+        < prometheus_index
+    )
+    for forbidden in ("down -v", "volume rm", "volume prune", "prometheus_data rm"):
+        assert all(forbidden not in line for line in log_lines)
+
+
+def test_production_prometheus_failure_is_nonzero_after_product_and_preserves_state(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "production"
+    bin_dir = tmp_path / "bin"
+    log_file = tmp_path / "deploy.log"
+    project_dir.mkdir()
+    bin_dir.mkdir()
+    _write_production_host_contract(project_dir)
+    (project_dir / ".env").write_text(
+        "DATABASE_URL=postgresql+psycopg://pulseplate:secret@db.example.com:25060/pulseplate\n",  # pragma: allowlist secret
+        encoding="utf-8",
+    )
+    tsdb_sentinel = project_dir / "prometheus_data" / "sentinel"
+    tsdb_sentinel.parent.mkdir()
+    tsdb_sentinel.write_text("preserve\n", encoding="utf-8")
+
+    docker_stub = f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'docker %s\n' "$*" >> "{log_file}"
+case "$*" in
+  *"ps -q app"*) printf 'app-id\n' ;;
+  *"up -d --pull never prometheus"*) exit 47 ;;
+esac
+"""
+    curl_stub = f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'curl %s\n' "$*" >> "{log_file}"
+"""
+    _write_executable(bin_dir / "docker", docker_stub)
+    _write_executable(bin_dir / "curl", curl_stub)
+    _write_executable(bin_dir / "sleep", "#!/usr/bin/env bash\nset -euo pipefail\n")
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{bin_dir}:{env['PATH']}",
+            "DOCKER_BIN": str(bin_dir / "docker"),
+            "PYTHON_BIN": sys.executable,
+            "CURL_BIN": str(bin_dir / "curl"),
+            "DEPLOY_DIR": str(project_dir),
+            "ENV_FILE": str(project_dir / ".env"),
+            "COMPOSE_FILE": CANONICAL_MANAGED_COMPOSE,
+            "IMAGE_REF": "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:test",
+            "TAG": "prod-vtest",
+            "PRODUCTION_DOMAIN": "pulseplate.test",
+            "HEALTH_MAX_ATTEMPTS": "1",
+            "HEALTH_SLEEP_S": "0",
+        }
+    )
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh"))],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 47
+    assert "Prometheus failed to start; app and Caddy remain running" in completed.stderr
+    assert tsdb_sentinel.read_text(encoding="utf-8") == "preserve\n"
+    log_lines = log_file.read_text(encoding="utf-8").splitlines()
+    app_index = next(
+        index for index, line in enumerate(log_lines) if "up -d --remove-orphans app" in line
+    )
+    caddy_index = next(
+        index for index, line in enumerate(log_lines) if "up -d --remove-orphans caddy" in line
+    )
+    prometheus_index = next(
+        index for index, line in enumerate(log_lines) if "up -d --pull never prometheus" in line
+    )
+    assert app_index < caddy_index < prometheus_index
+    for forbidden in ("down", "volume rm", "volume prune", "stop app", "stop caddy"):
+        assert all(forbidden not in line for line in log_lines[prometheus_index + 1 :])
+
+
+def _write_backup_prometheus_manifest(project: Path) -> Path:
+    manifest = project / "prometheus" / "image-manifest.json"
+    manifest.parent.mkdir(exist_ok=True)
+    manifest.write_text(_synthetic_prometheus_manifest_text(), encoding="utf-8")
+    return manifest
+
+
+@pytest.mark.parametrize("helper", ["postgres_backup.sh", "postgres_restore.sh"])
+@pytest.mark.parametrize("manifest_state", ["valid", "missing", "malformed", "missing-reader"])
+@pytest.mark.parametrize("explicit_manifest", [False, True])
+@pytest.mark.parametrize("ambient_ref", [None, "untrusted.example/prometheus:latest"])
+def test_postgres_helpers_derive_manifest_ref_before_compose(
+    tmp_path: Path,
+    helper: str,
+    manifest_state: str,
+    explicit_manifest: bool,
+    ambient_ref: str | None,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    manifest_project = tmp_path if explicit_manifest else project
+    manifest = _write_backup_prometheus_manifest(manifest_project)
+    if manifest_state == "missing":
+        manifest.unlink()
+    elif manifest_state == "malformed":
+        manifest.write_text("{}", encoding="utf-8")
+    dump = tmp_path / "input.dump"
+    dump.write_text("synthetic archive", encoding="utf-8")
+    calls = tmp_path / "calls"
+    docker = tmp_path / "native-docker"
+    _write_executable(
+        docker,
+        r"""#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$COMPOSE_CALLS"
+test "$PROMETHEUS_RUNTIME_REF" = "$EXPECTED_PROMETHEUS_REF"
+case "$*" in
+  *pg_dump*) printf 'synthetic archive\n' ;;
+  *pg_restore\ --list*) cat >/dev/null; printf '214; 1259 16387 TABLE public items user\n' ;;
+  *pg_restore*) cat >/dev/null ;;
+  *createdb*) ;;
+  *psql*) printf '1\n' ;;
+  *) exit 99 ;;
+esac
+""",
+    )
+    script = REPO_ROOT / "scripts/ops" / helper
+    if manifest_state == "missing-reader":
+        copied_script = tmp_path / "scripts/ops" / helper
+        copied_script.parent.mkdir(parents=True)
+        copied_script.write_bytes(script.read_bytes())
+        copied_script.chmod(0o755)
+        script = copied_script
+    argv = [str(script)]
+    if helper == "postgres_restore.sh":
+        argv += ["--verify-into", "pulseplate_restore_check_ref", str(dump)]
+    env = {
+        "PATH": os.environ["PATH"],
+        "PROJECT_DIR": str(project),
+        "PYTHON_BIN": sys.executable,
+        "DOCKER_BIN": str(docker),
+        "POSTGRES_USER": "synthetic_role",
+        "POSTGRES_DB": "synthetic_db",
+        "EXPECTED_PROMETHEUS_REF": PROMETHEUS_RUNTIME_REF,
+        "COMPOSE_CALLS": str(calls),
+    }
+    if explicit_manifest:
+        env["PROMETHEUS_IMAGE_MANIFEST"] = str(manifest)
+    if ambient_ref is not None:
+        env["PROMETHEUS_RUNTIME_REF"] = ambient_ref
+    result = subprocess.run(argv, env=env, capture_output=True, text=True, check=False)
+    if manifest_state == "valid":
+        assert result.returncode == 0, result.stderr
+        assert calls.read_text().splitlines()
+    else:
+        assert result.returncode != 0
+        assert not calls.exists()
+        assert not (project / "backups").exists()
+    assert dump.read_text() == "synthetic archive"
+
+
+def test_postgres_backup_helper_passes_project_dir_and_compose_file(tmp_path: Path) -> None:
+    project_dir = tmp_path / "project"
+    bin_dir = tmp_path / "bin"
+    backup_dir = project_dir / "backups"
+    log_file = tmp_path / "docker.log"
+    project_dir.mkdir()
+    _write_backup_prometheus_manifest(project_dir)
+    bin_dir.mkdir()
+    backup_dir.mkdir()
+    env_file = project_dir / "config" / "selected.env"
+    env_file.parent.mkdir()
+    env_file.write_text("POSTGRES_DB=pulseplate\n", encoding="utf-8")
+
+    docker_stub = f"""#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$*" >> "{log_file}"
+cat <<'EOF'
+FAKE_BACKUP
+EOF
+"""
+    _write_executable(bin_dir / "docker", docker_stub)
+    _write_stage_native_oracles(project_dir)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"  # pragma: allowlist secret
+    env["PROJECT_DIR"] = str(project_dir)
+    env["BACKUP_DIR"] = str(backup_dir)
+    env["COMPOSE_FILE"] = "docker-compose.staging.yaml"
+    env["ENV_FILE"] = str(env_file)
+    env["POSTGRES_USER"] = "pulseplate"
+    env["POSTGRES_DB"] = "pulseplate"
+    env["PYTHON_BIN"] = sys.executable
+    env["PYTHONPATH"] = str(REPO_ROOT)
+
+    completed = subprocess.run(
+        [str(REPO_ROOT / "scripts/ops/postgres_backup.sh")],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    assert "Backup created:" in completed.stdout
+    docker_call = log_file.read_text(encoding="utf-8")
+    assert f"compose --env-file {env_file} --project-directory {project_dir}" in docker_call
+    assert f"-f {project_dir / 'docker-compose.staging.yaml'}" in docker_call
+    assert "exec -T postgres pg_dump -U pulseplate -d pulseplate -Fc" in docker_call
+    backup_files = list(backup_dir.glob("pulseplate_*.dump"))
+    assert len(backup_files) == 1
+    assert backup_files[0].read_text(encoding="utf-8").strip() == "FAKE_BACKUP"
+    assert stat.S_IMODE(backup_files[0].stat().st_mode) == 0o600
+
+
+def test_postgres_backup_helper_uses_container_database_identity_when_host_env_is_absent(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "project"
+    bin_dir = tmp_path / "bin"
+    backup_dir = project_dir / "backups"
+    log_file = tmp_path / "docker.log"
+    project_dir.mkdir()
+    _write_backup_prometheus_manifest(project_dir)
+    bin_dir.mkdir()
+    backup_dir.mkdir()
+
+    docker_stub = f"""#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "{log_file}"
+printf 'FAKE_BACKUP\n'
+"""
+    _write_executable(bin_dir / "docker", docker_stub)
+    _write_stage_native_oracles(project_dir)
+
+    env = os.environ.copy()
+    env.pop("POSTGRES_USER", None)
+    env.pop("POSTGRES_DB", None)
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["PROJECT_DIR"] = str(project_dir)
+    env["BACKUP_DIR"] = str(backup_dir)
+    env["COMPOSE_FILE"] = "docker-compose.staging.yaml"
+    env["PYTHON_BIN"] = sys.executable
+    env["PYTHONPATH"] = str(REPO_ROOT)
+
+    completed = subprocess.run(
+        [str(REPO_ROOT / "scripts/ops/postgres_backup.sh")],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    assert "Backup created:" in completed.stdout
+    docker_call = log_file.read_text(encoding="utf-8")
+    assert "exec -T postgres sh -euc" in docker_call
+    assert 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc' in docker_call
+    backup_files = list(backup_dir.glob("pulseplate_*.dump"))
+    assert len(backup_files) == 1
+    assert backup_files[0].read_text(encoding="utf-8").strip() == "FAKE_BACKUP"
+
+
+def test_postgres_restore_helper_passes_project_dir_and_compose_file(tmp_path: Path) -> None:
+    project_dir = tmp_path / "project"
+    bin_dir = tmp_path / "bin"
+    log_file = tmp_path / "docker.log"
+    backup_file = tmp_path / "pulseplate.dump"
+    project_dir.mkdir()
+    _write_backup_prometheus_manifest(project_dir)
+    bin_dir.mkdir()
+    backup_file.write_text("FAKE_RESTORE", encoding="utf-8")
+
+    docker_stub = f"""#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$*" >> "{log_file}"
+if printf '%s\\n' "$*" | grep -q 'pg_restore'; then
+  cat >/dev/null
+fi
+"""
+    _write_executable(bin_dir / "docker", docker_stub)
+
+    env = os.environ.copy()
+    env["PYTHON_BIN"] = sys.executable
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["PROJECT_DIR"] = str(project_dir)
+    env["COMPOSE_FILE"] = "docker-compose.production.yaml"
+    env["POSTGRES_USER"] = "pulseplate"
+    env["POSTGRES_DB"] = "pulseplate"
+
+    completed = subprocess.run(
+        [
+            str(REPO_ROOT / "scripts/ops/postgres_restore.sh"),
+            "--verify-into",
+            "pulseplate_restore_check_fixture",
+            str(backup_file),
+        ],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    assert "Restore completed into: pulseplate_restore_check_fixture" in completed.stdout
+    docker_calls = log_file.read_text(encoding="utf-8").splitlines()
+    assert len(docker_calls) == 5
+    assert all(f"compose --project-directory {project_dir}" in call for call in docker_calls)
+    assert all(
+        f"-f {project_dir / 'docker-compose.production.yaml'}" in call for call in docker_calls
+    )
+    assert "pg_restore --list" in docker_calls[0]
+    assert "pg_restore --file=/dev/null" in docker_calls[1]
+    assert (
+        "createdb -U pulseplate --maintenance-db pulseplate --owner pulseplate --template=template0 pulseplate_restore_check_fixture"
+        in docker_calls[2]
+    )
+    assert (
+        "pg_restore -U pulseplate -d pulseplate_restore_check_fixture --exit-on-error --single-transaction --clean --if-exists"
+        in docker_calls[3]
+    )
+    assert all("DROP SCHEMA" not in call for call in docker_calls)
+
+
+def test_deploy_production_runs_migrations_before_caddy_and_external_ready(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "production"
+    bin_dir = tmp_path / "bin"
+    log_file = tmp_path / "deploy.log"
+    project_dir.mkdir()
+    bin_dir.mkdir()
+    _write_production_host_contract(project_dir)
+    (project_dir / ".env").write_text(
+        "\n".join(
+            [
+                "DATABASE_URL=postgresql+psycopg://pulseplate:secret@db.example.com:25060/pulseplate",  # pragma: allowlist secret
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    docker_stub = f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'docker %s\\n' "$*" >> "{log_file}"
+case "$*" in
+  *"compose --env-file "*"-f deploy/docker-compose.production.yaml ps -q app"*)
+    printf 'app-id\\n'
+    ;;
+  *"inspect --format "*)
+    printf 'healthy\\n'
+    ;;
+  *"ps --format "*)
+    printf 'CONTAINER ID\\n'
+    ;;
+esac
+"""
+    curl_stub = f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'curl %s\\n' "$*" >> "{log_file}"
+"""
+    sleep_stub = "#!/usr/bin/env bash\nset -euo pipefail\n"
+    _write_executable(bin_dir / "docker", docker_stub)
+    _write_executable(bin_dir / "curl", curl_stub)
+    _write_executable(bin_dir / "sleep", sleep_stub)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["DOCKER_BIN"] = str(bin_dir / "docker")
+    env["PYTHON_BIN"] = sys.executable
+    env["DEPLOY_DIR"] = str(project_dir)
+    env["ENV_FILE"] = str(project_dir / ".env")
+    env["COMPOSE_FILE"] = CANONICAL_MANAGED_COMPOSE
+    env["CURL_BIN"] = str(bin_dir / "curl")
+    env["IMAGE_REF"] = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:test"
+    env["TAG"] = "prod-vtest"
+    env["PRODUCTION_DOMAIN"] = "pulseplate.test"
+
+    subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh"))],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    log_lines = log_file.read_text(encoding="utf-8").splitlines()
+    migrate_index = _assert_log_index(
+        log_lines,
+        predicate=lambda line: "compose --env-file" in line
+        and "run --rm --no-deps app alembic upgrade head" in line,
+        message="Expected one-shot alembic migration step to appear in deploy log",
+    )
+    app_up_index = _assert_log_index(
+        log_lines,
+        predicate=lambda line: "compose --env-file" in line
+        and "up -d --remove-orphans app" in line,
+        message="Expected app docker compose up step to appear in deploy log",
+    )
+    caddy_build_index = _assert_log_index(
+        log_lines,
+        predicate=lambda line: "compose --env-file" in line and "build caddy" in line,
+        message="Expected caddy docker compose build step to appear in deploy log",
+    )
+    caddy_up_index = _assert_log_index(
+        log_lines,
+        predicate=lambda line: "compose --env-file" in line
+        and "up -d --remove-orphans caddy" in line,
+        message="Expected caddy docker compose up step to appear in deploy log",
+    )
+    external_ready_index = _assert_log_index(
+        log_lines,
+        predicate=lambda line: line.startswith("curl ") and "https://pulseplate.test/ready" in line,
+        message="Expected external readiness check to appear in deploy log",
+    )
+
+    assert migrate_index < app_up_index < caddy_build_index < caddy_up_index < external_ready_index
+    assert all("up -d --remove-orphans postgres" not in line for line in log_lines)
+    assert all("helper " not in line for line in log_lines)
+
+
+def test_deploy_production_preflight_only_exits_non_zero_when_default_env_file_is_missing(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "production"
+    bin_dir = tmp_path / "bin"
+    log_file = tmp_path / "deploy.log"
+    project_dir.mkdir()
+    bin_dir.mkdir()
+    _write_production_host_contract(project_dir)
+
+    docker_stub = f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'docker %s\\n' "$*" >> "{log_file}"
+"""
+    _write_executable(bin_dir / "docker", docker_stub)
+
+    curl, curl_marker = _install_unused_preflight_curl(bin_dir)
+    env = os.environ.copy()
+    env["CURL_BIN"] = str(curl)
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["DOCKER_BIN"] = str(bin_dir / "docker")
+    env["PYTHON_BIN"] = sys.executable
+    env["DEPLOY_DIR"] = str(project_dir)
+    env["COMPOSE_FILE"] = CANONICAL_MANAGED_COMPOSE
+
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh")), "--preflight-only"],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert not curl_marker.exists(), "preflight unexpectedly invoked curl"
+    assert completed.returncode == 1
+    assert f"Missing production env file: {project_dir / 'deploy' / '.env'}" in completed.stderr
+    assert "GitHub Actions does not provision it." in completed.stderr
+    assert "See deploy/PRODUCTION.md for the canonical bootstrap contract." in completed.stderr
+    # RU: Неуспешный --preflight-only запуск не должен создавать deploy log.
+    # EN: A failed --preflight-only run must not create a deploy log.
+    assert not log_file.exists()
+
+
+def test_deploy_production_fails_fast_when_resolved_compose_file_is_missing(tmp_path: Path) -> None:
+    project_dir = tmp_path / "production"
+    bin_dir = tmp_path / "bin"
+    log_file = tmp_path / "deploy.log"
+    project_dir.mkdir()
+    bin_dir.mkdir()
+    (project_dir / "deploy").mkdir()
+    (project_dir / ".env").write_text(
+        "\n".join(
+            [
+                "DATABASE_URL=postgresql+psycopg://pulseplate:secret@db.example.com:25060/pulseplate",  # pragma: allowlist secret
+                "PRODUCTION_DOMAIN=pulseplate.test",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    docker_stub = f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'docker %s\\n' "$*" >> "{log_file}"
+"""
+    _write_executable(bin_dir / "docker", docker_stub)
+
+    curl, curl_marker = _install_unused_preflight_curl(bin_dir)
+    env = os.environ.copy()
+    env["CURL_BIN"] = str(curl)
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["DOCKER_BIN"] = str(bin_dir / "docker")
+    env["PYTHON_BIN"] = sys.executable
+    env["DEPLOY_DIR"] = str(project_dir)
+    env["ENV_FILE"] = str(project_dir / ".env")
+    env["COMPOSE_FILE"] = CANONICAL_MANAGED_COMPOSE
+    env["IMAGE_REF"] = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:test"
+    env["TAG"] = "prod-vtest"
+
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh")), "--preflight-only"],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert not curl_marker.exists(), "preflight unexpectedly invoked curl"
+    assert completed.returncode == 1
+    assert "RESOLVED_COMPOSE_FILE does not exist: deploy/docker-compose.production.yaml" in (
+        completed.stderr
+    )
+    assert not log_file.exists()
+
+
+def test_deploy_production_logs_in_to_ghcr_with_resolved_docker_binary(tmp_path: Path) -> None:
+    project_dir = tmp_path / "production"
+    docker_home = tmp_path / "docker-home"
+    docker_dir = docker_home / "bin"
+    bin_dir = tmp_path / "bin"
+    log_file = tmp_path / "deploy.log"
+    project_dir.mkdir()
+    docker_dir.mkdir(parents=True)
+    bin_dir.mkdir()
+    _write_production_host_contract(project_dir)
+    (project_dir / ".env").write_text(
+        "\n".join(
+            [
+                "DATABASE_URL=postgresql+psycopg://pulseplate:secret@db.example.com:25060/pulseplate",  # pragma: allowlist secret
+                "GHCR_USER=stale-env-user",
+                "GHCR_TOKEN=stale-env-token",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    docker_stub = f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'docker %s\\n' "$*" >> "{log_file}"
+case "$*" in
+  "login ghcr.io -u deploy-bot --password-stdin")
+    cat >/dev/null
+    ;;
+  *"compose --env-file "*"-f deploy/docker-compose.production.yaml ps -q app"*)
+    printf 'app-id\\n'
+    ;;
+  *"inspect --format "*)
+    printf 'healthy\\n'
+    ;;
+  *"ps --format "*)
+    printf 'CONTAINER ID\\n'
+    ;;
+esac
+"""
+    curl_stub = f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'curl %s\\n' "$*" >> "{log_file}"
+"""
+    sleep_stub = "#!/usr/bin/env bash\nset -euo pipefail\n"
+    _write_executable(docker_dir / "docker", docker_stub)
+    _write_executable(bin_dir / "curl", curl_stub)
+    _write_executable(bin_dir / "sleep", sleep_stub)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["DOCKER_BIN"] = str(docker_dir / "docker")
+    env["PYTHON_BIN"] = sys.executable
+    env["DEPLOY_DIR"] = str(project_dir)
+    env["ENV_FILE"] = str(project_dir / ".env")
+    env["COMPOSE_FILE"] = CANONICAL_MANAGED_COMPOSE
+    env["CURL_BIN"] = str(bin_dir / "curl")
+    env["IMAGE_REF"] = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:test"
+    env["TAG"] = "prod-vtest"
+    env["PRODUCTION_DOMAIN"] = "pulseplate.test"
+    env["GHCR_USER"] = "deploy-bot"
+    env["GHCR_TOKEN"] = "read-token"
+
+    subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh"))],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        stdin=subprocess.DEVNULL,
+        timeout=30,
+        check=True,
+    )
+
+    log_lines = log_file.read_text(encoding="utf-8").splitlines()
+    login_index = _assert_log_index(
+        log_lines,
+        predicate=lambda line: line == "docker login ghcr.io -u deploy-bot --password-stdin",
+        message="Expected deploy script to log in to GHCR via resolved docker binary",
+    )
+    pull_index = _assert_log_index(
+        log_lines,
+        predicate=lambda line: "compose --env-file" in line and "pull app" in line,
+        message="Expected deploy script to pull the production app image",
+    )
+
+    assert login_index < pull_index
+    assert all("stale-env-user" not in line for line in log_lines)
+    assert all("stale-env-token" not in line for line in log_lines)
+
+
+def test_deploy_production_syncs_shell_bundle_and_prunes_stale_shell_files(tmp_path: Path) -> None:
+    project_dir = tmp_path / "production"
+    shell_root = project_dir.parent
+    shell_bundle_dir = tmp_path / "shell-bundle"
+    bin_dir = tmp_path / "bin"
+    log_file = tmp_path / "deploy.log"
+    project_dir.mkdir()
+    shell_bundle_dir.mkdir()
+    bin_dir.mkdir()
+    _write_production_host_contract(project_dir, include_checkpoint=False)
+    (project_dir / ".env").write_text(
+        "\n".join(
+            [
+                "DATABASE_URL=postgresql+psycopg://pulseplate:secret@db.example.com:25060/pulseplate",  # pragma: allowlist secret
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _write_shell_bundle_contract(shell_bundle_dir)
+    (shell_bundle_dir / "frontend" / "bundle-marker.txt").write_text(
+        "frontend-sync\n", encoding="utf-8"
+    )
+    (shell_root / "frontend").mkdir()
+    (shell_root / "frontend" / "outside-sentinel.txt").write_text(
+        "outside-shell\n", encoding="utf-8"
+    )
+    (project_dir / "frontend").mkdir()
+    (project_dir / "frontend" / "stale.txt").write_text("old-shell\n", encoding="utf-8")
+    (project_dir / "scripts").mkdir(exist_ok=True)
+    (project_dir / "scripts" / "diagnose_web.sh").write_text("stale-diagnose\n", encoding="utf-8")
+    (project_dir / "scripts" / "redeploy_caddy.sh").write_text("stale-redeploy\n", encoding="utf-8")
+    destination_ops_dir = project_dir / "scripts" / "ops"
+    destination_ops_dir.mkdir()
+    stale_backup_helper = destination_ops_dir / "postgres_backup.sh"
+    stale_backup_helper.write_text(
+        "#!/usr/bin/env bash\nprintf 'stale-backup-helper\\n'\n",
+        encoding="utf-8",
+    )
+    stale_backup_helper.chmod(0o755)
+    source_backup_helper = shell_bundle_dir / "scripts" / "ops" / "postgres_backup.sh"
+    reviewed_backup_helper = source_backup_helper.read_bytes()
+
+    docker_stub = f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'docker %s\\n' "$*" >> "{log_file}"
+case "$*" in
+  *"compose --env-file "*"-f deploy/docker-compose.production.yaml ps -q app"*)
+    printf 'app-id\\n'
+    ;;
+  *"inspect --format "*)
+    printf 'healthy\\n'
+    ;;
+  *"ps --format "*)
+    printf 'CONTAINER ID\\n'
+    ;;
+esac
+"""
+    curl_stub = f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'curl %s\\n' "$*" >> "{log_file}"
+"""
+    sleep_stub = "#!/usr/bin/env bash\nset -euo pipefail\n"
+    _write_executable(bin_dir / "docker", docker_stub)
+    _write_executable(bin_dir / "curl", curl_stub)
+    _write_executable(bin_dir / "sleep", sleep_stub)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["DOCKER_BIN"] = str(bin_dir / "docker")
+    env["PYTHON_BIN"] = sys.executable
+    env["DEPLOY_DIR"] = str(project_dir)
+    env["ENV_FILE"] = str(project_dir / ".env")
+    env["COMPOSE_FILE"] = CANONICAL_MANAGED_COMPOSE
+    env["CURL_BIN"] = str(bin_dir / "curl")
+    env["IMAGE_REF"] = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:test"
+    env["TAG"] = "prod-vtest"
+    env["PRODUCTION_DOMAIN"] = "pulseplate.test"
+    env["SHELL_BUNDLE_DIR"] = str(shell_bundle_dir)
+
+    subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh"))],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    assert (project_dir / "frontend" / "bundle-marker.txt").read_text(
+        encoding="utf-8"
+    ) == "frontend-sync\n"
+    assert (
+        (project_dir / "deploy" / "Caddyfile.production")
+        .read_text(encoding="utf-8")
+        .startswith("pulseplate.test")
+    )
+    assert not (project_dir / "Caddyfile.production").exists()
+    assert (shell_root / "frontend" / "outside-sentinel.txt").read_text(
+        encoding="utf-8"
+    ) == "outside-shell\n"
+    assert (project_dir / "deploy" / "docker-compose.production.yaml").read_text(
+        encoding="utf-8"
+    ) == PRODUCTION_COMPOSE_TEXT
+    published_config = project_dir / "deploy" / "prometheus" / "prometheus.yml"
+    published_rules = project_dir / "deploy" / "prometheus" / "alias-alerts.yml"
+    published_manifest = project_dir / "deploy" / "prometheus" / "image-manifest.json"
+    published_alert_config = project_dir / "deploy" / "alertmanager" / "alertmanager.yml"
+    published_alert_ignore = project_dir / "deploy" / "alertmanager" / "trivy-ignore.yaml"
+    published_postgres_manifest = (
+        project_dir / "deploy" / "postgres-pgvector" / "image-manifest.json"
+    )
+    assert published_config.read_text(encoding="utf-8") == PROMETHEUS_CONFIG_PATH.read_text(
+        encoding="utf-8"
+    )
+    assert published_rules.read_text(encoding="utf-8") == PROMETHEUS_RULES_PATH.read_text(
+        encoding="utf-8"
+    )
+    assert published_manifest.read_text(encoding="utf-8") == _synthetic_prometheus_manifest_text()
+    assert published_alert_config.read_text(encoding="utf-8") == ALERTMANAGER_CONFIG_PATH.read_text(
+        encoding="utf-8"
+    )
+    assert published_alert_ignore.read_text(encoding="utf-8") == ALERTMANAGER_IGNORE_PATH.read_text(
+        encoding="utf-8"
+    )
+    assert published_postgres_manifest.read_text(
+        encoding="utf-8"
+    ) == POSTGRES_MANIFEST_PATH.read_text(encoding="utf-8")
+    for published_path in (
+        project_dir / "deploy" / "docker-compose.production.yaml",
+        published_config,
+        published_rules,
+        published_manifest,
+        published_alert_config,
+        published_alert_ignore,
+        published_postgres_manifest,
+        project_dir / "deploy" / "Caddyfile.production",
+        project_dir / "frontend" / "bundle-marker.txt",
+    ):
+        assert stat.S_IMODE(published_path.stat().st_mode) == 0o644
+    for helper_path in (
+        project_dir / "scripts" / "diagnose_web.sh",
+        project_dir / "scripts" / "redeploy_caddy.sh",
+        stale_backup_helper,
+    ):
+        assert stat.S_IMODE(helper_path.stat().st_mode) == 0o755
+    assert list(project_dir.rglob(".pulseplate-*.tmp-*")) == []
+    assert list(project_dir.rglob(".pulseplate-*.old-*")) == []
+    assert not (project_dir / "frontend" / "stale.txt").exists()
+    assert (project_dir / "scripts" / "diagnose_web.sh").read_text(
+        encoding="utf-8"
+    ) == "#!/usr/bin/env bash\nprintf 'bundle-diagnose\\n'\n"
+    assert (project_dir / "scripts" / "redeploy_caddy.sh").read_text(
+        encoding="utf-8"
+    ) == "#!/usr/bin/env bash\nprintf 'bundle-redeploy\\n'\n"
+    assert stale_backup_helper.read_bytes() == reviewed_backup_helper
+    log_lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert all("pg_dump" not in line for line in log_lines)
+
+
+def test_production_contract_publication_failure_preserves_previous_backup_helper(
+    tmp_path: Path,
+) -> None:
+    env, project_dir, log_file, shell_bundle_dir = _production_preflight_fixture(
+        tmp_path,
+        with_bundle=True,
+    )
+    assert shell_bundle_dir is not None
+    destination_ops_dir = project_dir / "scripts" / "ops"
+    destination_ops_dir.mkdir(parents=True)
+    destination_backup_helper = destination_ops_dir / "postgres_backup.sh"
+    previous_helper = b"#!/usr/bin/env bash\nprintf 'previous-helper\\n'\n"
+    destination_backup_helper.write_bytes(previous_helper)
+    destination_backup_helper.chmod(0o755)
+
+    source_config = shell_bundle_dir / "deploy" / "prometheus" / "prometheus.yml"
+    oversized_config = tmp_path / "oversized-prometheus.yml"
+    oversized_config.write_bytes(b"x" * (4 * 1024 * 1024 + 1))
+    move_bin = shutil.which("mv")
+    assert move_bin is not None
+    docker_bin = Path(env["DOCKER_BIN"])
+    _write_executable(
+        docker_bin,
+        f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'docker %s\n' "$*" >> "{log_file}"
+case "$*" in
+  *"login ghcr.io"*)
+    "$STUB_MV_BIN" "$STUB_OVERSIZED_CONFIG" "$STUB_SOURCE_CONFIG"
+    ;;
+  *"config --services"*) printf 'app\nworker\ncaddy\nprometheus\n' ;;
+esac
+""",
+    )
+    env.update(
+        {
+            "IMAGE_REF": "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:test",
+            "TAG": "prod-vtest",
+            "GHCR_USER": "bundle-test",
+            "GHCR_TOKEN": "test-only-token",  # pragma: allowlist secret
+            "STUB_MV_BIN": move_bin,
+            "STUB_OVERSIZED_CONFIG": str(oversized_config),
+            "STUB_SOURCE_CONFIG": str(source_config),
+        }
+    )
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh"))],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "source must be one bounded regular file" in completed.stderr
+    assert destination_backup_helper.read_bytes() == previous_helper
+    assert stat.S_IMODE(destination_backup_helper.stat().st_mode) == 0o755
+    assert list(project_dir.rglob(".pulseplate-postgres_backup.sh.tmp-*")) == []
+    if log_file.exists():
+        assert all(
+            " stop " not in line and " up " not in line
+            for line in log_file.read_text(encoding="utf-8").splitlines()
+        )
+
+
+def test_production_full_sync_cannot_republish_contracts_changed_after_validation(
+    tmp_path: Path,
+) -> None:
+    env, project_dir, log_file, shell_bundle_dir = _production_preflight_fixture(
+        tmp_path,
+        with_bundle=True,
+    )
+    assert shell_bundle_dir is not None
+    source_manifest = shell_bundle_dir / "deploy" / "prometheus" / "image-manifest.json"
+    source_rules = shell_bundle_dir / "deploy" / "prometheus" / "alias-alerts.yml"
+    source_compose = shell_bundle_dir / "deploy" / "docker-compose.production.yaml"
+    bin_dir = Path(env["DOCKER_BIN"]).parent
+    tampered_manifest = '{"tampered":true}\n'
+    tampered_rules = "groups: []\n"
+    tampered_compose = "services:\n  prometheus:\n    image: prom/prometheus:latest\n"
+    docker_stub = f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'docker %s\\n' "$*" >> "{log_file}"
+case "$*" in
+  *"config --services"*) printf 'app\\nworker\\ncaddy\\nprometheus\\n' ;;
+  *"run --rm --no-deps app alembic upgrade head"*)
+    printf '%s' '{tampered_manifest}' > "{source_manifest}"
+    printf '%s' '{tampered_rules}' > "{source_rules}"
+    printf '%s' '{tampered_compose}' > "{source_compose}"
+    ;;
+  *"ps -q app"*) printf 'app-id\\n' ;;
+esac
+"""
+    _write_executable(bin_dir / "docker", docker_stub)
+    env.update(
+        {
+            "IMAGE_REF": "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:test",
+            "TAG": "prod-vtest",
+            "HEALTH_MAX_ATTEMPTS": "1",
+            "HEALTH_SLEEP_S": "0",
+        }
+    )
+
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh"))],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert source_manifest.read_text(encoding="utf-8") == tampered_manifest
+    assert source_rules.read_text(encoding="utf-8") == tampered_rules
+    assert source_compose.read_text(encoding="utf-8") == tampered_compose
+    assert (project_dir / "deploy" / "prometheus" / "image-manifest.json").read_text(
+        encoding="utf-8"
+    ) == _synthetic_prometheus_manifest_text()
+    assert (project_dir / "deploy" / "prometheus" / "alias-alerts.yml").read_text(
+        encoding="utf-8"
+    ) == PROMETHEUS_RULES_PATH.read_text(encoding="utf-8")
+    assert (project_dir / "deploy" / "docker-compose.production.yaml").read_text(
+        encoding="utf-8"
+    ) == PRODUCTION_COMPOSE_TEXT
+
+
+def test_deploy_production_syncs_shell_bundle_with_autodetected_compose_file(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "production"
+    shell_root = project_dir.parent
+    shell_bundle_dir = tmp_path / "shell-bundle"
+    bin_dir = tmp_path / "bin"
+    log_file = tmp_path / "deploy.log"
+    project_dir.mkdir()
+    shell_bundle_dir.mkdir()
+    bin_dir.mkdir()
+    _write_production_host_contract(project_dir, include_checkpoint=False)
+    (project_dir / ".env").write_text(
+        "DATABASE_URL=postgresql+psycopg://pulseplate:secret@db.example.com:25060/pulseplate\n",  # pragma: allowlist secret
+        encoding="utf-8",
+    )
+    _write_shell_bundle_contract(shell_bundle_dir)
+    (shell_bundle_dir / "frontend" / "bundle-marker.txt").write_text(
+        "frontend-sync\n", encoding="utf-8"
+    )
+
+    docker_stub = f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'docker %s\\n' "$*" >> "{log_file}"
+case "$*" in
+  *"compose --env-file "*"-f deploy/docker-compose.production.yaml ps -q app"*)
+    printf 'app-id\\n'
+    ;;
+  *"inspect --format "*)
+    printf 'healthy\\n'
+    ;;
+  *"ps --format "*)
+    printf 'CONTAINER ID\\n'
+    ;;
+esac
+"""
+    curl_stub = f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'curl %s\\n' "$*" >> "{log_file}"
+"""
+    sleep_stub = "#!/usr/bin/env bash\nset -euo pipefail\n"
+    _write_executable(bin_dir / "docker", docker_stub)
+    _write_executable(bin_dir / "curl", curl_stub)
+    _write_executable(bin_dir / "sleep", sleep_stub)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["DOCKER_BIN"] = str(bin_dir / "docker")
+    env["PYTHON_BIN"] = sys.executable
+    env["DEPLOY_DIR"] = str(project_dir)
+    env["ENV_FILE"] = str(project_dir / ".env")
+    env.pop("COMPOSE_FILE", None)
+    env["CURL_BIN"] = str(bin_dir / "curl")
+    env["IMAGE_REF"] = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:test"
+    env["TAG"] = "prod-vtest"
+    env["PRODUCTION_DOMAIN"] = "pulseplate.test"
+    env["SHELL_BUNDLE_DIR"] = str(shell_bundle_dir)
+
+    subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh"))],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    assert (project_dir / "deploy" / "docker-compose.production.yaml").read_text(
+        encoding="utf-8"
+    ) == PRODUCTION_COMPOSE_TEXT
+    assert (project_dir / "frontend" / "bundle-marker.txt").read_text(
+        encoding="utf-8"
+    ) == "frontend-sync\n"
+    assert (project_dir / "deploy" / "Caddyfile.production").is_file()
+    assert (project_dir / "scripts" / "diagnose_web.sh").read_text(
+        encoding="utf-8"
+    ) == "#!/usr/bin/env bash\nprintf 'bundle-diagnose\\n'\n"
+    assert (project_dir / "scripts" / "redeploy_caddy.sh").read_text(
+        encoding="utf-8"
+    ) == "#!/usr/bin/env bash\nprintf 'bundle-redeploy\\n'\n"
+
+
+def test_deploy_production_syncs_shell_bundle_with_relative_compose_subpath(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "production"
+    shell_root = project_dir.parent
+    shell_bundle_dir = tmp_path / "shell-bundle"
+    bin_dir = tmp_path / "bin"
+    log_file = tmp_path / "deploy.log"
+    project_dir.mkdir()
+    shell_bundle_dir.mkdir()
+    bin_dir.mkdir()
+    _write_production_host_contract(project_dir, include_checkpoint=False)
+    (project_dir / ".env").write_text(
+        "DATABASE_URL=postgresql+psycopg://pulseplate:secret@db.example.com:25060/pulseplate\n",  # pragma: allowlist secret
+        encoding="utf-8",
+    )
+    _write_shell_bundle_contract(shell_bundle_dir)
+    (shell_bundle_dir / "frontend" / "bundle-marker.txt").write_text(
+        "frontend-sync\n", encoding="utf-8"
+    )
+
+    docker_stub = f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'docker %s\\n' "$*" >> "{log_file}"
+case "$*" in
+  *"compose --env-file "*"-f deploy/docker-compose.production.yaml ps -q app"*)
+    printf 'app-id\\n'
+    ;;
+  *"inspect --format "*)
+    printf 'healthy\\n'
+    ;;
+  *"ps --format "*)
+    printf 'CONTAINER ID\\n'
+    ;;
+esac
+"""
+    curl_stub = f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'curl %s\\n' "$*" >> "{log_file}"
+"""
+    sleep_stub = "#!/usr/bin/env bash\nset -euo pipefail\n"
+    _write_executable(bin_dir / "docker", docker_stub)
+    _write_executable(bin_dir / "curl", curl_stub)
+    _write_executable(bin_dir / "sleep", sleep_stub)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["DOCKER_BIN"] = str(bin_dir / "docker")
+    env["PYTHON_BIN"] = sys.executable
+    env["DEPLOY_DIR"] = str(project_dir)
+    env["ENV_FILE"] = str(project_dir / ".env")
+    env["COMPOSE_FILE"] = "deploy/docker-compose.production.yaml"
+    env["CURL_BIN"] = str(bin_dir / "curl")
+    env["IMAGE_REF"] = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:test"
+    env["TAG"] = "prod-vtest"
+    env["PRODUCTION_DOMAIN"] = "pulseplate.test"
+    env["SHELL_BUNDLE_DIR"] = str(shell_bundle_dir)
+
+    subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh"))],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    assert (project_dir / "deploy" / "docker-compose.production.yaml").read_text(
+        encoding="utf-8"
+    ) == PRODUCTION_COMPOSE_TEXT
+    assert (project_dir / "scripts" / "diagnose_web.sh").read_text(
+        encoding="utf-8"
+    ) == "#!/usr/bin/env bash\nprintf 'bundle-diagnose\\n'\n"
+    assert (project_dir / "scripts" / "redeploy_caddy.sh").read_text(
+        encoding="utf-8"
+    ) == "#!/usr/bin/env bash\nprintf 'bundle-redeploy\\n'\n"
+
+
+def test_deploy_production_autodetects_deploy_subdir_compose_and_env_file(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "production"
+    deploy_dir = project_dir / "deploy"
+    bin_dir = tmp_path / "bin"
+    log_file = tmp_path / "deploy.log"
+    project_dir.mkdir()
+    bin_dir.mkdir()
+    _write_production_host_contract(project_dir)
+    (deploy_dir / ".env").write_text(
+        "\n".join(
+            [
+                "DATABASE_URL=postgresql+psycopg://pulseplate:secret@db.example.com:25060/pulseplate",  # pragma: allowlist secret
+                "PRODUCTION_DOMAIN=pulseplate.test",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    docker_stub = f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'docker %s\\n' "$*" >> "{log_file}"
+case "$*" in
+  *"compose --env-file "*"/deploy/.env -f deploy/docker-compose.production.yaml ps -q app"*)
+    printf 'app-id\\n'
+    ;;
+  *"inspect --format "*)
+    printf 'healthy\\n'
+    ;;
+  *"ps --format "*)
+    printf 'CONTAINER ID\\n'
+    ;;
+esac
+"""
+    curl_stub = f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'curl %s\\n' "$*" >> "{log_file}"
+"""
+    sleep_stub = "#!/usr/bin/env bash\nset -euo pipefail\n"
+    _write_executable(bin_dir / "docker", docker_stub)
+    _write_executable(bin_dir / "curl", curl_stub)
+    _write_executable(bin_dir / "sleep", sleep_stub)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["DOCKER_BIN"] = str(bin_dir / "docker")
+    env["PYTHON_BIN"] = sys.executable
+    env["DEPLOY_DIR"] = str(project_dir)
+    env.pop("COMPOSE_FILE", None)
+    env.pop("ENV_FILE", None)
+    env["CURL_BIN"] = str(bin_dir / "curl")
+    env["IMAGE_REF"] = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:test"
+    env["TAG"] = "prod-vtest"
+
+    subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh"))],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    log_lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert any(
+        "compose --env-file" in line
+        and f"{deploy_dir / '.env'} -f deploy/docker-compose.production.yaml pull app" in line
+        for line in log_lines
+    )
+    assert any(
+        "compose --env-file" in line
+        and f"{deploy_dir / '.env'} -f deploy/docker-compose.production.yaml up -d --remove-orphans caddy"
+        in line
+        for line in log_lines
+    )
+
+
+def test_deploy_production_uses_deploy_env_file_for_absolute_deploy_compose_path(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "production"
+    deploy_dir = project_dir / "deploy"
+    compose_file = deploy_dir / "docker-compose.production.yaml"
+    bin_dir = tmp_path / "bin"
+    log_file = tmp_path / "deploy.log"
+    project_dir.mkdir()
+    bin_dir.mkdir()
+    _write_production_host_contract(project_dir)
+    (deploy_dir / ".env").write_text(
+        "\n".join(
+            [
+                "DATABASE_URL=postgresql+psycopg://pulseplate:secret@db.example.com:25060/pulseplate",  # pragma: allowlist secret
+                "PRODUCTION_DOMAIN=pulseplate.test",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    docker_stub = f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'docker %s\\n' "$*" >> "{log_file}"
+case "$*" in
+  *"compose --env-file "*"/deploy/.env -f {compose_file} ps -q app"*)
+    printf 'app-id\\n'
+    ;;
+  *"inspect --format "*)
+    printf 'healthy\\n'
+    ;;
+  *"ps --format "*)
+    printf 'CONTAINER ID\\n'
+    ;;
+esac
+"""
+    curl_stub = f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'curl %s\\n' "$*" >> "{log_file}"
+"""
+    sleep_stub = "#!/usr/bin/env bash\nset -euo pipefail\n"
+    _write_executable(bin_dir / "docker", docker_stub)
+    _write_executable(bin_dir / "curl", curl_stub)
+    _write_executable(bin_dir / "sleep", sleep_stub)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["DOCKER_BIN"] = str(bin_dir / "docker")
+    env["PYTHON_BIN"] = sys.executable
+    env["DEPLOY_DIR"] = str(project_dir)
+    env["COMPOSE_FILE"] = str(compose_file)
+    env.pop("ENV_FILE", None)
+    env["CURL_BIN"] = str(bin_dir / "curl")
+    env["IMAGE_REF"] = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:test"
+    env["TAG"] = "prod-vtest"
+
+    subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh"))],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    log_lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert any(
+        "compose --env-file" in line and f"{deploy_dir / '.env'} -f {compose_file} pull app" in line
+        for line in log_lines
+    )
+    assert any(
+        "compose --env-file" in line
+        and f"{deploy_dir / '.env'} -f {compose_file} up -d --remove-orphans caddy" in line
+        for line in log_lines
+    )
+
+
+def test_deploy_production_rejects_compose_file_outside_deploy_dir_during_shell_sync(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "production"
+    shell_root = project_dir.parent
+    shell_bundle_dir = tmp_path / "shell-bundle"
+    outside_dir = tmp_path / "outside"
+    bin_dir = tmp_path / "bin"
+    log_file = tmp_path / "deploy.log"
+    project_dir.mkdir()
+    shell_bundle_dir.mkdir()
+    outside_dir.mkdir()
+    bin_dir.mkdir()
+    (project_dir / ".env").write_text(
+        "\n".join(
+            [
+                "DATABASE_URL=postgresql+psycopg://pulseplate:secret@db.example.com:25060/pulseplate",  # pragma: allowlist secret
+                "PRODUCTION_DOMAIN=pulseplate.test",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (outside_dir / "docker-compose.production.yaml").write_text("services: {}\n", encoding="utf-8")
+    (shell_bundle_dir / "frontend").mkdir()
+    (shell_bundle_dir / "frontend" / "bundle-marker.txt").write_text(
+        "frontend-sync\n", encoding="utf-8"
+    )
+    (shell_bundle_dir / "deploy").mkdir()
+    (shell_bundle_dir / "deploy" / "Caddyfile.production").write_text(
+        'pulseplate.test {\n    respond "ok"\n}\n',
+        encoding="utf-8",
+    )
+    (shell_bundle_dir / "scripts").mkdir()
+    (shell_bundle_dir / "scripts" / "diagnose_web.sh").write_text(
+        "#!/usr/bin/env bash\nprintf 'bundle-diagnose\\n'\n", encoding="utf-8"
+    )
+    (shell_bundle_dir / "scripts" / "redeploy_caddy.sh").write_text(
+        "#!/usr/bin/env bash\nprintf 'bundle-redeploy\\n'\n", encoding="utf-8"
+    )
+
+    docker_stub = f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'docker %s\\n' "$*" >> "{log_file}"
+case "$*" in
+  *"ps -q app"*)
+    printf 'app-id\\n'
+    ;;
+  *"inspect --format "*)
+    printf 'healthy\\n'
+    ;;
+  *"ps --format "*)
+    printf 'CONTAINER ID\\n'
+    ;;
+esac
+"""
+    sleep_stub = "#!/usr/bin/env bash\nset -euo pipefail\n"
+    _write_executable(bin_dir / "docker", docker_stub)
+    _write_executable(bin_dir / "sleep", sleep_stub)
+
+    curl, curl_marker = _install_unused_preflight_curl(bin_dir)
+    env = os.environ.copy()
+    env["CURL_BIN"] = str(curl)
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["DOCKER_BIN"] = str(bin_dir / "docker")
+    env["PYTHON_BIN"] = sys.executable
+    env["DEPLOY_DIR"] = str(project_dir)
+    env["ENV_FILE"] = str(project_dir / ".env")
+    env["COMPOSE_FILE"] = str(outside_dir / "docker-compose.production.yaml")
+    env["IMAGE_REF"] = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:test"
+    env["TAG"] = "prod-vtest"
+    env["SHELL_BUNDLE_DIR"] = str(shell_bundle_dir)
+
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh"))],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert not curl_marker.exists(), "preflight unexpectedly invoked curl"
+    assert completed.returncode == 1
+    assert "COMPOSE_FILE must select one exact canonical production Compose identity" in (
+        completed.stderr
+    )
+
+
+def test_deploy_production_exits_non_zero_when_migrations_fail(tmp_path: Path) -> None:
+    project_dir = tmp_path / "production"
+    bin_dir = tmp_path / "bin"
+    log_file = tmp_path / "deploy.log"
+    project_dir.mkdir()
+    bin_dir.mkdir()
+    _write_production_host_contract(project_dir)
+    (project_dir / ".env").write_text(
+        "\n".join(
+            [
+                "DATABASE_URL=postgresql+psycopg://pulseplate:secret@db.example.com:25060/pulseplate",  # pragma: allowlist secret
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    docker_stub = f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'docker %s\\n' "$*" >> "{log_file}"
+case "$*" in
+  *"compose --env-file "*"-f deploy/docker-compose.production.yaml ps -q app"*)
+    printf 'app-id\\n'
+    ;;
+  *"inspect --format "*)
+    printf 'healthy\\n'
+    ;;
+  *"compose --env-file "*"-f deploy/docker-compose.production.yaml run --rm --no-deps app alembic upgrade head"*)
+    printf 'migration failed\\n' >&2
+    exit 1
+    ;;
+  *"ps --format "*)
+    printf 'CONTAINER ID\\n'
+    ;;
+esac
+"""
+    curl_stub = f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'curl %s\\n' "$*" >> "{log_file}"
+"""
+    sleep_stub = "#!/usr/bin/env bash\nset -euo pipefail\n"
+    _write_executable(bin_dir / "docker", docker_stub)
+    _write_executable(bin_dir / "curl", curl_stub)
+    _write_executable(bin_dir / "sleep", sleep_stub)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["DOCKER_BIN"] = str(bin_dir / "docker")
+    env["PYTHON_BIN"] = sys.executable
+    env["DEPLOY_DIR"] = str(project_dir)
+    env["ENV_FILE"] = str(project_dir / ".env")
+    env["COMPOSE_FILE"] = CANONICAL_MANAGED_COMPOSE
+    env["CURL_BIN"] = str(bin_dir / "curl")
+    env["IMAGE_REF"] = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:test"
+    env["TAG"] = "prod-vtest"
+    env["PRODUCTION_DOMAIN"] = "pulseplate.test"
+
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh"))],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert "Database migrations failed (exit code: 1)" in completed.stderr
+
+    log_lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert any("run --rm --no-deps app alembic upgrade head" in line for line in log_lines)
+    assert all("up -d --remove-orphans app" not in line for line in log_lines)
+    assert all("up -d --remove-orphans caddy" not in line for line in log_lines)
+    assert not any(
+        line.startswith("curl ") and "https://pulseplate.test/ready" in line for line in log_lines
+    )
+
+
+def test_deploy_production_keeps_shell_bundle_untouched_when_migrations_fail(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "production"
+    shell_root = project_dir.parent
+    shell_bundle_dir = tmp_path / "shell-bundle"
+    bin_dir = tmp_path / "bin"
+    log_file = tmp_path / "deploy.log"
+    project_dir.mkdir()
+    shell_bundle_dir.mkdir()
+    bin_dir.mkdir()
+    _write_production_host_contract(project_dir, include_checkpoint=False)
+    (project_dir / ".env").write_text(
+        "DATABASE_URL=postgresql+psycopg://pulseplate:secret@db.example.com:25060/pulseplate\n",  # pragma: allowlist secret
+        encoding="utf-8",
+    )
+    _write_shell_bundle_contract(shell_bundle_dir)
+    (shell_bundle_dir / "frontend" / "bundle-marker.txt").write_text(
+        "frontend-sync\n", encoding="utf-8"
+    )
+    (project_dir / "frontend").mkdir()
+    (project_dir / "frontend" / "stale.txt").write_text("old-shell\n", encoding="utf-8")
+    (project_dir / "scripts").mkdir(exist_ok=True)
+    (project_dir / "scripts" / "diagnose_web.sh").write_text("stale-diagnose\n", encoding="utf-8")
+    (project_dir / "scripts" / "redeploy_caddy.sh").write_text("stale-redeploy\n", encoding="utf-8")
+
+    docker_stub = f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'docker %s\\n' "$*" >> "{log_file}"
+case "$*" in
+  *"compose --env-file "*"-f deploy/docker-compose.production.yaml run --rm --no-deps app alembic upgrade head"*)
+    printf 'migration failed\\n' >&2
+    exit 1
+    ;;
+esac
+"""
+    curl_stub = f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'curl %s\\n' "$*" >> "{log_file}"
+"""
+    _write_executable(bin_dir / "docker", docker_stub)
+    _write_executable(bin_dir / "curl", curl_stub)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["DOCKER_BIN"] = str(bin_dir / "docker")
+    env["PYTHON_BIN"] = sys.executable
+    env["DEPLOY_DIR"] = str(project_dir)
+    env["ENV_FILE"] = str(project_dir / ".env")
+    env["COMPOSE_FILE"] = CANONICAL_MANAGED_COMPOSE
+    env["CURL_BIN"] = str(bin_dir / "curl")
+    env["IMAGE_REF"] = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:test"
+    env["TAG"] = "prod-vtest"
+    env["PRODUCTION_DOMAIN"] = "pulseplate.test"
+    env["SHELL_BUNDLE_DIR"] = str(shell_bundle_dir)
+
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh"))],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert (project_dir / "frontend" / "stale.txt").read_text(encoding="utf-8") == "old-shell\n"
+    assert not (project_dir / "frontend" / "bundle-marker.txt").exists()
+    assert (project_dir / "scripts" / "diagnose_web.sh").read_text(
+        encoding="utf-8"
+    ) == "stale-diagnose\n"
+    assert (project_dir / "scripts" / "redeploy_caddy.sh").read_text(
+        encoding="utf-8"
+    ) == "stale-redeploy\n"
+
+
+@pytest.mark.parametrize(
+    "database_url",
+    [
+        "postgresql+psycopg://pulseplate:secret@postgres:5432/pulseplate",  # pragma: allowlist secret
+        "postgresql+psycopg://pulseplate:secret@postgres/pulseplate",  # pragma: allowlist secret
+        "postgresql+psycopg://pulseplate:secret@postgres:6543/pulseplate",  # pragma: allowlist secret
+    ],
+)
+def test_deploy_production_rejects_compose_local_postgres_dsn(
+    tmp_path: Path,
+    database_url: str,
+) -> None:
+    project_dir = tmp_path / "production"
+    bin_dir = tmp_path / "bin"
+    project_dir.mkdir()
+    bin_dir.mkdir()
+    _write_production_host_contract(project_dir)
+    (project_dir / ".env").write_text(
+        f"DATABASE_URL={database_url}\n",
+        encoding="utf-8",
+    )
+
+    docker_stub = "#!/usr/bin/env bash\nset -euo pipefail\nexit 0\n"
+    _write_executable(bin_dir / "docker", docker_stub)
+    _write_executable(bin_dir / "curl", "#!/usr/bin/env bash\necho unexpected-curl >&2\nexit 97\n")
+
+    env = os.environ.copy()
+    env["PYTHON_BIN"] = sys.executable
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["DOCKER_BIN"] = str(bin_dir / "docker")
+    env["PYTHON_BIN"] = sys.executable
+    env["CURL_BIN"] = str(bin_dir / "curl")
+    env["DEPLOY_DIR"] = str(project_dir)
+    env["ENV_FILE"] = str(project_dir / ".env")
+    env["COMPOSE_FILE"] = CANONICAL_MANAGED_COMPOSE
+    env["IMAGE_REF"] = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:test"
+    env["TAG"] = "prod-vtest"
+    env["PRODUCTION_DOMAIN"] = "pulseplate.test"
+
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh"))],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert "unexpected-curl" not in completed.stderr
+    assert "external managed PostgreSQL" in completed.stderr
+
+
+def test_deploy_production_rejects_compose_with_local_postgres_reference(tmp_path: Path) -> None:
+    project_dir = tmp_path / "production"
+    bin_dir = tmp_path / "bin"
+    project_dir.mkdir()
+    bin_dir.mkdir()
+    _write_production_host_contract(
+        project_dir,
+        compose_text=PRODUCTION_COMPOSE_TEXT.replace(
+            "services:\n", "services:\n  postgres:\n    image: postgres:16\n", 1
+        ),
+    )
+    (project_dir / ".env").write_text(
+        "DATABASE_URL=postgresql+psycopg://pulseplate:secret@db.example.com:25060/pulseplate\n",  # pragma: allowlist secret
+        encoding="utf-8",
+    )
+
+    docker_stub = """#!/usr/bin/env bash
+set -euo pipefail
+case "$*" in
+  *"config --services"*) printf 'app\npostgres\n' ;;
+esac
+"""
+    _write_executable(bin_dir / "docker", docker_stub)
+    _write_executable(bin_dir / "curl", "#!/usr/bin/env bash\necho unexpected-curl >&2\nexit 97\n")
+
+    env = os.environ.copy()
+    env["PYTHON_BIN"] = sys.executable
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["DOCKER_BIN"] = str(bin_dir / "docker")
+    env["PYTHON_BIN"] = sys.executable
+    env["CURL_BIN"] = str(bin_dir / "curl")
+    env["DEPLOY_DIR"] = str(project_dir)
+    env["ENV_FILE"] = str(project_dir / ".env")
+    env["COMPOSE_FILE"] = CANONICAL_MANAGED_COMPOSE
+    env["IMAGE_REF"] = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:test"
+    env["TAG"] = "prod-vtest"
+    env["PRODUCTION_DOMAIN"] = "pulseplate.test"
+
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh"))],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert "unexpected-curl" not in completed.stderr
+    assert "Managed production Compose must not contain a local postgres service" in (
+        completed.stderr
+    )
+
+
+@pytest.mark.parametrize(
+    "destination_helper_variant",
+    ("absent", "stale-executable", "stale-nonexec"),
+)
+@pytest.mark.parametrize(
+    "env_file_input", ("absolute", ".env", "./.env", "runtime config/selected.env", "missing.env")
+)
+def test_deploy_production_accepts_only_explicit_exact_self_hosted_database_contour(
+    tmp_path: Path,
+    destination_helper_variant: str,
+    env_file_input: str,
+) -> None:
+    project_dir = tmp_path / "production"
+    shell_bundle_dir = tmp_path / "shell-bundle"
+    bin_dir = tmp_path / "bin"
+    log_file = tmp_path / "docker.log"
+    project_dir.mkdir()
+    shell_bundle_dir.mkdir()
+    bin_dir.mkdir()
+    self_hosted_compose = _historical_AM_template(SELF_HOSTED_COMPOSE_PATH).decode("utf-8")
+    _write_production_host_contract(
+        project_dir,
+        compose_text=self_hosted_compose,
+        self_hosted=True,
+        include_checkpoint=False,
+    )
+    _write_shell_bundle_contract(
+        shell_bundle_dir,
+        compose_text=self_hosted_compose,
+        compose_name="docker-compose.production.selfhosted.yaml",
+    )
+    source_backup_helper = shell_bundle_dir / "scripts" / "ops" / "postgres_backup.sh"
+    source_backup_helper.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        'test "$ENV_FILE" = "$STUB_EXPECTED_ENV_FILE"\n'
+        'printf "reviewed-bundle-backup project=%s compose=%s env=%s\\n" "$PROJECT_DIR" "$COMPOSE_FILE" "$ENV_FILE" >> "$STUB_DEPLOY_LOG_FILE"\n'
+        'receipt="${BACKUP_DIR}/pulseplate_reviewed.dump"\n'
+        "printf 'synthetic-custom-dump' > \"$receipt\"\n"
+        "printf 'Backup created: %s\\n' \"$receipt\"\n",
+        encoding="utf-8",
+    )
+    source_backup_helper.chmod(0o755)
+    destination_backup_helper = project_dir / "scripts" / "ops" / "postgres_backup.sh"
+    stale_helper_bytes = (
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        'printf "stale-host-backup\\n" >> "$STUB_DEPLOY_LOG_FILE"\n'
+        'receipt="${BACKUP_DIR}/pulseplate_stale.dump"\n'
+        "printf 'synthetic-custom-dump' > \"$receipt\"\n"
+        'chmod 0600 "$receipt"\n'
+        "printf 'Backup created: %s\\n' \"$receipt\"\n"
+    ).encode()
+    if destination_helper_variant == "absent":
+        destination_backup_helper.unlink()
+        destination_backup_helper.parent.rmdir()
+        assert not destination_backup_helper.parent.exists()
+    else:
+        destination_backup_helper.write_bytes(stale_helper_bytes)
+        destination_backup_helper.chmod(
+            0o755 if destination_helper_variant == "stale-executable" else 0o644
+        )
+    selected_env = project_dir / (
+        env_file_input if env_file_input == "runtime config/selected.env" else ".env"
+    )
+    selected_env.parent.mkdir(parents=True, exist_ok=True)
+    selected_env.write_text(
+        "\n".join(
+            (
+                "DATABASE_URL=postgresql+psycopg://stale:managed@db.example.com/db",  # pragma: allowlist secret
+                "POSTGRES_DB=pulseplate",
+                "POSTGRES_USER=pulseplate",
+                "POSTGRES_PASSWORD=test-only",  # pragma: allowlist secret
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    if env_file_input == "missing.env":
+        (project_dir / "deploy" / ".env").write_text(
+            selected_env.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+    docker_stub = f"""#!/usr/bin/env bash
+set -euo pipefail
+if [ "$1" = "compose" ]; then
+  test "$2" = "--env-file"
+  test "$3" = "$STUB_EXPECTED_ENV_FILE"
+fi
+printf 'docker %s\n' "$*" >> "{log_file}"
+case "$*" in
+  *"config --services"*) printf 'app\ncaddy\npostgres\nprometheus\nworker\n' ;;
+  *"ps -q postgres"*) printf 'aaaaaaaaaaaa\n' ;;
+  *"ps -q app"*) printf 'bbbbbbbbbbbb\n' ;;
+  *"ps -q caddy"*) printf 'cccccccccccc\n' ;;
+  *"ps -q worker"*) printf 'dddddddddddd\n' ;;
+  *"inspect --format"*) printf 'healthy\n' ;;
+  *"ps --last 20"*) printf 'CONTAINER ID\n' ;;
+esac
+"""
+    _write_executable(bin_dir / "docker", docker_stub)
+    _write_executable(bin_dir / "curl", "#!/usr/bin/env bash\nset -euo pipefail\n")
+
+    env = os.environ.copy()
+    env.pop("GHCR_TOKEN", None)
+    env.pop("GHCR_USER", None)
+    env.update(
+        {
+            "DOCKER_BIN": str(bin_dir / "docker"),
+            "PYTHON_BIN": sys.executable,
+            "CURL_BIN": str(bin_dir / "curl"),
+            "DEPLOY_DIR": str(project_dir),
+            "ENV_FILE": str(selected_env) if env_file_input == "absolute" else env_file_input,
+            "COMPOSE_FILE": CANONICAL_SELF_HOSTED_COMPOSE,
+            "PRODUCTION_DOMAIN": "pulseplate.test",
+            "HEALTH_MAX_ATTEMPTS": "1",
+            "HEALTH_SLEEP_S": "0",
+            "IMAGE_REF": "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:test",
+            "TAG": "prod-vtest",
+            "STUB_DEPLOY_LOG_FILE": str(log_file),
+            "STUB_EXPECTED_ENV_FILE": str(selected_env),
+            "SHELL_BUNDLE_DIR": str(shell_bundle_dir),
+        }
+    )
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh")), "--preflight-only"],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if env_file_input == "missing.env":
+        assert completed.returncode == 1
+        assert "Missing production env file" in completed.stderr
+        assert not log_file.exists()
+        return
+    assert completed.returncode == 0, completed.stderr
+    assert "Production deploy preflight passed" in completed.stdout
+    if destination_helper_variant == "absent":
+        assert not destination_backup_helper.exists()
+        assert not destination_backup_helper.parent.exists()
+    else:
+        assert destination_backup_helper.read_bytes() == stale_helper_bytes
+        assert stat.S_IMODE(destination_backup_helper.stat().st_mode) == (
+            0o755 if destination_helper_variant == "stale-executable" else 0o644
+        )
+
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh"))],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    log_lines = log_file.read_text(encoding="utf-8").splitlines()
+    quiesce_index = next(
+        index for index, line in enumerate(log_lines) if " stop worker caddy app" in line
+    )
+    backup_index = next(
+        index for index, line in enumerate(log_lines) if line.startswith("reviewed-bundle-backup ")
+    )
+    old_stop_index = log_lines.index(f"docker stop {'a' * 64}")
+    candidate_index = next(
+        index for index, line in enumerate(log_lines) if " up -d --pull never postgres" in line
+    )
+    migration_index = next(
+        index
+        for index, line in enumerate(log_lines)
+        if " run --rm --no-deps app alembic upgrade head" in line
+    )
+    assert quiesce_index < backup_index < old_stop_index < candidate_index < migration_index
+    assert "stale-host-backup" not in log_lines
+    assert f"project={project_dir / 'deploy'}" in log_lines[backup_index]
+    assert f"env={selected_env}" in log_lines[backup_index]
+    assert (
+        f"compose={project_dir / 'deploy' / 'docker-compose.production.selfhosted.yaml'}"
+        in log_lines[backup_index]
+    )
+    assert destination_backup_helper.read_bytes() == source_backup_helper.read_bytes()
+    assert stat.S_IMODE(destination_backup_helper.stat().st_mode) == 0o755
+    backup_receipt = project_dir / "backups" / "pulseplate_reviewed.dump"
+    assert stat.S_IMODE(backup_receipt.stat().st_mode) == 0o600
+
+    alternate_backup_helper = project_dir / "scripts" / "ops" / "alternate_backup.sh"
+    alternate_backup_helper.write_bytes(source_backup_helper.read_bytes())
+    alternate_backup_helper.chmod(0o755)
+    env["BACKUP_HELPER"] = str(alternate_backup_helper)
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh")), "--preflight-only"],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 1
+    assert "backup helper must use the canonical deployed path" in completed.stderr
+    env.pop("BACKUP_HELPER")
+
+    env.pop("COMPOSE_FILE")
+    env["PROD_DEPLOY_MODE"] = "self-hosted"
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh")), "--preflight-only"],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 1
+    assert "RESOLVED_COMPOSE_FILE does not exist" in completed.stderr
+
+
+def _production_self_hosted_image_identity_fixture(
+    tmp_path: Path,
+) -> tuple[dict[str, str], Path]:
+    project_dir = tmp_path / "production"
+    shell_bundle_dir = tmp_path / "shell-bundle"
+    bin_dir = tmp_path / "bin"
+    log_file = tmp_path / "deploy.log"
+    project_dir.mkdir()
+    shell_bundle_dir.mkdir()
+    bin_dir.mkdir()
+    compose_text = _historical_AM_template(SELF_HOSTED_COMPOSE_PATH).decode("utf-8")
+    _write_production_host_contract(
+        project_dir, compose_text=compose_text, self_hosted=True, include_checkpoint=False
+    )
+    _write_shell_bundle_contract(
+        shell_bundle_dir,
+        compose_text=compose_text,
+        compose_name="docker-compose.production.selfhosted.yaml",
+    )
+    host_backup_helper = project_dir / "scripts" / "ops" / "postgres_backup.sh"
+    source_backup_helper = shell_bundle_dir / "scripts" / "ops" / "postgres_backup.sh"
+    source_backup_helper.write_bytes(host_backup_helper.read_bytes())
+    source_backup_helper.chmod(0o755)
+    env_file = project_dir / ".env"
+    env_file.write_text(
+        "POSTGRES_DB=pulseplate\nPOSTGRES_USER=pulseplate\nPOSTGRES_PASSWORD=test-only\n",  # pragma: allowlist secret
+        encoding="utf-8",
+    )
+    docker_path = bin_dir / "docker"
+    _write_executable(
+        docker_path,
+        f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'docker %s\\n' "$*" >> "{log_file}"
+case "$*" in
+  *"config --services"*) printf 'app\\ncaddy\\npostgres\\nprometheus\\nworker\\n' ;;
+  *"ps -q postgres"*) printf 'aaaaaaaaaaaa\\n' ;;
+  *"ps -q app"*) printf 'bbbbbbbbbbbb\\n' ;;
+  *"ps -q caddy"*) printf 'cccccccccccc\\n' ;;
+  *"ps -q worker"*) printf 'dddddddddddd\\n' ;;
+  *"inspect --format"*) printf 'healthy\\n' ;;
+  *"ps --last 20"*) printf 'CONTAINER ID\\n' ;;
+esac
+""",
+    )
+    strict_inspect = f"""if [ "${{1:-}}" = image ] && [ "${{2:-}}" = inspect ]; then
+  printf 'docker %s\\n' "$*" >> "$STUB_DEPLOY_LOG_FILE"
+  case "${{3:-}}" in
+    '{POSTGRES_RUNTIME_REF}')
+      inspect_count=0
+      if [ -f "$STUB_PRODUCTION_POSTGRES_REF_INSPECT_COUNTER_FILE" ]; then
+        IFS= read -r inspect_count < "$STUB_PRODUCTION_POSTGRES_REF_INSPECT_COUNTER_FILE"
+      fi
+      inspect_count=$((inspect_count + 1))
+      printf '%s\\n' "$inspect_count" > "$STUB_PRODUCTION_POSTGRES_REF_INSPECT_COUNTER_FILE"
+      if [ "$inspect_count" -eq 1 ]; then
+        if [ "${{STUB_PRODUCTION_PULLED_INSPECT_STATUS:-0}}" -ne 0 ]; then
+          printf '%s\\n' 'native-secret-value' >&2
+          exit "$STUB_PRODUCTION_PULLED_INSPECT_STATUS"
+        fi
+        if [ -n "${{STUB_PRODUCTION_PULLED_IMAGE_FILE:-}}" ]; then
+          cat "$STUB_PRODUCTION_PULLED_IMAGE_FILE"
+        else
+          printf '%s\\n' "$STUB_PRODUCTION_PULLED_POSTGRES_IMAGE_JSON"
+        fi
+      else
+        if [ "${{STUB_PRODUCTION_EXISTING_INSPECT_STATUS:-0}}" -ne 0 ]; then
+          printf '%s\\n' 'native-secret-value' >&2
+          exit "$STUB_PRODUCTION_EXISTING_INSPECT_STATUS"
+        fi
+        if [ -n "${{STUB_PRODUCTION_EXISTING_IMAGE_FILE:-}}" ]; then
+          cat "$STUB_PRODUCTION_EXISTING_IMAGE_FILE"
+        else
+          printf '%s\\n' "$STUB_PRODUCTION_EXISTING_POSTGRES_IMAGE_JSON"
+        fi
+      fi
+      ;;
+    '{POSTGRES_CONFIG_DIGEST}'|'{POSTGRES_PLATFORM_MANIFEST_DIGEST}')
+      printf '%s\\n' 'unexpected bare-ID image inspect' >&2
+      exit 92 ;;
+    '{PROMETHEUS_RUNTIME_REF}')
+      printf '%s\\n' "$STUB_PRODUCTION_PROMETHEUS_IMAGE_JSON" ;;
+    *)
+      printf '%s\\n' 'unexpected image inspect subject' >&2
+      exit 92 ;;
+  esac
+  exit 0
+fi
+"""
+    docker_script = docker_path.read_text(encoding="utf-8")
+    marker = "set -euo pipefail\n"
+    assert marker in docker_script
+    docker_path.write_text(
+        docker_script.replace(marker, marker + strict_inspect, 1), encoding="utf-8"
+    )
+    _write_executable(bin_dir / "curl", "#!/usr/bin/env bash\nset -euo pipefail\n")
+    env = os.environ.copy()
+    env.pop("GHCR_TOKEN", None)
+    env.pop("GHCR_USER", None)
+    env.update(
+        {
+            "DOCKER_BIN": str(docker_path),
+            "PYTHON_BIN": sys.executable,
+            "CURL_BIN": str(bin_dir / "curl"),
+            "DEPLOY_DIR": str(project_dir),
+            "ENV_FILE": str(env_file),
+            "COMPOSE_FILE": CANONICAL_SELF_HOSTED_COMPOSE,
+            "PRODUCTION_DOMAIN": "pulseplate.test",
+            "HEALTH_MAX_ATTEMPTS": "1",
+            "HEALTH_SLEEP_S": "0",
+            "IMAGE_REF": "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:test",
+            "TAG": "prod-vtest",
+            "STUB_DEPLOY_LOG_FILE": str(log_file),
+            "SHELL_BUNDLE_DIR": str(shell_bundle_dir),
+            "STUB_PRODUCTION_PULLED_POSTGRES_IMAGE_JSON": FAKE_POSTGRES_IMAGE_INSPECT_JSON,
+            "STUB_PRODUCTION_EXISTING_POSTGRES_IMAGE_JSON": FAKE_POSTGRES_IMAGE_INSPECT_JSON,
+            "STUB_PRODUCTION_PROMETHEUS_IMAGE_JSON": FAKE_PROMETHEUS_IMAGE_INSPECT_JSON,
+            "STUB_PRODUCTION_POSTGRES_REF_INSPECT_COUNTER_FILE": str(
+                tmp_path / "postgres-ref-inspect-count"
+            ),
+        }
+    )
+    return env, log_file
+
+
+@pytest.mark.parametrize("image_id", (POSTGRES_CONFIG_DIGEST, POSTGRES_PLATFORM_MANIFEST_DIGEST))
+def test_production_self_hosted_reuses_both_frozen_current_image_id_forms(
+    tmp_path: Path, image_id: str
+) -> None:
+    env, log_file = _production_self_hosted_image_identity_fixture(tmp_path)
+    env["STUB_POSTGRES_CONTAINER_INSPECT_JSON"] = _current_postgres_container_inspect(image_id)
+    env["STUB_PRODUCTION_EXISTING_POSTGRES_IMAGE_JSON"] = (
+        FAKE_POSTGRES_CONFIG_IMAGE_INSPECT_JSON
+        if image_id == POSTGRES_CONFIG_DIGEST
+        else FAKE_POSTGRES_IMAGE_INSPECT_JSON
+    )
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh"))],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    lines = log_file.read_text(encoding="utf-8").splitlines()
+    inspect_line = f"docker image inspect {POSTGRES_RUNTIME_REF}"
+    assert lines.count(inspect_line) == 2
+    assert f"docker image inspect {image_id}" not in lines
+    second_inspect = [i for i, line in enumerate(lines) if line == inspect_line][1]
+    stop_writers = next(i for i, line in enumerate(lines) if " stop worker caddy app" in line)
+    backup = lines.index("backup")
+    stop_postgres = lines.index(f"docker stop {'a' * 64}")
+    start_candidate = next(
+        i for i, line in enumerate(lines) if " up -d --pull never postgres" in line
+    )
+    migration = next(i for i, line in enumerate(lines) if "alembic upgrade head" in line)
+    assert second_inspect < stop_writers < backup < stop_postgres < start_candidate < migration
+
+
+@pytest.mark.parametrize("surface", ("staging", "production"))
+@pytest.mark.parametrize("image_id", (POSTGRES_CONFIG_DIGEST, POSTGRES_PLATFORM_MANIFEST_DIGEST))
+def test_pulled_postgres_admits_both_frozen_image_id_forms(
+    tmp_path: Path, surface: str, image_id: str
+) -> None:
+    inspected = (
+        FAKE_POSTGRES_CONFIG_IMAGE_INSPECT_JSON
+        if image_id == POSTGRES_CONFIG_DIGEST
+        else FAKE_POSTGRES_IMAGE_INSPECT_JSON
+    )
+    if surface == "staging":
+        env, log_file = _staging_deploy_fixture(tmp_path)
+        env["STUB_POSTGRES_IMAGE_INSPECT_JSON"] = inspected
+        backend_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64
+        caddy_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64
+        command = [str(_historical_deploy_script("scripts/deploy.sh")), backend_ref, caddy_ref]
+    else:
+        env, log_file = _production_self_hosted_image_identity_fixture(tmp_path)
+        env["STUB_PRODUCTION_PULLED_POSTGRES_IMAGE_JSON"] = inspected
+        command = [str(_historical_deploy_script("scripts/deploy_production.sh"))]
+    completed = subprocess.run(
+        command,
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert lines.count(f"docker image inspect {POSTGRES_RUNTIME_REF}") == 1
+    assert f"docker image inspect {image_id}" not in lines
+
+
+def test_production_self_hosted_keeps_frozen_legacy_image_transition(tmp_path: Path) -> None:
+    env, log_file = _production_self_hosted_image_identity_fixture(tmp_path)
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh"))],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert any(" stop worker caddy app" in line for line in lines)
+    assert not any("image inspect sha256:aad6289c" in line for line in lines)
+
+
+def test_production_self_hosted_rejects_foreign_legacy_image_before_quiescence(
+    tmp_path: Path,
+) -> None:
+    env, log_file = _production_self_hosted_image_identity_fixture(tmp_path)
+    inspected = json.loads(FAKE_POSTGRES_CONTAINER_INSPECT_JSON)
+    inspected[0]["Image"] = "sha256:" + "e" * 64
+    env["STUB_POSTGRES_CONTAINER_INSPECT_JSON"] = json.dumps(inspected)
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh"))],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode != 0
+    assert "legacy PostgreSQL image ID does not match" in completed.stderr
+    lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert any(line.startswith("docker inspect aaaaaaaaaaaa") for line in lines)
+    assert all(" stop worker caddy app" not in line for line in lines)
+    assert all(line != "backup" for line in lines)
+    assert all(" up -d --pull never postgres" not in line for line in lines)
+
+
+@pytest.mark.parametrize("image_id", (POSTGRES_CONFIG_DIGEST, POSTGRES_PLATFORM_MANIFEST_DIGEST))
+@pytest.mark.parametrize(
+    "variant",
+    (
+        "foreign-configured-image",
+        "foreign-image-id",
+        "native-failure",
+        "malformed",
+        "oversized",
+        "zero-records",
+        "multiple-records",
+        "duplicate-key",
+        "wrong-id",
+        "wrong-repository-digest",
+        "malformed-repository-digests",
+        "wrong-platform",
+        "wrong-user",
+        "wrong-entrypoint",
+        "wrong-environment",
+        "conflicting-env-first",
+        "conflicting-env-last",
+        "duplicate-env",
+        "wrong-label",
+    ),
+)
+def test_production_self_hosted_rejects_untrusted_existing_image_before_quiescence(
+    tmp_path: Path, image_id: str, variant: str
+) -> None:
+    env, log_file = _production_self_hosted_image_identity_fixture(tmp_path)
+    selected_image_id = "sha256:" + "e" * 64 if variant == "foreign-image-id" else image_id
+    container_inspect = json.loads(_current_postgres_container_inspect(selected_image_id))
+    if variant == "foreign-configured-image":
+        container_inspect[0]["Config"]["Image"] = "other.invalid/postgres:latest"
+    env["STUB_POSTGRES_CONTAINER_INSPECT_JSON"] = json.dumps(container_inspect)
+    if variant == "native-failure":
+        env["STUB_PRODUCTION_EXISTING_INSPECT_STATUS"] = "63"
+    elif variant == "oversized":
+        source = (
+            FAKE_POSTGRES_CONFIG_IMAGE_INSPECT_JSON
+            if image_id == POSTGRES_CONFIG_DIGEST
+            else FAKE_POSTGRES_IMAGE_INSPECT_JSON
+        )
+        oversized = json.loads(source)
+        oversized[0]["Config"]["Env"].append("PAD=" + "x" * 1_048_576)
+        oversized_file = tmp_path / "oversized-existing-image.json"
+        oversized_file.write_text(json.dumps(oversized), encoding="utf-8")
+        assert oversized_file.stat().st_size > 1_048_576
+        env["STUB_PRODUCTION_EXISTING_IMAGE_FILE"] = str(oversized_file)
+    elif variant in ("conflicting-env-first", "conflicting-env-last", "duplicate-env"):
+        source = (
+            FAKE_POSTGRES_CONFIG_IMAGE_INSPECT_JSON
+            if image_id == POSTGRES_CONFIG_DIGEST
+            else FAKE_POSTGRES_IMAGE_INSPECT_JSON
+        )
+        inspected = json.loads(source)
+        image_environment = inspected[0]["Config"]["Env"]
+        duplicate = "PG_MAJOR=15" if variant == "duplicate-env" else "PG_MAJOR=16"
+        if variant == "conflicting-env-first":
+            image_environment.insert(0, duplicate)
+        else:
+            image_environment.append(duplicate)
+        env["STUB_PRODUCTION_EXISTING_POSTGRES_IMAGE_JSON"] = json.dumps(inspected)
+    elif variant not in ("foreign-configured-image", "foreign-image-id"):
+        env["STUB_PRODUCTION_EXISTING_POSTGRES_IMAGE_JSON"] = (
+            _current_postgres_image_inspect_variant(variant, image_id)
+        )
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh"))],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode != 0
+    assert "native-secret-value" not in completed.stdout + completed.stderr
+    expected_error = {
+        "foreign-configured-image": "Existing PostgreSQL configured image is outside the closed transition set",
+        "foreign-image-id": "Existing current PostgreSQL image ID does not match the frozen candidate",
+    }.get(variant, "Existing current PostgreSQL image metadata is not the frozen candidate")
+    assert expected_error in completed.stderr
+    lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert any(line.startswith("docker inspect aaaaaaaaaaaa") for line in lines)
+    expected_ref_inspects = 1 if variant in ("foreign-configured-image", "foreign-image-id") else 2
+    assert lines.count(f"docker image inspect {POSTGRES_RUNTIME_REF}") == expected_ref_inspects
+    assert f"docker image inspect {image_id}" not in lines
+    assert all(" stop worker caddy app" not in line for line in lines)
+    assert all(line != "backup" for line in lines)
+    assert all(" up -d --pull never postgres" not in line for line in lines)
+    assert all("alembic upgrade head" not in line for line in lines)
+
+
+@pytest.mark.parametrize(
+    "variant",
+    (
+        "native-failure",
+        "malformed",
+        "zero-records",
+        "multiple-records",
+        "duplicate-key",
+        "wrong-repository-digest",
+        "malformed-repository-digests",
+        "foreign-id",
+        "missing-id",
+        "malformed-id",
+        "wrong-environment",
+        "conflicting-env-first",
+        "conflicting-env-last",
+        "duplicate-env",
+        "oversized",
+    ),
+)
+def test_production_self_hosted_rejects_untrusted_pulled_image_before_quiescence(
+    tmp_path: Path, variant: str
+) -> None:
+    env, log_file = _production_self_hosted_image_identity_fixture(tmp_path)
+    if variant == "native-failure":
+        env["STUB_PRODUCTION_PULLED_INSPECT_STATUS"] = "64"
+    elif variant == "oversized":
+        oversized = json.loads(FAKE_POSTGRES_IMAGE_INSPECT_JSON)
+        oversized[0]["Config"]["Env"].append("PAD=" + "x" * 1_048_576)
+        oversized_file = tmp_path / "oversized-pulled-image.json"
+        oversized_file.write_text(json.dumps(oversized), encoding="utf-8")
+        assert oversized_file.stat().st_size > 1_048_576
+        env["STUB_PRODUCTION_PULLED_IMAGE_FILE"] = str(oversized_file)
+    elif variant in ("malformed", "zero-records", "multiple-records"):
+        env["STUB_PRODUCTION_PULLED_POSTGRES_IMAGE_JSON"] = {
+            "malformed": "{",
+            "zero-records": "[]",
+            "multiple-records": json.dumps(
+                [
+                    json.loads(FAKE_POSTGRES_IMAGE_INSPECT_JSON)[0],
+                    json.loads(FAKE_POSTGRES_IMAGE_INSPECT_JSON)[0],
+                ]
+            ),
+        }[variant]
+    elif variant in ("conflicting-env-first", "conflicting-env-last", "duplicate-env"):
+        inspected = json.loads(FAKE_POSTGRES_IMAGE_INSPECT_JSON)
+        image_environment = inspected[0]["Config"]["Env"]
+        duplicate = "PG_MAJOR=15" if variant == "duplicate-env" else "PG_MAJOR=16"
+        if variant == "conflicting-env-first":
+            image_environment.insert(0, duplicate)
+        else:
+            image_environment.append(duplicate)
+        env["STUB_PRODUCTION_PULLED_POSTGRES_IMAGE_JSON"] = json.dumps(inspected)
+    else:
+        env["STUB_PRODUCTION_PULLED_POSTGRES_IMAGE_JSON"] = _postgres_image_inspect_variant(variant)
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh"))],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode != 0
+    assert "native-secret-value" not in completed.stdout + completed.stderr
+    assert "Pulled PostgreSQL image metadata is not the frozen candidate" in completed.stderr
+    lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert lines.count(f"docker image inspect {POSTGRES_RUNTIME_REF}") == 1
+    assert all(" stop worker caddy app" not in line for line in lines)
+    assert all(line != "backup" for line in lines)
+    assert all(" up -d --pull never postgres" not in line for line in lines)
+    assert all("alembic upgrade head" not in line for line in lines)
+
+
+def _postgres_function_source(script: str, name: str) -> str:
+    marker = f"{name}() {{\n"
+    start = script.index(marker)
+    next_header = re.search(r"(?m)^[A-Za-z_][A-Za-z_0-9]*\(\) \{\n", script[start + len(marker) :])
+    assert next_header is not None
+    next_start = start + len(marker) + next_header.start()
+    closing_brace = script.rfind("\n}\n", start, next_start)
+    assert closing_brace >= 0
+    end = closing_brace + len("\n}\n")
+    assert not script[end:next_start].strip()
+    return script[start:end]
+
+
+def test_staging_and_production_postgres_image_parsers_have_exact_source_parity() -> None:
+    staging = (_historical_deploy_script("scripts/deploy.sh")).read_text(encoding="utf-8")
+    production = (_historical_deploy_script("scripts/deploy_production.sh")).read_text(
+        encoding="utf-8"
+    )
+    metadata_source = _postgres_function_source(staging, "validate_postgres_image_metadata")
+    assert 'repo_digests = record.get("RepoDigests")' in metadata_source
+    assert "Pulled PostgreSQL image is not bound to the canonical GHCR digest" in metadata_source
+    final_condition = "or expected not in repo_digests"
+    assert production.count(final_condition) == 1
+    assert final_condition in _postgres_function_source(
+        production, "validate_postgres_image_metadata"
+    )
+    altered_production = production.replace(final_condition, "or expected in repo_digests", 1)
+    assert _postgres_function_source(
+        staging, "validate_postgres_image_metadata"
+    ) != _postgres_function_source(altered_production, "validate_postgres_image_metadata")
+    for function_name in (
+        "validate_postgres_image_metadata",
+        "validate_pulled_postgres_image",
+        "validate_pulled_postgres_mountpoint",
+        "validate_existing_postgres_image_identity",
+    ):
+        assert _postgres_function_source(staging, function_name) == _postgres_function_source(
+            production, function_name
+        )
+
+
+def test_deploy_production_does_not_require_home_when_docker_bin_is_explicit(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "production"
+    bin_dir = tmp_path / "bin"
+    log_file = tmp_path / "deploy.log"
+    project_dir.mkdir()
+    bin_dir.mkdir()
+    _write_production_host_contract(project_dir)
+    (project_dir / ".env").write_text(
+        "DATABASE_URL=postgresql+psycopg://pulseplate:secret@db.example.com:25060/pulseplate\n",  # pragma: allowlist secret
+        encoding="utf-8",
+    )
+
+    docker_stub = f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'docker %s\\n' "$*" >> "{log_file}"
+case "$*" in
+  *"compose --env-file "*"-f deploy/docker-compose.production.yaml ps -q app"*)
+    printf 'app-id\\n'
+    ;;
+  *"inspect --format "*)
+    printf 'healthy\\n'
+    ;;
+  *"ps --format "*)
+    printf 'CONTAINER ID\\n'
+    ;;
+esac
+"""
+    curl_stub = f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'curl %s\\n' "$*" >> "{log_file}"
+"""
+    sleep_stub = "#!/usr/bin/env bash\nset -euo pipefail\n"
+    _write_executable(bin_dir / "docker", docker_stub)
+    _write_executable(bin_dir / "curl", curl_stub)
+    _write_executable(bin_dir / "sleep", sleep_stub)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["DOCKER_BIN"] = str(bin_dir / "docker")
+    env["PYTHON_BIN"] = sys.executable
+    env.pop("HOME", None)
+    env["DEPLOY_DIR"] = str(project_dir)
+    env["ENV_FILE"] = str(project_dir / ".env")
+    env["COMPOSE_FILE"] = CANONICAL_MANAGED_COMPOSE
+    env["CURL_BIN"] = str(bin_dir / "curl")
+    env["IMAGE_REF"] = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:test"
+    env["TAG"] = "prod-vtest"
+    env["PRODUCTION_DOMAIN"] = "pulseplate.test"
+
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh"))],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    assert "Deploy dir:" in completed.stdout
+    assert "compose --env-file" in log_file.read_text(encoding="utf-8")
+    lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert all(" pull postgres" not in line for line in lines)
+    assert all(" image inspect sha256:06c914" not in line for line in lines)
+    assert all(" image inspect sha256:c822c68" not in line for line in lines)
+    assert all(POSTGRES_RUNTIME_REF not in line for line in lines)
+    assert f"docker stop {'a' * 64}" not in lines
+    assert all(" up -d --pull never postgres" not in line for line in lines)
+
+
+def test_deploy_production_rejects_relative_docker_bin_override(tmp_path: Path) -> None:
+    project_dir = tmp_path / "production"
+    project_dir.mkdir()
+    (project_dir / "docker-compose.production.yaml").write_text("services: {}\n", encoding="utf-8")
+    (project_dir / ".env").write_text(
+        "DATABASE_URL=postgresql+psycopg://pulseplate:secret@db.example.com:25060/pulseplate\n",  # pragma: allowlist secret
+        encoding="utf-8",
+    )
+
+    env = os.environ.copy()
+    env["DOCKER_BIN"] = "docker"
+    env["DEPLOY_DIR"] = str(project_dir)
+    env["ENV_FILE"] = str(project_dir / ".env")
+    env["COMPOSE_FILE"] = "docker-compose.production.yaml"
+    env["IMAGE_REF"] = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:test"
+    env["TAG"] = "prod-vtest"
+    env["PRODUCTION_DOMAIN"] = "pulseplate.test"
+
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh"))],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert "DOCKER_BIN must be an absolute path" in completed.stderr
+
+
+def test_diagnose_web_reports_green_for_spa_and_api_contract(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    log_file = tmp_path / "diag.log"
+    bin_dir.mkdir()
+
+    docker_stub = f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'docker %s\\n' "$*" >> "{log_file}"
+exit 0
+"""
+    curl_stub = """#!/usr/bin/env bash
+set -euo pipefail
+headers=""
+body=""
+    url=""
+    method="GET"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -X)
+      method="$2"
+      shift 2
+      ;;
+    -D)
+      headers="$2"
+      shift 2
+      ;;
+    -o)
+      body="$2"
+      shift 2
+      ;;
+    http://*|https://*)
+      url="$1"
+      shift
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+
+status="418"
+content_type="text/plain"
+payload="unexpected"
+case "$method:$url" in
+  GET:https://pulseplate.test/|GET:https://pulseplate.test/bmi|GET:https://pulseplate.test/profile|GET:https://pulseplate.test/plate|GET:https://pulseplate.test/progress)
+    status="200"
+    content_type="text/html; charset=utf-8"
+    payload='<!doctype html><html><head><link rel="stylesheet" href="/assets/index-test.css"></head><body><div id="root"></div></body></html>'
+    ;;
+  GET:https://pulseplate.test/assets/index-test.css)
+    status="200"
+    content_type="text/css"
+    payload='.grid{display:grid}.min-h-screen{min-height:100vh}.rounded-2xl{border-radius:1rem}'
+    ;;
+  GET:https://pulseplate.test/health|GET:https://pulseplate.test/openapi.json)
+    status="200"
+    content_type="application/json"
+    payload='{"ok": true}'
+    ;;
+  GET:https://pulseplate.test/sitemap.xml)
+    status="200"
+    content_type="application/xml"
+    payload='<?xml version="1.0" encoding="UTF-8"?><urlset><url><loc>https://pulseplate.test/</loc></url></urlset>'
+    ;;
+  POST:https://pulseplate.test/bmi)
+    status="422"
+    content_type="application/json"
+    payload='{"detail": "validation"}'
+    ;;
+  OPTIONS:https://pulseplate.test/bmi)
+    status="405"
+    content_type="application/json"
+    payload='{"detail": "Method Not Allowed"}'
+    ;;
+  GET:https://pulseplate.test/plan|GET:https://pulseplate.test/insight|GET:https://pulseplate.test/premium_bmr|GET:https://pulseplate.test/premium_targets|GET:https://pulseplate.test/api/v1/does-not-exist)
+    status="404"
+    content_type="application/json"
+    payload='{"detail": "not found"}'
+    ;;
+  GET:https://pulseplate.test/api/v1/admin/status)
+    status="403"
+    content_type="application/json"
+    payload='{"detail": "forbidden"}'
+    ;;
+  GET:https://pulseplate.test/legacy/bmi-calculator)
+    status="200"
+    content_type="text/html; charset=utf-8"
+    payload='<!doctype html><html><body><h1>Legacy calculator</h1></body></html>'
+    ;;
+  GET:https://pulseplate.test/ws)
+    status="400"
+    content_type="text/plain"
+    payload='upgrade required'
+    ;;
+esac
+
+printf 'HTTP/1.1 %s Stub\\nContent-Type: %s\\n\\n' "$status" "$content_type" > "$headers"
+printf '%s' "$payload" > "$body"
+printf '%s' "$status"
+"""
+    _write_executable(bin_dir / "docker", docker_stub)
+    _write_executable(bin_dir / "curl", curl_stub)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+
+    completed = subprocess.run(
+        [
+            "bash",
+            str(REPO_ROOT / "scripts/diagnose_web.sh"),
+            "--skip-caddy-validate",
+            "--base-url",
+            "https://pulseplate.test",
+        ],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    assert "PASS: spa-bmi: /bmi serves the SPA shell with HTTP 200." in completed.stdout
+    assert (
+        "PASS: static-css: /assets/index-test.css is public CSS with HTTP 200." in completed.stdout
+    )
+    assert "PASS: health-json: /health reaches the JSON backend surface." in completed.stdout
+    assert "PASS: sitemap-xml: /sitemap.xml reaches the XML sitemap surface." in completed.stdout
+    assert (
+        "PASS: legacy-bmi-post: /bmi reached the backend JSON surface (status 422)."
+        in completed.stdout
+    )
+    assert "PASS: legacy-bmi-options: /bmi stayed off SPA/static-405" in completed.stdout
+    assert "PASS: legacy-plan-get: /plan stayed off the SPA shell" in completed.stdout
+    assert "PASS: legacy-insight-get: /insight stayed off the SPA shell" in completed.stdout
+    assert (
+        "PASS: legacy-bmi-calculator-get: /legacy/bmi-calculator stayed off the SPA shell"
+        in completed.stdout
+    )
+    assert (
+        "PASS: api-prefix: /api/v1/does-not-exist reached the backend JSON surface"
+        in completed.stdout
+    )
+    assert (
+        "PASS: admin-canary: /api/v1/admin/status reached the admin/backend canary surface"
+        in completed.stdout
+    )
+    assert "PASS: websocket-upgrade: /ws did not fall through to SPA" in completed.stdout
+    assert "Summary: all requested checks passed." in completed.stdout
+
+
+def test_diagnose_web_uses_cloudflare_access_service_token_headers(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    log_file = tmp_path / "diag-access.log"
+    bin_dir.mkdir()
+
+    docker_stub = "#!/usr/bin/env bash\nset -euo pipefail\nexit 0\n"
+    curl_stub = f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'curl %s\\n' "$*" >> "{log_file}"
+headers=""
+body=""
+url=""
+method="GET"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -X)
+      method="$2"
+      shift 2
+      ;;
+    -D)
+      headers="$2"
+      shift 2
+      ;;
+    -o)
+      body="$2"
+      shift 2
+      ;;
+    http://*|https://*)
+      url="$1"
+      shift
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+
+status="418"
+content_type="text/plain"
+payload="unexpected"
+case "$method:$url" in
+  GET:https://pulseplate.test/|GET:https://pulseplate.test/bmi|GET:https://pulseplate.test/profile|GET:https://pulseplate.test/plate|GET:https://pulseplate.test/progress)
+    status="200"
+    content_type="text/html; charset=utf-8"
+    payload='<!doctype html><html><head><link rel="stylesheet" href="/assets/index-test.css"></head><body><div id="root"></div></body></html>'
+    ;;
+  GET:https://pulseplate.test/assets/index-test.css)
+    status="200"
+    content_type="text/css"
+    payload='.grid{{display:grid}}.min-h-screen{{min-height:100vh}}.rounded-2xl{{border-radius:1rem}}'
+    ;;
+  GET:https://pulseplate.test/health|GET:https://pulseplate.test/openapi.json)
+    status="200"
+    content_type="application/json"
+    payload='{{"ok": true}}'
+    ;;
+  GET:https://pulseplate.test/sitemap.xml)
+    status="200"
+    content_type="application/xml"
+    payload='<?xml version="1.0" encoding="UTF-8"?><urlset><url><loc>https://pulseplate.test/</loc></url></urlset>'
+    ;;
+  POST:https://pulseplate.test/bmi)
+    status="422"
+    content_type="application/json"
+    payload='{{"detail": "validation"}}'
+    ;;
+  OPTIONS:https://pulseplate.test/bmi)
+    status="405"
+    content_type="application/json"
+    payload='{{"detail": "Method Not Allowed"}}'
+    ;;
+  GET:https://pulseplate.test/plan|GET:https://pulseplate.test/insight|GET:https://pulseplate.test/premium_bmr|GET:https://pulseplate.test/premium_targets|GET:https://pulseplate.test/api/v1/does-not-exist)
+    status="404"
+    content_type="application/json"
+    payload='{{"detail": "not found"}}'
+    ;;
+  GET:https://pulseplate.test/api/v1/admin/status)
+    status="403"
+    content_type="application/json"
+    payload='{{"detail": "forbidden"}}'
+    ;;
+  GET:https://pulseplate.test/legacy/bmi-calculator)
+    status="200"
+    content_type="text/html; charset=utf-8"
+    payload='<!doctype html><html><body><h1>Legacy calculator</h1></body></html>'
+    ;;
+  GET:https://pulseplate.test/ws)
+    status="400"
+    content_type="text/plain"
+    payload='upgrade required'
+    ;;
+esac
+
+printf 'HTTP/1.1 %s Stub\\nContent-Type: %s\\n\\n' "$status" "$content_type" > "$headers"
+printf '%s' "$payload" > "$body"
+printf '%s' "$status"
+"""
+    _write_executable(bin_dir / "docker", docker_stub)
+    _write_executable(bin_dir / "curl", curl_stub)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["CF_ACCESS_CLIENT_ID"] = "client-id"
+    env["CF_ACCESS_CLIENT_SECRET"] = "client-secret"  # pragma: allowlist secret
+
+    completed = subprocess.run(
+        [
+            "bash",
+            str(REPO_ROOT / "scripts/diagnose_web.sh"),
+            "--skip-caddy-validate",
+            "--base-url",
+            "https://pulseplate.test",
+        ],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    log_output = log_file.read_text(encoding="utf-8")
+    assert "-H CF-Access-Client-Id: client-id" in log_output
+    assert "-H CF-Access-Client-Secret: client-secret" in log_output
+    static_css_calls = [
+        line
+        for line in log_output.splitlines()
+        if "https://pulseplate.test/assets/index-test.css" in line
+    ]
+    assert static_css_calls
+    assert all("CF-Access-Client-" not in line for line in static_css_calls)
+    assert (
+        "PASS: Cloudflare Access service-token headers enabled for private probes."
+        in completed.stdout
+    )
+
+
+def test_diagnose_web_fails_when_admin_canary_route_is_missing(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+
+    docker_stub = "#!/usr/bin/env bash\nset -euo pipefail\nexit 0\n"
+    curl_stub = """#!/usr/bin/env bash
+set -euo pipefail
+headers=""
+body=""
+url=""
+method="GET"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -X)
+      method="$2"
+      shift 2
+      ;;
+    -D)
+      headers="$2"
+      shift 2
+      ;;
+    -o)
+      body="$2"
+      shift 2
+      ;;
+    http://*|https://*)
+      url="$1"
+      shift
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+
+status="418"
+content_type="text/plain"
+payload="unexpected"
+case "$method:$url" in
+  GET:https://pulseplate.test/|GET:https://pulseplate.test/bmi|GET:https://pulseplate.test/profile|GET:https://pulseplate.test/plate|GET:https://pulseplate.test/progress)
+    status="200"
+    content_type="text/html; charset=utf-8"
+    payload='<!doctype html><html><head><link rel="stylesheet" href="/assets/index-test.css"></head><body><div id="root"></div></body></html>'
+    ;;
+  GET:https://pulseplate.test/assets/index-test.css)
+    status="200"
+    content_type="text/css"
+    payload='.grid{display:grid}.min-h-screen{min-height:100vh}.rounded-2xl{border-radius:1rem}'
+    ;;
+  GET:https://pulseplate.test/health|GET:https://pulseplate.test/openapi.json)
+    status="200"
+    content_type="application/json"
+    payload='{"ok": true}'
+    ;;
+  GET:https://pulseplate.test/sitemap.xml)
+    status="200"
+    content_type="application/xml"
+    payload='<?xml version="1.0" encoding="UTF-8"?><urlset><url><loc>https://pulseplate.test/</loc></url></urlset>'
+    ;;
+  POST:https://pulseplate.test/bmi)
+    status="422"
+    content_type="application/json"
+    payload='{"detail": "validation"}'
+    ;;
+  OPTIONS:https://pulseplate.test/bmi)
+    status="405"
+    content_type="application/json"
+    payload='{"detail": "Method Not Allowed"}'
+    ;;
+  GET:https://pulseplate.test/plan|GET:https://pulseplate.test/insight|GET:https://pulseplate.test/premium_bmr|GET:https://pulseplate.test/premium_targets|GET:https://pulseplate.test/api/v1/does-not-exist|GET:https://pulseplate.test/api/v1/admin/status)
+    status="404"
+    content_type="application/json"
+    payload='{"detail": "not found"}'
+    ;;
+  GET:https://pulseplate.test/legacy/bmi-calculator)
+    status="200"
+    content_type="text/html; charset=utf-8"
+    payload='<!doctype html><html><body><h1>Legacy calculator</h1></body></html>'
+    ;;
+  GET:https://pulseplate.test/ws)
+    status="400"
+    content_type="text/plain"
+    payload='upgrade required'
+    ;;
+esac
+
+printf 'HTTP/1.1 %s Stub\\nContent-Type: %s\\n\\n' "$status" "$content_type" > "$headers"
+printf '%s' "$payload" > "$body"
+printf '%s' "$status"
+"""
+    _write_executable(bin_dir / "docker", docker_stub)
+    _write_executable(bin_dir / "curl", curl_stub)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+
+    completed = subprocess.run(
+        [
+            "bash",
+            str(REPO_ROOT / "scripts/diagnose_web.sh"),
+            "--skip-caddy-validate",
+            "--base-url",
+            "https://pulseplate.test",
+        ],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert (
+        "FAIL: admin-canary: /api/v1/admin/status returned 404, so the admin canary route is missing or misrouted."
+        in completed.stdout
+    )
+
+
+def test_diagnose_web_rejects_partial_cloudflare_access_service_token_env(
+    tmp_path: Path,
+) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+
+    docker_stub = "#!/usr/bin/env bash\nset -euo pipefail\nexit 0\n"
+    _write_executable(bin_dir / "docker", docker_stub)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["CF_ACCESS_CLIENT_ID"] = "client-id"
+    env.pop("CF_ACCESS_CLIENT_SECRET", None)
+
+    completed = subprocess.run(
+        ["bash", str(REPO_ROOT / "scripts/diagnose_web.sh"), "--check-caddy-config-only"],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert (
+        "FAIL: CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET must be provided together"
+        in completed.stdout
+    )
+
+
+def test_diagnose_web_fails_without_base_url_for_http_probes(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+
+    docker_stub = "#!/usr/bin/env bash\nset -euo pipefail\nexit 0\n"
+    _write_executable(bin_dir / "docker", docker_stub)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env.pop("BASE_URL", None)
+    env.pop("PRODUCTION_DOMAIN", None)
+
+    completed = subprocess.run(
+        ["bash", str(REPO_ROOT / "scripts/diagnose_web.sh"), "--skip-caddy-validate"],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert "FAIL: BASE_URL or PRODUCTION_DOMAIN is required for HTTP probes." in completed.stdout
+
+
+def test_diagnose_web_warns_when_docker_daemon_is_unavailable(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+
+    docker_stub = """#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "info" ]]; then
+  exit 1
+fi
+exit 0
+"""
+    _write_executable(bin_dir / "docker", docker_stub)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+
+    completed = subprocess.run(
+        ["bash", str(REPO_ROOT / "scripts/diagnose_web.sh"), "--check-caddy-config-only"],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    assert (
+        "WARN: Docker daemon/socket is unavailable; skipping local Caddyfile validation."
+        in completed.stdout
+    )
+
+
+def test_diagnose_web_reports_failure_for_spa_or_api_contract(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    log_file = tmp_path / "diag-fail.log"
+    bin_dir.mkdir()
+
+    docker_stub = f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'docker %s\\n' "$*" >> "{log_file}"
+exit 0
+"""
+    curl_stub = """#!/usr/bin/env bash
+set -euo pipefail
+headers=""
+body=""
+url=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -D)
+      headers="$2"
+      shift 2
+      ;;
+    -o)
+      body="$2"
+      shift 2
+      ;;
+    http://*|https://*)
+      url="$1"
+      shift
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+
+status="200"
+content_type="text/html; charset=utf-8"
+payload='<!doctype html><html><body><h1>maintenance</h1></body></html>'
+
+if [[ "$url" == "https://pulseplate.test/health" ]]; then
+  status="500"
+  content_type="text/html; charset=utf-8"
+  payload='<html><body>error</body></html>'
+elif [[ "$url" == "https://pulseplate.test/openapi.json" ]]; then
+  status="200"
+  content_type="application/json"
+  payload='{"ok": true}'
+elif [[ "$url" == "https://pulseplate.test/ws" ]]; then
+  status="400"
+  content_type="text/plain"
+  payload='upgrade required'
+fi
+
+printf 'HTTP/1.1 %s Stub\\nContent-Type: %s\\n\\n' "$status" "$content_type" > "$headers"
+printf '%s' "$payload" > "$body"
+printf '%s' "$status"
+"""
+    _write_executable(bin_dir / "docker", docker_stub)
+    _write_executable(bin_dir / "curl", curl_stub)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+
+    completed = subprocess.run(
+        [
+            "bash",
+            str(REPO_ROOT / "scripts/diagnose_web.sh"),
+            "--skip-caddy-validate",
+            "--base-url",
+            "https://pulseplate.test",
+        ],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert "FAIL: spa-root: response does not contain the SPA shell marker." in completed.stdout
+    assert "FAIL: health-json: expected HTTP 200, got 500." in completed.stdout
+
+
+@pytest.mark.parametrize(
+    ("caller", "scenario"),
+    [
+        (caller, scenario)
+        for caller in ["redeploy_caddy.sh", "diagnose_production.sh", "fix_production_env.sh"]
+        for scenario in [
+            "fresh",
+            "hostile",
+            "missing",
+            "malformed",
+            "missing-reader",
+            "relative-python",
+            "missing-python",
+            "secondary-location",
+        ]
+    ]
+    + [("redeploy_caddy.sh", "relative-location")],
+)
+def test_standalone_production_callers_derive_manifest_ref(
+    tmp_path: Path, caller: str, scenario: str
+) -> None:
+    primary = tmp_path / "primary"
+    secondary = tmp_path / "secondary"
+    project = secondary if scenario == "secondary-location" else primary
+    project.mkdir()
+    manifest = _write_backup_prometheus_manifest(project)
+    _write_prometheus_helper(project)
+    (project / "docker-compose.production.yaml").write_text("services: {}\n", encoding="utf-8")
+    env_text = "DATABASE_URL=postgresql+psycopg://role@db.example/pulseplate\n"
+    env_text += "PRODUCTION_DOMAIN=pulseplate.test\n"
+    (project / ".env").write_text(env_text, encoding="utf-8")
+
+    if scenario == "missing":
+        manifest.unlink()
+    elif scenario == "malformed":
+        manifest.write_text("{}", encoding="utf-8")
+    elif scenario == "missing-reader":
+        (project / "scripts/ci/prometheus_source_image.py").unlink()
+
+    script_text = (REPO_ROOT / "scripts" / caller).read_text(encoding="utf-8")
+    if caller != "redeploy_caddy.sh":
+        # Preserve the real /srv -> /opt selection, with only its two fixed roots isolated.
+        script_text = script_text.replace('"/srv/pulseplate-production"', shlex.quote(str(primary)))
+        script_text = script_text.replace('"/opt/pulseplate"', shlex.quote(str(secondary)))
+    script = (
+        project / "scripts" if caller == "redeploy_caddy.sh" else tmp_path / "copied"
+    ) / caller
+    script.parent.mkdir(exist_ok=True)
+    _write_executable(script, script_text)
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    calls = tmp_path / "docker-calls"
+    _write_executable(
+        bin_dir / "native-docker",
+        r"""#!/usr/bin/env bash
+set -euo pipefail
+printf '%s|%s\n' "$*" "${PROMETHEUS_RUNTIME_REF:-}" >> "$CALL_LOG"
+if [ "${1:-}" = compose ] && [ "${2:-}" != version ]; then
+    test "${PROMETHEUS_RUNTIME_REF:-}" = "$EXPECTED_PROMETHEUS_REF"
+fi
+""",
+    )
+    (bin_dir / "docker").symlink_to("native-docker")
+    _write_executable(bin_dir / "sudo", "#!/usr/bin/env bash\nexit 0\n")
+    env = {
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "HOME": str(tmp_path),
+        "DEPLOY_DIR": str(project),
+        "PYTHON_BIN": sys.executable,
+        "CALL_LOG": str(calls),
+        "EXPECTED_PROMETHEUS_REF": PROMETHEUS_RUNTIME_REF,
+    }
+    if scenario != "fresh":
+        env["PROMETHEUS_RUNTIME_REF"] = "untrusted.example/prometheus:latest"
+    if scenario == "relative-python":
+        env["PYTHON_BIN"] = "python3"
+    elif scenario == "missing-python":
+        env["PYTHON_BIN"] = str(tmp_path / "absent-python")
+    elif scenario == "relative-location":
+        env["DEPLOY_DIR"] = project.name
+    completed = subprocess.run(
+        ["/bin/bash", str(script)],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    lines = calls.read_text().splitlines() if calls.exists() else []
+    project_calls = [
+        line
+        for line in lines
+        if line.startswith("compose ") and not line.startswith("compose version|")
+    ]
+    if scenario in {"fresh", "hostile", "secondary-location", "relative-location"}:
+        assert completed.returncode == 0, completed.stderr
+        assert project_calls
+        assert all(line.endswith("|" + PROMETHEUS_RUNTIME_REF) for line in project_calls)
+    else:
+        assert completed.returncode != 0
+        assert not project_calls
+        assert (project / ".env").read_text(encoding="utf-8") == env_text
+        assert not list(project.glob(".env.backup.*"))
+
+
+def test_redeploy_caddy_runs_diagnose_web_when_domain_is_available(tmp_path: Path) -> None:
+    temp_repo = tmp_path / "repo"
+    deploy_dir = temp_repo / "deploy"
+    scripts_dir = temp_repo / "scripts"
+    bin_dir = tmp_path / "bin"
+    log_file = tmp_path / "redeploy.log"
+    temp_repo.mkdir()
+    deploy_dir.mkdir()
+    scripts_dir.mkdir()
+    bin_dir.mkdir()
+    _write_prometheus_helper(temp_repo)
+    _write_backup_prometheus_manifest(deploy_dir)
+
+    (deploy_dir / "docker-compose.production.yaml").write_text("services: {}\n", encoding="utf-8")
+    (deploy_dir / ".env").write_text('PRODUCTION_DOMAIN="pulseplate.test"\n', encoding="utf-8")
+
+    diagnose_stub = f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'diagnose BASE_URL=%s ARGS=%s\\n' "${{BASE_URL:-}}" "$*" >> "{log_file}"
+"""
+    _write_executable(scripts_dir / "diagnose_web.sh", diagnose_stub)
+    _write_executable(
+        scripts_dir / "redeploy_caddy.sh",
+        (REPO_ROOT / "scripts" / "redeploy_caddy.sh").read_text(encoding="utf-8"),
+    )
+
+    docker_stub = f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'docker %s\\n' "$*" >> "{log_file}"
+if [[ "$*" == "compose version" ]]; then
+  exit 0
+fi
+exit 0
+"""
+    _write_executable(bin_dir / "docker", docker_stub)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["DEPLOY_DIR"] = str(deploy_dir)
+    env["PYTHON_BIN"] = sys.executable
+    env["DIAG_MAX_ATTEMPTS"] = "1"
+    env["DIAG_RETRY_DELAY_SECONDS"] = "0"
+
+    subprocess.run(
+        ["bash", str(scripts_dir / "redeploy_caddy.sh")],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    log_lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert any(
+        "docker compose -f docker-compose.production.yaml build caddy" in line for line in log_lines
+    )
+    assert any(
+        "docker compose -f docker-compose.production.yaml up -d caddy" in line for line in log_lines
+    )
+    assert any(
+        "diagnose BASE_URL=https://pulseplate.test ARGS=--skip-caddy-validate" in line
+        for line in log_lines
+    )
+
+
+def test_redeploy_caddy_exits_non_zero_when_diagnosis_fails(tmp_path: Path) -> None:
+    temp_repo = tmp_path / "repo"
+    deploy_dir = temp_repo / "deploy"
+    scripts_dir = temp_repo / "scripts"
+    bin_dir = tmp_path / "bin"
+    log_file = tmp_path / "redeploy.log"
+    temp_repo.mkdir()
+    deploy_dir.mkdir()
+    scripts_dir.mkdir()
+    bin_dir.mkdir()
+    _write_prometheus_helper(temp_repo)
+    _write_backup_prometheus_manifest(deploy_dir)
+
+    (deploy_dir / "docker-compose.production.yaml").write_text("services: {}\n", encoding="utf-8")
+    (deploy_dir / ".env").write_text('PRODUCTION_DOMAIN="pulseplate.test"\n', encoding="utf-8")
+
+    diagnose_stub = f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'diagnose-fail BASE_URL=%s ARGS=%s\\n' "${{BASE_URL:-}}" "$*" >> "{log_file}"
+exit 1
+"""
+    _write_executable(scripts_dir / "diagnose_web.sh", diagnose_stub)
+    _write_executable(
+        scripts_dir / "redeploy_caddy.sh",
+        (REPO_ROOT / "scripts" / "redeploy_caddy.sh").read_text(encoding="utf-8"),
+    )
+
+    docker_stub = f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'docker %s\\n' "$*" >> "{log_file}"
+if [[ "$*" == "compose version" ]]; then
+  exit 0
+fi
+exit 0
+"""
+    _write_executable(bin_dir / "docker", docker_stub)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["DEPLOY_DIR"] = str(deploy_dir)
+    env["PYTHON_BIN"] = sys.executable
+    env["DIAG_MAX_ATTEMPTS"] = "2"
+    env["DIAG_RETRY_DELAY_SECONDS"] = "0"
+
+    completed = subprocess.run(
+        ["bash", str(scripts_dir / "redeploy_caddy.sh")],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert "❌ diagnose_web.sh reported a routing mismatch" in completed.stdout
+
+
+def _write_stage_native_oracles(project_dir: Path) -> None:
+    """Keep real JSON validators while replacing native mount/crypto observations."""
+    from scripts.ops.check_staging_security import DEVICE_PATH, STORAGE_ROOT
+
+    (project_dir / "scripts" / "ops").mkdir(parents=True, exist_ok=True)
+    (project_dir / "scripts" / "ci").mkdir(parents=True, exist_ok=True)
+    (project_dir / "secrets").mkdir(exist_ok=True)
+    (project_dir / "backups").mkdir(exist_ok=True)
+    (project_dir / "synthetic-storage" / "postgres").mkdir(parents=True, mode=0o700)
+    receipt = {
+        "schema": "pulseplate.staging-storage.v1",
+        "droplet_id": 594869239,
+        "volume_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "volume_name": "pulseplate-staging-data",
+        "filesystem_uuid": "11111111-2222-3333-4444-555555555555",
+        "mountpoint": STORAGE_ROOT,
+        "device": DEVICE_PATH,
+        "size_gib": 50,
+        "backend_uid": 1000,
+        "backend_gid": 1000,
+    }
+    (project_dir / ".staging-storage.json").write_text(json.dumps(receipt))
+    (project_dir / ".staging-storage.json").chmod(0o600)
+    for name in (
+        "postgres_ca",
+        "postgres_server_crt",
+        "postgres_server_key",
+        "postgres_password",
+        "postgres_pgpass",
+    ):
+        target = project_dir / "secrets" / name
+        target.write_text("native-crypto-oracle-fixture")
+        target.chmod(0o600)
+    _write_executable(
+        project_dir / "scripts" / "ops" / "check_staging_security.py",
+        """#!/usr/bin/env python3
+import argparse, json, os, sys
+from pathlib import Path
+from scripts.ops import check_staging_security as security
+parser = argparse.ArgumentParser()
+parser.add_argument("--project-dir", type=Path, required=True)
+parser.add_argument("--storage-only", action="store_true")
+parser.add_argument("--compose-stdin", action="store_true")
+parser.add_argument("--print-backup-dir", action="store_true")
+parser.add_argument("--fresh-postgres", action="store_true")
+args = parser.parse_args()
+try:
+    security.validate_contract(json.loads((args.project_dir / ".staging-storage.json").read_text()))
+    if args.compose_stdin:
+        security.validate_compose(json.loads(sys.stdin.read()), args.project_dir)
+    if args.fresh_postgres:
+        security.STORAGE_ROOT = str(args.project_dir / "synthetic-storage")
+        counter = args.project_dir / "fresh-census-count"
+        count = int(counter.read_text()) + 1 if counter.exists() else 1
+        counter.write_text(str(count))
+        if count == 2 and os.getenv("STUB_BACKING_APPEARS_AFTER_FIRST") == "1":
+            (Path(security.STORAGE_ROOT) / "postgres" / "PG_VERSION").write_text("15")
+        security.check_empty_data_directory("postgres")
+except (ValueError, OSError) as error:
+    print("Staging security HOLD: " + str(error), file=sys.stderr)
+    raise SystemExit(1)
+print(str(args.project_dir / "backups") if args.print_backup_dir else "Native staging probes verified")
+""",
+    )
+    _write_executable(
+        project_dir / "scripts" / "ci" / "check_pgvector_attestations.py",
+        """#!/usr/bin/env python3
+import json, os, subprocess
+from scripts.ci import check_pgvector_attestations as verifier
+from tests.test_pgvector_attestations import packet
+_, payloads = packet()
+def verified_crypto(arguments):
+    kind = arguments[arguments.index("--predicate-type") + 1]
+    if os.getenv("STUB_ATTESTATION_STATUS", "0") != "0":
+        raise RuntimeError("Native attestation crypto rejected")
+    return subprocess.CompletedProcess(arguments, 0, json.dumps(payloads[kind]), "")
+verifier.native._run_gh = verified_crypto
+raise SystemExit(verifier.main())
+""",
+    )
+
+
+def _staging_deploy_fixture(tmp_path: Path) -> tuple[dict[str, str], Path]:
+    project_dir = tmp_path / "staging"
+    bin_dir = tmp_path / "bin"
+    log_file = tmp_path / "deploy.log"
+    project_dir.mkdir()
+    _write_prometheus_helper(project_dir)
+    bin_dir.mkdir()
+    (project_dir / "scripts" / "ops").mkdir(parents=True)
+    (project_dir / "prometheus").mkdir()
+    (project_dir / "alertmanager").mkdir()
+    (project_dir / "postgres-pgvector").mkdir()
+    (project_dir / "secrets").mkdir()
+    (project_dir / "secrets").chmod(0o700)
+    (project_dir / "backups").mkdir()
+    (project_dir / "docker-compose.staging.yaml").write_text(
+        _historical_AM_template(STAGING_COMPOSE_PATH).decode("utf-8"), encoding="utf-8"
+    )
+    (project_dir / "alertmanager" / "alertmanager.yml").write_text(
+        ALERTMANAGER_CONFIG_PATH.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (project_dir / "alertmanager" / "trivy-ignore.yaml").write_text(
+        ALERTMANAGER_IGNORE_PATH.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (project_dir / "Caddyfile").write_text(":80 { respond ok }\n", encoding="utf-8")
+    (project_dir / "prometheus" / "prometheus.yml").write_text(
+        PROMETHEUS_CONFIG_PATH.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (project_dir / "prometheus" / "alias-alerts.yml").write_text(
+        PROMETHEUS_RULES_PATH.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (project_dir / "prometheus" / "image-manifest.json").write_text(
+        _synthetic_prometheus_manifest_text(), encoding="utf-8"
+    )
+    (project_dir / "postgres-pgvector" / "image-manifest.json").write_text(
+        POSTGRES_MANIFEST_PATH.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (project_dir / "secrets" / "pulseplate_metrics_scrape_key").write_text(
+        METRICS_SECRET_SENTINEL, encoding="ascii"
+    )
+    (project_dir / "secrets" / "pulseplate_metrics_scrape_key").chmod(0o444)
+    (project_dir / ".attested-digest-deploy-v1").write_text(
+        "pulseplate-staging-attested-digest-v1", encoding="utf-8"
+    )
+    (project_dir / ".env").write_text(
+        "\n".join(
+            (
+                "STAGING_DOMAIN=staging.example.com",
+                "POSTGRES_USER=pulseplate",
+                "POSTGRES_DB=pulseplate",
+                "POSTGRES_PASSWORD=test-only",  # pragma: allowlist secret
+                "DATABASE_URL=postgresql+psycopg://pulseplate:test-only@postgres/pulseplate",  # pragma: allowlist secret
+                "GHCR_USER=pulseplate-ci",
+                "GHCR_TOKEN=test-only-token",  # pragma: allowlist secret
+                "STAGING_IMAGE_REF=ghcr.io/attacker/override:latest",
+                "STAGING_CADDY_IMAGE_REF=ghcr.io/attacker/override:latest",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (project_dir / ".env").chmod(0o600)
+    _write_stage_native_oracles(project_dir)
+    _write_executable(
+        project_dir / "scripts" / "ops" / "postgres_backup.sh",
+        f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'backup docker=%s env_file=%s args=%s\\n' \
+  "${{DOCKER_BIN:-}}" "${{ENV_FILE:-}}" "$*" >> "{log_file}"
+if [ "${{STUB_BACKUP_FAILURE:-0}}" -ne 0 ]; then
+  exit "${{STUB_BACKUP_FAILURE}}"
+fi
+receipt="${{BACKUP_DIR}}/pulseplate_test.dump"
+printf 'synthetic-custom-dump' > "$receipt"
+chmod 0600 "$receipt"
+printf 'Backup created: %s\\n' "$receipt"
+""",
+    )
+    backend_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64
+    backend_image_id = "sha256:" + "c" * 64
+    worker_hash = "e" * 64
+    app_id = "b" * 64
+    worker_id = "d" * 64
+    backend_image_inspect = tmp_path / "backend-image-inspect.json"
+    backend_image_inspect.write_text(
+        json.dumps(
+            [
+                {
+                    "Id": backend_image_id,
+                    "Os": "linux",
+                    "Architecture": "amd64",
+                    "RepoDigests": [backend_ref],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    worker_inspect = tmp_path / "worker-gate-inspect.jsonl"
+    records = []
+    for service, container_id in (("app", app_id), ("worker", worker_id)):
+        records.append(
+            {
+                "gate": "worker_v1",
+                "id": container_id,
+                "image": backend_image_id,
+                "config": {
+                    "image": backend_ref,
+                    "healthcheck": {"Test": ["NONE"]} if service == "worker" else None,
+                },
+                "labels": {
+                    "com.docker.compose.project": "pulseplate-staging",
+                    "com.docker.compose.service": service,
+                    "com.docker.compose.oneoff": "False",
+                    "com.docker.compose.config-hash": (
+                        worker_hash if service == "worker" else "f" * 64
+                    ),
+                },
+                "restart_count": 0,
+                "state": {
+                    "running": True,
+                    "status": "running",
+                    "exit_code": 0,
+                    "oom": False,
+                    "dead": False,
+                    "restarting": False,
+                    "paused": False,
+                    "pid": 42,
+                    "started_at": "2026-09-28T17:00:00Z",
+                    "health": None,
+                },
+            }
+        )
+    worker_inspect.write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8"
+    )
+    _write_executable(
+        bin_dir / "docker",
+        f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'docker %s\n' "$*" >> "{log_file}"
+if [ "${{STUB_ALERTMANAGER_IMAGE_ABSENT:-0}}" = 1 ]; then
+  case "$*" in
+    *"pull alertmanager"*|*"image inspect {ALERTMANAGER_RUNTIME_REF}"*|*"--entrypoint /bin/amtool"*) exit 91 ;;
+  esac
+fi
+printf 'env backend=%s caddy=%s config=%s\n' "${{STAGING_IMAGE_REF:-}}" "${{STAGING_CADDY_IMAGE_REF:-}}" "${{DOCKER_CONFIG:-}}" >> "{log_file}"
+case "$*" in
+  start\\ *)
+    if [ -n "${{STUB_RESTART_FAILURE_ID:-}}" ] && \
+       [ "$*" = "start $STUB_RESTART_FAILURE_ID" ]; then
+      exit "${{STUB_RESTART_FAILURE_STATUS:-77}}"
+    fi
+    ;;
+  stop\\ *)
+    if [ -n "${{STUB_POSTGRES_STOP_FAILURE_ID:-}}" ] && \
+       [ "$*" = "stop $STUB_POSTGRES_STOP_FAILURE_ID" ]; then
+      exit "${{STUB_POSTGRES_STOP_FAILURE_STATUS:-47}}"
+    fi
+    ;;
+  *"login ghcr.io"*"--password-stdin"*) cat >/dev/null ;;
+  *"info --format"*"Architecture"*) printf 'amd64\n' ;;
+  *"config --hash worker"*)
+    if [ "${{STUB_WORKER_HASH_HANG:-0}}" = "1" ]; then
+      printf '%s' "$$" > "$STUB_HUNG_PID_FILE"
+      exec /bin/sleep 60
+    fi
+    if [ "${{STUB_WORKER_HASH_PIPE_CHILD:-0}}" = "1" ]; then
+      /bin/sleep 60 &
+      printf '%s' "$!" > "$STUB_HUNG_PID_FILE"
+      exit 0
+    fi
+    printf 'worker %s\n' "$STUB_WORKER_HASH"
+    ;;
+  *"ps --all --quiet --no-trunc"*"service=app"*) printf '%s\n' "$STUB_APP_FULL_ID" ;;
+  *"ps --all --quiet --no-trunc"*"service=worker"*)
+    if [ "${{STUB_WORKER_WITH_ONEOFF:-0}}" = "1" ] && \
+       [[ "$*" != *"label=com.docker.compose.oneoff=False"* ]]; then
+      printf '%s\n%s\n' "$STUB_WORKER_FULL_ID" "${{STUB_ONEOFF_FULL_ID}}"
+    else
+      printf '%s\n' "$STUB_WORKER_FULL_ID"
+    fi
+    ;;
+  *"inspect --format"*"State.Running"*) printf 'true\n' ;;
+  *"ps -q postgres"*)
+    if [[ "${{STUB_POSTGRES_CONTAINER_ABSENT:-0}}" != "1" ]] || \
+       [[ -f "${{STUB_POSTGRES_STARTED_FILE:-/nonexistent}}" ]]; then
+      printf 'aaaaaaaaaaaa\n'
+    fi
+    ;;
+  *"inspect --format"*) printf 'healthy\n' ;;
+  *"ps -q app"*) printf 'bbbbbbbbbbbb\n' ;;
+  *"ps -q caddy"*) printf 'cccccccccccc\n' ;;
+  *"ps -q worker"*) printf 'dddddddddddd\n' ;;
+  *"up -d --pull never postgres"*)
+    if [[ "${{STUB_POSTGRES_UP_FAILURE:-0}}" != "0" ]]; then
+      exit "${{STUB_POSTGRES_UP_FAILURE}}"
+    fi
+    : > "$STUB_POSTGRES_STARTED_FILE"
+    ;;
+  *"psycopg.connect"*)
+    exit "${{STUB_APPLICATION_TLS_STATUS:-0}}"
+    ;;
+  *"run --rm --no-deps app alembic upgrade head"*)
+    if [[ "${{STUB_MIGRATION_FAILURE:-0}}" == "1" ]]; then
+      exit 42
+    fi
+    ;;
+esac
+""",
+    )
+    _write_executable(
+        bin_dir / "timeout",
+        f"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'timeout %s\n' "$*" >> "{log_file}"
+if [ "$1" != "--signal=TERM" ] || [ "$2" != "--kill-after=2s" ] || [ "$3" != "25s" ]; then
+  exit 99
+fi
+if [ "${{STUB_WORKER_UP_TIMEOUT:-0}}" = "1" ]; then
+  exit 124
+fi
+shift 3
+"$@"
+""",
+    )
+    _write_executable(
+        bin_dir / "stat",
+        """#!/usr/bin/env bash
+set -euo pipefail
+case "${*: -1}" in
+  *.attested-digest-deploy-v1) printf '0:0:644\\n' ;;
+  *.env) printf '%s\\n' "${STUB_ENV_MODE:-600}" ;;
+  *postgres_backup.sh) printf '%s\\n' "${STUB_HELPER_MODE:-755}" ;;
+  *pulseplate_test.dump) printf '600\\n' ;;
+  */secrets) printf '%s\\n' "${STUB_SECRET_DIR_METADATA:-$EUID:700}" ;;
+  *pulseplate_metrics_scrape_key) printf '%s\\n' "${STUB_SECRET_FILE_METADATA:-$EUID:444}" ;;
+  *alertmanager_smtp_key) printf '%s\\n' "${STUB_ALERTMANAGER_SECRET_FILE_METADATA:-$EUID:444}" ;;
+  *) exit 1 ;;
+esac
+""",
+    )
+    _write_executable(
+        bin_dir / "curl",
+        f'#!/usr/bin/env bash\nprintf \'curl %s\\n\' "$*" >> "{log_file}"\n',
+    )
+    _write_executable(bin_dir / "sleep", "#!/usr/bin/env bash\nexit 0\n")
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{bin_dir}:{env['PATH']}",
+            "PROJECT_DIR": str(project_dir),
+            "ENV_FILE": str(project_dir / ".env"),
+            "COMPOSE_FILE": str(project_dir / "docker-compose.staging.yaml"),
+            "BACKUP_DIR": str(project_dir / "backups"),
+            "BACKUP_HELPER": str(project_dir / "scripts" / "ops" / "postgres_backup.sh"),
+            "STAGING_DEPLOY_MARKER": str(project_dir / ".attested-digest-deploy-v1"),
+            "DOCKER_BIN": str(bin_dir / "docker"),
+            "PYTHON_BIN": sys.executable,
+            "PYTHONPATH": str(REPO_ROOT),
+            "STUB_PROMETHEUS_COMPOSE_JSON": _staging_compose_fixture_json(project_dir),
+            "CURL_BIN": str(bin_dir / "curl"),
+            "STAT_BIN": str(bin_dir / "stat"),
+            "STAGING_DOMAIN": "staging.example.com",
+            "GHCR_USER": "pulseplate-ci",
+            "GHCR_TOKEN": "test-only-token",  # pragma: allowlist secret
+            "HEALTH_MAX_ATTEMPTS": "1",
+            "HEALTH_SLEEP_S": "0",
+            "STUB_POSTGRES_STARTED_FILE": str(tmp_path / "postgres-started"),
+            "STUB_POSTGRES_IMAGE_INSPECT_COUNTER_FILE": str(
+                tmp_path / "postgres-image-inspect-count"
+            ),
+            "STUB_DEPLOY_LOG_FILE": str(log_file),
+            "STUB_BACKEND_IMAGE_INSPECT_FILE": str(backend_image_inspect),
+            "STUB_WORKER_INSPECT_FILE": str(worker_inspect),
+            "STUB_WORKER_HASH": worker_hash,
+            "STUB_APP_FULL_ID": app_id,
+            "STUB_WORKER_FULL_ID": worker_id,
+        }
+    )
+    _write_checkpoint_contract(project_dir, staging=True)
+    return env, log_file
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        (),
+        ("latest",),
+        ("ghcr.io/katsiarynakavaleuskaya/pulseplate:abc", "caddy:2.11.4"),
+        (
+            "docker.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64,
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64,
+        ),
+        (
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "A" * 64,
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64,
+        ),
+        (
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64,
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64,
+        ),
+        (
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64,
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64,
+            "unexpected",
+        ),
+    ),
+)
+def test_staging_deploy_rejects_unsafe_image_references_before_side_effects(
+    tmp_path: Path,
+    arguments: tuple[str, ...],
+) -> None:
+    env, log_file = _staging_deploy_fixture(tmp_path)
+
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy.sh")), *arguments],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert not log_file.exists()
+
+
+def test_staging_deploy_preflight_validates_contract_without_mutation(tmp_path: Path) -> None:
+    env, log_file = _staging_deploy_fixture(tmp_path)
+    backend_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64
+    caddy_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64
+
+    completed = subprocess.run(
+        [
+            str(_historical_deploy_script("scripts/deploy.sh")),
+            "--preflight-only",
+            backend_ref,
+            caddy_ref,
+        ],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    log_lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert any(line == "docker info --format {{.Architecture}}" for line in log_lines)
+    assert any("compose --env-file" in line and "config --quiet" in line for line in log_lines)
+    assert not any("login" in line or "pull" in line or "up -d" in line for line in log_lines)
+    assert "Staging deploy preflight passed" in completed.stdout
+
+
+@pytest.mark.parametrize(
+    ("scheduler_mode_value", "expected_returncode"),
+    (
+        ("external # scheduler owner", 0),
+        (" disabled\t# maintenance window", 0),
+        ("external#not-a-compose-comment", 1),
+        ('"external"', 1),
+        ("'external'", 1),
+        ("${SCHEDULER_MODE}", 1),
+    ),
+)
+def test_staging_deploy_matches_bounded_compose_scheduler_mode_syntax(
+    tmp_path: Path,
+    scheduler_mode_value: str,
+    expected_returncode: int,
+) -> None:
+    env, _log_file = _staging_deploy_fixture(tmp_path)
+    env.pop("FOOD_UPDATE_SCHEDULER_MODE", None)
+    env_file = Path(env["ENV_FILE"])
+    with env_file.open("a", encoding="utf-8") as handle:
+        handle.write(f"FOOD_UPDATE_SCHEDULER_MODE={scheduler_mode_value}\n")
+    backend_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64
+    caddy_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64
+
+    completed = subprocess.run(
+        [
+            str(_historical_deploy_script("scripts/deploy.sh")),
+            "--preflight-only",
+            backend_ref,
+            caddy_ref,
+        ],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == expected_returncode, completed.stderr
+    if expected_returncode == 0:
+        assert "Staging deploy preflight passed" in completed.stdout
+    else:
+        assert "FOOD_UPDATE_SCHEDULER_MODE must be exactly external or disabled" in completed.stderr
+
+
+@pytest.mark.parametrize("alerting_selected", [False, True])
+@pytest.mark.parametrize("scheduler_mode", ["external", "disabled"])
+def test_staging_deploy_preserves_backup_migration_caddy_order_and_cli_identity(
+    tmp_path: Path,
+    scheduler_mode: str,
+    alerting_selected: bool,
+) -> None:
+    env, log_file = _staging_deploy_fixture(tmp_path)
+    env["FOOD_UPDATE_SCHEDULER_MODE"] = scheduler_mode
+    env.pop("COMPOSE_PROFILES", None)
+    if alerting_selected:
+        key = Path(env["PROJECT_DIR"]) / "secrets/alertmanager_smtp_key"
+        key.write_text("synthetic-only", encoding="ascii")
+        key.chmod(0o444)
+        env["COMPOSE_PROFILES"] = "scheduler-external, alerting"
+    else:
+        env["STUB_ALERTMANAGER_IMAGE_ABSENT"] = "1"
+    project_dir = Path(env["PROJECT_DIR"])
+    selected_env_file = project_dir / "config" / "selected.env"
+    selected_env_file.parent.mkdir()
+    selected_env_file.write_bytes((project_dir / ".env").read_bytes())
+    selected_env_file.chmod(0o600)
+    env["ENV_FILE"] = str(selected_env_file)
+    backend_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64
+    caddy_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64
+
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy.sh")), backend_ref, caddy_ref],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    log_lines = log_file.read_text(encoding="utf-8").splitlines()
+    alertmanager_commands = [
+        (index, line)
+        for index, line in enumerate(log_lines)
+        if "pull alertmanager" in line
+        or f"image inspect {ALERTMANAGER_RUNTIME_REF}" in line
+        or "--entrypoint /bin/amtool" in line
+    ]
+    assert bool(alertmanager_commands) is alerting_selected
+    if alerting_selected:
+        assert len(alertmanager_commands) == 3
+        quiesce_index = _assert_log_index(
+            log_lines,
+            predicate=lambda line: " stop worker caddy app" in line,
+            message="product quiesce missing",
+        )
+        assert all(index < quiesce_index for index, _ in alertmanager_commands)
+    login_index = _assert_log_index(
+        log_lines, predicate=lambda line: "docker login ghcr.io" in line, message="missing login"
+    )
+    pull_index = _assert_log_index(
+        log_lines,
+        predicate=lambda line: "compose " in line and " pull app caddy postgres prometheus" in line,
+        message="missing exact app, Caddy, PostgreSQL, and Prometheus pull",
+    )
+    image_inspect_index = _assert_log_index(
+        log_lines,
+        predicate=lambda line: line.startswith("docker image inspect "),
+        message="missing pulled Prometheus platform manifest validation",
+    )
+    backup_index = _assert_log_index(
+        log_lines, predicate=lambda line: line.startswith("backup "), message="missing backup"
+    )
+    postgres_index = _assert_log_index(
+        log_lines,
+        predicate=lambda line: "compose " in line and " up -d --pull never postgres" in line,
+        message="missing Postgres bootstrap",
+    )
+    quiesce_index = _assert_log_index(
+        log_lines,
+        predicate=lambda line: "compose " in line and " stop worker caddy app" in line,
+        message="missing worker/app/Caddy quiesce",
+    )
+    migration_index = _assert_log_index(
+        log_lines,
+        predicate=lambda line: "compose " in line
+        and " run --rm --no-deps app alembic upgrade head" in line,
+        message="missing one-shot migration",
+    )
+    app_index = _assert_log_index(
+        log_lines,
+        predicate=lambda line: "compose " in line and " up -d --pull never app" in line,
+        message="missing app start",
+    )
+    caddy_index = _assert_log_index(
+        log_lines,
+        predicate=lambda line: "compose " in line and " up -d --pull never caddy" in line,
+        message="missing Caddy start",
+    )
+    assert (
+        login_index
+        < pull_index
+        < image_inspect_index
+        < quiesce_index
+        < backup_index
+        < postgres_index
+        < migration_index
+        < app_index
+        < caddy_index
+    )
+    worker_starts = [
+        index
+        for index, line in enumerate(log_lines)
+        if line.startswith("docker ") and " up -d " in line and line.endswith(" worker")
+    ]
+    if scheduler_mode == "external":
+        assert len(worker_starts) == 1
+        assert app_index < worker_starts[0] < caddy_index
+        assert " --wait" not in log_lines[worker_starts[0]]
+        worker_inspects = [
+            index for index, line in enumerate(log_lines) if line == "worker-gate-inspect"
+        ]
+        assert len(worker_inspects) == 3
+        assert worker_starts[0] < worker_inspects[0] < worker_inspects[1] < caddy_index
+        assert caddy_index < worker_inspects[2]
+    else:
+        assert not worker_starts
+        assert "worker-gate-inspect" not in log_lines
+        assert any(line.endswith(" rm -f worker") for line in log_lines)
+    assert all(
+        line.endswith("--profile * config --format json")
+        or line.endswith("--profile alerting config --format json")
+        or line.endswith("--profile alerting pull alertmanager")
+        or line.endswith("--profile * config --hash worker")
+        for line in log_lines
+        if "--profile" in line
+    )
+    assert all(" up -d postgres" not in line for line in log_lines)
+    assert f"backup docker={env['DOCKER_BIN']}" in log_lines[backup_index]
+    assert f"env_file={selected_env_file}" in log_lines[backup_index]
+
+    env_lines = [line for line in log_lines if line.startswith("env backend=")]
+    assert env_lines
+    assert all(f"backend={backend_ref}" in line for line in env_lines)
+    assert all(f"caddy={caddy_ref}" in line for line in env_lines)
+    docker_config = env_lines[-1].split(" config=", 1)[1]
+    assert docker_config
+    assert not Path(docker_config).exists()
+
+
+def _run_staging_worker_gate_fixture(env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    backend_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64
+    caddy_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64
+    return subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy.sh")), backend_ref, caddy_ref],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+@pytest.mark.parametrize(
+    "failure",
+    (
+        "app_absent",
+        "app_duplicate",
+        "app_image_id",
+        "app_stopped",
+        "absent",
+        "duplicate",
+        "oneoff",
+        "image_id",
+        "config_image",
+        "config_hash",
+        "stopped",
+        "exit_code",
+        "oom",
+        "restarting",
+        "healthcheck",
+        "malformed",
+        "oversize",
+        "timeout",
+    ),
+)
+def test_staging_worker_gate_holds_before_caddy_on_untrusted_runtime(
+    tmp_path: Path, failure: str
+) -> None:
+    env, log_file = _staging_deploy_fixture(tmp_path)
+    env["FOOD_UPDATE_SCHEDULER_MODE"] = "external"
+    inspect_file = Path(env["STUB_WORKER_INSPECT_FILE"])
+    records = [json.loads(line) for line in inspect_file.read_text(encoding="utf-8").splitlines()]
+    worker = records[1]
+    app = records[0]
+    if failure == "app_absent":
+        env["STUB_APP_FULL_ID"] = ""
+    elif failure == "app_duplicate":
+        env["STUB_APP_FULL_ID"] += "\n" + "e" * 64
+    elif failure == "app_image_id":
+        app["image"] = "sha256:" + "9" * 64
+    elif failure == "app_stopped":
+        app["state"].update(running=False, status="exited", pid=0)
+    elif failure == "absent":
+        env["STUB_WORKER_FULL_ID"] = ""
+    elif failure == "duplicate":
+        env["STUB_WORKER_FULL_ID"] += "\n" + "e" * 64
+    elif failure == "oneoff":
+        worker["labels"]["com.docker.compose.oneoff"] = "True"
+    elif failure == "image_id":
+        worker["image"] = "sha256:" + "9" * 64
+    elif failure == "config_image":
+        worker["config"]["image"] = "ghcr.io/other/image@sha256:" + "a" * 64
+    elif failure == "config_hash":
+        worker["labels"]["com.docker.compose.config-hash"] = "9" * 64
+    elif failure == "stopped":
+        worker["state"].update(running=False, status="exited", pid=0)
+    elif failure == "exit_code":
+        worker["state"]["exit_code"] = 1
+    elif failure == "oom":
+        worker["state"]["oom"] = True
+    elif failure == "restarting":
+        worker["state"]["restarting"] = True
+    elif failure == "healthcheck":
+        worker["config"]["healthcheck"] = {"Test": ["CMD", "true"]}
+    elif failure == "malformed":
+        inspect_file.write_text('{"gate":"worker_v1", "gate":"duplicate"}\n', encoding="utf-8")
+    elif failure == "oversize":
+        inspect_file.write_text("X" * 8193, encoding="utf-8")
+    elif failure == "timeout":
+        env["STUB_WORKER_UP_TIMEOUT"] = "1"
+    if failure not in {"malformed", "oversize"}:
+        inspect_file.write_text(
+            "\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8"
+        )
+
+    completed = _run_staging_worker_gate_fixture(env)
+
+    assert completed.returncode != 0
+    assert "HOLD before Caddy" in completed.stderr
+    log_lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert not any(" up -d --pull never caddy" in line for line in log_lines)
+    assert not any(" up -d --pull never prometheus" in line for line in log_lines)
+
+
+@pytest.mark.parametrize("drift_service", ("app", "worker"))
+def test_staging_worker_gate_rechecks_same_generation_after_https(
+    tmp_path: Path, drift_service: str
+) -> None:
+    env, log_file = _staging_deploy_fixture(tmp_path)
+    env["FOOD_UPDATE_SCHEDULER_MODE"] = "external"
+    inspect_file = Path(env["STUB_WORKER_INSPECT_FILE"])
+    records = [json.loads(line) for line in inspect_file.read_text(encoding="utf-8").splitlines()]
+    records[0 if drift_service == "app" else 1]["restart_count"] = 1
+    after_file = tmp_path / "worker-inspect-after.jsonl"
+    after_file.write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8"
+    )
+    env["STUB_WORKER_INSPECT_DRIFT_FILE"] = str(tmp_path / "worker-inspect-count")
+    env["STUB_WORKER_INSPECT_AFTER_FILE"] = str(after_file)
+
+    completed = _run_staging_worker_gate_fixture(env)
+
+    assert completed.returncode != 0
+    assert "generation changed after HTTPS" in completed.stderr
+    log_lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert (
+        sum(
+            line.startswith("docker ") and " up -d --pull never --no-deps worker" in line
+            for line in log_lines
+        )
+        == 1
+    )
+    assert any(" up -d --pull never caddy" in line for line in log_lines)
+    assert not any(" up -d --pull never prometheus" in line for line in log_lines)
+
+
+def test_staging_worker_gate_excludes_oneoff_from_exact_census(tmp_path: Path) -> None:
+    env, log_file = _staging_deploy_fixture(tmp_path)
+    env["FOOD_UPDATE_SCHEDULER_MODE"] = "external"
+    env["STUB_WORKER_WITH_ONEOFF"] = "1"
+    env["STUB_ONEOFF_FULL_ID"] = "e" * 64
+
+    completed = _run_staging_worker_gate_fixture(env)
+
+    assert completed.returncode == 0, completed.stderr
+    log_lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert any(
+        line.startswith("docker ps --all --quiet --no-trunc")
+        and "label=com.docker.compose.service=worker" in line
+        and "label=com.docker.compose.oneoff=False" in line
+        for line in log_lines
+    )
+
+
+@pytest.mark.parametrize(
+    ("hung_command", "stub_flag"),
+    (
+        ("image_inspect", "STUB_BACKEND_IMAGE_INSPECT_HANG"),
+        ("worker_hash", "STUB_WORKER_HASH_HANG"),
+        ("image_pipe_child", "STUB_BACKEND_IMAGE_PIPE_CHILD"),
+        ("hash_pipe_child", "STUB_WORKER_HASH_PIPE_CHILD"),
+    ),
+)
+def test_staging_worker_native_hang_is_bounded_and_holds_before_caddy(
+    tmp_path: Path, hung_command: str, stub_flag: str
+) -> None:
+    import signal
+    import time
+
+    env, log_file = _staging_deploy_fixture(tmp_path)
+    env["FOOD_UPDATE_SCHEDULER_MODE"] = "external"
+    env[stub_flag] = "1"
+    hung_pid_file = tmp_path / "hung-native-pid"
+    env["STUB_HUNG_PID_FILE"] = str(hung_pid_file)
+
+    completed = subprocess.run(
+        [
+            str(_historical_deploy_script("scripts/deploy.sh")),
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64,
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64,
+        ],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+        # The worker gate has a 30-second deadline; this outer bound also covers fixture setup.
+        timeout=45,
+    )
+
+    assert completed.returncode != 0
+    assert "HOLD" in completed.stderr
+    log_lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert not any(" up -d --pull never caddy" in line for line in log_lines)
+    hung_pid = int(hung_pid_file.read_text(encoding="ascii"))
+    ps_bin = shutil.which("ps")
+    assert ps_bin is not None
+    active = True
+    for _ in range(20):
+        state = subprocess.run(
+            [ps_bin, "-o", "stat=", "-p", str(hung_pid)],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=2,
+        ).stdout.strip()
+        active = bool(state) and not state.startswith("Z")
+        if not active:
+            break
+        time.sleep(0.05)
+    if active:
+        os.kill(hung_pid, signal.SIGKILL)
+    assert not active, f"{hung_command} left its owned native child active"
+
+
+@pytest.mark.parametrize("failure", ("digest", "id", "platform", "duplicate", "oversize"))
+def test_staging_worker_backend_image_identity_fails_before_product_mutation(
+    tmp_path: Path, failure: str
+) -> None:
+    env, log_file = _staging_deploy_fixture(tmp_path)
+    env["FOOD_UPDATE_SCHEDULER_MODE"] = "external"
+    image_file = Path(env["STUB_BACKEND_IMAGE_INSPECT_FILE"])
+    record = json.loads(image_file.read_text(encoding="utf-8"))[0]
+    if failure == "digest":
+        record["RepoDigests"] = ["ghcr.io/other/image@sha256:" + "a" * 64]
+    elif failure == "id":
+        record["Id"] = "not-an-image-id"
+    elif failure == "platform":
+        record["Architecture"] = "arm64"
+    elif failure == "duplicate":
+        image_file.write_text('[{"Id":"first","Id":"second"}]', encoding="utf-8")
+    elif failure == "oversize":
+        image_file.write_text("X" * 65537, encoding="utf-8")
+    if failure not in {"duplicate", "oversize"}:
+        image_file.write_text(json.dumps([record]), encoding="utf-8")
+
+    completed = _run_staging_worker_gate_fixture(env)
+
+    assert completed.returncode != 0
+    assert "Pulled backend image identity is untrusted" in completed.stderr
+    log_lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert not any(" stop worker caddy app" in line for line in log_lines)
+    assert not any(" up -d --pull never app" in line for line in log_lines)
+
+
+def test_staging_backup_failure_preserves_primary_exit_and_never_switches_postgres(
+    tmp_path: Path,
+) -> None:
+    env, log_file = _staging_deploy_fixture(tmp_path)
+    env["STUB_BACKUP_FAILURE"] = "33"
+    backend_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64
+    caddy_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64
+
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy.sh")), backend_ref, caddy_ref],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 33
+    assert "backup execution failed ambiguously" in completed.stderr
+    assert "captured product writers remain quiesced" in completed.stderr
+    log_lines = log_file.read_text(encoding="utf-8").splitlines()
+    quiesce = next(
+        index for index, line in enumerate(log_lines) if " stop worker caddy app" in line
+    )
+    backup = next(index for index, line in enumerate(log_lines) if line.startswith("backup "))
+    assert quiesce < backup
+    assert all(" up -d --pull never postgres" not in line for line in log_lines)
+    assert all(line != f"docker stop {'a' * 64}" for line in log_lines)
+    assert all(not line.startswith("docker start ") for line in log_lines)
+
+
+def test_old_postgres_stop_failure_keeps_product_writers_quiesced(
+    tmp_path: Path,
+) -> None:
+    env, log_file = _staging_deploy_fixture(tmp_path)
+    env.update(
+        {
+            "STUB_POSTGRES_STOP_FAILURE_ID": "a" * 64,
+            "STUB_POSTGRES_STOP_FAILURE_STATUS": "47",
+        }
+    )
+    backend_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64
+    caddy_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64
+
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy.sh")), backend_ref, caddy_ref],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 47
+    assert "captured product writers remain quiesced" in completed.stderr
+    log_lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert f"docker stop {'a' * 64}" in log_lines
+    assert all(not line.startswith("docker start ") for line in log_lines)
+    assert all(" up -d --pull never postgres" not in line for line in log_lines)
+    assert all(" alembic upgrade head" not in line for line in log_lines)
+
+    bash_bin = shutil.which("bash")
+    assert bash_bin is not None
+    for relative_path in ("scripts/deploy.sh", "scripts/deploy_production.sh"):
+        script = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+        marker = 'if "$DOCKER_BIN" stop "$postgres_container" >/dev/null; then'
+        start = script.index(marker)
+        line_start = script.rfind("\n", 0, start) + 1
+        indentation = script[line_start:start]
+        closing = f"\n{indentation}fi"
+        end = script.index(closing, start) + len(closing)
+        stop_failure_branch = script[start:end]
+        assert "captured product writers remain quiesced" in stop_failure_branch
+        assert "restart_captured_product_containers_after_failure" not in stop_failure_branch
+
+        branch_log = tmp_path / f"{Path(relative_path).stem}-ambiguous-stop.log"
+        docker_stub = tmp_path / f"{Path(relative_path).stem}-docker"
+        _write_executable(
+            docker_stub,
+            f'#!/usr/bin/env bash\nprintf \'docker %s\\n\' "$*" > "{branch_log}"\nexit 47\n',
+        )
+        branch_program = (
+            "set -euo pipefail\n"
+            f'DOCKER_BIN="{docker_stub}"\n'
+            f'postgres_container="{"a" * 64}"\n'
+            f"{stop_failure_branch}\n"
+        )
+        branch_result = subprocess.run(
+            [bash_bin, "-c", branch_program],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert branch_result.returncode == 47
+        assert "captured product writers remain quiesced" in branch_result.stderr
+        assert branch_log.read_text(encoding="utf-8") == f"docker stop {'a' * 64}\n"
+
+
+def test_postgres_identity_revalidation_failure_keeps_product_writers_quiesced(
+    tmp_path: Path,
+) -> None:
+    bash_bin = shutil.which("bash")
+    assert bash_bin is not None
+    marker = (
+        'if assert_existing_postgres_unchanged "$postgres_state_receipt" '
+        '"$postgres_runtime_receipt"; then'
+    )
+
+    for relative_path in ("scripts/deploy.sh", "scripts/deploy_production.sh"):
+        script = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+        assert script.count(marker) == 2
+        search_from = 0
+        for occurrence in range(2):
+            start = script.index(marker, search_from)
+            line_start = script.rfind("\n", 0, start) + 1
+            indentation = script[line_start:start]
+            closing = f"\n{indentation}fi"
+            end = script.index(closing, start) + len(closing)
+            branch = script[start:end]
+            search_from = end
+            assert "PostgreSQL identity revalidation failed" in branch
+            assert "captured product writers remain quiesced" in branch
+            assert "restart_captured_product_containers_after_failure" not in branch
+
+            restart_log = tmp_path / f"{Path(relative_path).stem}-{occurrence}-restart.log"
+            branch_program = (
+                "set -euo pipefail\n"
+                'postgres_state_receipt="state"\n'
+                'postgres_runtime_receipt="runtime"\n'
+                "assert_existing_postgres_unchanged() { return 42; }\n"
+                "restart_captured_product_containers_after_failure() {\n"
+                f"  printf 'restarted\\n' > \"{restart_log}\"\n"
+                "}\n"
+                f"{branch}\n"
+            )
+            completed = subprocess.run(
+                [bash_bin, "-c", branch_program],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            assert completed.returncode == 42
+            assert "captured product writers remain quiesced" in completed.stderr
+            assert not restart_log.exists()
+
+
+@pytest.mark.parametrize("relative_path", ("scripts/deploy.sh", "scripts/deploy_production.sh"))
+@pytest.mark.parametrize(
+    ("inspect_status", "inspect_output", "expected_message"),
+    (
+        (66, "", "Unable to inspect app container running state"),
+        (0, "unknown\n", "Invalid app container running state"),
+        (0, "true\nfalse\n", "Invalid app container running state"),
+    ),
+)
+def test_product_service_census_fails_closed_on_untrusted_inspect_state(
+    tmp_path: Path,
+    relative_path: str,
+    inspect_status: int,
+    inspect_output: str,
+    expected_message: str,
+) -> None:
+    bash_bin = shutil.which("bash")
+    assert bash_bin is not None
+    script = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+    start = script.index("capture_running_service_container() {\n")
+    end = script.index("\n}\n\nrestart_captured_product_containers()", start) + len("\n}\n")
+    function = script[start:end]
+    docker_stub = tmp_path / f"docker-{Path(relative_path).stem}-{inspect_status}"
+    _write_executable(
+        docker_stub,
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        'case "$*" in\n'
+        "  *\"ps -q app\"*) printf 'bbbbbbbbbbbb\\n' ;;\n"
+        '  *"inspect --format"*)\n'
+        '    if [ "$STUB_INSPECT_STATUS" -ne 0 ]; then exit "$STUB_INSPECT_STATUS"; fi\n'
+        "    printf '%b' \"$STUB_INSPECT_OUTPUT\"\n"
+        "    ;;\n"
+        "  *) exit 70 ;;\n"
+        "esac\n",
+    )
+    program = (
+        "set -euo pipefail\n"
+        f'DOCKER_BIN="{docker_stub}"\n'
+        f'COMPOSE=("{docker_stub}" compose)\n'
+        'dc() { "$DOCKER_BIN" compose "$@"; }\n'
+        f"{function}\n"
+        "capture_running_service_container app\n"
+    )
+    completed = subprocess.run(
+        [bash_bin, "-c", program],
+        env={
+            **os.environ,
+            "STUB_INSPECT_STATUS": str(inspect_status),
+            "STUB_INSPECT_OUTPUT": inspect_output,
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert completed.stdout == ""
+    assert expected_message in completed.stderr
+
+
+def test_deploy_backup_helpers_receive_selected_compose_env_file() -> None:
+    staging_script = (_historical_deploy_script("scripts/deploy.sh")).read_text(encoding="utf-8")
+    production_script = (_historical_deploy_script("scripts/deploy_production.sh")).read_text(
+        encoding="utf-8"
+    )
+    helper_script = (REPO_ROOT / "scripts/ops/postgres_backup.sh").read_text(encoding="utf-8")
+
+    assert "export DOCKER_BIN BACKUP_DIR PROJECT_DIR COMPOSE_FILE ENV_FILE" in staging_script
+    assert "export DOCKER_BIN BACKUP_DIR POSTGRES_USER POSTGRES_DB ENV_FILE" in production_script
+    assert 'ENV_FILE="${ENV_FILE:-}"' in helper_script
+    assert 'compose_cmd+=(--env-file "$ENV_FILE")' in helper_script
+
+
+def test_postgres_backup_and_receipt_failures_keep_product_writers_quiesced() -> None:
+    markers = (
+        ('if backup_output="$(', "PostgreSQL backup execution failed ambiguously"),
+        (
+            'if backup_receipt="$(validate_backup_receipt "$backup_output" '
+            '"$postgres_container")"; then',
+            "PostgreSQL backup receipt validation failed",
+        ),
+    )
+    for relative_path in ("scripts/deploy.sh", "scripts/deploy_production.sh"):
+        script = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+        for marker, expected_message in markers:
+            assert script.count(marker) == 1
+            start = script.index(marker)
+            line_start = script.rfind("\n", 0, start) + 1
+            indentation = script[line_start:start]
+            closing = f"\n{indentation}fi"
+            end = script.index(closing, start) + len(closing)
+            failure_branch = script[start:end]
+            assert expected_message in failure_branch
+            assert "captured product writers remain quiesced" in failure_branch
+            assert "restart_captured_product_containers_after_failure" not in failure_branch
+
+
+@pytest.mark.parametrize(
+    "variant",
+    ("unknown-image", "wrong-image-id", "wrong-pgdata", "runtime-failure", "identity-drift"),
+)
+def test_staging_existing_postgres_requires_closed_image_and_pgdata_identity(
+    tmp_path: Path,
+    variant: str,
+) -> None:
+    env, log_file = _staging_deploy_fixture(tmp_path)
+    inspect_payload = json.loads(FAKE_POSTGRES_CONTAINER_INSPECT_JSON)
+    if variant == "unknown-image":
+        inspect_payload[0]["Config"]["Image"] = "attacker.invalid/not-postgres:latest"
+    elif variant == "wrong-image-id":
+        inspect_payload[0]["Image"] = "sha256:" + "e" * 64
+    elif variant == "wrong-pgdata":
+        inspect_payload[0]["Config"]["Env"] = ["PGDATA=/wrong", "PG_MAJOR=15"]
+    elif variant == "runtime-failure":
+        env["STUB_POSTGRES_RUNTIME_STATUS"] = "65"
+    else:
+        drift_payload = json.loads(json.dumps(inspect_payload))
+        drift_payload[0]["Id"] = "f" * 64
+        env["STUB_POSTGRES_INSPECT_DRIFT_FILE"] = str(tmp_path / "inspect-drift")
+        env["STUB_POSTGRES_CONTAINER_INSPECT_JSON_AFTER_FIRST"] = json.dumps(drift_payload)
+    env["STUB_POSTGRES_CONTAINER_INSPECT_JSON"] = json.dumps(inspect_payload)
+    backend_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64
+    caddy_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64
+
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy.sh")), backend_ref, caddy_ref],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    log_lines = log_file.read_text(encoding="utf-8").splitlines()
+    if variant != "identity-drift":
+        assert all(" stop worker caddy app" not in line for line in log_lines)
+    assert all(not line.startswith("backup ") for line in log_lines)
+    assert all(" up -d --pull never postgres" not in line for line in log_lines)
+
+
+def _current_postgres_container_inspect(image_id: str) -> str:
+    inspected = json.loads(FAKE_POSTGRES_CONTAINER_INSPECT_JSON)
+    inspected[0]["Config"]["Image"] = POSTGRES_RUNTIME_REF
+    inspected[0]["Image"] = image_id
+    return json.dumps(inspected)
+
+
+def _current_postgres_image_inspect_variant(
+    variant: str, image_id: str = POSTGRES_PLATFORM_MANIFEST_DIGEST
+) -> str:
+    source = (
+        FAKE_POSTGRES_CONFIG_IMAGE_INSPECT_JSON
+        if image_id == POSTGRES_CONFIG_DIGEST
+        else FAKE_POSTGRES_IMAGE_INSPECT_JSON
+    )
+    payload = json.loads(source)
+    record = payload[0]
+    if variant == "malformed":
+        return '{"Config.Env":"native-secret-value"'
+    if variant == "zero-records":
+        return "[]"
+    if variant == "multiple-records":
+        return json.dumps([record, record])
+    if variant == "duplicate-key":
+        return json.dumps(payload).replace('"Id":', '"Id":"native-secret-value","Id":', 1)
+    if variant == "wrong-id":
+        record["Id"] = "sha256:" + "e" * 64
+    elif variant == "missing-id":
+        del record["Id"]
+    elif variant == "wrong-repository-digest":
+        record["RepoDigests"] = [f"other.invalid/image@{POSTGRES_PLATFORM_MANIFEST_DIGEST}"]
+    elif variant == "malformed-repository-digests":
+        record["RepoDigests"].append(None)
+    elif variant == "wrong-platform":
+        record["Architecture"] = "arm64"
+    elif variant == "missing-config":
+        del record["Config"]
+    elif variant == "wrong-user":
+        record["Config"]["User"] = "0"
+    elif variant == "wrong-entrypoint":
+        record["Config"]["Entrypoint"] = ["/bin/sh"]
+    elif variant == "wrong-environment":
+        record["Config"]["Env"] = ["PG_MAJOR=15", "PG_MINOR=19"]
+    elif variant == "wrong-label":
+        record["Config"]["Labels"]["com.pulseplate.pgvector.version"] = "0.8.5"
+    else:
+        raise AssertionError(f"unsupported current PostgreSQL image variant: {variant}")
+    return json.dumps(payload)
+
+
+@pytest.mark.parametrize("image_id", (POSTGRES_CONFIG_DIGEST, POSTGRES_PLATFORM_MANIFEST_DIGEST))
+def test_staging_existing_current_postgres_accepts_only_frozen_id_forms(
+    tmp_path: Path, image_id: str
+) -> None:
+    env, log_file = _staging_deploy_fixture(tmp_path)
+    env["STUB_POSTGRES_CONTAINER_INSPECT_JSON"] = _current_postgres_container_inspect(image_id)
+    env["STUB_POSTGRES_EXISTING_IMAGE_FORM"] = (
+        "config" if image_id == POSTGRES_CONFIG_DIGEST else "platform"
+    )
+    backend_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64
+    caddy_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64
+
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy.sh")), backend_ref, caddy_ref],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    log_lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert log_lines.count(f"docker image inspect {POSTGRES_RUNTIME_REF}") == 2
+    assert f"docker image inspect {image_id}" not in log_lines
+    assert any(" stop worker caddy app" in line for line in log_lines)
+    assert any(line.startswith("backup ") for line in log_lines)
+
+
+@pytest.mark.parametrize(
+    "variant",
+    (
+        "foreign-configured-image",
+        "foreign-image-id",
+        "inspect-failure",
+        "native-stderr",
+        "malformed",
+        "oversized",
+        "zero-records",
+        "multiple-records",
+        "duplicate-key",
+        "wrong-id",
+        "missing-id",
+        "wrong-repository-digest",
+        "malformed-repository-digests",
+        "wrong-platform",
+        "missing-config",
+        "wrong-user",
+        "wrong-entrypoint",
+        "wrong-environment",
+        "wrong-label",
+    ),
+)
+def test_staging_existing_current_postgres_rejects_untrusted_id_before_quiescence(
+    tmp_path: Path, variant: str
+) -> None:
+    env, log_file = _staging_deploy_fixture(tmp_path)
+    image_id = (
+        "sha256:" + "e" * 64 if variant == "foreign-image-id" else POSTGRES_PLATFORM_MANIFEST_DIGEST
+    )
+    container_inspect = json.loads(_current_postgres_container_inspect(image_id))
+    if variant == "foreign-configured-image":
+        container_inspect[0]["Config"]["Image"] = "other.invalid/postgres:latest"
+    env["STUB_POSTGRES_CONTAINER_INSPECT_JSON"] = json.dumps(container_inspect)
+    env["STUB_POSTGRES_EXISTING_IMAGE_FORM"] = "platform"
+    if variant in ("inspect-failure", "native-stderr"):
+        env["STUB_POSTGRES_EXISTING_PLATFORM_IMAGE_INSPECT_STATUS"] = "64"
+        env["STUB_POSTGRES_EXISTING_PLATFORM_IMAGE_INSPECT_STDERR"] = "native-secret-value"
+    elif variant == "oversized":
+        oversized_payload = json.loads(FAKE_POSTGRES_IMAGE_INSPECT_JSON)
+        oversized_payload[0]["Config"]["Env"].append("PAD=" + "x" * 1_048_576)
+        oversized_file = tmp_path / "oversized-image-inspect.json"
+        oversized_file.write_text(json.dumps(oversized_payload), encoding="utf-8")
+        assert oversized_file.stat().st_size > 1_048_576
+        env["STUB_POSTGRES_EXISTING_PLATFORM_IMAGE_INSPECT_FILE"] = str(oversized_file)
+    elif variant not in ("foreign-configured-image", "foreign-image-id"):
+        env["STUB_POSTGRES_EXISTING_PLATFORM_IMAGE_INSPECT_JSON"] = (
+            _current_postgres_image_inspect_variant(variant)
+        )
+    backend_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64
+    caddy_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64
+
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy.sh")), backend_ref, caddy_ref],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "native-secret-value" not in completed.stdout + completed.stderr
+    if variant == "foreign-configured-image":
+        assert "configured image is outside the closed transition set" in completed.stderr
+    elif variant == "foreign-image-id":
+        assert "image ID does not match the frozen candidate" in completed.stderr
+    else:
+        assert "image metadata is not the frozen candidate" in completed.stderr
+    log_lines = log_file.read_text(encoding="utf-8").splitlines()
+    expected_ref_inspects = 1 if variant in ("foreign-configured-image", "foreign-image-id") else 2
+    assert log_lines.count(f"docker image inspect {POSTGRES_RUNTIME_REF}") == expected_ref_inspects
+    assert f"docker image inspect {image_id}" not in log_lines
+    assert all(" stop worker caddy app" not in line for line in log_lines)
+    assert all(not line.startswith("backup ") for line in log_lines)
+    assert all(" up -d --pull never postgres" not in line for line in log_lines)
+    assert all("alembic upgrade head" not in line for line in log_lines)
+
+
+@pytest.mark.parametrize(
+    "variant",
+    ("inspect-failure", "wrong-id", "wrong-repository-digest", "wrong-platform", "duplicate-key"),
+)
+def test_staging_existing_current_config_id_requires_own_inspect_before_quiescence(
+    tmp_path: Path, variant: str
+) -> None:
+    env, log_file = _staging_deploy_fixture(tmp_path)
+    inspect_trace = tmp_path / "config-image-inspect.trace"
+    env["STUB_POSTGRES_EXISTING_CONFIG_IMAGE_INSPECT_TRACE"] = str(inspect_trace)
+    env["STUB_POSTGRES_CONTAINER_INSPECT_JSON"] = _current_postgres_container_inspect(
+        POSTGRES_CONFIG_DIGEST
+    )
+    if variant == "inspect-failure":
+        env["STUB_POSTGRES_EXISTING_CONFIG_IMAGE_INSPECT_STATUS"] = "64"
+        env["STUB_POSTGRES_EXISTING_CONFIG_IMAGE_INSPECT_STDERR"] = "native-secret-value"
+    else:
+        env["STUB_POSTGRES_EXISTING_CONFIG_IMAGE_INSPECT_JSON"] = (
+            _current_postgres_image_inspect_variant(variant, POSTGRES_CONFIG_DIGEST)
+        )
+    backend_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64
+    caddy_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64
+
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy.sh")), backend_ref, caddy_ref],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "image metadata is not the frozen candidate" in completed.stderr
+    assert "native-secret-value" not in completed.stdout + completed.stderr
+    log_lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert inspect_trace.read_text(encoding="utf-8").splitlines() == [
+        f"image inspect {POSTGRES_RUNTIME_REF}"
+    ]
+    assert log_lines.count(f"docker image inspect {POSTGRES_RUNTIME_REF}") == 2
+    assert f"docker image inspect {POSTGRES_CONFIG_DIGEST}" not in log_lines
+    assert all(" stop worker caddy app" not in line for line in log_lines)
+    assert all(not line.startswith("backup ") for line in log_lines)
+    assert all(" up -d --pull never postgres" not in line for line in log_lines)
+    assert all("alembic upgrade head" not in line for line in log_lines)
+
+
+@pytest.mark.parametrize("surface", ("pulled", "config-id", "platform-id"))
+@pytest.mark.parametrize("field", ("PGDATA", "PG_MAJOR", "PG_MINOR"))
+@pytest.mark.parametrize("order", ("wrong-first", "wrong-last", "duplicate-exact", "no-equals"))
+def test_staging_postgres_image_rejects_duplicate_runtime_environment_before_quiescence(
+    tmp_path: Path, surface: str, field: str, order: str
+) -> None:
+    env, log_file = _staging_deploy_fixture(tmp_path)
+    image_id = (
+        POSTGRES_CONFIG_DIGEST if surface == "config-id" else POSTGRES_PLATFORM_MANIFEST_DIGEST
+    )
+    source = (
+        FAKE_POSTGRES_CONFIG_IMAGE_INSPECT_JSON
+        if surface == "config-id"
+        else FAKE_POSTGRES_IMAGE_INSPECT_JSON
+    )
+    inspected = json.loads(source)
+    image_environment = inspected[0]["Config"]["Env"]
+    canonical = next(item for item in image_environment if item.startswith(f"{field}="))
+    conflicting = {
+        "PGDATA": "PGDATA=/wrong/location",
+        "PG_MAJOR": "PG_MAJOR=16",
+        "PG_MINOR": "PG_MINOR=18",
+    }[field]
+    if order == "wrong-first":
+        image_environment.insert(0, conflicting)
+    elif order == "wrong-last":
+        image_environment.append(conflicting)
+    elif order == "duplicate-exact":
+        image_environment.append(canonical)
+    else:
+        image_environment.append(field)
+    image_payload = json.dumps(inspected)
+    if surface == "pulled":
+        env["STUB_POSTGRES_IMAGE_INSPECT_JSON"] = image_payload
+    else:
+        env["STUB_POSTGRES_CONTAINER_INSPECT_JSON"] = _current_postgres_container_inspect(image_id)
+        env["STUB_POSTGRES_EXISTING_IMAGE_FORM"] = (
+            "config" if image_id == POSTGRES_CONFIG_DIGEST else "platform"
+        )
+        variable = (
+            "STUB_POSTGRES_EXISTING_CONFIG_IMAGE_INSPECT_JSON"
+            if surface == "config-id"
+            else "STUB_POSTGRES_EXISTING_PLATFORM_IMAGE_INSPECT_JSON"
+        )
+        env[variable] = image_payload
+    backend_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64
+    caddy_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64
+
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy.sh")), backend_ref, caddy_ref],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    log_lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert all(" stop worker caddy app" not in line for line in log_lines)
+    assert all(not line.startswith("backup ") for line in log_lines)
+    assert all("alembic upgrade head" not in line for line in log_lines)
+    assert all(" up -d --pull never postgres" not in line for line in log_lines)
+    assert completed.returncode != 0, (surface, field, order, completed.stderr)
+    assert "PostgreSQL image" in completed.stderr
+
+
+def test_staging_rejects_unlistable_backup_before_postgres_switch(tmp_path: Path) -> None:
+    env, log_file = _staging_deploy_fixture(tmp_path)
+    env["STUB_PG_RESTORE_LIST_STATUS"] = "67"
+    backend_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64
+    caddy_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64
+
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy.sh")), backend_ref, caddy_ref],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "not a listable custom-format dump" in completed.stderr
+    log_lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert all(" up -d --pull never postgres" not in line for line in log_lines)
+    assert all(not line.startswith("docker stop a") for line in log_lines)
+
+
+@pytest.mark.parametrize("relative_path", ("scripts/deploy.sh", "scripts/deploy_production.sh"))
+@pytest.mark.parametrize(
+    ("listing_status", "listing", "expected_status", "expected_message"),
+    (
+        (0, "", 0, None),
+        (
+            0,
+            "unrelated_volume\npulseplate_postgres_data\n",
+            1,
+            "volume exists without one trustworthy running container",
+        ),
+        (0, "invalid volume\n", 1, "volume listing is malformed"),
+        (47, "", 47, "Unable to establish PostgreSQL volume absence"),
+    ),
+)
+def test_fresh_postgres_volume_probe_requires_definitive_absence(
+    tmp_path: Path,
+    relative_path: str,
+    listing_status: int,
+    listing: str,
+    expected_status: int,
+    expected_message: str | None,
+) -> None:
+    bash_bin = shutil.which("bash")
+    assert bash_bin is not None
+    script = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+    marker = "require_absent_postgres_volume() {\n"
+    start = script.index(marker)
+    end = script.index("\n}\n", start) + len("\n}\n")
+    function_definition = script[start:end]
+    assert script.count("require_absent_postgres_volume") == 3
+
+    docker_stub = tmp_path / f"{Path(relative_path).stem}-docker"
+    response = (
+        f"exit {listing_status}" if listing_status != 0 else f"printf '%b' {json.dumps(listing)}"
+    )
+    _write_executable(
+        docker_stub,
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        'if [ "$*" != "volume ls --quiet" ]; then exit 99; fi\n'
+        f"{response}\n",
+    )
+    program = (
+        "set -euo pipefail\n"
+        f'DOCKER_BIN="{docker_stub}"\n'
+        'POSTGRES_VOLUME_NAME="pulseplate_postgres_data"\n'
+        f'PYTHON_BIN="{shutil.which("true")}"\n'
+        f'PROJECT_DIR="{tmp_path}"\n'
+        f"{function_definition}\n"
+        "require_absent_postgres_volume\n"
+    )
+    completed = subprocess.run(
+        [bash_bin, "-c", program],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == expected_status
+    if expected_message is None:
+        assert completed.stderr == ""
+    else:
+        assert expected_message in completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "fresh_marker", "start_marker"),
+    (
+        (
+            "scripts/deploy.sh",
+            "Fresh PostgreSQL path admitted: rendered named volume is absent",
+            "Starting the already pulled exact PostgreSQL candidate without registry access",
+        ),
+        (
+            "scripts/deploy_production.sh",
+            "Fresh self-hosted PostgreSQL path admitted: rendered named volume is absent",
+            "Starting exact self-hosted PostgreSQL image without a registry pull",
+        ),
+    ),
+)
+def test_fresh_postgres_volume_recheck_is_the_last_gate_before_candidate_start(
+    relative_path: str,
+    fresh_marker: str,
+    start_marker: str,
+) -> None:
+    script = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+    fresh_index = script.index(fresh_marker)
+    start_index = script.index(start_marker, fresh_index)
+    handoff_block = script[fresh_index:start_index]
+
+    assert handoff_block.count("require_absent_postgres_volume") == 1
+    assert "captured product writers remain quiesced" in handoff_block
+    assert "restart_captured_product_containers_after_failure" not in handoff_block
+
+
+def test_staging_orphan_postgres_volume_holds_before_quiesce_or_switch(tmp_path: Path) -> None:
+    env, log_file = _staging_deploy_fixture(tmp_path)
+    env["STUB_POSTGRES_CONTAINER_ABSENT"] = "1"
+    env["STUB_POSTGRES_VOLUME_LIST_OUTPUT"] = "pulseplate_postgres_data\n"
+    backend_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64
+    caddy_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64
+
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy.sh")), backend_ref, caddy_ref],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "volume exists without one trustworthy running container" in completed.stderr
+    log_lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert all(" stop worker caddy app" not in line for line in log_lines)
+    assert all(" up -d --pull never postgres" not in line for line in log_lines)
+    assert all(not line.startswith("backup ") for line in log_lines)
+
+
+def test_staging_absent_volume_uses_fresh_path_without_backup(tmp_path: Path) -> None:
+    env, log_file = _staging_deploy_fixture(tmp_path)
+    env["STUB_POSTGRES_CONTAINER_ABSENT"] = "1"
+    backend_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64
+    caddy_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64
+
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy.sh")), backend_ref, caddy_ref],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    log_lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert any(" stop worker caddy app" in line for line in log_lines)
+    assert any(" up -d --pull never postgres" in line for line in log_lines)
+    assert all(not line.startswith("backup ") for line in log_lines)
+
+
+def test_staging_fresh_volume_appearance_after_quiesce_holds_before_candidate_start(
+    tmp_path: Path,
+) -> None:
+    env, log_file = _staging_deploy_fixture(tmp_path)
+    volume_counter = tmp_path / "postgres-volume-list-count"
+    env.update(
+        {
+            "STUB_POSTGRES_CONTAINER_ABSENT": "1",
+            "STUB_POSTGRES_VOLUME_LIST_COUNTER_FILE": str(volume_counter),
+            "STUB_POSTGRES_VOLUME_LIST_OUTPUT_AFTER_FIRST": "pulseplate_postgres_data\n",
+        }
+    )
+    backend_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64
+    caddy_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64
+
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy.sh")), backend_ref, caddy_ref],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert "volume exists without one trustworthy running container" in completed.stderr
+    assert "volume revalidation failed; captured product writers remain quiesced" in (
+        completed.stderr
+    )
+    assert volume_counter.read_text(encoding="utf-8") == "2\n"
+    log_lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert any(" stop worker caddy app" in line for line in log_lines)
+    assert all(" up -d --pull never postgres" not in line for line in log_lines)
+    assert all(not line.startswith("backup ") for line in log_lines)
+
+
+def test_staging_ambiguous_volume_listing_holds_before_quiesce_or_switch(
+    tmp_path: Path,
+) -> None:
+    env, log_file = _staging_deploy_fixture(tmp_path)
+    env["STUB_POSTGRES_CONTAINER_ABSENT"] = "1"
+    env["STUB_POSTGRES_VOLUME_LIST_STATUS"] = "47"
+    backend_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64
+    caddy_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64
+
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy.sh")), backend_ref, caddy_ref],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 47
+    assert "Unable to establish PostgreSQL volume absence; HOLD" in completed.stderr
+    log_lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert all(" stop worker caddy app" not in line for line in log_lines)
+    assert all(" up -d --pull never postgres" not in line for line in log_lines)
+    assert all(not line.startswith("backup ") for line in log_lines)
+
+
+def test_staging_deploy_migration_failure_keeps_app_and_caddy_stopped(tmp_path: Path) -> None:
+    env, log_file = _staging_deploy_fixture(tmp_path)
+    env["STUB_MIGRATION_FAILURE"] = "1"
+    backend_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64
+    caddy_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64
+
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy.sh")), backend_ref, caddy_ref],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 42
+    assert "Caddy and app remain stopped" in completed.stderr
+    log_lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert any(" stop worker caddy app" in line for line in log_lines)
+    assert any(" run --rm --no-deps app alembic upgrade head" in line for line in log_lines)
+    assert not any(" up -d --pull never app" in line for line in log_lines)
+    assert not any(" up -d --pull never caddy" in line for line in log_lines)
+
+
+def test_staging_deploy_treats_env_file_as_data_and_drops_registry_credentials(
+    tmp_path: Path,
+) -> None:
+    env, log_file = _staging_deploy_fixture(tmp_path)
+    project_dir = Path(env["PROJECT_DIR"])
+    command_marker = tmp_path / "env-was-executed"
+    with (project_dir / ".env").open("a", encoding="utf-8") as handle:
+        handle.write("COMPOSE_FILE=/tmp/attacker-compose.yaml\n")
+        handle.write(f'ENV_EXECUTION_PROBE=$(touch "{command_marker}")\n')
+
+    backend_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64
+    caddy_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy.sh")), backend_ref, caddy_ref],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert not command_marker.exists()
+    log_lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert all("/tmp/attacker-compose.yaml" not in line for line in log_lines)
+    logout_index = _assert_log_index(
+        log_lines,
+        predicate=lambda line: line == "docker logout ghcr.io",
+        message="missing registry logout",
+    )
+    backup_index = _assert_log_index(
+        log_lines, predicate=lambda line: line.startswith("backup "), message="missing backup"
+    )
+    assert logout_index < backup_index
+
+
+@pytest.mark.parametrize(
+    "invalid_boundary",
+    (
+        "env-symlink",
+        "env-mode",
+        "compose-symlink",
+        "caddy-symlink",
+        "prometheus-config-symlink",
+        "prometheus-rules-missing",
+        "prometheus-rules-symlink",
+        "prometheus-manifest-symlink",
+        "secret-dir-symlink",
+        "secret-file-symlink",
+        "secret-dir-mode",
+        "secret-file-mode",
+        "secret-dir-owner",
+        "secret-file-owner",
+        "helper-symlink",
+        "helper-mode",
+    ),
+)
+def test_staging_deploy_rejects_invalid_local_control_files_before_docker_side_effects(
+    tmp_path: Path,
+    invalid_boundary: str,
+) -> None:
+    env, log_file = _staging_deploy_fixture(tmp_path)
+    project_dir = Path(env["PROJECT_DIR"])
+    env_file = project_dir / ".env"
+    compose_file = project_dir / "docker-compose.staging.yaml"
+    caddyfile = project_dir / "Caddyfile"
+    prometheus_config = project_dir / "prometheus" / "prometheus.yml"
+    prometheus_rules = project_dir / "prometheus" / "alias-alerts.yml"
+    prometheus_manifest = project_dir / "prometheus" / "image-manifest.json"
+    secret_dir = project_dir / "secrets"
+    secret_file = secret_dir / "pulseplate_metrics_scrape_key"
+    backup_helper = Path(env["BACKUP_HELPER"])
+
+    if invalid_boundary == "env-symlink":
+        real_env = project_dir / ".env.real"
+        env_file.rename(real_env)
+        env_file.symlink_to(real_env)
+    elif invalid_boundary == "env-mode":
+        env["STUB_ENV_MODE"] = "644"
+    elif invalid_boundary == "compose-symlink":
+        real_compose = compose_file.with_suffix(".real")
+        compose_file.rename(real_compose)
+        compose_file.symlink_to(real_compose)
+    elif invalid_boundary == "caddy-symlink":
+        real_caddyfile = caddyfile.with_suffix(".real")
+        caddyfile.rename(real_caddyfile)
+        caddyfile.symlink_to(real_caddyfile)
+    elif invalid_boundary == "prometheus-config-symlink":
+        real_config = prometheus_config.with_suffix(".real")
+        prometheus_config.rename(real_config)
+        prometheus_config.symlink_to(real_config)
+    elif invalid_boundary == "prometheus-rules-missing":
+        prometheus_rules.unlink()
+    elif invalid_boundary == "prometheus-rules-symlink":
+        real_rules = prometheus_rules.with_suffix(".real")
+        prometheus_rules.rename(real_rules)
+        prometheus_rules.symlink_to(real_rules)
+    elif invalid_boundary == "prometheus-manifest-symlink":
+        real_manifest = prometheus_manifest.with_suffix(".real")
+        prometheus_manifest.rename(real_manifest)
+        prometheus_manifest.symlink_to(real_manifest)
+    elif invalid_boundary == "secret-dir-symlink":
+        real_secret_dir = project_dir / "secrets.real"
+        secret_dir.rename(real_secret_dir)
+        secret_dir.symlink_to(real_secret_dir, target_is_directory=True)
+    elif invalid_boundary == "secret-file-symlink":
+        real_secret_file = secret_dir / "pulseplate_metrics_scrape_key.real"
+        secret_file.rename(real_secret_file)
+        secret_file.symlink_to(real_secret_file)
+    elif invalid_boundary == "secret-dir-mode":
+        env["STUB_SECRET_DIR_METADATA"] = f"{os.geteuid()}:755"
+    elif invalid_boundary == "secret-file-mode":
+        env["STUB_SECRET_FILE_METADATA"] = f"{os.geteuid()}:400"
+    elif invalid_boundary == "secret-dir-owner":
+        env["STUB_SECRET_DIR_METADATA"] = "999:700"
+    elif invalid_boundary == "secret-file-owner":
+        env["STUB_SECRET_FILE_METADATA"] = "999:444"
+    elif invalid_boundary == "helper-symlink":
+        real_helper = backup_helper.with_suffix(".real")
+        backup_helper.rename(real_helper)
+        backup_helper.symlink_to(real_helper)
+    else:
+        backup_helper.chmod(0o777)
+        env["STUB_HELPER_MODE"] = "777"
+
+    backend_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64
+    caddy_ref = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy.sh")), backend_ref, caddy_ref],
+        cwd=str(REPO_ROOT),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert not log_file.exists()
+
+
+def test_staging_deploy_readiness_probe_has_per_request_timeout() -> None:
+    deploy_script = (_historical_deploy_script("scripts/deploy.sh")).read_text(encoding="utf-8")
+
+    assert "urlopen('http://localhost:8000/ready', timeout=5).read()" in deploy_script
+
+
+def test_obs1b_deploy_scripts_keep_canonical_guard_product_first_and_non_destructive() -> None:
+    staging_script = (_historical_deploy_script("scripts/deploy.sh")).read_text(encoding="utf-8")
+    production_script = (_historical_deploy_script("scripts/deploy_production.sh")).read_text(
+        encoding="utf-8"
+    )
+    canonical_guard = (
+        "from app.main import app; from app.security.production_invariants import "
+        "assert_production_runtime_invariants; assert_production_runtime_invariants(app=app)"
+    )
+    for script in (staging_script, production_script):
+        assert canonical_guard in script
+        assert "assert_production_runtime_invariants()" not in script
+        assert "|| true" not in script
+        assert "down -v" not in script
+        assert "volume rm" not in script
+        assert "volume prune" not in script
+        assert 'cat "$METRICS_SECRET_FILE"' not in script
+        assert 'source "$METRICS_SECRET_FILE"' not in script
+        assert script.index(canonical_guard) < script.index("alembic upgrade head")
+        assert "/bin/promtool check ready" in script
+        assert "/bin/promtool check healthy" in script
+    assert staging_script.index("up -d --pull never caddy") < staging_script.index(
+        "up -d --pull never prometheus"
+    )
+    assert production_script.index("up -d --remove-orphans caddy") < production_script.index(
+        "up -d --pull never prometheus"
+    )
+
+
+@pytest.mark.parametrize("pytest_exit", (0, 23))
+def test_cd_pgvector_admission_executes_complete_canonical_suite_and_propagates_failure(
+    pytest_exit: int,
+) -> None:
+    ci = yaml.safe_load((REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
+    cd = yaml.safe_load(CD_WORKFLOW_PATH.read_text(encoding="utf-8"))
+    canonical = next(
+        step["run"]
+        for step in ci["jobs"]["pgvector_compat"]["steps"]
+        if step["name"] == "Prove pgvector binding, extension, and RLS compatibility"
+    )
+    step = cd["jobs"]["postgres-pgvector-ci-admission"]["steps"][-1]
+    actual = step["run"]
+    marker = "python -m pytest -q"
+    assert canonical.count(marker) == actual.count(marker) == 1
+    targets = shlex.split(canonical.split(marker, maxsplit=1)[1].replace("\\\n", " "))
+    assert shlex.split(actual.split(marker, maxsplit=1)[1].replace("\\\n", " ")) == targets
+    assert all(target.startswith("tests/") and target.endswith(".py") for target in targets)
+    bash_bin = shutil.which("bash")
+    assert bash_bin is not None
+    prefix = (
+        "set -euo pipefail\n"
+        'git() { test "$*" = "rev-parse HEAD"; printf "%s\\n" "$GITHUB_SHA"; }\n'
+        "python() {\n"
+        '  test "$CI:$GITHUB_ACTIONS:$APP_ENV:$ENVIRONMENT:$PGVECTOR_COMPAT_REQUIRED" '
+        '= "true:true:test:test:1"\n'
+        '  printf "%s\\n" "$@"\n'
+        '  return "$PYTEST_STUB_EXIT"\n'
+        "}\n"
+    )
+    completed = subprocess.run(
+        [bash_bin, "-c", prefix + actual],
+        env={
+            "PATH": os.defpath,
+            **step["env"],
+            "GITHUB_EVENT_NAME": "push",
+            "GITHUB_REF": "refs/heads/main",
+            "GITHUB_REPOSITORY": "Katsiarynakavaleuskaya/PulsePlate",
+            "GITHUB_SHA": "a" * 40,
+            "PYTEST_STUB_EXIT": str(pytest_exit),
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.stdout.splitlines() == ["-m", "pytest", "-q", *targets]
+    assert completed.returncode == pytest_exit, completed.stderr
+
+
+def test_signed_apk_index_size_exception_preserves_unrelated_file_limit() -> None:
+    """The reviewed signed index must not raise the repository-wide 500KB default."""
+    import re
+
+    config = yaml.safe_load((REPO_ROOT / ".pre-commit-config.yaml").read_text())
+    hooks = [
+        hook
+        for repo in config["repos"]
+        for hook in repo["hooks"]
+        if hook["id"] == "check-added-large-files"
+    ]
+    assert len(hooks) == 2
+    normal, index = hooks
+    assert normal.get("args", []) == []
+    assert index["args"] == ["--maxkb=2048", "--enforce-all"]
+    index_path = "deploy/postgres-pgvector/builder-apk-index.tar.gz"
+    for path in (index_path, index_path + ".extra", "unrelated.bin", "deploy/other/index.tar.gz"):
+        selected = [
+            hook
+            for hook in hooks
+            if re.search(hook.get("files", ""), path)
+            and not re.search(hook.get("exclude", "^$"), path)
+        ]
+        assert len(selected) == 1
+        assert (selected[0] is index) == (path == index_path)
+
+
+@pytest.mark.parametrize("scenario", ["ready-after-init", "never-ready", "output-with-error"])
+def test_postgres_runtime_waits_for_final_tcp_database_before_sql(
+    tmp_path: Path, scenario: str
+) -> None:
+    """The init-only Unix server can accept connections before the database exists."""
+    workflow = yaml.safe_load(CD_WORKFLOW_PATH.read_text())
+    steps = workflow["jobs"]["postgres-pgvector-publish"]["steps"]
+    run = next(
+        step["run"]
+        for step in steps
+        if step.get("name") == "Prove PostgreSQL 15 pgvector 0.8.6 and same-volume continuity"
+    )
+    start = run.split("start_postgres() {", 1)[1].split("\n}\n", 1)[0]
+    shell = shutil.which("bash")
+    assert shell is not None
+    # Calls one and two model the init-only server; the third exposes the final TCP DB.
+    program = (
+        r"""
+set -euo pipefail
+database_user=synthetic_user
+database_password=synthetic_password
+database_name=pgvector_compat
+prefix=owned_prefix
+sleep() { :; }
+docker() {
+  printf '%s\n' "$*" >> "$CALLS"
+  if [ "$1" = run ]; then return 0; fi
+  if [ "$1" = logs ]; then return 0; fi
+  if [[ "$*" == *pg_isready* ]]; then return 0; fi
+  if [[ "$*" == *'--command SELECT 1'* ]]; then
+    [[ "$*" == *'--host 127.0.0.1'* ]] || return 9
+    [[ "$*" == *'--dbname pgvector_compat'* ]] || return 9
+    local n
+    n="$(cat "$STATE")"
+    n=$((n + 1))
+    printf '%s' "$n" > "$STATE"
+    if [ "$SCENARIO" = never-ready ]; then return 2; fi
+    if [ "$SCENARIO" = output-with-error ]; then printf '1\n'; return 2; fi
+    if [ "$n" -lt 3 ]; then return 2; fi
+    printf '1\n'
+    return 0
+  fi
+  return 1
+}
+start_postgres() {"""
+        + start
+        + r"""
+}
+start_postgres owned_container owned_volume owned_image
+test "$(cat "$STATE")" = 3
+"""
+    )
+    state = tmp_path / "state"
+    state.write_text("0")
+    calls = tmp_path / "calls"
+    result = subprocess.run(
+        [shell, "-c", program],
+        env={**os.environ, "STATE": str(state), "CALLS": str(calls), "SCENARIO": scenario},
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    if scenario == "ready-after-init":
+        assert result.returncode == 0, result.stderr
+        assert calls.read_text().count("--command SELECT 1") == 3
+    else:
+        assert result.returncode != 0
+        assert "Synthetic PostgreSQL image did not become ready" in result.stderr
+        assert calls.read_text().count("--command SELECT 1") == 60
+    assert "pg_isready" not in calls.read_text()
+
+
+@pytest.mark.parametrize(
+    "oracle,value,message",
+    [
+        ("STUB_ATTESTATION_STATUS", "1", "Native attestation crypto rejected"),
+        ("STUB_BACKEND_IDS", "0:0", "Backend runtime user differs"),
+    ],
+)
+def test_staging_crypto_and_passfile_owner_rejection_precede_product_mutation(
+    tmp_path: Path, oracle: str, value: str, message: str
+) -> None:
+    env, log_file = _staging_deploy_fixture(tmp_path)
+    env[oracle] = value
+    backend = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64
+    caddy = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64
+    completed = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy.sh")), backend, caddy],
+        env=env,
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode != 0
+    assert message in completed.stderr
+    assert all(
+        " stop worker caddy app" not in line
+        and " up " not in line
+        and not line.startswith("backup ")
+        for line in log_file.read_text().splitlines()
+    )
+
+
+def test_staging_backup_full_archive_failure_preserves_old_dump_and_no_publication(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "staging"
+    project.mkdir()
+    _write_backup_prometheus_manifest(project)
+    _write_stage_native_oracles(project)
+    docker = tmp_path / "docker"
+    _write_executable(docker, "#!/usr/bin/env bash\nset -euo pipefail\nprintf 'FAKE_BACKUP\\n'\n")
+    old = project / "backups" / "pulseplate_old.dump"
+    old.write_text("preserve-old-native-dump")
+    env = {
+        **os.environ,
+        "PROJECT_DIR": str(project),
+        "BACKUP_DIR": str(old.parent),
+        "COMPOSE_FILE": "docker-compose.staging.yaml",
+        "DOCKER_BIN": str(docker),
+        "PYTHON_BIN": sys.executable,
+        "PYTHONPATH": str(REPO_ROOT),
+        "POSTGRES_USER": "pulseplate",
+        "POSTGRES_DB": "pulseplate",
+        "STUB_PG_RESTORE_BODY_STATUS": "51",
+    }
+    completed = subprocess.run(
+        [str(REPO_ROOT / "scripts/ops/postgres_backup.sh")],
+        env=env,
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 51
+    assert "Backup created:" not in completed.stdout
+    assert list(old.parent.glob("pulseplate_*.dump")) == [old]
+    assert old.read_text() == "preserve-old-native-dump"
+    assert not list(old.parent.glob(".pulseplate-backup.*"))
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        (),
+        ("file.dump",),
+        ("--verify-into", "pulseplate", "file.dump"),
+        ("--verify-into", "arbitrary_target", "file.dump"),
+        ("--replace-existing", "pulseplate", "file.dump"),
+        *[
+            ("--replace-existing", "pulseplate_restore_check_" + kind, "file.dump")
+            for kind in ("ordinary", "publication", "nonpublic", "global")
+        ],
+        ("--unknown", "pulseplate_restore_check_01", "file.dump"),
+        ("--verify-into", "pulseplate_restore_check_bad-name", "file.dump"),
+    ],
+)
+def test_restore_requires_explicit_isolated_target_before_native_mutation(
+    tmp_path: Path, arguments: tuple[str, ...]
+) -> None:
+    docker = tmp_path / "docker"
+    log = tmp_path / "docker.log"
+    _write_executable(docker, f"#!/usr/bin/env bash\nprintf 'mutation\\n' >> '{log}'\n")
+    completed = subprocess.run(
+        [str(REPO_ROOT / "scripts/ops/postgres_restore.sh"), *arguments],
+        env={
+            **os.environ,
+            "POSTGRES_USER": "pulseplate",
+            "POSTGRES_DB": "pulseplate",
+            "DOCKER_BIN": str(docker),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 2
+    assert not log.exists()
+
+
+@pytest.mark.parametrize("tls_status", [0, 61])
+def test_existing_staging_passfile_authentication_precedes_all_product_stops(
+    tmp_path: Path, tls_status: int
+) -> None:
+    env, log_file = _staging_deploy_fixture(tmp_path)
+    env["STUB_APPLICATION_TLS_STATUS"] = str(tls_status)
+    backend = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64
+    caddy = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64
+    result = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy.sh")), backend, caddy],
+        env=env,
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    calls = log_file.read_text().splitlines()
+    tls_calls = [i for i, call in enumerate(calls) if "psycopg.connect" in call]
+    assert tls_calls and "connect_timeout=10" in calls[tls_calls[0]]
+    if tls_status:
+        assert result.returncode == tls_status
+        assert (
+            "HOLD for an explicit verified credential/TLS migration before quiescence"
+            in result.stderr
+        )
+        assert all(
+            " stop " not in call and " up " not in call and not call.startswith("backup ")
+            for call in calls
+        )
+    else:
+        assert result.returncode == 0, result.stderr
+        stop = next(i for i, call in enumerate(calls) if " stop worker caddy app" in call)
+        assert tls_calls[0] < stop < tls_calls[-1]
+
+
+def test_generic_and_staging_backup_units_keep_their_distinct_storage_contracts() -> None:
+    generic = (REPO_ROOT / "deploy/systemd/pulseplate-postgres-backup.service.example").read_text()
+    staging = (
+        REPO_ROOT / "deploy/systemd/pulseplate-staging-postgres-backup.service.example"
+    ).read_text()
+    assert "COMPOSE_FILE=docker-compose.production.selfhosted.yaml" in generic
+    assert "check_staging_security.py" not in generic
+    assert (
+        "RequiresMountsFor=/mnt/pulseplate-staging-data /srv/pulseplate-staging/secrets" in staging
+    )
+    assert (
+        "BindsTo=mnt-pulseplate\\x2dstaging\\x2ddata.mount srv-pulseplate\\x2dstaging-secrets.mount"
+        in staging
+    )
+    assert "COMPOSE_FILE=docker-compose.staging.yaml" in staging
+    assert "--storage-only" in staging
+    assert (
+        "systemd/pulseplate-staging-postgres-backup.service.example"
+        in (REPO_ROOT / "docs/deploy/STAGING.md").read_text()
+    )
+
+
+def test_verification_restore_selects_source_database_when_role_name_differs(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "production"
+    project.mkdir()
+    _write_backup_prometheus_manifest(project)
+    dump = tmp_path / "input.dump"
+    dump.write_text("synthetic archive")
+    docker = tmp_path / "docker"
+    calls = tmp_path / "calls"
+    _write_executable(
+        docker,
+        f'#!/usr/bin/env bash\nset -euo pipefail\nprintf "%s\\n" "$*" >> "{calls}"\n',
+    )
+    result = subprocess.run(
+        [
+            str(REPO_ROOT / "scripts/ops/postgres_restore.sh"),
+            "--verify-into",
+            "pulseplate_restore_check_distinct",
+            str(dump),
+        ],
+        env={
+            **os.environ,
+            "PYTHON_BIN": sys.executable,
+            "PROJECT_DIR": str(project),
+            "DOCKER_BIN": str(docker),
+            "POSTGRES_USER": "application_role",
+            "POSTGRES_DB": "application_database",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    create = next(call for call in calls.read_text().splitlines() if "createdb" in call)
+    assert (
+        "createdb -U application_role --maintenance-db application_database --owner application_role --template=template0 pulseplate_restore_check_distinct"
+        in create
+    )
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_status", "last_operation"),
+    [
+        ("none", 0, "psql"),
+        ("unreadable-list", 41, "list"),
+        ("empty-inventory", 1, "list"),
+        ("unreadable-body", 42, "decode"),
+        ("existing-target", 43, "createdb"),
+        ("late-sql", 44, "restore"),
+        ("extra-table", 1, "psql"),
+        ("missing-table", 1, "psql"),
+    ],
+)
+def test_verification_restore_rejects_each_failed_stage_without_deletion_or_success(
+    tmp_path: Path, failure: str, expected_status: int, last_operation: str
+) -> None:
+    project = tmp_path / "production"
+    project.mkdir()
+    _write_backup_prometheus_manifest(project)
+    dump = tmp_path / "input.dump"
+    dump.write_text("synthetic archive")
+    docker, calls = tmp_path / "native-docker", tmp_path / "calls"
+    _write_executable(
+        docker,
+        r"""#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$RESTORE_CALLS"
+case "$*" in
+  *pg_restore\ --list*)
+    [ "$RESTORE_FAILURE" != unreadable-list ] || exit 41
+    if [ "$RESTORE_FAILURE" = empty-inventory ]; then exit 0; fi
+    printf '214; 1259 16387 TABLE public items user\n'
+    ;;
+  *pg_restore\ --file=/dev/null*)
+    [ "$RESTORE_FAILURE" != unreadable-body ] || exit 42
+    cat >/dev/null
+    ;;
+  *createdb*)
+    [ "$RESTORE_FAILURE" != existing-target ] || exit 43
+    ;;
+  *pg_restore*)
+    cat >/dev/null
+    [ "$RESTORE_FAILURE" != late-sql ] || exit 44
+    ;;
+  *psql*)
+    case "$RESTORE_FAILURE" in
+      extra-table) printf '2\n' ;;
+      missing-table) printf '0\n' ;;
+      *) printf '1\n' ;;
+    esac
+    ;;
+  *) exit 99 ;;
+esac
+""",
+    )
+    result = subprocess.run(
+        [
+            str(REPO_ROOT / "scripts/ops/postgres_restore.sh"),
+            "--verify-into",
+            "pulseplate_restore_check_new",
+            str(dump),
+        ],
+        env={
+            **os.environ,
+            "PYTHON_BIN": sys.executable,
+            "PROJECT_DIR": str(project),
+            "DOCKER_BIN": str(docker),
+            "POSTGRES_USER": "role",
+            "POSTGRES_DB": "source_database",
+            "COMPOSE_FILE": "selected.yaml",
+            "ENV_FILE": "selected.env",
+            "RESTORE_CALLS": str(calls),
+            "RESTORE_FAILURE": failure,
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == expected_status, result.stderr
+    operations = calls.read_text().splitlines()
+    assert all(
+        f"--env-file {project}/selected.env --project-directory {project} -f {project}/selected.yaml exec -T postgres"
+        in call
+        for call in operations
+    )
+    expected_order = ["list", "decode", "createdb", "restore", "psql"]
+    assert len(operations) == expected_order.index(last_operation) + 1
+    assert all("DROP " not in call and "dropdb" not in call for call in operations)
+    if len(operations) >= 3:
+        assert (
+            "createdb -U role --maintenance-db source_database --owner role --template=template0 pulseplate_restore_check_new"
+            in operations[2]
+        )
+    if len(operations) >= 4:
+        assert (
+            "pg_restore -U role -d pulseplate_restore_check_new --exit-on-error --single-transaction --clean --if-exists"
+            in operations[3]
+        )
+    assert ("Restore completed" in result.stdout) is (failure == "none")
+
+
+@pytest.mark.parametrize("archive_kind", ["absent", "empty", "symlink", "directory"])
+def test_verification_restore_rejects_invalid_archive_paths_before_compose(
+    tmp_path: Path, archive_kind: str
+) -> None:
+    dump = tmp_path / "archive"
+    if archive_kind == "empty":
+        dump.touch()
+    elif archive_kind == "directory":
+        dump.mkdir()
+    elif archive_kind == "symlink":
+        real = tmp_path / "real"
+        real.write_text("dump")
+        dump.symlink_to(real)
+    docker, calls = tmp_path / "native-docker", tmp_path / "calls"
+    _write_executable(docker, f"#!/usr/bin/env bash\nprintf 'called' > '{calls}'\n")
+    result = subprocess.run(
+        [
+            str(REPO_ROOT / "scripts/ops/postgres_restore.sh"),
+            "--verify-into",
+            "pulseplate_restore_check_new",
+            str(dump),
+        ],
+        env={
+            **os.environ,
+            "DOCKER_BIN": str(docker),
+            "POSTGRES_USER": "role",
+            "POSTGRES_DB": "source",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 1
+    assert "nonempty regular non-symlink" in result.stderr
+    assert not calls.exists()
+
+
+@pytest.mark.parametrize(
+    "compose_path",
+    [
+        "docker-compose.staging.yaml",
+        "./docker-compose.staging.yaml",
+        "config/docker-compose.staging.yaml",
+    ],
+)
+def test_reserved_staging_compose_paths_cannot_bypass_encrypted_backup_destination(
+    tmp_path: Path, compose_path: str
+) -> None:
+    project = tmp_path / "staging"
+    project.mkdir()
+    _write_stage_native_oracles(project)
+    docker = tmp_path / "docker"
+    _write_executable(docker, "#!/usr/bin/env bash\nset -euo pipefail\nprintf 'FAKE_BACKUP\\n'\n")
+    unencrypted = tmp_path / "other-backups"
+    result = subprocess.run(
+        [str(REPO_ROOT / "scripts/ops/postgres_backup.sh")],
+        env={
+            **os.environ,
+            "PROJECT_DIR": str(project) + "/",
+            "COMPOSE_FILE": compose_path,
+            "BACKUP_DIR": str(unencrypted),
+            "DOCKER_BIN": str(docker),
+            "PYTHON_BIN": sys.executable,
+            "POSTGRES_USER": "role",
+            "POSTGRES_DB": "database",
+            "PYTHONPATH": str(REPO_ROOT),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 1
+    assert "Staging backup destination must be the admitted encrypted directory" in result.stderr
+    assert not unencrypted.exists()
+
+
+def test_production_custom_name_containing_staging_does_not_select_reserved_contract(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "production-staging-reference"
+    project.mkdir()
+    _write_backup_prometheus_manifest(project)
+    docker = tmp_path / "docker"
+    _write_executable(docker, "#!/usr/bin/env bash\nset -euo pipefail\nprintf 'FAKE_BACKUP\\n'\n")
+    result = subprocess.run(
+        [str(REPO_ROOT / "scripts/ops/postgres_backup.sh")],
+        env={
+            **os.environ,
+            "PYTHON_BIN": sys.executable,
+            "PROJECT_DIR": str(project),
+            "COMPOSE_FILE": "docker-compose.production-staging.yaml",
+            "DOCKER_BIN": str(docker),
+            "POSTGRES_USER": "role",
+            "POSTGRES_DB": "database",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "Backup created:" in result.stdout
+
+
+@pytest.mark.parametrize("matches_selected_name", [True, False])
+def test_staging_deploy_binds_running_container_to_selected_v5_volume_name(
+    tmp_path: Path, matches_selected_name: bool
+) -> None:
+    env, log_file = _staging_deploy_fixture(tmp_path)
+    rendered = json.loads(env["STUB_PROMETHEUS_COMPOSE_JSON"])
+    selected_name = "pulseplate-staging_postgres_data_v5"
+    rendered["volumes"]["postgres_data"]["name"] = selected_name
+    rendered["volumes"]["prometheus_data"]["name"] = "pulseplate-staging_prometheus_data_v5"
+    rendered["services"]["postgres"]["volumes"][0]["source"] = "postgres_data"
+    env["STUB_PROMETHEUS_COMPOSE_JSON"] = json.dumps(rendered)
+    inspected = json.loads(FAKE_POSTGRES_CONTAINER_INSPECT_JSON)
+    manifest = json.loads(POSTGRES_MANIFEST_PATH.read_text())
+    inspected[0]["Config"]["Image"] = POSTGRES_RUNTIME_REF
+    inspected[0]["Image"] = manifest["config_digest"]
+    inspected[0]["Mounts"][0]["Name"] = (
+        selected_name if matches_selected_name else "pulseplate-staging_postgres_data"
+    )
+    env["STUB_POSTGRES_CONTAINER_INSPECT_JSON"] = json.dumps(inspected)
+    backend = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64
+    caddy = "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64
+    result = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy.sh")), backend, caddy],
+        env=env,
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    calls = log_file.read_text().splitlines()
+    if matches_selected_name:
+        assert result.returncode == 0, result.stderr
+        assert any(call.startswith("backup ") for call in calls)
+        assert any(" up -d --pull never postgres" in call for call in calls)
+    else:
+        assert result.returncode == 1
+        assert (
+            "Existing PostgreSQL volume does not match rendered Compose identity" in result.stderr
+        )
+        assert all(
+            " stop " not in call and " up " not in call and not call.startswith("backup ")
+            for call in calls
+        )
+
+
+@pytest.mark.parametrize("when", ["before-quiesce", "after-quiesce"])
+def test_staging_populated_backing_without_volume_object_never_starts_postgres(
+    tmp_path: Path, when: str
+) -> None:
+    env, log_file = _staging_deploy_fixture(tmp_path)
+    env["STUB_POSTGRES_CONTAINER_ABSENT"] = "1"
+    backing = tmp_path / "staging" / "synthetic-storage" / "postgres"
+    if when == "before-quiesce":
+        (backing / ".retained").touch()
+    else:
+        env["STUB_BACKING_APPEARS_AFTER_FIRST"] = "1"
+    completed = subprocess.run(
+        [
+            str(_historical_deploy_script("scripts/deploy.sh")),
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64,
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64,
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 1, completed.stderr
+    assert "populated" in completed.stderr
+    log_lines = log_file.read_text().splitlines()
+    assert all(" up -d --pull never postgres" not in line for line in log_lines)
+    assert any(" stop worker caddy app" in line for line in log_lines) is (when == "after-quiesce")
+    assert all(not line.startswith("backup ") for line in log_lines)
+    assert list(backing.iterdir())
+
+
+def test_prometheus_census_is_repeated_immediately_before_service_recreation() -> None:
+    script = (_historical_deploy_script("scripts/deploy.sh")).read_text()
+    start = script.index('if "${COMPOSE[@]}" up -d --pull never prometheus; then')
+    gate = script.rindex("validate_staging_database_binding --storage-only", 0, start)
+    assert script[gate:start].splitlines() == [
+        "validate_staging_database_binding --storage-only",
+        'echo "Starting Prometheus after complete product health"',
+    ]
+    assert script.index("validate_staging_database_binding\n") < script.index(
+        '"${COMPOSE[@]}" stop worker caddy app'
+    )
+
+
+@pytest.mark.parametrize("profiles", [None, "scheduler-external, alerting"])
+def test_staging_promtool_preflight_does_not_create_a_service_data_volume(
+    tmp_path: Path, profiles: str | None
+) -> None:
+    bash = shutil.which("bash")
+    assert bash
+    script = (_historical_deploy_script("scripts/deploy.sh")).read_text()
+    start = script.index(
+        '"$DOCKER_BIN" run', script.index('echo "Validating the exact Prometheus configuration')
+    )
+    end = script.index('\necho "Invoking the canonical application', start)
+    launcher_start = script.index("run_trusted_contract() {")
+    launcher_end = script.index("\nvalidate_prometheus_image_manifest() {", launcher_start)
+    selector_start = script.index("alertmanager_selected() {")
+    selector_end = script.index("\n}\n", selector_start) + len("\n}\n")
+    argv_file = tmp_path / "argv.jsonl"
+    docker = tmp_path / "docker-argv-capture"
+    _write_executable(
+        docker,
+        f"#!{sys.executable}\nimport json, sys\nfrom pathlib import Path\n"
+        f"with Path({str(argv_file)!r}).open('a') as log: "
+        "log.write(json.dumps(sys.argv[1:]) + '\\n')\n",
+    )
+    env = {
+        **os.environ,
+        "DOCKER_BIN": str(docker),
+        "PYTHON_BIN": sys.executable,
+        "PROJECT_DIR": str(tmp_path),
+        "ALERTMANAGER_CONTRACT_HELPER": str(_historical_AM_helper()),
+        "ALERTMANAGER_CASE": "accepted",
+        "PROMETHEUS_RUNTIME_REF": PROMETHEUS_RUNTIME_REF,
+        "PROMETHEUS_CONFIG": str(tmp_path / "config.yml"),
+        "PROMETHEUS_RULES": str(tmp_path / "alias-alerts.yml"),
+        "ALERTMANAGER_CONFIG": str(tmp_path / "alertmanager.yml"),
+        "ALERTMANAGER_RUNTIME_REF": ALERTMANAGER_RUNTIME_REF,
+        "ALERTMANAGER_SELECTION": "selected" if profiles is not None else "off",
+        "METRICS_SECRET_FILE": str(tmp_path / "key"),
+    }
+    env.pop("COMPOSE_PROFILES", None)
+    if profiles is not None:
+        env["COMPOSE_PROFILES"] = profiles
+    completed = subprocess.run(
+        [
+            bash,
+            "-euc",
+            script[launcher_start:launcher_end]
+            + script[selector_start:selector_end]
+            + script[start:end],
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    commands = [json.loads(line) for line in argv_file.read_text().splitlines()]
+    assert len(commands) == (3 if profiles is not None else 2)
+    config_argv, rules_argv = commands[:2]
+    assert config_argv[:10] == [
+        "run",
+        "--rm",
+        "--pull",
+        "never",
+        "--platform",
+        "linux/amd64",
+        "--network",
+        "none",
+        "--read-only",
+        "--user",
+    ]
+    for argv in commands:
+        assert "compose" not in argv and "--volume" not in argv and "-v" not in argv
+    mounts = [config_argv[index + 1] for index, arg in enumerate(config_argv) if arg == "--mount"]
+    assert mounts == [
+        f"type=bind,source={tmp_path}/config.yml,target=/etc/prometheus/prometheus.yml,readonly",
+        f"type=bind,source={tmp_path}/alias-alerts.yml,target=/etc/prometheus/alias-alerts.yml,readonly",
+        f"type=bind,source={tmp_path}/key,target=/run/secrets/pulseplate_metrics_scrape_key,readonly",
+    ]
+    assert config_argv[-6:] == [
+        "--entrypoint",
+        "/bin/promtool",
+        PROMETHEUS_RUNTIME_REF,
+        "check",
+        "config",
+        "/etc/prometheus/prometheus.yml",
+    ]
+    assert rules_argv[-6:] == [
+        "--entrypoint",
+        "/bin/promtool",
+        PROMETHEUS_RUNTIME_REF,
+        "check",
+        "rules",
+        "/etc/prometheus/alias-alerts.yml",
+    ]
+    if profiles is not None:
+        assert commands[2][-3:] == [
+            ALERTMANAGER_RUNTIME_REF,
+            "check-config",
+            "/etc/alertmanager/alertmanager.yml",
+        ]
+
+
+@pytest.mark.parametrize("when", ["before-quiesce", "after-quiesce"])
+def test_staging_legacy_orphan_or_late_volume_is_not_fresh(tmp_path: Path, when: str) -> None:
+    env, log_file = _staging_deploy_fixture(tmp_path)
+    env["STUB_POSTGRES_CONTAINER_ABSENT"] = "1"
+    if when == "before-quiesce":
+        env["STUB_POSTGRES_VOLUME_LIST_OUTPUT"] = "pulseplate-staging_postgres_data\n"
+    else:
+        env["STUB_POSTGRES_VOLUME_LIST_COUNTER_FILE"] = str(tmp_path / "volume-count")
+        env["STUB_POSTGRES_VOLUME_LIST_OUTPUT_AFTER_FIRST"] = "pulseplate-staging_postgres_data\n"
+    result = subprocess.run(
+        [
+            str(_historical_deploy_script("scripts/deploy.sh")),
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64,
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64,
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 1
+    assert "volume exists without one trustworthy running container" in result.stderr
+    lines = log_file.read_text().splitlines()
+    assert all(" up -d --pull never postgres" not in line for line in lines)
+    assert any(" stop worker caddy app" in line for line in lines) is (when == "after-quiesce")
+
+
+@pytest.mark.parametrize(
+    "status,build,binding,download,expected",
+    [
+        ("200", True, True, "empty-presence", 0),
+        ("404", True, True, "empty-presence", 0),
+        ("404", False, True, "empty-presence", 1),
+        ("404", True, False, "empty-presence", 1),
+        ("200", False, True, "empty-presence", 1),
+        ("403", True, True, "empty-presence", 1),
+        ("500", True, True, "empty-presence", 1),
+        ("network", True, True, "empty-presence", 7),
+        ("200", True, True, "native", 0),
+        ("200", True, True, "missing", 1),
+        ("200", True, True, "failed", 1),
+    ],
+)
+def test_shared_pgvector_presence_shell_runs_real_inventory_cli(
+    tmp_path: Path, status: str, build: bool, binding: bool, download: str, expected: int
+) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "python3").symlink_to(sys.executable)
+    _write_executable(
+        bin_dir / "curl",
+        f"""#!{sys.executable}
+import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+if os.environ["CASE_STATUS"] == "network":
+    sys.exit(7)
+Path(args[args.index("--output") + 1]).write_text(json.dumps({{"attestations": [] if os.environ["CASE_DOWNLOAD"] == "empty-presence" else [{{"bundle_url": "opaque"}}]}}))
+print(os.environ["CASE_STATUS"], end="")
+""",
+    )
+    _write_executable(
+        bin_dir / "gh",
+        f"""#!{sys.executable}
+import base64, json, os, sys
+from pathlib import Path
+if sys.argv[1:] == ["--version"]:
+    print("gh version test-native-fixture")
+    sys.exit(0)
+assert sys.argv[1:3] == ["attestation", "download"]
+assert sys.argv[-2:] == ["--limit", "100"]
+Path(os.environ["DOWNLOAD_CALLED"]).write_text("called")
+if os.environ["CASE_DOWNLOAD"] == "failed":
+    sys.exit(1)
+if os.environ["CASE_DOWNLOAD"] == "native":
+    digest = sys.argv[3].split("@", 1)[1]
+    record = {{"dsseEnvelope": {{"payload": base64.b64encode(json.dumps({{"subject": [], "predicateType": "unrelated"}}).encode()).decode()}}}}
+    Path(digest + ".jsonl").write_text(json.dumps(record) + "\\n")
+""",
+    )
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(POSTGRES_MANIFEST_PATH.read_text())
+    sbom = tmp_path / "sbom.json"
+    sbom.write_text('{"spdxVersion":"SPDX-2.3"}')
+    result = tmp_path / "decision.json"
+    repo = "Katsiarynakavaleuskaya/PulsePlate"
+    sha = "a" * 40
+    env = {
+        **os.environ,
+        "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"],
+        "GH_TOKEN": "synthetic-test-token",
+        "GITHUB_REPOSITORY": repo,
+        "GITHUB_SHA": sha,
+        "GITHUB_RUN_ID": "1",
+        "GITHUB_RUN_ATTEMPT": "1",
+        "RUNNER_TEMP": str(tmp_path),
+        "CASE_STATUS": status,
+        "CASE_DOWNLOAD": download,
+        "DOWNLOAD_CALLED": str(tmp_path / "download-called"),
+    }
+    args = [
+        shutil.which("bash"),
+        str(REPO_ROOT / "scripts/ci/classify_pgvector_attestations.sh"),
+        str(manifest),
+        str(result),
+    ]
+    if build:
+        args += [
+            "--current-build",
+            "--sbom",
+            str(sbom),
+            "--source-sha",
+            sha if binding else "b" * 40,
+            "--run-invocation-uri",
+            "https://github.com/" + repo + "/actions/runs/1/attempts/1",
+        ]
+    completed = subprocess.run(
+        args, cwd=REPO_ROOT, env=env, text=True, capture_output=True, check=False
+    )
+    assert completed.returncode == expected, completed.stderr
+    assert not list(tmp_path.glob("pulseplate-pgvector-attestations.*"))
+    assert (tmp_path / "download-called").exists() == (
+        status == "200" and download != "empty-presence"
+    )
+    if expected == 0:
+        decision = json.loads(result.read_text())
+        assert all(
+            decision[key] == "create"
+            for key in ("mode", "provenance_mode", "materials_mode", "sbom_mode")
+        )
+        assert decision["source_sha"] == sha
+    else:
+        assert not result.exists()
+
+
+@pytest.mark.parametrize("scheduler_mode", ["external", "disabled"])
+@pytest.mark.parametrize(
+    "fault",
+    [
+        None,
+        "missing-worker",
+        "sslmode",
+        "ca",
+        "passfile",
+        "identity",
+        "password",
+        "config-failure",
+        "malformed",
+    ],
+)
+def test_staging_security_config_includes_profiled_worker_without_activation(
+    tmp_path: Path, scheduler_mode: str, fault: str | None
+) -> None:
+    env, log_file = _staging_deploy_fixture(tmp_path)
+    env["FOOD_UPDATE_SCHEDULER_MODE"] = scheduler_mode
+    env.pop("COMPOSE_PROFILES", None)
+    payload = json.loads(env["STUB_PROMETHEUS_COMPOSE_JSON"])
+    worker = payload["services"]["worker"]["environment"]
+    if fault == "missing-worker":
+        payload["services"].pop("worker")
+    elif fault == "password":
+        worker["PGPASSWORD"] = "test-only"  # pragma: allowlist secret - synthetic rejection fixture
+    elif fault in ("sslmode", "ca", "passfile", "identity"):
+        old, replacement = {
+            "sslmode": ("sslmode=verify-full", "sslmode=require"),
+            "ca": ("sslrootcert=/run/secrets/postgres_ca", "sslrootcert=/wrong/ca"),
+            "passfile": ("passfile=/run/secrets/postgres_pgpass", "passfile=/wrong/passfile"),
+            "identity": ("@postgres:5432/", "@other:5432/"),
+        }[fault]
+        assert old in worker["DATABASE_URL"]
+        worker["DATABASE_URL"] = worker["DATABASE_URL"].replace(old, replacement)
+    env["STUB_PROMETHEUS_COMPOSE_JSON"] = (
+        "not-json" if fault == "malformed" else json.dumps(payload)
+    )
+    if fault == "config-failure":
+        env["STUB_COMPOSE_CONFIG_STATUS"] = "37"
+    result = subprocess.run(
+        [
+            str(_historical_deploy_script("scripts/deploy.sh")),
+            "--preflight-only",
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64,
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64,
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert (result.returncode == 0) is (fault is None), result.stderr
+    log = log_file.read_text().splitlines()
+    profile_commands = [line for line in log if "--profile" in line]
+    if fault not in ("config-failure", "malformed"):
+        assert profile_commands
+        assert any(line.endswith("--profile * config --format json") for line in profile_commands)
+        assert all(
+            line.endswith("--profile * config --format json")
+            or line.endswith("--profile alerting config --format json")
+            for line in profile_commands
+        )
+    assert not any(" up " in line or " start " in line or " pull " in line for line in log)
+    assert (
+        "Staging deploy preflight passed" in result.stdout
+        if fault is None
+        else "Staging deploy preflight passed" not in result.stdout
+    )
+
+
+def test_staging_security_caller_uses_exact_config_only_profile_arguments(tmp_path: Path) -> None:
+    source = (_historical_deploy_script("scripts/deploy.sh")).read_text()
+    body = source.split("validate_staging_database_binding() {\n", 1)[1].split("\n}\n", 1)[0]
+    bash = shutil.which("bash")
+    assert bash is not None
+    program = (
+        """set -euo pipefail
+fake_docker() {
+  [ "$#" -eq 10 ] && [ "$1" = compose ] && [ "$2" = --env-file ] &&
+  [ "$3" = selected.env ] && [ "$4" = -f ] && [ "$5" = selected.yaml ] &&
+  [ "$6" = --profile ] && [ "$7" = '*' ] && [ "$8" = config ] &&
+  [ "$9" = --format ] && [ "${10}" = json ] || return 99
+  printf '{"services":{"worker":{}}}\\n'
+}
+fake_checker() {
+  [ "$#" -eq 5 ] && [ "$1" = /selected/scripts/ops/check_staging_security.py ] &&
+  [ "$2" = --project-dir ] && [ "$3" = /selected ] &&
+  [ "$4" = --compose-stdin ] && [ "$5" = --storage-only ] || return 98
+  local payload
+  IFS= read -r payload
+  [ "$payload" = '{"services":{"worker":{}}}' ]
+}
+COMPOSE=(fake_docker compose --env-file selected.env -f selected.yaml)
+PYTHON_BIN=fake_checker
+PROJECT_DIR=/selected
+validate_staging_database_binding() {
+"""
+        + body
+        + """
+}
+validate_staging_database_binding --storage-only
+[ "${#COMPOSE[@]}" -eq 6 ]
+[ "${COMPOSE_PROFILES+x}" != x ]
+"""
+    )
+    env = os.environ.copy()
+    env.pop("COMPOSE_PROFILES", None)
+    # These filenames would expand an unquoted '*' and must never become argv.
+    (tmp_path / "one").touch()
+    (tmp_path / "two").touch()
+    result = subprocess.run(
+        [bash, "-c", program], cwd=tmp_path, env=env, capture_output=True, text=True, check=False
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("surface", ("staging", "production"))
+@pytest.mark.parametrize("image_case", ("prior", "current"))
+@pytest.mark.parametrize("id_form", ("config", "platform"))
+@pytest.mark.parametrize(
+    "fault",
+    (
+        "valid",
+        "extra-repo-digest",
+        "config-crosspair",
+        "platform-crosspair",
+        "base-crosspair",
+        "repo-crosspair",
+        "captured-crosspair",
+        "inspect-crosspair",
+        "foreign-ref",
+        "floating-ref",
+    ),
+)
+def test_postgres_metadata_selects_one_exact_derived_tuple(
+    tmp_path: Path, surface: str, image_case: str, id_form: str, fault: str
+) -> None:
+    """Execute the actual reader; independent old/new field unions must reject."""
+    bash = shutil.which("bash")
+    assert bash is not None
+    script_name = "deploy.sh" if surface == "staging" else "deploy_production.sh"
+    source = (REPO_ROOT / "scripts" / script_name).read_text(encoding="utf-8")
+    program = _postgres_function_source(source, "validate_postgres_image_metadata")
+    if image_case == "prior":
+        runtime_ref = POSTGRES_PRIOR_RUNTIME_REF
+        platform = POSTGRES_PRIOR_PLATFORM_DIGEST
+        config = POSTGRES_PRIOR_CONFIG_DIGEST
+        base = POSTGRES_PRIOR_BASE_DIGEST
+        other_ref = POSTGRES_RUNTIME_REF
+        other_platform, other_config, other_base = (
+            POSTGRES_PLATFORM_MANIFEST_DIGEST,
+            POSTGRES_CONFIG_DIGEST,
+            POSTGRES_BASE_DIGEST,
+        )
+    else:
+        runtime_ref = POSTGRES_RUNTIME_REF
+        platform, config, base = (
+            POSTGRES_PLATFORM_MANIFEST_DIGEST,
+            POSTGRES_CONFIG_DIGEST,
+            POSTGRES_BASE_DIGEST,
+        )
+        other_ref = POSTGRES_PRIOR_RUNTIME_REF
+        other_platform, other_config, other_base = (
+            POSTGRES_PRIOR_PLATFORM_DIGEST,
+            POSTGRES_PRIOR_CONFIG_DIGEST,
+            POSTGRES_PRIOR_BASE_DIGEST,
+        )
+    image_id = config if id_form == "config" else platform
+    record = json.loads(FAKE_POSTGRES_IMAGE_INSPECT_JSON)[0]
+    record["Id"] = image_id
+    record["RepoDigests"] = [f"ghcr.io/katsiarynakavaleuskaya/pulseplate@{platform}"]
+    record["Config"]["Labels"]["com.pulseplate.postgres.base-manifest"] = base
+    captured_image = image_id
+    inspect_subject = runtime_ref
+    if fault == "extra-repo-digest":
+        record["RepoDigests"].append("example.invalid/retained@sha256:" + "f" * 64)
+    elif fault in {"config-crosspair", "platform-crosspair"}:
+        record["Id"] = other_config if fault == "config-crosspair" else other_platform
+        captured_image = record["Id"]
+    elif fault == "base-crosspair":
+        record["Config"]["Labels"]["com.pulseplate.postgres.base-manifest"] = other_base
+    elif fault == "repo-crosspair":
+        record["RepoDigests"] = [f"ghcr.io/katsiarynakavaleuskaya/pulseplate@{other_platform}"]
+    elif fault == "captured-crosspair":
+        captured_image = other_config if id_form == "config" else other_platform
+    elif fault == "inspect-crosspair":
+        inspect_subject = other_ref
+    elif fault == "foreign-ref":
+        runtime_ref = runtime_ref.replace("katsiarynakavaleuskaya/pulseplate", "other/postgres")
+        inspect_subject = runtime_ref
+    elif fault == "floating-ref":
+        runtime_ref = runtime_ref.split("@", maxsplit=1)[0]
+        inspect_subject = runtime_ref
+    inspect_file = tmp_path / "inspect.json"
+    inspect_file.write_text(json.dumps([record]), encoding="utf-8")
+    log = tmp_path / "inspect-log"
+    docker = tmp_path / "postgres-tuple-inspect"
+    _write_executable(
+        docker,
+        "#!/bin/sh\n" + 'printf "%s\\n" "$*" >> "$INSPECT_LOG"\n' + 'cat "$INSPECT_FILE"\n',
+    )
+    command = "validate_postgres_image_metadata " + " ".join(
+        shlex.quote(value) for value in (runtime_ref, inspect_subject, captured_image)
+    )
+    result = subprocess.run(
+        [bash, "-c", "set -euo pipefail\n" + program + command + "\nprintf 'accepted\\n'\n"],
+        env={
+            "PATH": os.defpath,
+            "DOCKER_BIN": str(docker),
+            "PYTHON_BIN": sys.executable,
+            "POSTGRES_RUNTIME_REF": POSTGRES_RUNTIME_REF,
+            "INSPECT_FILE": str(inspect_file),
+            "INSPECT_LOG": str(log),
+        },
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    if fault in {"valid", "extra-repo-digest"}:
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "accepted\n"
+        assert log.read_text().splitlines() == [f"image inspect {runtime_ref}"]
+    else:
+        assert result.returncode != 0
+        assert "accepted" not in result.stdout
+        if fault == "inspect-crosspair":
+            assert not log.exists(), "substituted subject must reject before native inspect"
+
+
+@pytest.mark.parametrize("surface", ("staging", "production"))
+@pytest.mark.parametrize("image_case", ("prior", "current"))
+@pytest.mark.parametrize("id_form", ("config", "platform"))
+def test_existing_postgres_prior_and_current_use_own_inspection(
+    tmp_path: Path, surface: str, image_case: str, id_form: str
+) -> None:
+    """Exercise both existing-service branches without admitting a prior candidate pull."""
+    bash = shutil.which("bash")
+    assert bash is not None
+    script_name = "deploy.sh" if surface == "staging" else "deploy_production.sh"
+    source = (REPO_ROOT / "scripts" / script_name).read_text(encoding="utf-8")
+    program = "".join(
+        _postgres_function_source(source, name)
+        for name in (
+            "validate_postgres_image_metadata",
+            "validate_pulled_postgres_image",
+            "validate_existing_postgres_image_identity",
+        )
+    )
+    if image_case == "prior":
+        runtime_ref, platform, config, base = (
+            POSTGRES_PRIOR_RUNTIME_REF,
+            POSTGRES_PRIOR_PLATFORM_DIGEST,
+            POSTGRES_PRIOR_CONFIG_DIGEST,
+            POSTGRES_PRIOR_BASE_DIGEST,
+        )
+    else:
+        runtime_ref, platform, config, base = (
+            POSTGRES_RUNTIME_REF,
+            POSTGRES_PLATFORM_MANIFEST_DIGEST,
+            POSTGRES_CONFIG_DIGEST,
+            POSTGRES_BASE_DIGEST,
+        )
+    image_id = config if id_form == "config" else platform
+    record = json.loads(FAKE_POSTGRES_IMAGE_INSPECT_JSON)[0]
+    record["Id"] = image_id
+    record["RepoDigests"] = [f"ghcr.io/katsiarynakavaleuskaya/pulseplate@{platform}"]
+    record["Config"]["Labels"]["com.pulseplate.postgres.base-manifest"] = base
+    inspect_file = tmp_path / "inspect.json"
+    inspect_file.write_text(json.dumps([record]), encoding="utf-8")
+    log = tmp_path / "inspect-log"
+    docker = tmp_path / "postgres-own-inspect"
+    _write_executable(
+        docker,
+        "#!/bin/sh\n" + 'printf "%s\\n" "$*" >> "$INSPECT_LOG"\n' + 'cat "$INSPECT_FILE"\n',
+    )
+    environment = {
+        "PATH": os.defpath,
+        "DOCKER_BIN": str(docker),
+        "PYTHON_BIN": sys.executable,
+        "POSTGRES_RUNTIME_REF": POSTGRES_RUNTIME_REF,
+        "INSPECT_FILE": str(inspect_file),
+        "INSPECT_LOG": str(log),
+    }
+    existing = subprocess.run(
+        [
+            bash,
+            "-c",
+            "set -euo pipefail\n"
+            + program
+            + "validate_existing_postgres_image_identity "
+            + shlex.quote(image_id)
+            + " "
+            + shlex.quote(runtime_ref),
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    assert existing.returncode == 0, existing.stderr
+    assert log.read_text().splitlines() == [f"image inspect {runtime_ref}"]
+    pulled = subprocess.run(
+        [
+            bash,
+            "-c",
+            "set -euo pipefail\n"
+            + program
+            + "validate_pulled_postgres_image "
+            + shlex.quote(runtime_ref),
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    assert (pulled.returncode == 0) is (image_case == "current"), pulled.stderr
+    if image_case == "prior":
+        assert log.read_text().splitlines() == [f"image inspect {runtime_ref}"]
+
+
+@pytest.mark.parametrize("surface", ("staging", "production", "cd"))
+@pytest.mark.parametrize("scenario", ("empty", "nonempty", "native-error"))
+def test_postgres_mountpoint_native_status_reaches_standalone_caller(
+    tmp_path: Path, surface: str, scenario: str
+) -> None:
+    """Native find errors cannot become empty success through the Docker caller seam."""
+    bash = shutil.which("bash")
+    find = shutil.which("find")
+    assert bash is not None and find is not None
+    if surface == "cd":
+        workflow = yaml.safe_load(CD_WORKFLOW_PATH.read_text(encoding="utf-8"))
+        run = next(
+            step["run"]
+            for step in workflow["jobs"]["postgres-pgvector-publish"]["steps"]
+            if step.get("name") == "Prove PostgreSQL 15 pgvector 0.8.6 and same-volume continuity"
+        )
+        match = next(
+            item
+            for item in re.finditer(r"-ec '([^']+)'", run)
+            if "mountpoint_entry=" in item.group(1)
+        )
+        child = match.group(1)
+        start = run.rfind("docker run --rm", 0, match.start())
+        caller = run[start : match.end()]
+        program = 'docker() { "$DOCKER_BIN" "$@"; }\n' + caller
+    else:
+        script_name = "deploy.sh" if surface == "staging" else "deploy_production.sh"
+        source = (REPO_ROOT / "scripts" / script_name).read_text(encoding="utf-8")
+        function = _postgres_function_source(source, "validate_pulled_postgres_mountpoint")
+        match = re.search(r"-ec '([^']+)'", function)
+        assert match is not None
+        child = match.group(1)
+        program = function + 'validate_pulled_postgres_mountpoint "$POSTGRES_RUNTIME_REF"\n'
+    target = tmp_path / "leaf"
+    target.mkdir()
+    if scenario == "nonempty":
+        (target / "child").write_text("retained", encoding="utf-8")
+    inspected_target = tmp_path / "missing" if scenario == "native-error" else target
+    child = child.replace("/var/lib/postgresql/data", shlex.quote(str(inspected_target)))
+    child = 'stat() { printf "70:70:700\\n"; }\n' + child
+    # Metadata is a unit seam; find itself remains the real native command.
+    docker = tmp_path / "postgres-mountpoint-probe"
+    log = tmp_path / "docker-log"
+    _write_executable(
+        docker,
+        "#!/bin/sh\n"
+        + 'printf "%s\\n" "$*" >> "$DOCKER_LOG"\n'
+        + 'exec "$PROBE_SHELL" -ec "$PROBE_PROGRAM"\n',
+    )
+    result = subprocess.run(
+        [bash, "-c", "set -euo pipefail\n" + program + "\nprintf 'accepted\\n'\n"],
+        env={
+            "PATH": os.defpath,
+            "DOCKER_BIN": str(docker),
+            "PROBE_SHELL": bash,
+            "PROBE_PROGRAM": child,
+            "DOCKER_LOG": str(log),
+            "POSTGRES_RUNTIME_REF": POSTGRES_RUNTIME_REF,
+            "PGVECTOR_FINAL_LOCAL_TAG": "synthetic-final",
+            "volume_name": "synthetic-volume",
+        },
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    invocation = log.read_text()
+    assert "--user 70:70" in invocation and "--cap-drop ALL" in invocation
+    assert "--network none" in invocation and "no-new-privileges:true" in invocation
+    if scenario == "empty":
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "accepted\n"
+    else:
+        assert result.returncode != 0
+        assert "accepted" not in result.stdout
+        if scenario == "native-error":
+            assert "find:" in result.stderr
+
+
+@pytest.mark.parametrize("query", ("directories", "files", "artifacts"))
+@pytest.mark.parametrize("scenario", ("valid", "partial-error"))
+def test_postgres_recipe_native_find_status_precedes_count_or_sort(
+    tmp_path: Path, query: str, scenario: str
+) -> None:
+    """A real native partial enumeration cannot satisfy a downstream count or sort."""
+    bash = shutil.which("bash")
+    find = shutil.which("find")
+    assert bash is not None and find is not None
+    recipe = (POSTGRES_MANIFEST_PATH.parent / "Containerfile").read_text(encoding="utf-8")
+    variable = {
+        "directories": "apk_directory_paths",
+        "files": "apk_file_paths",
+        "artifacts": "runtime_artifact_paths",
+    }[query]
+    lines = recipe.splitlines()
+    index = next(i for i, line in enumerate(lines) if line.strip().startswith(variable + "="))
+    native_pair = "\n".join(line.strip().removesuffix(" \\") for line in lines[index : index + 2])
+    target = tmp_path / "input"
+    target.mkdir()
+    if query == "artifacts":
+        for name, count in (("lib", 21), ("extension", 21), ("license", 22)):
+            directory = target / name
+            directory.mkdir()
+            for number in range(count):
+                (directory / str(number)).write_text("synthetic", encoding="utf-8")
+        for source, name in (
+            ("/out/usr/lib/postgresql15", "lib"),
+            ("/out/usr/share/postgresql15/extension", "extension"),
+            ("/out/usr/share/licenses/pgvector", "license"),
+        ):
+            native_pair = native_pair.replace(source, shlex.quote(str(target / name)))
+        output = tmp_path / "inventory-paths"
+        native_pair = native_pair.replace(
+            "/tmp/runtime-artifact-paths.txt", shlex.quote(str(output))
+        )
+    else:
+        directory = target / "x86_64"
+        directory.mkdir()
+        for number in range(42):
+            (directory / str(number)).write_text("synthetic", encoding="utf-8")
+        native_pair = native_pair.replace("/tmp/builder-apks", shlex.quote(str(target)))
+    prefix = ""
+    if scenario == "partial-error":
+        prefix = (
+            'find() { first="$1"; shift; '
+            + shlex.quote(find)
+            + ' "$first" "$MISSING_SUBJECT" "$@"; }\n'
+        )
+    result = subprocess.run(
+        [bash, "-c", "set -euo pipefail\n" + prefix + native_pair + "\nprintf 'accepted\\n'\n"],
+        env={"PATH": os.defpath, "MISSING_SUBJECT": str(tmp_path / "missing")},
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    if scenario == "valid":
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "accepted\n"
+        if query == "artifacts":
+            assert len(output.read_text().splitlines()) == 64
+    else:
+        assert result.returncode != 0
+        assert "find:" in result.stderr and "accepted" not in result.stdout
+        if query == "artifacts":
+            assert not output.exists(), "failed find must stop before the sort output is written"
+
+
+@pytest.mark.parametrize("scenario", ("valid", "forbidden-entry", "native-error"))
+def test_postgres_recipe_entry_census_uses_real_native_type_and_status(
+    tmp_path: Path, scenario: str
+) -> None:
+    bash = shutil.which("bash")
+    assert bash is not None
+    recipe = (POSTGRES_MANIFEST_PATH.parent / "Containerfile").read_text(encoding="utf-8")
+    lines = recipe.splitlines()
+    index = next(
+        i for i, line in enumerate(lines) if line.strip().startswith("prohibited_apk_entry=")
+    )
+    program = "\n".join(line.strip().removesuffix(" \\") for line in lines[index : index + 2])
+    target = tmp_path / "inputs"
+    target.mkdir()
+    (target / "regular").write_text("synthetic", encoding="utf-8")
+    if scenario == "forbidden-entry":
+        (target / "link").symlink_to(target / "regular")
+    if scenario == "native-error":
+        target = tmp_path / "missing"
+    program = program.replace("/tmp/builder-apks", shlex.quote(str(target)))
+    result = subprocess.run(
+        [bash, "-c", "set -euo pipefail\n" + program + "\nprintf 'accepted\\n'\n"],
+        env={"PATH": os.defpath},
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    if scenario == "valid":
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "accepted\n"
+    else:
+        assert result.returncode != 0 and "accepted" not in result.stdout
+        if scenario == "native-error":
+            assert "find:" in result.stderr
+
+
+@pytest.mark.parametrize("scenario", ("valid", "wrong-parent", "native-error"))
+def test_cd_postgres_source_base_parent_equality_blocks_before_initialization(
+    tmp_path: Path, scenario: str
+) -> None:
+    """Execute the exact native-result binding; errors and changed parents reject."""
+    bash = shutil.which("bash")
+    assert bash is not None
+    workflow = yaml.safe_load(CD_WORKFLOW_PATH.read_text(encoding="utf-8"))
+    run = next(
+        step["run"]
+        for step in workflow["jobs"]["postgres-pgvector-publish"]["steps"]
+        if step.get("name") == "Prove PostgreSQL 15 pgvector 0.8.6 and same-volume continuity"
+    )
+    start = run.index('base_parent_metadata="$(')
+    end = run.index('if docker volume inspect "$volume_name"', start)
+    proof = run[start:end]
+    docker = tmp_path / "postgres-parent-probe"
+    parents = "/var 0:0:755\n/var/lib 0:0:755\n/var/lib/postgresql 70:70:750\n"
+    if scenario == "wrong-parent":
+        parents = parents.replace("70:70:750", "70:70:700")
+    _write_executable(
+        docker,
+        "#!/bin/sh\n"
+        + ("exit 67\n" if scenario == "native-error" else 'printf "%s" "$PARENT_METADATA"\n'),
+    )
+    result = subprocess.run(
+        [
+            bash,
+            "-c",
+            'set -euo pipefail\ndocker() { "$DOCKER_BIN" "$@"; }\n'
+            + proof
+            + "\nprintf 'initialize\\n'\n",
+        ],
+        env={"PATH": os.defpath, "DOCKER_BIN": str(docker), "PARENT_METADATA": parents},
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    assert (result.returncode == 0) is (scenario == "valid"), result.stderr
+    assert ("initialize" in result.stdout) is (scenario == "valid")
+
+
+@pytest.mark.parametrize("scenario", ("valid", "omit-legacy-release", "legacy-proof-fails"))
+def test_cd_postgres_prior_transition_releases_fixed_port_after_legacy_proof(
+    tmp_path: Path, scenario: str
+) -> None:
+    """Execute the publisher program with an occupied-port and retained-volume model."""
+    bash = shutil.which("bash")
+    assert bash is not None
+    workflow = yaml.safe_load(CD_WORKFLOW_PATH.read_text(encoding="utf-8"))
+    run = next(
+        step["run"]
+        for step in workflow["jobs"]["postgres-pgvector-publish"]["steps"]
+        if step.get("name") == "Prove PostgreSQL 15 pgvector 0.8.6 and same-volume continuity"
+    )
+    boundary = (
+        'test "$transitioned_postgres" = "postgres (PostgreSQL) 15.19"\n'
+        'docker rm -f "$legacy_container_name" >/dev/null\n'
+    )
+    assert run.count(boundary) == 1
+    if scenario == "omit-legacy-release":
+        run = run.replace(boundary, boundary.splitlines(keepends=True)[0], 1)
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "volumes").mkdir()
+    docker = tmp_path / "postgres-port-lifecycle"
+    _write_executable(
+        docker,
+        r"""#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$STATE_ROOT/commands"
+case "$1:$2" in
+  pull:--platform) exit 0 ;;
+  volume:inspect) test -f "$STATE_ROOT/volumes/$3" ;;
+  volume:create)
+    printf 'retained-volume-data\n' > "$STATE_ROOT/volumes/$3"
+    printf 'volume:%s\n' "$3" >> "$STATE_ROOT/lifecycle"
+    ;;
+  run:--rm)
+    case "$*" in
+      *'stat -c "%n %u:%g:%a"'*)
+        printf '/var 0:0:755\n/var/lib 0:0:755\n/var/lib/postgresql 70:70:750\n'
+        ;;
+      *mountpoint_entry=*) exit 0 ;;
+      *) exit 91 ;;
+    esac
+    ;;
+  run:--detach)
+    name=''
+    publish=''
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --name) name="$2"; shift ;;
+        --publish) publish="$2"; shift ;;
+      esac
+      shift
+    done
+    test "$publish" = '127.0.0.1:5432:5432'
+    if [ -f "$STATE_ROOT/port-owner" ]; then
+      printf '127.0.0.1:5432 already occupied\n' >&2
+      exit 73
+    fi
+    printf '%s\n' "$name" > "$STATE_ROOT/port-owner"
+    printf 'start:%s\n' "$name" >> "$STATE_ROOT/lifecycle"
+    ;;
+  rm:-f)
+    test "$(cat "$STATE_ROOT/port-owner")" = "$3"
+    rm "$STATE_ROOT/port-owner"
+    printf 'stop:%s\n' "$3" >> "$STATE_ROOT/lifecycle"
+    ;;
+  exec:*)
+    case "$*" in
+      *'postgres --version'*)
+        printf 'version:%s\n' "$2" >> "$STATE_ROOT/lifecycle"
+        case "$2:$CASE_SCENARIO" in
+          *-legacy-postgres:legacy-proof-fails) printf 'postgres (PostgreSQL) 0\n' ;;
+          *) printf 'postgres (PostgreSQL) 15.19\n' ;;
+        esac
+        ;;
+      *'SELECT 1'*) printf '1\n' ;;
+      *'SELECT oid FROM pg_database'*) printf '101\n' ;;
+      *'SELECT extversion FROM pg_extension'*) printf '0.8.6\n' ;;
+      *'SELECT value FROM pulseplate_pgvector_sentinel'*) printf 'persistent\n' ;;
+      *'SELECT value FROM pulseplate_legacy_sentinel'*) printf 'legacy-persistent\n' ;;
+      *'SELECT value || '*pulseplate_prior_sentinel*) printf 'prior-persistent:[1,2,3]\n' ;;
+      *'SELECT embedding <-> '*) printf '0\n' ;;
+      *'CREATE EXTENSION vector;'*|*'CREATE TABLE '*|*'INSERT INTO '*) exit 0 ;;
+      *) exit 92 ;;
+    esac
+    ;;
+  *) exit 93 ;;
+esac
+""",
+    )
+    result = subprocess.run(
+        [bash, "-c", 'docker() { "$DOCKER_BIN" "$@"; }\n' + run],
+        env={
+            "PATH": os.defpath,
+            "DOCKER_BIN": str(docker),
+            "STATE_ROOT": str(state),
+            "CASE_SCENARIO": scenario,
+            "PGVECTOR_RESOURCE_PREFIX": "pulseplate-pgvector-1234-2",
+            "PGVECTOR_FINAL_LOCAL_TAG": "synthetic-current",
+        },
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    prefix = "pulseplate-pgvector-1234-2"
+    legacy = prefix + "-legacy-postgres"
+    prior = prefix + "-prior-postgres"
+    events = (state / "lifecycle").read_text().splitlines()
+    assert (state / "volumes" / (prefix + "-legacy-data")).read_text() == ("retained-volume-data\n")
+    legacy_version = events.index("version:" + legacy)
+    stops = [index for index, event in enumerate(events) if event == "stop:" + legacy]
+    if scenario == "valid":
+        assert result.returncode == 0, result.stderr
+        assert len(stops) == 2
+        assert legacy_version < stops[-1] < events.index("start:" + prior)
+        assert (state / "port-owner").read_text().strip() == prior
+    else:
+        assert result.returncode != 0
+        assert len(stops) == 1 and stops[0] < legacy_version
+        assert "start:" + prior not in events
+        assert (state / "port-owner").read_text().strip() == legacy
+        if scenario == "omit-legacy-release":
+            assert "127.0.0.1:5432 already occupied" in result.stderr
+
+
+@pytest.mark.parametrize("case", ["intact", "changed", "legacy"])
+def test_checkpoint_publication_copy_binds_exact_written_bytes(tmp_path: Path, case: str) -> None:
+    script = (_historical_deploy_script("scripts/deploy_production.sh")).read_text()
+    start = script.index("def copy_open_file(")
+    end = script.index("\n\ndef tree_walk(", start)
+    admitted = b"admitted checkpoint bytes\n"
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    actual = b"different checkpoint bytes\n" if case == "changed" else admitted
+    source.write_bytes(actual)
+    expected = "" if case == "legacy" else "sha256:" + hashlib.sha256(admitted).hexdigest()
+    program = (
+        "import hashlib, os, sys\n"
+        + script[start:end]
+        + "\nwith open(sys.argv[1], 'rb') as source, open(sys.argv[2], 'wb') as destination:\n"
+        + "    copy_open_file(source.fileno(), os.fstat(source.fileno()), destination.fileno(), "
+        + "label='fixture', expected_hash=sys.argv[3] or None)\n"
+        + "print('accepted copied bytes')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-", str(source), str(destination), expected],
+        input=program,
+        env={"PATH": os.defpath, "LANG": "C", "HOME": str(tmp_path)},
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert destination.read_bytes() == actual
+    if case == "changed":
+        assert result.returncode != 0
+        assert result.stderr.strip() == "Checkpoint contract hash mismatch"
+        assert "accepted copied bytes" not in result.stdout
+    else:
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "accepted copied bytes"
+
+
+@pytest.mark.parametrize("relative", CHECKPOINT_PATHS)
+@pytest.mark.parametrize(
+    "fault", ["none", "absent", "symlink", "directory", "stale", "parent-link"]
+)
+def test_staging_checkpoint_admission_rejects_before_mutation(
+    tmp_path: Path, relative: str, fault: str
+) -> None:
+    project = tmp_path / "staging"
+    _write_checkpoint_contract(project, staging=True)
+    staged_relative = relative.removeprefix("deploy/")
+    target = project / staged_relative
+    original = target.read_bytes()
+    external = tmp_path / "external"
+    if fault == "parent-link":
+        target.parent.rename(external)
+        target.parent.symlink_to(external, target_is_directory=True)
+    elif fault != "none":
+        target.unlink()
+        if fault == "symlink":
+            external.write_bytes(original)
+            target.symlink_to(external)
+        elif fault == "directory":
+            target.mkdir()
+        elif fault == "stale":
+            target.write_bytes(original + b"unreviewed")
+    script = (_historical_deploy_script("scripts/deploy.sh")).read_text()
+    start = script.index('"$PYTHON_BIN" - "$PROJECT_DIR" <<\'PY_CHECKPOINT\'')
+    end = script.index("\nPY_CHECKPOINT", start) + len("\nPY_CHECKPOINT")
+    assert "'sha256:" + hashlib.sha256(original).hexdigest() + "'" in script
+    bash = shutil.which("bash")
+    assert bash is not None
+    result = subprocess.run(
+        [bash, "-c", "set -euo pipefail\n" + script[start:end] + "\ntouch mutation\n"],
+        env={"PATH": os.environ["PATH"], "PYTHON_BIN": sys.executable, "PROJECT_DIR": str(project)},
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert (result.returncode == 0) is (fault == "none"), result.stderr
+    assert (tmp_path / "mutation").exists() is (fault == "none")
+
+
+@pytest.mark.parametrize("relative", CHECKPOINT_PATHS)
+@pytest.mark.parametrize(
+    "fault", ["none", "absent", "symlink", "directory", "stale", "parent-link"]
+)
+@pytest.mark.parametrize("carrier", ["installed", "bundle"])
+def test_checkpoint_admission_rejects_before_protected_publication(
+    tmp_path: Path, relative: str, fault: str, carrier: str
+) -> None:
+    project = tmp_path / "production"
+    bundle = tmp_path / "bundle"
+    _write_checkpoint_contract(project)
+    installed_am_helper = project / "scripts/ci/fetch_docker_source_artifacts.py"
+    installed_am_helper.parent.mkdir(parents=True, exist_ok=True)
+    installed_am_helper.write_bytes((_historical_AM_helper()).read_bytes())
+    if carrier == "bundle":
+        _write_shell_bundle_contract(bundle)
+    else:
+        _write_checkpoint_contract(bundle)
+    (project / "deploy").mkdir(exist_ok=True)
+    target = (project if carrier == "installed" else bundle) / relative
+    original = target.read_bytes()
+    external = tmp_path / "external"
+    if fault == "parent-link":
+        target.parent.rename(external)
+        target.parent.symlink_to(external, target_is_directory=True)
+    elif fault != "none":
+        target.unlink()
+        if fault == "symlink":
+            external.write_bytes(original)
+            target.symlink_to(external)
+        elif fault == "directory":
+            target.mkdir()
+        elif fault == "stale":
+            target.write_bytes(original + b"unreviewed")
+    script = (_historical_deploy_script("scripts/deploy_production.sh")).read_text()
+    assert "'sha256:" + hashlib.sha256(original).hexdigest() + "'" in script
+    a = script.index("contract_destination_transaction() {")
+    b = script.index("\nvalidate_contract_destinations_safely() {", a)
+    operation = "publish-contracts" if carrier == "bundle" else "validate-checkpoint-installed"
+    values = [
+        str(bundle / p)
+        for p in (
+            "deploy/docker-compose.production.yaml",
+            "deploy/prometheus/prometheus.yml",
+            "deploy/prometheus/alias-alerts.yml",
+            "deploy/prometheus/image-manifest.json",
+            "deploy/alertmanager/alertmanager.yml",
+            "deploy/alertmanager/trivy-ignore.yaml",
+            "deploy/postgres-pgvector/image-manifest.json",
+        )
+    ] + ["", "", "", "", str(bundle / "scripts/ops/postgres_backup.sh")]
+    bash = shutil.which("bash")
+    assert bash is not None
+    program = (
+        "set -euo pipefail\n"
+        + script[a:b]
+        + "\ncontract_destination_transaction "
+        + shlex.quote(operation)
+    )
+    if carrier == "bundle":
+        program += " " + " ".join(shlex.quote(value) for value in values)
+    program += "\ntouch mutation\n"
+    before_tree = sorted(
+        (
+            str(path.relative_to(project)),
+            path.lstat().st_mode,
+            path.lstat().st_dev,
+            path.lstat().st_ino,
+            path.read_bytes() if path.is_file() else None,
+        )
+        for path in project.rglob("*")
+    )
+    result = subprocess.run(
+        [bash, "-c", program],
+        env={
+            "PATH": os.environ["PATH"],
+            "PYTHON_BIN": sys.executable,
+            "ALERTMANAGER_CONTRACT_HELPER_SHA256": hashlib.sha256(
+                (_historical_AM_helper()).read_bytes()
+            ).hexdigest(),
+            "REQUESTED_DEPLOY_DIR": str(project),
+            "COMPOSE_RELATIVE_IDENTITY": CANONICAL_MANAGED_COMPOSE,
+            "PROMETHEUS_CONTRACT_HELPER_SHA256": hashlib.sha256(
+                (REPO_ROOT / "scripts/ci/prometheus_source_image.py").read_bytes()
+            ).hexdigest(),
+        },
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert (result.returncode == 0) is (fault == "none"), result.stderr
+    assert (tmp_path / "mutation").exists() is (fault == "none")
+    after_tree = sorted(
+        (
+            str(path.relative_to(project)),
+            path.lstat().st_mode,
+            path.lstat().st_dev,
+            path.lstat().st_ino,
+            path.read_bytes() if path.is_file() else None,
+        )
+        for path in project.rglob("*")
+    )
+    if fault != "none":
+        assert after_tree == before_tree
+    elif carrier == "bundle":
+        for member in CHECKPOINT_PATHS:
+            assert (project / member).read_bytes() == (REPO_ROOT / member).read_bytes()
+        assert not any(path.name.startswith(".pulseplate-") for path in project.rglob("*"))
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "none",
+        "candidate-placement",
+        "candidate-copy",
+        "early-cleanup",
+        "missing-checkout",
+        "missing-subject",
+        "missing-scanner",
+        "retained-missing-cleanup",
+        "retained-early-cleanup",
+        "retained-duplicate-cleanup",
+    ],
+)
+def test_alertmanager_current_four_controls_live_steps_are_in_same_trusted_consumer_job(
+    fault: str,
+) -> None:
+    import copy
+
+    workflow = yaml.safe_load(CD_WORKFLOW_PATH.read_text(encoding="utf-8"))
+    jobs = workflow["jobs"]
+    expected_jobs = {"prometheus-image-security-pr", "prometheus-image-security-trusted"}
+    live_name = "Scan accepted AM and execute all four current controls"
+    cleanup_name = "Remove designated AM controller after credential cleanup"
+    scan_name = "Scan exact Prometheus image without suppressions"
+    setup_name = "Select AM Python without dependency or SDK installation"
+
+    def assert_placement(candidate_jobs: dict[str, Any]) -> None:
+        for name, expected in (
+            (live_name, expected_jobs),
+            (cleanup_name, expected_jobs | {"alertmanager-retained-candidate"}),
+        ):
+            assert {
+                job_name
+                for job_name, job in candidate_jobs.items()
+                if any(step.get("name") == name for step in job.get("steps", []))
+            } == expected
+        retained = candidate_jobs["alertmanager-retained-candidate"]["steps"]
+        retained_names = [step.get("name") for step in retained]
+        assert retained_names.count(cleanup_name) == 1
+        assert live_name not in retained_names
+        prepare = retained_names.index("Prepare exact AM subject before material execution")
+        cleanup = retained_names.index(cleanup_name)
+        proxy = retained_names.index("Validate existing credential-free AM native Python proxy")
+        assert prepare + 1 == cleanup and cleanup + 1 == proxy
+        assert retained[prepare]["id"] == "alertmanager-image"
+        retained_ids = [step.get("id") for step in retained]
+        assert retained_ids.count("alertmanager-control") == 1
+        assert retained_ids.index("alertmanager-control") < prepare
+        assert retained[cleanup]["if"] == (
+            "always() && (steps.alertmanager-control.outcome == 'success' || "
+            "steps.alertmanager-control.outcome == 'failure')"
+        )
+        assert "env" not in retained[cleanup]
+        assert 'rm -rf -- "$controller"' in retained[cleanup]["run"]
+        assert 'test ! -e "$controller" && test ! -L "$controller"' in retained[cleanup]["run"]
+        assert (
+            candidate_jobs["prometheus-image-security-pr"]["steps"]
+            is candidate_jobs["prometheus-image-security-trusted"]["steps"]
+        )
+        for job_name in expected_jobs:
+            job = candidate_jobs[job_name]
+            assert job["permissions"] == {
+                "contents": "read",
+                "actions": "read",
+                "pull-requests": "read",
+                "packages": "read",
+            }
+            steps = job["steps"]
+            names = [step.get("name") for step in steps]
+            for name in (scan_name, live_name, cleanup_name, setup_name):
+                assert names.count(name) == 1
+            scan, live, cleanup, setup = (
+                names.index(name) for name in (scan_name, live_name, cleanup_name, setup_name)
+            )
+            assert scan + 1 == live and live + 1 == cleanup and cleanup + 1 == setup
+            ids = [step.get("id") for step in steps]
+            for step_id in (
+                "alertmanager-control",
+                "alertmanager-image",
+                "prometheus-image",
+                "prometheus_trivy",
+            ):
+                assert ids.count(step_id) == 1
+            checkout = ids.index("alertmanager-control")
+            subject = ids.index("alertmanager-image")
+            assert checkout < subject < scan
+            assert ids.index("prometheus-image") < scan
+            assert ids.index("prometheus_trivy") < scan
+            assert steps[checkout]["with"]["path"] == "artifacts/orchestration/alertmanager-control"
+            assert steps[checkout]["with"]["persist-credentials"] is False
+            assert steps[scan]["env"]["TRIVY_BIN"] == "${{ steps.prometheus_trivy.outputs.path }}"
+            live_step = steps[live]
+            assert live_step["env"]["ALERTMANAGER_CONTROLLER_SOURCE"] == (
+                "${{ steps.alertmanager-image.outputs.controller_source }}"
+            )
+            assert live_step["env"]["TRIVY_BIN"] == "${{ steps.prometheus_trivy.outputs.path }}"
+            for token in ("GH_TOKEN", "GITHUB_TOKEN"):
+                assert live_step["env"][token] == "${{ secrets.GITHUB_TOKEN }}"
+                assert token not in job.get("env", {})
+            assert 'cd "$controller"' in live_step["run"]
+            assert 'test "$(git -C "$controller" rev-parse HEAD)"' in live_step["run"]
+            assert (
+                "python3 -B -E -s -S -m scripts.ci.fetch_docker_source_artifacts"
+                in live_step["run"]
+            )
+            assert steps[cleanup]["if"] == (
+                "always() && (steps.alertmanager-control.outcome == 'success' || "
+                "steps.alertmanager-control.outcome == 'failure')"
+            )
+            assert "env" not in steps[cleanup]
+            assert 'test ! -e "$controller" && test ! -L "$controller"' in steps[cleanup]["run"]
+
+    assert_placement(jobs)
+    if fault == "none":
+        return
+    changed = copy.deepcopy(jobs)
+    steps = changed["prometheus-image-security-pr"]["steps"]
+    live = next(step for step in steps if step.get("name") == live_name)
+    cleanup = next(step for step in steps if step.get("name") == cleanup_name)
+    if fault in {"candidate-placement", "candidate-copy"}:
+        changed["alertmanager-candidate-build"]["steps"].extend([live, cleanup])
+        if fault == "candidate-placement":
+            steps.remove(live)
+            steps.remove(cleanup)
+    elif fault.startswith("retained-"):
+        retained = changed["alertmanager-retained-candidate"]["steps"]
+        retained_cleanup = next(step for step in retained if step.get("name") == cleanup_name)
+        if fault == "retained-duplicate-cleanup":
+            retained.append(retained_cleanup)
+        else:
+            retained.remove(retained_cleanup)
+            if fault == "retained-early-cleanup":
+                retained.insert(0, retained_cleanup)
+    elif fault == "early-cleanup":
+        steps.remove(cleanup)
+        steps.insert(
+            next(i for i, step in enumerate(steps) if step.get("name") == scan_name), cleanup
+        )
+    else:
+        removed_id = {
+            "missing-checkout": "alertmanager-control",
+            "missing-subject": "alertmanager-image",
+            "missing-scanner": "prometheus_trivy",
+        }[fault]
+        next(step for step in steps if step.get("id") == removed_id).pop("id")
+    with pytest.raises(AssertionError):
+        assert_placement(changed)
+
+
+def test_prometheus_cd_separates_pr_and_staging_without_duplicating_steps() -> None:
+    workflow = yaml.safe_load(CD_WORKFLOW_PATH.read_text(encoding="utf-8"))
+    jobs = workflow["jobs"]
+    pr = jobs["prometheus-image-security-pr"]
+    trusted = jobs["prometheus-image-security-trusted"]
+    gate = jobs["prometheus-image-security"]
+    assert "environment" not in pr
+    assert trusted["environment"] == "staging"
+    assert pr["steps"] is trusted["steps"]
+    assert pr["if"] == (
+        "always() && github.event_name == 'pull_request' "
+        "&& needs.postgres-pgvector-contract.result == 'success'"
+    )
+    assert "github.event_name == 'pull_request'" not in trusted["if"]
+    assert "github.ref == 'refs/heads/main'" in trusted["if"]
+    assert "startsWith(github.ref, 'refs/tags/v')" in trusted["if"]
+    assert "github.event_name == 'schedule'" in trusted["if"]
+    assert (
+        pr["permissions"]
+        == trusted["permissions"]
+        == {"contents": "read", "actions": "read", "packages": "read", "pull-requests": "read"}
+    )
+    assert gate["permissions"] == {}
+    assert "environment" not in gate
+    assert gate["needs"] == [
+        "postgres-pgvector-contract",
+        "postgres-pgvector-admission",
+        "postgres-pgvector-reuse",
+        "prometheus-image-security-pr",
+        "prometheus-image-security-trusted",
+    ]
+    consumer = next(step for step in pr["steps"] if step.get("id") == "prometheus-image")
+    assert consumer["env"]["GHCR_READ_TOKEN"] == (
+        "${{ github.event_name == 'pull_request' && "
+        "steps.prometheus-evidence.outcome == 'success' && steps.prometheus-evidence.outputs.mode == 'unchanged_pr_published' && "
+        "secrets.GITHUB_TOKEN || github.event_name != 'pull_request' && "
+        "steps.prometheus-route.outputs.mode == 'trusted_published' && "
+        "secrets.GHCR_READ_TOKEN || '' }}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("event_name", "pr_result", "trusted_result", "expected_exit"),
+    [
+        ("pull_request", "success", "skipped", 0),
+        ("push", "skipped", "success", 0),
+        ("schedule", "skipped", "success", 0),
+        ("pull_request", "failure", "skipped", 1),
+        ("pull_request", "success", "success", 1),
+        ("pull_request", "skipped", "success", 1),
+        ("push", "success", "skipped", 1),
+        ("push", "skipped", "failure", 1),
+        ("schedule", "skipped", "cancelled", 1),
+        ("workflow_dispatch", "skipped", "success", 1),
+        ("pull_request", "", "skipped", 1),
+    ],
+)
+def test_prometheus_cd_aggregate_requires_only_the_selected_successful_execution(
+    tmp_path: Path, event_name: str, pr_result: str, trusted_result: str, expected_exit: int
+) -> None:
+    workflow = yaml.safe_load(CD_WORKFLOW_PATH.read_text(encoding="utf-8"))
+    step = workflow["jobs"]["prometheus-image-security"]["steps"][0]
+    bash = shutil.which("bash")
+    assert bash is not None
+    result = subprocess.run(
+        [bash, "-c", step["run"]],
+        cwd=tmp_path,
+        env={
+            "GITHUB_EVENT_NAME": event_name,
+            "PR_RESULT": pr_result,
+            "TRUSTED_RESULT": trusted_result,
+        },
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    assert result.returncode == expected_exit, result.stderr
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "delayed-success",
+        "timeout",
+        "api-error",
+        "interrupt",
+        "cleanup",
+        "short-job",
+        "pr",
+        "registry-token",
+    ],
+)
+def test_trusted_prometheus_wait_keeps_admission_and_cleanup_boundaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    import signal
+    import time
+
+    workflow = yaml.safe_load(CD_WORKFLOW_PATH.read_text())
+    jobs = workflow["jobs"]
+    trusted = jobs["prometheus-image-security-trusted"]
+    pr = jobs["prometheus-image-security-pr"]
+    step = next(
+        item
+        for item in trusted["steps"]
+        if item.get("name") == "Wait for the exact trusted Prometheus publisher"
+    )
+    assert (
+        step["if"]
+        == "${{ success() && github.event_name != 'pull_request' && steps.prometheus-route.outputs.mode == 'trusted_published' }}"
+    )
+    assert set(step["env"]) == {"GH_TOKEN", "GITHUB_TOKEN", "PROMETHEUS_CREDENTIAL_ROUTE"}
+    assert trusted["env"]["PROMETHEUS_JOB_TIMEOUT_MINUTES"] == trusted["timeout-minutes"]
+    assert (
+        trusted["env"]["PROMETHEUS_CONSUME_SECONDS"]
+        == pr["env"]["PROMETHEUS_CONSUME_SECONDS"]
+        == "900"
+    )
+    assert (
+        trusted["env"]["PROMETHEUS_CLEANUP_SECONDS"]
+        == pr["env"]["PROMETHEUS_CLEANUP_SECONDS"]
+        == "120"
+    )
+    assert pr["steps"] is trusted["steps"]
+    consumer = next(item for item in trusted["steps"] if item.get("id") == "prometheus-image")
+    assert trusted["steps"].index(step) < trusted["steps"].index(consumer)
+    assert consumer["run"].count("--operation consume") == 1
+    assert "continue-on-error" not in step and "continue-on-error" not in consumer
+    assert "if" not in consumer  # Default success() prevents consume after a failed wait.
+    event = tmp_path / "event.json"
+    event.write_text('{"ref":"refs/heads/main"}')
+    head = "1" * 40
+    environment = {
+        "GITHUB_EVENT_NAME": "pull_request" if case == "pr" else "push",
+        "GITHUB_EVENT_PATH": str(event),
+        "GITHUB_SHA": head,
+        "GITHUB_WORKSPACE": str(REPO_ROOT),
+        "RUNNER_TEMP": str(tmp_path),
+        "GITHUB_RUN_ID": "123",
+        "GITHUB_RUN_ATTEMPT": "1",
+        "GH_TOKEN": "synthetic-read-token",
+        "GITHUB_TOKEN": "synthetic-read-token",
+        "PROMETHEUS_CREDENTIAL_ROUTE": "trusted_published",
+        "PROMETHEUS_PUBLICATION_WAIT_SECONDS": "10800",
+        "PROMETHEUS_CONSUME_SECONDS": "900",
+        "PROMETHEUS_CLEANUP_SECONDS": "120",
+        "PROMETHEUS_SECURITY_RESERVE_SECONDS": "2400",
+        "PROMETHEUS_JOB_TIMEOUT_MINUTES": "55" if case == "short-job" else "255",
+    }
+    if case == "registry-token":
+        environment["GHCR_READ_TOKEN"] = "synthetic-registry-token"
+    monkeypatch.setattr(os, "environ", environment)
+    elapsed = [0.0]
+    calls: list[str] = []
+    monkeypatch.setattr(time, "monotonic", lambda: elapsed[0])
+    monkeypatch.setattr(time, "sleep", lambda seconds: elapsed.__setitem__(0, elapsed[0] + seconds))
+    monkeypatch.setattr(signal, "signal", lambda *args: None)
+
+    class API:
+        def __init__(self, private: Path, evidence: Path, deadline: float, cleanup: int) -> None:
+            assert private.parent == evidence.parent
+            assert deadline == 10800 and cleanup == 120
+            assert "GHCR_READ_TOKEN" not in os.environ
+            calls.append("api")
+
+        def close(self) -> None:
+            calls.append("close")
+            if case == "cleanup":
+                raise prometheus_source.QualificationError("synthetic_cleanup_failure")
+
+    def admission(
+        api: object, root: Path, event: dict[str, object], kind: str, selected: str
+    ) -> dict[str, object]:
+        assert isinstance(api, API) and root == REPO_ROOT and selected == head and kind == "push"
+        assert event == {"ref": "refs/heads/main"}
+        calls.append("admission")
+        return {"publisher_head": head}
+
+    def predecessor(api: object, selected: str) -> dict[str, object]:
+        assert isinstance(api, API) and selected == head
+        calls.append("predecessor")
+        if case == "api-error":
+            raise prometheus_source.QualificationError("synthetic_auth_failure")
+        if case == "interrupt":
+            raise KeyboardInterrupt
+        if case == "timeout" or elapsed[0] <= 900:
+            raise prometheus_source.QualificationError("positive_publication_predecessor_active")
+        return {"run": {"head_sha": head, "conclusion": "success"}}
+
+    monkeypatch.setattr(prometheus_source, "GitHubRead", API)
+    monkeypatch.setattr(prometheus_source, "event_admission", admission)
+    monkeypatch.setattr(prometheus_source, "require_publication_predecessor", predecessor)
+    program = compile(_prometheus_cd_python(step), "<trusted-publication-wait>", "exec")
+    if case == "delayed-success":
+        exec(program, {"__name__": "__main__"})
+        assert elapsed[0] == 930
+        assert (
+            json.loads(
+                (
+                    tmp_path / "prometheus-publication-wait-123-1/evidence/predecessor.json"
+                ).read_text()
+            )["run"]["head_sha"]
+            == head
+        )
+    else:
+        expected = (
+            KeyboardInterrupt
+            if case == "interrupt"
+            else SystemExit if case in {"pr", "registry-token"} else RuntimeError
+        )
+        with pytest.raises(expected):
+            exec(program, {"__name__": "__main__"})
+    if case in {"short-job", "pr", "registry-token"}:
+        assert calls == []
+    else:
+        assert calls[0:2] == ["api", "admission"] and calls[-1] == "close"
+    if case == "timeout":
+        assert elapsed[0] == 10800
+
+
+@pytest.mark.parametrize(
+    "case,cleanup_failure",
+    [
+        (case, False)
+        for case in (
+            "failure",
+            "cancelled",
+            "timed_out",
+            "job-failure",
+            "job-cancelled",
+            "job-timed_out",
+            "missing-job",
+            "skipped-job",
+            "malformed",
+            "api-error",
+            "pending-terminal",
+            "missing-active-success",
+            "new-attempt-success",
+            "missing-timeout",
+            "active-timeout",
+        )
+    ]
+    + [("job-failure", True), ("api-error", True)],
+)
+def test_trusted_prometheus_wait_uses_real_terminal_recognition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    case: str,
+    cleanup_failure: bool,
+) -> None:
+    import signal
+    import time
+    from tests.test_prometheus_source_image import (
+        _PublicationPredecessorAPI,
+        _publication_wait_observations,
+    )
+
+    workflow = yaml.safe_load(CD_WORKFLOW_PATH.read_text())
+    steps = workflow["jobs"]["prometheus-image-security-trusted"]["steps"]
+    step = next(
+        row for row in steps if row.get("name") == "Wait for the exact trusted Prometheus publisher"
+    )
+    consumer = next(row for row in steps if row.get("id") == "prometheus-image")
+    assert "if" not in consumer and "continue-on-error" not in step
+    event = tmp_path / "event.json"
+    event.write_text('{"ref":"refs/heads/main"}')
+    environment = {
+        "GITHUB_EVENT_NAME": "push",
+        "GITHUB_EVENT_PATH": str(event),
+        "GITHUB_SHA": "1" * 40,
+        "GITHUB_WORKSPACE": str(REPO_ROOT),
+        "RUNNER_TEMP": str(tmp_path),
+        "GITHUB_RUN_ID": "123",
+        "GITHUB_RUN_ATTEMPT": "1",
+        "GH_TOKEN": "synthetic-read-token",
+        "GITHUB_TOKEN": "synthetic-read-token",
+        "PROMETHEUS_CREDENTIAL_ROUTE": "trusted_published",
+        "PROMETHEUS_PUBLICATION_WAIT_SECONDS": "120",
+        "PROMETHEUS_CONSUME_SECONDS": "900",
+        "PROMETHEUS_CLEANUP_SECONDS": "120",
+        "PROMETHEUS_SECURITY_RESERVE_SECONDS": "2400",
+        "PROMETHEUS_JOB_TIMEOUT_MINUTES": "255",
+    }
+    monkeypatch.setattr(os, "environ", environment)
+    elapsed = [0.0]
+    sleeps: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        elapsed[0] += seconds
+
+    monkeypatch.setattr(time, "monotonic", lambda: elapsed[0])
+    monkeypatch.setattr(time, "sleep", sleep)
+    monkeypatch.setattr(signal, "signal", lambda *args: None)
+    snapshots, diagnostic, expected_sleeps = _publication_wait_observations(case)
+    observed: list[_PublicationPredecessorAPI] = []
+    real_close = prometheus_source.GitHubRead.close
+
+    class API(_PublicationPredecessorAPI):
+        def __init__(self, private: Path, evidence: Path, deadline: float, cleanup: int) -> None:
+            super().__init__(snapshots=snapshots)
+            assert deadline == 120 and cleanup == 120
+            self.private = private
+            self.private.mkdir(mode=0o700)
+            for child in ("home", "config", "cache", "tmp"):
+                (self.private / child).mkdir(mode=0o700)
+            self.process = None
+            self.environment = {}
+            self.known = b""
+            self.additional_known = ()
+            if case == "api-error":
+                endpoint = f"/repos/{prometheus_source.GHCR_REPOSITORY}/actions/workflows/build.yml/runs?event=push&head_sha={'1' * 40}&per_page=100&page=1"
+                self.overrides[endpoint] = prometheus_source.QualificationError(
+                    "GitHub_native_failed"
+                )
+            observed.append(self)
+
+        def begin_cleanup(self) -> float:
+            if cleanup_failure:
+                raise prometheus_source.QualificationError("synthetic_cleanup_failure")
+            return elapsed[0] + 120
+
+        def close(self) -> None:
+            # Exercise the existing primary-preserving cleanup implementation,
+            # rather than a mocked close that erases the publication error.
+            real_close(self)
+
+    def admission(*args: object) -> dict[str, str]:
+        return {"publisher_head": "1" * 40}
+
+    monkeypatch.setattr(prometheus_source, "GitHubRead", API)
+    monkeypatch.setattr(prometheus_source, "event_admission", admission)
+    program = compile(_prometheus_cd_python(step), "<trusted-publication-wait>", "exec")
+    if diagnostic is None:
+        exec(program, {"__name__": "__main__"})
+        result = json.loads(
+            (tmp_path / "prometheus-publication-wait-123-1/evidence/predecessor.json").read_text()
+        )
+        assert result["run"]["conclusion"] == result["job"]["conclusion"] == "success"
+    else:
+        with pytest.raises(prometheus_source.QualificationError) as raised:
+            exec(program, {"__name__": "__main__"})
+        # pytest's regex match includes exception notes; check the primary
+        # diagnostic and the cleanup note independently and exactly.
+        assert str(raised.value) == diagnostic
+        assert getattr(raised.value, "__notes__", []) == (
+            ["GitHub cleanup also failed:synthetic_cleanup_failure"] if cleanup_failure else []
+        )
+        assert not (
+            tmp_path / "prometheus-publication-wait-123-1/evidence/predecessor.json"
+        ).exists()
+    if expected_sleeps >= 0:
+        assert len(sleeps) == expected_sleeps
+        assert observed[0].observation == (0 if case == "api-error" else expected_sleeps + 1)
+    else:
+        assert elapsed[0] == 120 and sum(sleeps) == 120 and observed[0].observation == 4
+    if case == "new-attempt-success":
+        assert any("/attempts/2/jobs" in endpoint for endpoint in observed[0].requests)
+    if cleanup_failure:
+        assert "GitHub cleanup also failed:synthetic_cleanup_failure" in capsys.readouterr().err
+    else:
+        assert not observed[0].private.exists()
+
+
+@pytest.fixture
+def alertmanager_contract_inputs(tmp_path: Path) -> tuple[Path, dict[str, object]]:
+    """A complete valid AM model for the actual pure CLI; no Docker execution or credential input."""
+    root = tmp_path / "installed"
+    root.mkdir()
+    (root / "alertmanager").mkdir()
+    compose = root / "docker-compose.staging.yaml"
+    selected, _ = alertmanager_source._alertmanager_contract_subject()
+    compose.write_text(
+        _historical_AM_template(STAGING_COMPOSE_PATH)
+        .decode("utf-8")
+        .replace(ALERTMANAGER_RUNTIME_REF, selected)
+    )
+    shutil.copyfile(ALERTMANAGER_CONFIG_PATH, root / "alertmanager/alertmanager.yml")
+    (root / "alertmanager/trivy-ignore.yaml").write_bytes(b"vulnerabilities: []\n")
+    model = json.loads(_staging_compose_fixture_json(root))
+    model["name"] = "deploy"
+    model["services"]["alertmanager"]["image"] = selected
+    return root, model
+
+
+def _run_alertmanager_pure_contract(
+    root: Path,
+    model: dict[str, object],
+    *,
+    runtime: str = "absent",
+    profiles: str = "",
+    fault: str | None = None,
+    instant: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Exercise the real same-FD input protocol with native-shaped synthetic captures."""
+    selected, config_id = alertmanager_source._alertmanager_contract_subject()
+    candidate = json.dumps(model).encode()
+    installed = json.dumps(model).encode()
+    census = b"" if runtime == "absent" else ("e" * 64 + "\n").encode()
+    container = _alertmanager_census_inspect_record(
+        status="exited" if runtime == "stopped" else "running"
+    )
+    container["Image"] = (
+        alertmanager_source._ALERT_OLD_RUNTIME_CONFIG if runtime == "old" else config_id
+    )
+    image = {
+        "Id": container["Image"],
+        "Os": "linux",
+        "Architecture": "amd64",
+        "RepoDigests": [
+            alertmanager_source._ALERT_OLD_RUNTIME_REF if runtime == "old" else selected
+        ],
+        "RootFS": {"Layers": alertmanager_source._ALERT_HISTORICAL_C10["graph"]["diff_ids"]},
+    }
+    status = 0
+    if fault == "namespace":
+        installed = json.dumps({**model, "name": "another"}).encode()
+    elif fault == "failed-empty":
+        status = 1
+    elif fault == "duplicate-census":
+        census += census
+    elif fault == "short-census":
+        census = b"eeee\n"
+    elif fault == "carriage-census":
+        census = b"e" * 64 + b"\r\n"
+    elif fault == "container-id":
+        container["Id"] = "f" * 64
+    elif fault == "state-string":
+        container["State"]["Running"] = "false"
+    elif fault == "state-restarting":
+        container["State"]["Restarting"] = True
+    elif fault == "image-config":
+        image["Id"] = (
+            alertmanager_source._ALERT_OLD_RUNTIME_CONFIG if runtime != "old" else config_id
+        )
+    elif fault == "repo-suffix":
+        image["RepoDigests"] = ["evil.invalid/pulseplate@" + selected.split("@", 1)[1]]
+    elif fault == "duplicate-repo":
+        image["RepoDigests"] *= 2
+    elif fault == "missing-repo":
+        image["RepoDigests"] = []
+    elif fault == "oom-history":
+        container["State"]["OOMKilled"] = True
+    elif fault == "duplicate-json":
+        installed = b'{"name":"deploy","name":"deploy"}'
+    elif fault == "nonfinite":
+        installed = b'{"name":"deploy","x":NaN}'
+    elif fault == "oversize":
+        installed = b" " * (1048576 + 1)
+    capture_values = {"candidate": candidate, "installed-compose": installed, "census": census}
+    if runtime != "absent":
+        capture_values["container"] = json.dumps([container]).encode()
+    if runtime not in ("absent", "stopped"):
+        capture_values["image"] = json.dumps([image]).encode()
+    opened = {}
+    try:
+        for name, value in capture_values.items():
+            path = root / (name + ".capture")
+            path.write_bytes(value)
+            path.chmod(0o600)
+            opened[name] = path.open("rb")
+            # A previous prefix has exhausted the file description; final must pread offset zero.
+            opened[name].read()
+        script = _historical_AM_helper()
+        if instant is not None:
+            frozen = root / "clock-bound-fetcher.py"
+            source = script.read_text()
+            clock = "datetime.now(timezone.utc) < datetime(2026, 10, 21"
+            assert source.count(clock) == 1
+            frozen.write_text(
+                source.replace(
+                    clock, 'datetime.fromisoformat("' + instant + '") < datetime(2026, 10, 21'
+                )
+            )
+            script = frozen
+        argv = [
+            sys.executable,
+            "-I",
+            "-S",
+            str(script),
+            "--alertmanager-contract",
+            "--phase",
+            "final",
+            "--compose",
+            str(root / "docker-compose.staging.yaml"),
+            "--installed-compose",
+            str(root / "docker-compose.staging.yaml"),
+            "--config",
+            str(root / "alertmanager/alertmanager.yml"),
+            "--policy",
+            str(root / "alertmanager/trivy-ignore.yaml"),
+            "--contour",
+            "staging",
+            "--profiles=" + profiles,
+        ]
+        for name in capture_values:
+            if name != "candidate":
+                argv += [
+                    "--" + name + "-fd",
+                    str(opened[name].fileno()),
+                    "--" + name + "-exit",
+                    str(status if name == "census" else 0),
+                ]
+        if fault == "alias":
+            index = argv.index("--installed-compose-fd") + 1
+            argv[index] = str(opened["candidate"].fileno())
+        return subprocess.run(
+            argv,
+            stdin=opened["candidate"],
+            pass_fds=tuple(value.fileno() for value in opened.values()),
+            env={"PATH": os.defpath, "PYTHONDONTWRITEBYTECODE": "1"},
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    finally:
+        for stream in opened.values():
+            stream.close()
+
+
+@pytest.mark.parametrize("runtime", ("absent", "stopped", "accepted"))
+@pytest.mark.parametrize("profiles", ("", "alerting"))
+def test_alertmanager_same_F_final_rereads_complete_captures_after_prefix_EOF(
+    alertmanager_contract_inputs: tuple[Path, dict[str, object]], runtime: str, profiles: str
+) -> None:
+    root, model = alertmanager_contract_inputs
+    actual = _run_alertmanager_pure_contract(
+        root, model, runtime=runtime, profiles=profiles, instant="2026-10-22T00:00:00+00:00"
+    )
+    assert actual.returncode == 0, actual.stderr
+    assert actual.stdout == ("selected\n" if profiles else "off\n")
+
+
+@pytest.mark.parametrize(
+    "fault",
+    (
+        "namespace",
+        "failed-empty",
+        "duplicate-census",
+        "short-census",
+        "carriage-census",
+        "container-id",
+        "state-string",
+        "state-restarting",
+        "image-config",
+        "repo-suffix",
+        "duplicate-repo",
+        "missing-repo",
+        "duplicate-json",
+        "nonfinite",
+        "oversize",
+        "alias",
+    ),
+)
+def test_alertmanager_same_F_final_rejects_actual_native_boundary_fault(
+    alertmanager_contract_inputs: tuple[Path, dict[str, object]], fault: str
+) -> None:
+    root, model = alertmanager_contract_inputs
+    actual = _run_alertmanager_pure_contract(root, model, runtime="accepted", fault=fault)
+    assert actual.returncode != 0
+    assert "AM_contract" in actual.stderr
+    assert actual.stdout == ""
+
+
+@pytest.mark.parametrize(
+    "instant,allowed",
+    (
+        ("2026-10-20T23:59:59+00:00", True),
+        ("2026-10-21T00:00:00+00:00", False),
+        ("2026-10-22T00:00:00+00:00", False),
+    ),
+)
+@pytest.mark.parametrize("profiles", ("", "alerting"))
+def test_alertmanager_same_F_selected_S_still_censuses_running_O_at_final_cutoff(
+    alertmanager_contract_inputs: tuple[Path, dict[str, object]],
+    instant: str,
+    allowed: bool,
+    profiles: str,
+) -> None:
+    root, model = alertmanager_contract_inputs
+    actual = _run_alertmanager_pure_contract(
+        root, model, runtime="old", profiles=profiles, instant=instant
+    )
+    assert (actual.returncode == 0) is allowed, actual.stderr
+    if not allowed:
+        assert "Trivy exception has expired" in actual.stderr
+
+
+def test_alertmanager_same_F_stopped_oom_history_is_not_new_health_invariant(
+    alertmanager_contract_inputs: tuple[Path, dict[str, object]],
+) -> None:
+    root, model = alertmanager_contract_inputs
+    actual = _run_alertmanager_pure_contract(root, model, runtime="stopped", fault="oom-history")
+    assert actual.returncode == 0, actual.stderr
+
+
+@pytest.mark.parametrize("runtime", ("absent", "stopped", "accepted"))
+@pytest.mark.parametrize("native_failure", (False, True))
+def test_alertmanager_collector_actual_status_private_captures_and_fixed_native_operands(
+    alertmanager_contract_inputs: tuple[Path, dict[str, object]], runtime: str, native_failure: bool
+) -> None:
+    root, model = alertmanager_contract_inputs
+    selected, config_id = alertmanager_source._alertmanager_contract_subject()
+    container = _alertmanager_census_inspect_record(
+        status="exited" if runtime == "stopped" else "running"
+    )
+    container["Image"] = config_id
+    image = {
+        "Id": config_id,
+        "Os": "linux",
+        "Architecture": "amd64",
+        "RepoDigests": [selected],
+        "RootFS": {"Layers": alertmanager_source._ALERT_HISTORICAL_C10["graph"]["diff_ids"]},
+    }
+    docker = root / "synthetic-docker"
+    log = root / "calls.jsonl"
+    docker.write_text(
+        "#!"
+        + sys.executable
+        + "\nimport json,sys\n"
+        + "args=sys.argv[1:]\n"
+        + "with open("
+        + repr(str(log))
+        + ", 'a') as stream:stream.write(json.dumps(args)+'\\n')\n"
+        + "if args[0]=='compose': print("
+        + repr(json.dumps(model))
+        + ")\n"
+        + "elif args[0]=='ps':\n"
+        + (
+            " sys.exit(7)\n"
+            if native_failure
+            else " print("
+            + repr("" if runtime == "absent" else "e" * 64)
+            + ") if "
+            + repr(runtime != "absent")
+            + " else None\n"
+        )
+        + "elif args[:2]==['image','inspect']: print("
+        + repr(json.dumps([image]))
+        + ")\n"
+        + "elif args[0]=='inspect': print("
+        + repr(json.dumps([container]))
+        + ")\n"
+        + "else:sys.exit(99)\n"
+    )
+    docker.chmod(0o755)
+    environment = root / "selected.env"
+    environment.write_bytes(b"")
+    argv = [
+        sys.executable,
+        "-I",
+        "-S",
+        str(_historical_AM_helper()),
+        "--alertmanager-contract-collect",
+        "--compose",
+        str(root / "docker-compose.staging.yaml"),
+        "--installed-compose",
+        str(root / "docker-compose.staging.yaml"),
+        "--config",
+        str(root / "alertmanager/alertmanager.yml"),
+        "--policy",
+        str(root / "alertmanager/trivy-ignore.yaml"),
+        "--contour",
+        "staging",
+        "--profiles=",
+        "--env-file",
+        str(environment),
+        "--docker",
+        str(docker),
+    ]
+    actual = subprocess.run(
+        argv,
+        env={"PATH": os.defpath, "TMPDIR": str(root)},
+        text=True,
+        capture_output=True,
+        timeout=15,
+        check=False,
+    )
+    assert (actual.returncode == 0) is not native_failure, actual.stderr
+    assert actual.stdout == ("" if native_failure else "off accepted\n")
+    if native_failure:
+        assert "AM_contract_native_exit:census:7" in actual.stderr
+    calls = [json.loads(line) for line in log.read_text().splitlines()]
+    assert calls[0][0] == calls[1][0] == "compose"
+    assert all(call[call.index("--project-directory") + 1] == str(root) for call in calls[:2])
+    assert all(call[0] in ("compose", "ps", "inspect", "image") for call in calls)
+    assert not any("pull" in call or "up" in call or "stop" in call for call in calls)
+    if not native_failure:
+        assert len(calls) == {"absent": 3, "stopped": 4, "accepted": 5}[runtime]
+    assert not list(root.glob("pulseplate-am-admission-*")), "owned raw captures survived cleanup"
+
+
+@pytest.mark.parametrize("selected_case", ("old", "accepted"))
+@pytest.mark.parametrize("wrong_case", (False, True))
+def test_alertmanager_selected_image_phase_uses_only_canonical_tuple_and_ref_projection(
+    selected_case: str,
+    wrong_case: bool,
+) -> None:
+    ref, config_id = alertmanager_source._alertmanager_contract_subject()
+    if selected_case == "old":
+        ref, config_id = (
+            alertmanager_source._ALERT_OLD_RUNTIME_REF,
+            alertmanager_source._ALERT_OLD_RUNTIME_CONFIG,
+        )
+    args = [
+        sys.executable,
+        "-I",
+        "-S",
+        str(_historical_AM_helper()),
+        "--alertmanager-contract",
+        "--phase",
+        "selected-image",
+        "--selected-case",
+        selected_case,
+    ]
+    projected = subprocess.run(
+        [*args, "--field", "runtime_ref"],
+        env={"PATH": os.defpath},
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    assert projected.returncode == 0 and projected.stdout == ref + "\n", projected.stderr
+    image = {
+        "Id": config_id,
+        "Os": "linux",
+        "Architecture": "amd64",
+        "RepoDigests": [ref],
+        "RootFS": {"Layers": alertmanager_source._ALERT_HISTORICAL_C10["graph"]["diff_ids"]},
+    }
+    if wrong_case:
+        image["Id"] = (
+            alertmanager_source._ALERT_OLD_RUNTIME_CONFIG
+            if selected_case == "accepted"
+            else alertmanager_source._alertmanager_contract_subject()[1]
+        )
+    actual = subprocess.run(
+        args,
+        input=json.dumps([image]),
+        env={"PATH": os.defpath},
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    assert (actual.returncode == 0) is not wrong_case, actual.stderr
+    assert actual.stdout == ("" if wrong_case else selected_case + "\n")
+
+
+def test_alertmanager_collector_shorter_parent_rejects_before_native_effect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The collector reserves cleanup inside an existing parent deadline before dispatch."""
+    import signal
+
+    calls: list[float] = []
+    monkeypatch.setattr(signal, "getitimer", lambda timer: (2.0, 0.0))
+    monkeypatch.setattr(signal, "setitimer", lambda timer, value, *rest: calls.append(value))
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("native operation escaped parent bound"),
+    )
+    with pytest.raises(ValueError, match="AM_contract_parent_budget"):
+        alertmanager_source._alertmanager_contract_collect([])
+    assert calls == [], "rejection must preserve the existing parent's alarm"
+
+
+@pytest.mark.parametrize("survivor", (False, True))
+def test_alertmanager_collector_keeps_exited_leader_until_descendant_cleanup(
+    alertmanager_contract_inputs: tuple[Path, dict[str, object]],
+    monkeypatch: pytest.MonkeyPatch,
+    survivor: bool,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An exited successful leader cannot turn a surviving owned descendant into admission."""
+    import signal
+    from types import SimpleNamespace
+
+    root, model = alertmanager_contract_inputs
+    docker = root / "synthetic-docker"
+    docker.write_bytes(b"synthetic executable")
+    docker.chmod(0o755)
+    environment = root / "selected.env"
+    environment.write_bytes(b"")
+    events: list[str] = []
+    state = {"group_live": False, "clock": 0.0}
+    monkeypatch.setattr(alertmanager_source.time, "monotonic", lambda: state["clock"])
+    monkeypatch.setattr(
+        alertmanager_source.time,
+        "sleep",
+        lambda value: state.__setitem__("clock", state["clock"] + value),
+    )
+    monkeypatch.setattr(signal, "getitimer", lambda timer: (0.0, 0.0))
+    monkeypatch.setattr(signal, "setitimer", lambda *args: None)
+    monkeypatch.setattr(signal, "getsignal", lambda sig: signal.SIG_DFL)
+    monkeypatch.setattr(signal, "signal", lambda *args: None)
+
+    class Child:
+        pid = 987654
+
+        def __init__(self, command: list[str], **kwargs: object) -> None:
+            assert kwargs["start_new_session"] is True
+            state["group_live"] = True
+            self.stdout, self.stderr = self.pipe(
+                json.dumps(model).encode() if command[1] == "compose" else b""
+            ), self.pipe(b"")
+
+        @staticmethod
+        def pipe(raw: bytes) -> object:
+            read, write = os.pipe()
+            os.write(write, raw)
+            os.close(write)
+            return os.fdopen(read, "rb")
+
+        def poll(self) -> int:
+            pytest.fail("leader was reaped before owned-group cleanup")
+
+        def wait(self, **kwargs: object) -> int:
+            assert events[-1] == "kill-owned-group"
+            events.append("reap-own-leader")
+            return 0
+
+    def waitid(kind: int, pid: int, flags: int) -> object:
+        assert kind == os.P_PID and pid == Child.pid and flags & os.WNOWAIT
+        events.append("observe-without-reaping")
+        return SimpleNamespace(si_pid=pid, si_status=0, si_code=os.CLD_EXITED)
+
+    def killpg(pid: int, value: int) -> None:
+        assert pid == Child.pid
+        if value == signal.SIGKILL:
+            assert events[-1] == "observe-without-reaping"
+            events.append("kill-owned-group")
+            state["group_live"] = survivor
+        else:
+            assert value == 0 and "reap-own-leader" in events
+            if not state["group_live"]:
+                events.append("observed-absence")
+                raise ProcessLookupError()
+
+    monkeypatch.setattr(subprocess, "Popen", Child)
+    monkeypatch.setattr(os, "waitid", waitid)
+    monkeypatch.setattr(os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(os, "killpg", killpg)
+    argv = [
+        "--alertmanager-contract-collect",
+        "--compose",
+        str(root / "docker-compose.staging.yaml"),
+        "--installed-compose",
+        str(root / "docker-compose.staging.yaml"),
+        "--config",
+        str(root / "alertmanager/alertmanager.yml"),
+        "--policy",
+        str(root / "alertmanager/trivy-ignore.yaml"),
+        "--contour",
+        "staging",
+        "--profiles=",
+        "--env-file",
+        str(environment),
+        "--docker",
+        str(docker),
+    ]
+    if survivor:
+        with pytest.raises(ValueError, match="AM_contract_owned_group_survived"):
+            alertmanager_source._alertmanager_contract_collect(argv)
+        assert capsys.readouterr().out == ""
+        assert events == ["observe-without-reaping", "kill-owned-group", "reap-own-leader"]
+    else:
+        assert alertmanager_source._alertmanager_contract_collect(argv) == 0
+        assert capsys.readouterr().out == "off accepted\n"
+        assert (
+            events
+            == [
+                "observe-without-reaping",
+                "kill-owned-group",
+                "reap-own-leader",
+                "observed-absence",
+            ]
+            * 3
+        )
+
+
+@pytest.mark.parametrize("leaf", ("alertmanager.yml", "trivy-ignore.yaml"))
+def test_staging_missing_installed_alertmanager_files_hold_without_runtime_absence_claim(
+    tmp_path: Path,
+    leaf: str,
+) -> None:
+    env, log = _staging_deploy_fixture(tmp_path)
+    (Path(env["PROJECT_DIR"]) / "alertmanager" / leaf).unlink()
+    result = subprocess.run(
+        [
+            str(_historical_deploy_script("scripts/deploy.sh")),
+            "--preflight-only",
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64,
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64,
+        ],
+        env=env,
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert (
+        result.returncode != 0
+        and "Staging file must be a regular non-symlink file" in result.stderr
+    )
+    assert "/alertmanager/" + leaf in result.stderr
+    assert "preflight passed" not in result.stdout
+    assert not log.exists() or all(
+        not any(verb in line for verb in (" pull ", " up ", " start ", " stop "))
+        for line in log.read_text().splitlines()
+    )
+
+
+@pytest.mark.parametrize(
+    "arguments,diagnostic",
+    [
+        (["--phase", "candidate", "--phase", "final"], "AM_contract_duplicate_option"),
+        (["--phas", "candidate"], "unrecognized arguments"),
+    ],
+)
+def test_alertmanager_pure_ABI_rejects_duplicate_and_abbreviated_options_before_data_reads(
+    arguments: list[str],
+    diagnostic: str,
+) -> None:
+    selected = [
+        sys.executable,
+        "-I",
+        "-S",
+        str(_historical_AM_helper()),
+        "--alertmanager-contract",
+        *arguments,
+    ]
+    result = subprocess.run(
+        selected,
+        stdin=subprocess.DEVNULL,
+        env={"PATH": os.defpath},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0 and result.stdout == ""
+    # An abbreviated missing required phase is rejected by argparse before operand/file reads.
+    assert diagnostic in result.stderr or (
+        arguments[0] == "--phas" and "required: --phase" in result.stderr
+    )
+
+
+@pytest.mark.parametrize("profiles", ("", "alerting"))
+@pytest.mark.parametrize("fault", ("old-at-cutoff", "old-after-cutoff", "namespace"))
+def test_production_first_bundle_rejects_running_old_or_changed_installed_namespace(
+    tmp_path: Path,
+    profiles: str,
+    fault: str,
+) -> None:
+    env, project, log, bundle = _production_preflight_fixture(tmp_path, with_bundle=True)
+    assert bundle is not None
+    installed = project / "deploy/docker-compose.production.yaml"
+    model = yaml.safe_load(installed.read_text())
+    model["services"].pop("alertmanager")
+    installed.write_text(yaml.safe_dump(model, sort_keys=False))
+    for leaf in ("alertmanager.yml", "trivy-ignore.yaml"):
+        (project / "deploy/alertmanager" / leaf).unlink()
+    (project / "deploy/alertmanager").rmdir()
+    instant = (
+        "2026-10-21T00:00:01+00:00" if fault == "old-after-cutoff" else "2026-10-21T00:00:00+00:00"
+    )
+    script = _alertmanager_clock_bound_deploy(
+        tmp_path, env, _historical_deploy_script("scripts/deploy_production.sh"), instant
+    )
+    (bundle / "scripts/ci/fetch_docker_source_artifacts.py").write_bytes(
+        (project / "scripts/ci/fetch_docker_source_artifacts.py").read_bytes()
+    )
+    env.update(
+        {
+            "COMPOSE_PROFILES": profiles,
+            "STUB_INSTALLED_NO_ALERTMANAGER": str(installed),
+            "STUB_CENSUS_LOG": str(log),
+            "STUB_ALERTMANAGER_PS_IDS": "e" * 64,
+            "STUB_ALERTMANAGER_INSPECT_JSON": json.dumps([_alertmanager_census_inspect_record()]),
+        }
+    )
+    if fault == "namespace":
+        env["STUB_INSTALLED_PROJECT_NAME"] = "different-project"
+    result = subprocess.run(
+        [str(script), "--preflight-only"],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert (
+        "AM_contract_installed_project_identity"
+        if fault == "namespace"
+        else "Selected or running Alertmanager Trivy exception has expired"
+    ) in result.stderr
+    assert not (project / "deploy/alertmanager").exists()
+    entries = log.read_text().splitlines() if log.exists() else []
+    assert any("ps --all --no-trunc --quiet" in line for line in entries) is (fault != "namespace")
+    assert all(
+        not any(verb in line for verb in (" pull ", " up ", " stop ", " start "))
+        for line in entries
+    )
+
+
+@pytest.mark.parametrize("profiles", ("", "alerting"))
+def test_staging_new_selection_still_rejects_running_old_at_cutoff(
+    tmp_path: Path,
+    profiles: str,
+) -> None:
+    env, log = _staging_deploy_fixture(tmp_path)
+    env.update(
+        {
+            "COMPOSE_PROFILES": profiles,
+            "STUB_CENSUS_LOG": str(log),
+            "STUB_ALERTMANAGER_PS_IDS": "e" * 64,
+            "STUB_ALERTMANAGER_INSPECT_JSON": json.dumps(
+                [_alertmanager_census_inspect_record(project=Path(env["PROJECT_DIR"]).name)]
+            ),
+        }
+    )
+    script = _alertmanager_clock_bound_deploy(
+        tmp_path, env, _historical_deploy_script("scripts/deploy.sh"), "2026-10-21T00:00:00+00:00"
+    )
+    result = subprocess.run(
+        [
+            str(script),
+            "--preflight-only",
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "a" * 64,
+            "ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:" + "b" * 64,
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert (
+        result.returncode != 0
+        and "Selected or running Alertmanager Trivy exception has expired" in result.stderr
+    )
+    assert any("ps --all --no-trunc --quiet" in line for line in log.read_text().splitlines())
+    assert all(
+        not any(verb in line for verb in (" pull ", " up ", " stop ", " start "))
+        for line in log.read_text().splitlines()
+    )
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        None,
+        "missing-context",
+        "relative-context",
+        "symlink-context",
+        "mount",
+        "secret",
+        "config",
+        "policy",
+    ],
+)
+def test_alertmanager_pure_candidate_separates_incoming_bytes_from_installed_targets(
+    alertmanager_contract_inputs: tuple[Path, dict[str, object]], fault: str | None
+) -> None:
+    installed, model = alertmanager_contract_inputs
+    incoming = installed.parent / "payload"
+    shutil.copytree(installed, incoming)
+    # A first bundle has source bytes but no installed AM leaves yet.
+    shutil.rmtree(installed / "alertmanager")
+    context = installed / "docker-compose.staging.yaml"
+    if fault == "relative-context":
+        context = Path("docker-compose.staging.yaml")
+    elif fault == "symlink-context":
+        linked = installed.parent / "linked-compose.yaml"
+        linked.symlink_to(context)
+        context = linked
+    elif fault == "mount":
+        model["services"]["alertmanager"]["volumes"][0]["source"] = str(
+            incoming / "alertmanager/alertmanager.yml"
+        )
+    elif fault == "secret":
+        model["secrets"]["alertmanager_smtp_key"]["file"] = str(
+            incoming / "secrets/alertmanager_smtp_key"
+        )
+    elif fault == "config":
+        (incoming / "alertmanager/alertmanager.yml").write_text("invalid incoming configuration")
+    elif fault == "policy":
+        (incoming / "alertmanager/trivy-ignore.yaml").write_bytes(b"vulnerabilities: []\n\n")
+    argv = [
+        sys.executable,
+        "-I",
+        "-S",
+        str(_historical_AM_helper()),
+        "--alertmanager-contract",
+        "--phase",
+        "candidate",
+        "--compose",
+        str(incoming / "docker-compose.staging.yaml"),
+        "--config",
+        str(incoming / "alertmanager/alertmanager.yml"),
+        "--policy",
+        str(incoming / "alertmanager/trivy-ignore.yaml"),
+        "--contour",
+        "staging",
+        "--profiles=",
+    ]
+    if fault != "missing-context":
+        argv += ["--installed-compose", str(context)]
+    result = subprocess.run(
+        argv,
+        input=json.dumps(model),
+        env={"PATH": os.defpath},
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert (result.returncode == 0) is (fault is None), result.stderr
+    assert result.stdout == ("accepted\n" if fault is None else "")
+    assert not (installed / "alertmanager").exists()
+
+
+def test_alertmanager_selected_image_rejects_surplus_installed_context(tmp_path: Path) -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            str(_historical_AM_helper()),
+            "--alertmanager-contract",
+            "--phase",
+            "selected-image",
+            "--selected-case",
+            "accepted",
+            "--field",
+            "runtime_ref",
+            "--installed-compose",
+            str(tmp_path / "absent"),
+        ],
+        stdin=subprocess.DEVNULL,
+        env={"PATH": os.defpath},
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode != 0 and result.stdout == ""
+    assert "AM_contract_selected_image_operands" in result.stderr
+
+
+@pytest.mark.parametrize("self_hosted", [False, True])
+def test_production_incoming_renderers_share_installed_project_directory(
+    tmp_path: Path, self_hosted: bool
+) -> None:
+    env, project, log, bundle = _production_preflight_fixture(tmp_path, with_bundle=True)
+    assert bundle is not None
+    if self_hosted:
+        name = "docker-compose.production.selfhosted.yaml"
+        # The existing fixture owns the complete self-hosted source/manifest contract.
+        for root in (project, bundle):
+            (root / "deploy" / name).write_bytes(_historical_AM_template(SELF_HOSTED_COMPOSE_PATH))
+        env["COMPOSE_FILE"] = "deploy/" + name
+        env.update(
+            {
+                "POSTGRES_DB": "synthetic",
+                "POSTGRES_USER": "synthetic",
+                "POSTGRES_PASSWORD": "synthetic",
+            }
+        )
+        stub = Path(env["DOCKER_BIN"])
+        stub.write_text(
+            stub.read_text().replace(
+                "app\\nworker\\ncaddy\\nprometheus\\n",
+                "app\\nworker\\ncaddy\\nprometheus\\npostgres\\n",
+            )
+        )
+    assert not (bundle / "deploy/.env").exists()
+    result = subprocess.run(
+        [str(_historical_deploy_script("scripts/deploy_production.sh")), "--preflight-only"],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    calls = [line for line in log.read_text().splitlines() if "config --format json" in line]
+    assert calls
+    assert all("--project-directory " + str(project / "deploy") in line for line in calls)
+    assert any("-f " + str(bundle / "deploy") in line for line in calls)
+    assert not (bundle / "deploy/.env").exists()
+
+
+@pytest.mark.parametrize("raw", [b"[]", b"[{}]"])
+def test_alertmanager_candidate_keeps_object_guard_after_union_decode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw: bytes
+) -> None:
+    """Inspection arrays remain decodable but cannot become a candidate object by typing."""
+    decoded = alertmanager_source._alertmanager_contract_json(raw)
+    assert type(decoded) is list
+    monkeypatch.setattr(
+        alertmanager_source,
+        "_alertmanager_contract_file",
+        lambda *args: pytest.fail("array candidate reached source-file reads"),
+    )
+    with pytest.raises(ValueError, match="AM_contract_contour"):
+        alertmanager_source._alertmanager_contract_candidate(
+            decoded,
+            tmp_path / "compose.yaml",
+            tmp_path / "config.yaml",
+            tmp_path / "policy.yaml",
+            "production",
+            installed_compose=tmp_path / "installed.yaml",
+        )
+
+
+def test_alertmanager_pure_image_keeps_unconfigured_subject_hold_before_optional_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_ref, config_id = alertmanager_source._alertmanager_contract_subject()
+    image = [
+        {"Id": config_id, "Os": "linux", "Architecture": "amd64", "RepoDigests": [runtime_ref]}
+    ]
+    monkeypatch.setattr(alertmanager_source, "_ALERT_ACCEPTED_CANDIDATE", None)
+    with pytest.raises(ValueError, match="AM_accepted_producer_UNCONFIGURED_HOLD"):
+        alertmanager_source._alertmanager_contract_image(image, config_id)
+
+
+def test_alertmanager_trusted_helper_readers_bind_complete_current_source_bytes() -> None:
+    """Reader consistency only; hashes do not grant independent trust or authorization."""
+    expected = hashlib.sha256(
+        (REPO_ROOT / "scripts/ci/fetch_docker_source_artifacts.py").read_bytes()
+    ).hexdigest()
+    for relative in ("scripts/deploy.sh", "scripts/deploy_production.sh"):
+        assert re.findall(
+            r'ALERTMANAGER_CONTRACT_HELPER_SHA256="([0-9a-f]{64})"',
+            (REPO_ROOT / relative).read_text(),
+        ) == [expected]
+
+
+@pytest.mark.parametrize("current", [False, True])
+def test_alertmanager_compiler_epoch_is_exact(current: bool) -> None:
+    compiler = "go1.27.3" if current else "go1.27.2"
+    raw = (
+        f"/out/alertmanager: {compiler}\n"
+        "\tpath\tgithub.com/prometheus/alertmanager/cmd/alertmanager\n"
+        "\tmod\tgithub.com/prometheus/alertmanager\t(devel)\n"
+        "\tdep\tgolang.org/x/net\tv0.60.0\n"
+        "\tdep\tgoogle.golang.org/grpc\tv1.83.2\n"
+        "\tbuild\tCGO_ENABLED=0\n\tbuild\tGOOS=linux\n\tbuild\tGOARCH=amd64\n"
+        "\tbuild\t-tags=netgo\n\tbuild\t-trimpath=true\n"
+    ).encode()
+    assert (
+        alertmanager_source._alertmanager_build_information(
+            raw,
+            "alertmanager",
+            current=current,
+            compiler_artifact=prometheus_source.RETAINED_GO if (current) else prometheus_source.GO,
+        )["Go"]
+        == compiler
+    )
+    with pytest.raises(prometheus_source.QualificationError, match="AM_actual_Go_build_version"):
+        alertmanager_source._alertmanager_build_information(
+            raw,
+            "alertmanager",
+            current=not current,
+            compiler_artifact=(
+                prometheus_source.RETAINED_GO if (not current) else prometheus_source.GO
+            ),
+        )
+
+
+def _synthetic_AM_negative_control(current: bool, ca_severity: str = "HIGH") -> dict[str, Any]:
+    """Parser fixtures only; they never claim native scanner execution."""
+    affected = [
+        ("CVE-2026-84445", "pkg:golang/google.golang.org/grpc@v1.83.1"),
+        ("CVE-2026-78669", "pkg:golang/golang.org/x/net@v0.58.0"),
+        ("CVE-2026-78669", "pkg:golang/stdlib@v1.26.8"),
+        ("CVE-2026-78667", "pkg:golang/stdlib@v1.26.8"),
+        ("CVE-2026-97031", "pkg:golang/stdlib@v1.26.8"),
+    ]
+    if current:
+        affected.append(("CVE-2026-111943", "pkg:golang/stdlib@v1.26.8"))
+    return {
+        "ArtifactType": "container_image",
+        "Metadata": {"ImageID": "synthetic-control"},
+        "Results": [
+            {
+                "Target": target,
+                "Class": "lang-pkgs",
+                "Type": "gobinary",
+                "Packages": [{"Name": "stdlib", "Version": "v1.26.8"}],
+                "Vulnerabilities": [
+                    {
+                        "VulnerabilityID": cve,
+                        "PkgIdentifier": {"PURL": purl},
+                        "Severity": ca_severity if cve == "CVE-2026-111943" else "HIGH",
+                    }
+                    for cve, purl in affected
+                ],
+            }
+            for target in ("bin/alertmanager", "bin/amtool")
+        ],
+    }
+
+
+@pytest.mark.parametrize("current,ca_severity", [(False, "HIGH"), (True, "HIGH"), (True, "MEDIUM")])
+def test_alertmanager_negative_control_keeps_disjoint_epochs(
+    current: bool, ca_severity: str
+) -> None:
+    report = _synthetic_AM_negative_control(current, ca_severity)
+    original = json.dumps(report, sort_keys=True)
+    result = alertmanager_source._alertmanager_vulnerability_control(
+        report, "synthetic-control", current=current
+    )
+    assert result == {
+        "scope": "KNOWN_VULNERABLE_CONTROL_ONLY_NEVER_CANDIDATE",
+        "known_HIGH_occurrences": 12 if current and ca_severity == "HIGH" else 10,
+        "all_severity_findings_retained": True,
+        "image_config": "synthetic-control",
+    }
+    assert json.dumps(report, sort_keys=True) == original
+    with pytest.raises(prometheus_source.QualificationError, match="inventory_changed_HOLD"):
+        alertmanager_source._alertmanager_vulnerability_control(
+            report, "synthetic-control", current=not current
+        )
+    if not current:
+        for severity in ("UNKNOWN", "LOW", "MEDIUM", "HIGH", "CRITICAL"):
+            with pytest.raises(
+                prometheus_source.QualificationError, match="inventory_changed_HOLD"
+            ):
+                alertmanager_source._alertmanager_vulnerability_control(
+                    _synthetic_AM_negative_control(True, severity), "synthetic-control"
+                )
+
+
+@pytest.mark.parametrize("severity", ["UNKNOWN", "LOW", "MEDIUM", "HIGH", "CRITICAL"])
+@pytest.mark.parametrize("current", [False, True])
+def test_alertmanager_historical_control_retains_non062_lower_severity(
+    current: bool, severity: str
+) -> None:
+    report = _synthetic_AM_negative_control(current)
+    for row in report["Results"]:
+        row["Vulnerabilities"].append(
+            {
+                "VulnerabilityID": "CVE-2026-78661",
+                "Severity": severity,
+                "PkgIdentifier": {"PURL": "pkg:golang/golang.org/x/net@v0.58.0"},
+            }
+        )
+    plan = {"state": "DECLARED_ONLY_COMPILER_HOLD"}
+    assert "derivation_epoch" not in plan
+    before = json.dumps(report, sort_keys=True)
+    if severity in ("HIGH", "CRITICAL"):
+        with pytest.raises(prometheus_source.QualificationError, match="inventory_changed_HOLD"):
+            alertmanager_source._alertmanager_vulnerability_control(
+                report, "synthetic-control", current=current, qualification_plan=plan
+            )
+    else:
+        result = alertmanager_source._alertmanager_vulnerability_control(
+            report, "synthetic-control", current=current, qualification_plan=plan
+        )
+        assert result == {
+            "scope": "KNOWN_VULNERABLE_CONTROL_ONLY_NEVER_CANDIDATE",
+            "known_HIGH_occurrences": 12 if current else 10,
+            "all_severity_findings_retained": True,
+            "image_config": "synthetic-control",
+        }
+    assert json.dumps(report, sort_keys=True) == before
+
+
+@pytest.mark.parametrize("ca_severity", ["HIGH", "MEDIUM"])
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "missing",
+        "both-missing",
+        "extra",
+        "duplicate",
+        "duplicate-CA",
+        "duplicate-CA-low",
+        "target",
+        "PURL",
+        "missing-PURL",
+        "malformed-PURL",
+        "secret",
+        "class",
+        "type",
+        "wrong-class-CA-copy",
+        "wrong-class-HC-copy",
+        "CA-low",
+        "CA-unknown",
+        "CA-critical",
+        "CA-mixed",
+        "CA-malformed",
+        "other-HIGH-rescore",
+    ],
+)
+def test_alertmanager_current_negative_control_rejects_incomplete_or_changed_report(
+    fault: str,
+    ca_severity: str,
+) -> None:
+    report = _synthetic_AM_negative_control(True, ca_severity)
+    row = report["Results"][0]
+    ca_finding = row["Vulnerabilities"][-1]
+    diagnostic = "AM_known_vulnerable_control_inventory_changed_HOLD"
+    if fault == "missing":
+        row["Vulnerabilities"].pop()
+    elif fault == "both-missing":
+        for result in report["Results"]:
+            result["Vulnerabilities"].pop()
+    elif fault == "extra":
+        row["Vulnerabilities"].append(
+            {
+                "VulnerabilityID": "CVE-unexpected",
+                "Severity": "HIGH",
+                "PkgIdentifier": {"PURL": "pkg:golang/other@v1"},
+            }
+        )
+    elif fault == "duplicate":
+        row["Vulnerabilities"].append(dict(row["Vulnerabilities"][0]))
+    elif fault in ("duplicate-CA", "duplicate-CA-low"):
+        duplicate = dict(ca_finding)
+        if fault == "duplicate-CA-low":
+            duplicate["Severity"] = "LOW"
+        row["Vulnerabilities"].append(duplicate)
+    elif fault == "target":
+        row["Target"] = "usr/bin/alertmanager"
+    elif fault == "PURL":
+        ca_finding["PkgIdentifier"]["PURL"] = "pkg:golang/stdlib@v1.27.3"
+    elif fault == "missing-PURL":
+        ca_finding["PkgIdentifier"].pop("PURL")
+        diagnostic = "AM_vulnerable_control_PURL"
+    elif fault == "malformed-PURL":
+        ca_finding["PkgIdentifier"] = []
+        diagnostic = "AM_vulnerable_control_PURL"
+    elif fault == "secret":
+        row["Secrets"] = [{"Match": "synthetic-only"}]
+        diagnostic = "AM_vulnerable_control_result"
+    elif fault in ("class", "type"):
+        row["Class" if fault == "class" else "Type"] = "unexpected"
+    elif fault in ("wrong-class-CA-copy", "wrong-class-HC-copy"):
+        # Legitimate targets stay present; a copied target cannot grant row authority.
+        report["Results"].append(
+            {
+                "Target": row["Target"],
+                "Class": "os-pkgs",
+                "Type": "alpine",
+                "Vulnerabilities": [
+                    dict(
+                        ca_finding if fault == "wrong-class-CA-copy" else row["Vulnerabilities"][0]
+                    )
+                ],
+            }
+        )
+    elif fault in ("CA-low", "CA-unknown", "CA-critical", "CA-malformed"):
+        ca_finding["Severity"] = {
+            "CA-low": "LOW",
+            "CA-unknown": "UNKNOWN",
+            "CA-critical": "CRITICAL",
+            "CA-malformed": None,
+        }[fault]
+        if fault == "CA-malformed":
+            diagnostic = "AM_vulnerable_control_finding"
+    elif fault == "CA-mixed":
+        ca_finding["Severity"] = "HIGH" if ca_severity == "MEDIUM" else "MEDIUM"
+    else:
+        row["Vulnerabilities"][0]["Severity"] = "MEDIUM"
+    with pytest.raises(prometheus_source.QualificationError, match=diagnostic):
+        alertmanager_source._alertmanager_vulnerability_control(
+            report, "synthetic-control", current=True
+        )
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [None, "extra", "missing", "hash", "mode", "duplicate-row", "path", "empty", "directory"],
+)
+def test_alertmanager_current_support_transport_is_complete(
+    tmp_path: Path, fault: str | None
+) -> None:
+    api_raw = b'{"synthetic":true}\n'
+    rows = [
+        {
+            "path": "GitHub-1.json",
+            "size": len(api_raw),
+            "mode": 0o600,
+            "sha256": hashlib.sha256(api_raw).hexdigest(),
+        }
+    ]
+    if fault == "hash":
+        rows[0]["sha256"] = "0" * 64
+    elif fault == "mode":
+        rows[0]["mode"] = 0o644
+    elif fault == "duplicate-row":
+        rows.append(dict(rows[0]))
+    elif fault == "path":
+        rows[0]["path"] = "../GitHub-1.json"
+    elif fault == "empty":
+        rows.clear()
+    archive = tmp_path / "support.zip"
+    members = {
+        "input-inspection.json": b"{}",
+        "native-support/artifact-payload-members.json": b"{}",
+    }
+    if fault != "missing":
+        members["github-read-evidence/GitHub-1.json"] = api_raw
+    if fault == "extra":
+        members["unaccounted.txt"] = b"surplus"
+    with zipfile.ZipFile(archive, "w") as out:
+        for name, raw in members.items():
+            info = zipfile.ZipInfo(name)
+            info.external_attr = (stat.S_IFREG | 0o600) << 16
+            out.writestr(info, raw)
+        if fault == "directory":
+            out.writestr("unaccounted/", b"")
+    with zipfile.ZipFile(archive) as retained:
+
+        def check() -> None:
+            alertmanager_source._alertmanager_current_support_transport(
+                retained,
+                retained.infolist(),
+                {"native-support/artifact-payload-members.json"},
+                {"github_read_evidence": rows},
+            )
+
+        if fault is None:
+            check()
+        else:
+            with pytest.raises(prometheus_source.QualificationError):
+                check()
+
+
+@pytest.mark.parametrize(
+    ("outcomes", "terminal"),
+    [
+        (("404", "ok"), ""),
+        (("500", "502", "ok"), ""),
+        (("503-after", "ok"), ""),
+        (("429-after", "ok"), ""),
+        (("reset", "ok"), ""),
+        (("wrapped-timeout", "ok"), ""),
+        (("reset", "wrapped-reset", "timeout"), "temporary transport failure on attempt 3"),
+        (("429-long",), "HTTP 429 on attempt 1"),
+        (("429-invalid",), "Invalid support metadata retry delay"),
+        (("wrapped-tls",), "transport failed"),
+        (("unknown-url-error",), "transport failed"),
+        (("404", "404", "404"), "HTTP 404 on attempt 3"),
+        (("504", "504", "504"), "HTTP 504 on attempt 3"),
+        (("403",), "HTTP 403 on attempt 1"),
+        (("401",), "HTTP 401 on attempt 1"),
+        (("501",), "HTTP 501 on attempt 1"),
+        (("503-long",), "HTTP 503 on attempt 1"),
+        (("tls",), "transport failed"),
+        (("redirect",), "HTTP 302 on attempt 1"),
+        (("invalid-json",), "JSONDecodeError"),
+        (("wrong-digest",), "AM_support_uploaded_archive_identity"),
+        (("oversized",), "metadata exceeds its bound"),
+    ],
+)
+def test_alertmanager_S_reads_only_its_fresh_upload_before_validating(
+    tmp_path: Path,
+    outcomes: tuple[str, ...],
+    terminal: str,
+) -> None:
+    import textwrap
+
+    job = yaml.safe_load(CD_WORKFLOW_PATH.read_bytes())["jobs"]["alertmanager-input-inspection"]
+    step = next(
+        s
+        for s in job["steps"]
+        if s["name"] == "Verify the completed support upload identity and size"
+    )
+    assert step["if"] == "success()" and step["timeout-minutes"] == 1
+    assert "timeout --kill-after=1s 55s python3 -B -E -s -S -" in step["run"]
+    trace = tmp_path / "native-requests"
+    native = textwrap.dedent("""
+        import io, json, os, ssl, time, urllib.error, urllib.request, urllib.response
+        from email.message import Message
+        from pathlib import Path
+        trace = Path(os.environ["FIXTURE_TRACE"])
+        outcomes = iter(json.loads(os.environ["FIXTURE_RESPONSES"]))
+        now = time.monotonic()
+        time.monotonic = lambda: now
+        def wait(delay):
+            global now
+            now += delay
+            with trace.open("a") as stream: print("wait", delay, file=stream)
+        time.sleep = wait
+        def exchange(handler, request):
+            assert request.get_method() == "GET"
+            assert request.full_url == "https://api.github.com/repos/Katsiarynakavaleuskaya/PulsePlate/actions/artifacts/33"
+            assert request.get_header("Authorization") == "Bearer " + os.environ["GH_TOKEN"]
+            assert 0 < request.timeout <= 12
+            item = next(outcomes)
+            with trace.open("a") as stream: print("GET", item, file=stream)
+            headers = Message()
+            status = int(item[:3]) if item[:3].isdigit() else 302 if item == "redirect" else 200
+            if item == "tls": raise ssl.SSLCertVerificationError("PRIVATE-TRANSPORT")
+            if item == "wrapped-tls": raise urllib.error.URLError(ssl.SSLCertVerificationError("PRIVATE-TRANSPORT"))
+            if item == "timeout": raise TimeoutError("PRIVATE-TRANSPORT")
+            if item == "wrapped-timeout": raise urllib.error.URLError(TimeoutError("PRIVATE-TRANSPORT"))
+            if item == "reset": raise ConnectionResetError("PRIVATE-TRANSPORT")
+            if item == "wrapped-reset": raise urllib.error.URLError(ConnectionResetError("PRIVATE-TRANSPORT"))
+            if item == "unknown-url-error": raise urllib.error.URLError("PRIVATE-TRANSPORT")
+            if item == "redirect": headers["Location"] = "https://foreign.invalid/redacted"
+            if item in ("503-after", "429-after"): headers["Retry-After"] = "3"
+            if item in ("503-long", "429-long"): headers["Retry-After"] = "999"
+            if item == "429-invalid": headers["Retry-After"] = "PRIVATE-TRANSPORT"
+            body = os.environ["FIXTURE_BODY"].encode()
+            if item == "invalid-json" or status != 200: body = b"PRIVATE-TRANSPORT"
+            if item == "oversized": body = b"x" * 65537
+            res = urllib.response.addinfourl(io.BytesIO(body), headers, request.full_url, status)
+            res.msg = "status"
+            return res
+        urllib.request.HTTPSHandler.https_open = exchange
+    """)
+    # Use the actual workflow body, canonical no-redirect HTTPS opener and strict S verifier.
+    digest = hashlib.sha256(b"synthetic support ZIP").hexdigest()
+    sha = "a" * 40
+    artifact = {
+        "id": 33,
+        "expired": False,
+        "size_in_bytes": 1024,
+        "digest": "sha256:" + ("0" * 64 if "wrong-digest" in outcomes else digest),
+        "name": "alertmanager-input-inspection-22-1",
+        "workflow_run": {
+            "id": 22,
+            "head_sha": sha,
+            "repository_id": 1043311030,
+            "head_repository_id": 1043311030,
+        },
+    }
+    result = subprocess.run(
+        [sys.executable, "-B", "-E", "-s", "-S", "-c", native + _prometheus_cd_python(step)],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+        env={
+            "GH_TOKEN": "synthetic-support-only",
+            "AM_ARTIFACT_DIGEST": digest,
+            "AM_ARTIFACT_ID": "33",
+            "GITHUB_RUN_ID": "22",
+            "GITHUB_RUN_ATTEMPT": "1",
+            "GITHUB_SHA": sha,
+            "FIXTURE_TRACE": str(trace),
+            "FIXTURE_RESPONSES": json.dumps(outcomes),
+            "FIXTURE_BODY": json.dumps(artifact),
+        },
+    )
+    assert (result.returncode != 0) == bool(terminal), result.stderr
+    if terminal:
+        assert terminal in result.stderr
+    assert (
+        "PRIVATE-TRANSPORT" not in result.stderr and "synthetic-support-only" not in result.stderr
+    )
+    assert result.stdout == ""
+    lines = trace.read_text().splitlines()
+    assert [line for line in lines if line.startswith("GET ")] == [
+        "GET " + status for status in outcomes
+    ]
+    expected = (
+        [3.0]
+        if outcomes[0] in ("503-after", "429-after")
+        else [float(i) for i in range(1, len(outcomes))]
+    )
+    assert [float(line.split()[1]) for line in lines if line.startswith("wait ")] == expected
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        None,
+        "one-over",
+        "empty",
+        "expired",
+        "digest",
+        "other-run",
+        "other-source",
+        "foreign",
+        "other-name",
+        "wrong-id",
+    ],
+)
+def test_alertmanager_requires_actual_completed_S_upload(fault: str | None) -> None:
+    source = "1" * 40
+    env = {
+        "GITHUB_RUN_ID": "22",
+        "GITHUB_RUN_ATTEMPT": "1",
+        "AM_ARTIFACT_ID": "33",
+        "AM_ARTIFACT_DIGEST": "a" * 64,
+        "GITHUB_SHA": source,
+    }
+    record = {
+        "id": 34 if fault == "wrong-id" else 33,
+        "expired": fault == "expired",
+        "size_in_bytes": (
+            0
+            if fault == "empty"
+            else alertmanager_source._ALERT_S_ARCHIVE_BYTES + int(fault == "one-over")
+        ),
+        "digest": "sha256:" + ("b" if fault == "digest" else "a") * 64,
+        "name": "other" if fault == "other-name" else "alertmanager-input-inspection-22-1",
+        "workflow_run": {
+            "id": 23 if fault == "other-run" else 22,
+            "head_sha": "2" * 40 if fault == "other-source" else source,
+            "repository_id": 1043311030,
+            "head_repository_id": 7 if fault == "foreign" else 1043311030,
+        },
+    }
+    if fault is None:
+        alertmanager_source._alertmanager_support_upload(record, env)
+    else:
+        with pytest.raises(
+            prometheus_source.QualificationError, match="AM_support_uploaded_archive_identity"
+        ):
+            alertmanager_source._alertmanager_support_upload(record, env)
+
+
+@pytest.mark.parametrize(
+    "name,minimum,maximum,diagnostic",
+    [
+        ("native-support/trivy-cache/db/trivy.db", 1, 1856 * 1024**2, "DB_size"),
+        ("native-support/trivy", 0, 192 * 1024**2, "native_size"),
+        ("native-support/artifact-payload-members.json", 1, 2 * 1024**2, "size"),
+        ("native-support/evidence/native-report.json", 0, 16 * 1024**2, "native_size"),
+        ("github-read-evidence/GitHub-1.stdout", 0, 16 * 1024**2, "API_size"),
+        ("input-inspection.json", 1, 2 * 1024**2, "inspection_size"),
+    ],
+)
+def test_alertmanager_support_file_resource_boundaries(
+    name: str, minimum: int, maximum: int, diagnostic: str
+) -> None:
+    budget = alertmanager_source._alertmanager_support_sizes
+    assert budget([(name, minimum)]) == minimum
+    assert budget([(name, maximum)]) == maximum
+    with pytest.raises(prometheus_source.QualificationError, match="size"):
+        budget([(name, minimum - 1)])
+    with pytest.raises(prometheus_source.QualificationError, match=diagnostic):
+        budget([(name, maximum + 1)])
+
+
+def test_alertmanager_support_accounts_for_all_four_classes_and_shared_space() -> None:
+    budget = alertmanager_source._alertmanager_support_sizes
+    mib = 1024**2
+    # Two admitted class limits can fill the independent expanded ceiling.
+    db = ("native-support/trivy-cache/db/trivy.db", 1856 * mib)
+    native = [("native-support/a", 192 * mib), ("native-support/b", 192 * mib - 3)]
+    footer = ("native-support/artifact-payload-members.json", 1)
+    api = ("github-read-evidence/GitHub-1.stdout", 1)
+    inspection = ("input-inspection.json", 1)
+    files = [db, *native, footer, api, inspection]
+    assert budget(files, complete=True) == 2240 * mib
+    for omitted in (db, footer, api, inspection):
+        with pytest.raises(prometheus_source.QualificationError, match="required_classes"):
+            budget((row for row in files if row != omitted), complete=True)
+    for extra, diagnostic in (
+        (("native-support/c", 1), "AM_support_size"),
+        (("native-support/c", 4), "AM_support_native_size"),
+        (db, "AM_support_DB_size"),
+        (("other", 0), "AM_support_inspection_size"),
+        (("github-read-evidence/other", 0), "AM_support_inspection_size"),
+    ):
+        with pytest.raises(prometheus_source.QualificationError, match=diagnostic):
+            budget([*files, extra], complete=True)
+    api_sizes = [(f"github-read-evidence/GitHub-{i}.stdout", 16 * mib) for i in (1, 2)]
+    assert budget(api_sizes) == 32 * mib
+    with pytest.raises(prometheus_source.QualificationError, match="API_size"):
+        budget([*api_sizes, ("github-read-evidence/GitHub-3.stdout", 1)])
+
+
+def test_alertmanager_support_member_counts_and_disk_reserve(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    budget = alertmanager_source._alertmanager_support_sizes
+    native = [(f"native-support/file-{i}", 0) for i in range(256)]
+    api = [(f"github-read-evidence/GitHub-{i+1}.stdout", 0) for i in range(768)]
+    assert budget(native + api) == 0
+    for members, extra, diagnostic in (
+        (native, ("native-support/extra", 0), "native_size"),
+        (api, ("github-read-evidence/GitHub-769.stderr", 0), "API_size"),
+        (native + api, ("input-inspection.json", 1), "AM_support_size"),
+    ):
+        with pytest.raises(prometheus_source.QualificationError, match=diagnostic):
+            budget([*members, extra])
+    current = shutil.disk_usage(tmp_path)
+    required = 8192
+    free_at_boundary = required + alertmanager_source._ALERT_S_FREE_RESERVE
+    for free in (free_at_boundary, free_at_boundary - 1):
+        monkeypatch.setattr(shutil, "disk_usage", lambda _: current._replace(free=free))
+        if free == free_at_boundary:
+            alertmanager_source._alertmanager_support_space(tmp_path, required)
+        else:
+            with pytest.raises(prometheus_source.QualificationError, match="AM_support_free_space"):
+                alertmanager_source._alertmanager_support_space(tmp_path, required)
+
+
+def test_alertmanager_support_bounds_zip_metadata_without_restricting_member_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Force a real ZIP64 end record, including its locator, without a multi-GiB fixture.
+    monkeypatch.setattr(zipfile, "ZIP64_LIMIT", 1024)
+    path = tmp_path / "S.zip"
+    payload_size = 2 * 1024**2
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as producer:
+        producer.comment = b"valid uploader comment"
+        with producer.open("payload", "w", force_zip64=True) as member:
+            member.write(b"a" * payload_size)
+    with alertmanager_source._AlertmanagerSupportZipStream(io.FileIO(path, "rb")) as source:
+        with pytest.raises(prometheus_source.QualificationError, match="AM_support_ZIP_directory"):
+            source.read()
+        with zipfile.ZipFile(source) as archive:
+            assert archive.comment == b"valid uploader comment"
+            assert archive.getinfo("payload").compress_type == zipfile.ZIP_STORED
+            source.reading_directory = False
+            assert archive.read("payload") == b"a" * payload_size
+    bad_path = tmp_path / "oversized-directory.zip"
+    with zipfile.ZipFile(bad_path, "w") as producer:
+        for index in range(20):
+            producer.writestr(str(index) + "x" * 60000, b"")
+    with (
+        alertmanager_source._AlertmanagerSupportZipStream(io.FileIO(bad_path, "rb")) as source,
+        pytest.raises(prometheus_source.QualificationError, match="AM_support_ZIP_directory"),
+        zipfile.ZipFile(source),
+    ):
+        pytest.fail("an oversized ZIP directory was allocated")
+
+
+@pytest.mark.parametrize(
+    "hook,job,accepted", [(60, 190, True), (40, 190, False), (60, 189, False), (60, 170, False)]
+)
+def test_alertmanager_ci_lint_budget_preserves_native_caps(
+    monkeypatch: pytest.MonkeyPatch, hook: int, job: int, accepted: bool
+) -> None:
+    phases = {
+        "PREP_SECONDS": 600,
+        "PAIR_SECONDS": 1800,
+        "SECURITY_SECONDS": 1800,
+        "NATIVE_SECONDS": 2400,
+        "PUBLICATION_SECONDS": 1800,
+        "CLEANUP_SECONDS": 45,
+        "NATIVE_CLEANUP_SECONDS": 120,
+        "SCAN_TIMEOUT_SECONDS": 300,
+        "SCAN_PROCESS_SECONDS": 330,
+    }
+    for key, value in phases.items():
+        monkeypatch.setenv("ALERTMANAGER_" + key, str(value))
+    for key, value in {
+        "CALLER_KIND": "ci-lint",
+        "JOB_TIMEOUT_MINUTES": str(job),
+        "GENERIC_NATIVE_MINUTES": "40",
+        "LINT_CHECK_MINUTES": str(hook),
+    }.items():
+        monkeypatch.setenv("ALERTMANAGER_" + key, value)
+    if accepted:
+        assert alertmanager_source._alertmanager_limits(caller=True) == phases
+    else:
+        with pytest.raises(prometheus_source.QualificationError):
+            alertmanager_source._alertmanager_limits(caller=True)
+
+
+@pytest.mark.parametrize(
+    "fault", [None, "missing", "duplicate", "pending", "attempt", "foreign", "artifact"]
+)
+def test_alertmanager_current_inputs_select_exact_actual_predecessor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str | None
+) -> None:
+    source_sha = "a" * 40
+    run = {
+        "id": 101,
+        "head_sha": source_sha,
+        "head_branch": "codex/python-setup-security-stabilization",
+        "run_attempt": 1,
+        "status": "completed",
+        "conclusion": "success",
+    }
+    if fault == "pending":
+        run["status"] = "in_progress"
+    elif fault == "attempt":
+        run["run_attempt"] = 2
+    elif fault == "foreign":
+        run["head_branch"] = "unrelated-owner"
+    runs = [] if fault == "missing" else [run]
+    if fault == "duplicate":
+        runs.append({**run, "id": 102})
+    artifact = {
+        "id": 201,
+        "name": "alertmanager-module-qualification-101-1",
+        "digest": "sha256:" + "b" * 64,
+    }
+    observed: list[tuple[Any, ...]] = []
+
+    class API:
+        def json(self, endpoint: str) -> dict[str, int]:
+            return {"total_count": len(runs) if "/workflows/" in endpoint else 1}
+
+        def pages(self, endpoint: str, key: str, count: int) -> list[dict[str, Any]]:
+            if key == "workflow_runs":
+                return runs
+            identifier = int(endpoint.split("/runs/")[1].split("/")[0])
+            if key == "jobs":
+                return [
+                    {
+                        "id": identifier + 1000,
+                        "name": "alertmanager-module-qualification",
+                        "run_id": identifier,
+                        "head_sha": source_sha,
+                        "status": "completed",
+                        "conclusion": "success",
+                    }
+                ]
+            return (
+                []
+                if fault == "artifact"
+                else [{**artifact, "name": f"alertmanager-module-qualification-{identifier}-1"}]
+            )
+
+    def authenticated(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        observed.append((args, kwargs))
+        return {"run": args[1], "artifact": args[2], "source": args[3]}
+
+    monkeypatch.delenv("GITHUB_RUN_ID", raising=False)
+    monkeypatch.setattr(alertmanager_source, "_alertmanager_authenticated_inputs", authenticated)
+    arguments = {
+        "kind": "qualification",
+        "source_files": {path: "c" * 64 for path in alertmanager_source._ALERT_Q_SOURCE_FILES},
+    }
+    if fault is None:
+        result = alertmanager_source._alertmanager_current_inputs(
+            API(), source_sha, tmp_path / "qualification.zip", **arguments
+        )
+        assert result == {"run": 101, "artifact": 201, "source": source_sha}
+        assert len(observed) == 1
+        assert observed[0][1]["current_artifact_digest"] == artifact["digest"]
+        assert observed[0][1]["current_source_files"] == arguments["source_files"]
+    else:
+        with pytest.raises(prometheus_source.QualificationError):
+            alertmanager_source._alertmanager_current_inputs(
+                API(), source_sha, tmp_path / "qualification.zip", **arguments
+            )
+        assert observed == []
+
+
+def test_historical_AM_oracle_is_independent_of_current_static_data(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    before = _historical_AM_scan_oracle()
+    monkeypatch.setattr(alertmanager_source, "_ALERT_CURRENT_SCAN_ORACLE", {})
+    assert _historical_AM_scan_oracle() == before
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        None,
+        "missing",
+        "both-missing",
+        "duplicate-low",
+        "duplicate-high",
+        "wrong-row",
+        "wrong-purl",
+        "wrong-target",
+        "wrong-class",
+        "unknown",
+        "critical",
+        "mixed",
+        "epoch",
+        "inputs",
+        "not-current",
+    ],
+)
+def test_alertmanager_negative_control_062_exact_fourteen_and_all_severity_identity(
+    fault: str | None,
+) -> None:
+    report = _synthetic_AM_negative_control(True)
+    plan = {
+        "derivation_epoch": alertmanager_source._ALERT_XNET062_METADATA_EPOCH,
+        "command_module_inputs": {"alertmanager": {}, "amtool": {}},
+    }
+    for row in report["Results"]:
+        row["Vulnerabilities"].append(
+            {
+                "VulnerabilityID": "CVE-2026-97054",
+                "Severity": "UNKNOWN",
+                "PkgIdentifier": {"PURL": "pkg:golang/stdlib@v1.26.8"},
+            }
+        )
+        row["Vulnerabilities"].append(
+            {
+                "VulnerabilityID": "CVE-2026-78661",
+                "Severity": "HIGH",
+                "PkgIdentifier": {"PURL": "pkg:golang/golang.org/x/net@v0.58.0"},
+            }
+        )
+    if fault == "missing":
+        report["Results"][0]["Vulnerabilities"].pop()
+    elif fault == "both-missing":
+        for row in report["Results"]:
+            row["Vulnerabilities"].pop()
+    elif fault == "duplicate-high":
+        report["Results"][0]["Vulnerabilities"].append(
+            dict(report["Results"][0]["Vulnerabilities"][-1])
+        )
+    elif fault == "wrong-target":
+        report["Results"][0]["Target"] = "bin/other"
+    elif fault == "wrong-class":
+        report["Results"][0]["Class"] = "os-pkgs"
+    elif fault in ("unknown", "critical", "mixed"):
+        for row in report["Results"]:
+            row["Vulnerabilities"][-1]["Severity"] = (
+                "CRITICAL" if fault == "critical" else "UNKNOWN"
+            )
+            if fault == "mixed":
+                break
+    elif fault == "epoch":
+        plan["derivation_epoch"] = "unrecognized"
+    elif fault == "inputs":
+        plan["command_module_inputs"] = {"alertmanager": {}}
+    elif fault in ("duplicate-low", "wrong-row"):
+        finding = {
+            "VulnerabilityID": "CVE-2026-78661",
+            "Severity": "LOW",
+            "PkgIdentifier": {"PURL": "pkg:golang/golang.org/x/net@v0.58.0"},
+        }
+        if fault == "wrong-row":
+            report["Results"].append(
+                {
+                    "Target": "bin/alertmanager",
+                    "Class": "os-pkgs",
+                    "Type": "alpine",
+                    "Vulnerabilities": [finding],
+                }
+            )
+        else:
+            report["Results"][0]["Vulnerabilities"].append(finding)
+    elif fault == "wrong-purl":
+        report["Results"][0]["Vulnerabilities"][-1]["PkgIdentifier"][
+            "PURL"
+        ] = "pkg:golang/stdlib@v1.26.8"
+    if fault is not None:
+        with pytest.raises(
+            prometheus_source.QualificationError,
+            match="AM_(known_vulnerable_control|control_062_qualification)",
+        ):
+            alertmanager_source._alertmanager_vulnerability_control(
+                report, "synthetic-control", current=fault != "not-current", qualification_plan=plan
+            )
+    else:
+        observed = alertmanager_source._alertmanager_vulnerability_control(
+            report, "synthetic-control", current=True, qualification_plan=plan
+        )
+        assert observed["known_HIGH_occurrences"] == 14
+        with pytest.raises(prometheus_source.QualificationError):
+            alertmanager_source._alertmanager_vulnerability_control(
+                report, "synthetic-control", current=True
+            )
+
+
+@pytest.mark.parametrize("field", ["ID", "PURL"])
+@pytest.mark.parametrize("malformed", [None, [], {}, 1, True])
+def test_alertmanager_negative_control_consumed_identity_types_before_hash(
+    field: str, malformed: Any
+) -> None:
+    report = _synthetic_AM_negative_control(True)
+    finding = report["Results"][0]["Vulnerabilities"][0]
+    if field == "ID":
+        finding["VulnerabilityID"] = malformed
+    else:
+        finding["PkgIdentifier"]["PURL"] = malformed
+    with pytest.raises(
+        prometheus_source.QualificationError,
+        match="AM_vulnerable_control_" + ("ID_type" if field == "ID" else "PURL"),
+    ):
+        alertmanager_source._alertmanager_vulnerability_control(
+            report, "synthetic-control", current=True
+        )
+
+
+@pytest.mark.parametrize(
+    ("fresh", "severity", "expected_high"),
+    [(False, "UNKNOWN", 14), (True, "MEDIUM", 14), (True, "HIGH", 16)],
+)
+@pytest.mark.parametrize(
+    "fault",
+    [
+        None,
+        "missing",
+        "duplicate",
+        "mixed",
+        "low",
+        "critical",
+        "wrong-purl",
+        "wrong-target",
+        "extra-high",
+        "extra-critical",
+    ],
+)
+def test_alertmanager_062_old_control_requires_exact_vendor_pair(
+    fresh: bool, severity: str, expected_high: int, fault: str | None
+) -> None:
+    report = _synthetic_AM_negative_control(True)
+    plan = {
+        "derivation_epoch": alertmanager_source._ALERT_XNET062_METADATA_EPOCH,
+        "command_module_inputs": {"alertmanager": {}, "amtool": {}},
+    }
+    for row in report["Results"]:
+        for cve, level, purl in (
+            ("CVE-2026-78661", "HIGH", "pkg:golang/golang.org/x/net@v0.58.0"),
+            ("CVE-2026-97054", severity, "pkg:golang/stdlib@v1.26.8"),
+        ):
+            row["Vulnerabilities"].append(
+                {"VulnerabilityID": cve, "Severity": level, "PkgIdentifier": {"PURL": purl}}
+            )
+    first, second = report["Results"]
+    finding = first["Vulnerabilities"][-1]
+    if fault == "missing":
+        first["Vulnerabilities"].pop()
+    elif fault == "duplicate":
+        first["Vulnerabilities"].append(finding.copy())
+    elif fault == "mixed":
+        finding["Severity"] = "HIGH" if severity == "MEDIUM" else "MEDIUM"
+    elif fault in ("low", "critical"):
+        for row in report["Results"]:
+            row["Vulnerabilities"][-1]["Severity"] = fault.upper()
+    elif fault == "wrong-purl":
+        finding["PkgIdentifier"] = {"PURL": "pkg:golang/stdlib@v1.26.9"}
+    elif fault == "wrong-target":
+        second["Vulnerabilities"].append(first["Vulnerabilities"].pop())
+    elif fault in ("extra-high", "extra-critical"):
+        first["Vulnerabilities"].append(
+            {
+                **finding,
+                "VulnerabilityID": "CVE-unexpected",
+                "Severity": fault.split("-")[1].upper(),
+            }
+        )
+    if fault is None:
+        assert (
+            alertmanager_source._alertmanager_vulnerability_control(
+                report,
+                "synthetic-control",
+                current=True,
+                qualification_plan=plan,
+                fresh_scan=fresh,
+            )["known_HIGH_occurrences"]
+            == expected_high
+        )
+        fresh = not fresh
+    diagnostic = "AM_known_vulnerable_control_inventory_changed_HOLD"
+    if fault == "duplicate":
+        diagnostic += "_duplicate_or_identity"
+    with pytest.raises(prometheus_source.QualificationError, match=f"^{diagnostic}$"):
+        alertmanager_source._alertmanager_vulnerability_control(
+            report,
+            "synthetic-control",
+            current=True,
+            qualification_plan=plan,
+            fresh_scan=fresh,
+        )
+
+
+@pytest.mark.parametrize(
+    "fault", [None, "missing-swap", "extra-byte", "duplicate-source", "policy"]
+)
+def test_alertmanager_2495_only_the_two_regular_compose_images(fault: str | None) -> None:
+    files = alertmanager_source._ALERT_SELECTION_FILES
+    base = {path: b"other data\n" for path in files}
+    old = b"    image: ghcr.io/katsiarynakavaleuskaya/pulseplate:postgres-15.19-pgvector0.8.6-alpine3.23@sha256:d4437ad4970b4099e4cb7d05b7fa625c7e6959949d1374f1f2d4bd4149ae5fa3\n"
+    new = b"    image: ghcr.io/katsiarynakavaleuskaya/pulseplate:postgres-15.20-pgvector0.8.6-alpine3.23@sha256:5b81202040bbcfbf4fc29ee32c6e6a8c824c27c50aa41c80e62418c5c2ec3adc\n"
+    head = base.copy()
+    for path in (files[0], files[2]):
+        base[path] += old
+        head[path] += new
+    if fault == "missing-swap":
+        head[files[2]] = base[files[2]]
+    elif fault == "extra-byte":
+        head[files[0]] += b" "
+    elif fault == "duplicate-source":
+        base[files[0]] += old
+    elif fault == "policy":
+        head[files[4]] += b"# altered\n"
+    assert alertmanager_source._alertmanager_2495_compose_sources(base, head) is (fault is None)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "pins",
+        "mapping",
+        "extra",
+        "altered-caller",
+        "wrong-mapping",
+        "wrong-workflow",
+        "synthetic-merge",
+        "synthetic-wrong-base",
+        "nonbytes-git",
+        "null-parents",
+        "nonstr-parent",
+        "boolean-pr",
+    ],
+)
+@pytest.mark.parametrize("profile", ["transition", "corrective", "owner-first", "owner-second"])
+def test_alertmanager_transition_binds_real_git_successor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str, profile: str
+) -> None:
+    corrective = profile == "corrective"
+    designated = profile.startswith("owner-")
+    number = 29 if profile == "owner-second" else 17
+    git = shutil.which("git")
+    assert git is not None
+    repo = tmp_path / "repository"
+    repo.mkdir()
+
+    def command(*args: str) -> bytes:
+        return subprocess.run(
+            [git, *safe_git_config_args(), "-C", str(repo), *args],
+            check=True,
+            capture_output=True,
+            env=git_env_without_parent_state(),
+        ).stdout
+
+    def commit(subject: str) -> str:
+        command("add", ".")
+        command(
+            "-c",
+            "user.name=Example",
+            "-c",
+            "user.email=example@example.invalid",
+            "commit",
+            "-qm",
+            subject,
+        )
+        return command("rev-parse", "HEAD").decode().strip()
+
+    command("init", "-q")
+    (repo / "policy").write_text("frozen\n")
+    incumbent = (
+        alertmanager_source._ALERT_COPY_INCUMBENT
+        if corrective
+        else alertmanager_source._ALERT_INCUMBENT_CONTROLLER
+    )
+    for name in alertmanager_source._ALERT_CALLERS:
+        file = repo / name
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text(f"  ALERTMANAGER_CONTROLLER_SOURCE: '{incumbent}'\n")
+    for name in (
+        "scripts/ci/check_docker_runtime_dependency_surface.py",
+        "scripts/ci/prometheus_source_image.py",
+        "scripts/ops/notify_premium_alias_checkpoint_failure.py",
+        "tests/__init__.py",
+        "tests/test_notify_premium_alias_checkpoint_failure.py",
+    ):
+        fixture = repo / name
+        fixture.parent.mkdir(parents=True, exist_ok=True)
+        fixture.write_text("reviewed native dependency\n")
+    base = commit("base")
+    monkeypatch.setattr(
+        alertmanager_source, "_ALERT_COPY_BASE" if corrective else "_ALERT_TRANSITION_BASE", base
+    )
+    if designated:
+        command("checkout", "-b", "maintenance-a" if number == 17 else "another-owner-ref")
+    (repo / "scripts/ci/check_docker_runtime_dependency_surface.py").write_text(
+        "reviewed repair control: " + profile
+    )
+    controller = commit("controller")
+    for name in alertmanager_source._ALERT_CALLERS:
+        file = repo / name
+        file.write_text(file.read_text().replace(incumbent, controller))
+    if case == "extra":
+        (repo / "other").write_text("drift")
+    if case == "altered-caller":
+        file.write_text(file.read_text() + "# altered caller\n")
+    head = commit("pin controller")
+    grant = {"base": base, "controller": controller, "callers": head} if designated else None
+    if case in ("mapping", "wrong-mapping"):
+        mapping = (
+            repo
+            / "docs/review"
+            / (f"PR_{number}_FIXED_MAPPING.md" if case == "mapping" else "PR_18_FIXED_MAPPING.md")
+        )
+        mapping.parent.mkdir(parents=True)
+        mapping.write_text("closeout\n")
+        head = commit("mapping")
+    monkeypatch.setenv(
+        "GITHUB_WORKFLOW_REF",
+        f"Katsiarynakavaleuskaya/PulsePlate/.github/workflows/ci.yml@refs/pull/{number}/merge",
+    )
+    workflow_sha = base if case == "wrong-workflow" else head
+    if case in ("synthetic-merge", "synthetic-wrong-base"):
+        first_parent = base if case == "synthetic-merge" else controller
+        workflow_sha = (
+            command(
+                "-c",
+                "user.name=Example",
+                "-c",
+                "user.email=example@example.invalid",
+                "commit-tree",
+                head + "^{tree}",
+                "-p",
+                first_parent,
+                "-p",
+                head,
+                "-m",
+                "GitHub PR test merge",
+            )
+            .decode()
+            .strip()
+        )
+        assert workflow_sha != head
+    monkeypatch.setenv("GITHUB_WORKFLOW_SHA", workflow_sha)
+
+    class API:
+        private = tmp_path
+
+        def json(self, endpoint: str) -> dict[str, Any]:
+            revision = endpoint.rsplit("/", 1)[1]
+            return {
+                "sha": revision,
+                "tree": {"sha": command("rev-parse", revision + "^{tree}").decode().strip()},
+                "parents": (
+                    None
+                    if case == "null-parents"
+                    else [
+                        {"sha": True if case == "nonstr-parent" else value}
+                        for value in command("log", "-1", "--format=%P", revision).decode().split()
+                    ]
+                ),
+            }
+
+        def _capture(
+            self, argv: list[str], maximum: int, *, environment: dict[str, str]
+        ) -> bytes | str:
+            assert argv[0] == git and "--no-replace-objects" in argv
+            if case == "nonbytes-git":
+                return "malformed native output"
+            return subprocess.run(argv, env=environment, check=True, capture_output=True).stdout
+
+    if case in ("pins", "mapping", "synthetic-merge"):
+        alertmanager_source._alertmanager_transition_successor(
+            API(), repo, head, controller, number, corrective=corrective, grant=grant
+        )
+    else:
+        diagnostic = {
+            "extra": "AM_transition_only_two_callers",
+            "altered-caller": "AM_transition_exact_caller_pin",
+            "wrong-mapping": "AM_transition_closeout_only",
+            "wrong-workflow": "AM_transition_executing_tree",
+            "synthetic-wrong-base": "AM_transition_executing_tree",
+            "nonbytes-git": "AM_transition_native_Git_bytes",
+            "null-parents": "AM_transition_direct_parent",
+            "nonstr-parent": "AM_transition_direct_parent",
+            "boolean-pr": "AM_transition_controller_designation",
+        }[case]
+        with pytest.raises(prometheus_source.QualificationError, match=diagnostic):
+            alertmanager_source._alertmanager_transition_successor(
+                API(),
+                repo,
+                head,
+                controller,
+                True if case == "boolean-pr" else number,
+                corrective=corrective,
+                grant=grant,
+            )
+
+
+def test_alertmanager_transition_merge_proves_distant_native_ancestry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import time
+
+    git = shutil.which("git")
+    assert git is not None
+    root = tmp_path / "full"
+    root.mkdir()
+    env = git_env_without_parent_state()
+
+    def command(*args: str, payload: bytes | None = None) -> str:
+        result = subprocess.run(
+            [git, *safe_git_config_args(), "-C", str(root), *args],
+            check=True,
+            capture_output=True,
+            input=payload,
+            env=env,
+        )
+        return result.stdout.decode().strip()
+
+    command("init", "-q")
+    command("symbolic-ref", "HEAD", "refs/heads/main")
+    commits = []
+    for i in range(1, 254):
+        parent = f"from :{i-1}\n" if i > 1 else ""
+        commits.append(
+            f"commit refs/heads/main\nmark :{i}\ncommitter Fixture <test@example.invalid> 1000000000 +0000\ndata 1\nx\n{parent}\n"
+        )
+    command("fast-import", "--quiet", payload="".join(commits).encode())
+    base = command("rev-parse", "HEAD~252")
+    merged = command("rev-parse", "HEAD~251")
+    head = command("rev-parse", "HEAD")
+    monkeypatch.setattr(alertmanager_source, "_ALERT_TRANSITION_BASE", base)
+    calls: list[str] = []
+
+    class API:
+        deadline = time.monotonic() + 60
+
+        def json(self, endpoint: str) -> dict[str, Any]:
+            calls.append(endpoint)
+            assert endpoint == "/repos/Katsiarynakavaleuskaya/PulsePlate/pulls/2501"
+            return {
+                "number": 2501,
+                "state": "closed",
+                "merged": True,
+                "merge_commit_sha": merged,
+                "head": {
+                    "ref": alertmanager_source._ALERT_TRANSITION_BRANCH,
+                    "repo": {"id": 1043311030},
+                },
+                "base": {"ref": "main", "repo": {"id": 1043311030}},
+            }
+
+    api = API()
+    assert (
+        alertmanager_source._alertmanager_merged_ref(
+            api,
+            alertmanager_source._ALERT_TRANSITION_BRANCH,
+            head,
+            root,
+            number=2501,
+        )
+        == merged
+    )
+    assert len(calls) == 1
+    with pytest.raises(prometheus_source.QualificationError, match="^native_failed$"):
+        alertmanager_source._alertmanager_native_ancestor(api, root, head, base)
+    unrelated = command(
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit-tree",
+        command("rev-parse", "HEAD^{tree}"),
+        "-m",
+        "unrelated root",
+    )
+    with pytest.raises(prometheus_source.QualificationError, match="^native_failed$"):
+        alertmanager_source._alertmanager_native_ancestor(api, root, unrelated, head)
+    shallow = tmp_path / "shallow"
+    command("clone", "--quiet", "--depth", "1", root.as_uri(), str(shallow))
+    with pytest.raises(prometheus_source.QualificationError, match="^AM_ancestry_shallow_history$"):
+        alertmanager_source._alertmanager_native_ancestor(api, shallow, head, head)
+    (root / ".git/info/grafts").write_text(f"{head} {base}\n")
+    with pytest.raises(prometheus_source.QualificationError, match="^AM_ancestry_grafts$"):
+        alertmanager_source._alertmanager_native_ancestor(api, root, base, head)
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        None,
+        "no-closeout",
+        "old-failure",
+        "wrong-parent",
+        "different-tree",
+        "wrong-mapping",
+        "wrong-pin",
+        "matching-foreign-pin",
+        "wrong-executing-PR",
+        "approved-executing-PR",
+        "unbound-content",
+        "symlink-final-caller",
+        "extra-W-file",
+        "wrong-controller-mode",
+        "wrong-owner",
+        "no-PR",
+        "two-PRs",
+        "reserved",
+        "stale-list",
+        "stale-publisher",
+    ],
+)
+def test_corrective_squash_preserves_controller_callers_and_original_producer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str | None
+) -> None:
+    """A deleted topic branch after squash still has authenticated PR commits and trees."""
+    source = alertmanager_source
+    base = source._ALERT_COPY_BASE
+    controller, pins, final, merged, publisher = (c * 40 for c in "12345")
+    repo = {"id": 1043311030, "full_name": prometheus_source.GHCR_REPOSITORY}
+    number = 2495 if fault == "reserved" else 1729
+    mapping = f"docs/review/PR_{number}_FIXED_MAPPING.md"
+    pr = {
+        "number": number,
+        "state": "closed",
+        "merged": True,
+        "merge_commit_sha": base if fault == "old-failure" else merged,
+        "head": {
+            "sha": pins if fault == "no-closeout" else final,
+            "ref": source._ALERT_COPY_BRANCH,
+            "repo": repo,
+        },
+        "base": {"ref": "main", "sha": base, "repo": repo},
+    }
+    reader_pr = fault in ("wrong-executing-PR", "approved-executing-PR")
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request" if reader_pr else "push")
+    monkeypatch.setenv("GITHUB_REF", "refs/pull/2495/merge" if reader_pr else "refs/heads/main")
+    monkeypatch.setenv("GITHUB_SHA", publisher)
+    monkeypatch.setenv(
+        "ALERTMANAGER_CONTROLLER_SOURCE",
+        controller if fault == "approved-executing-PR" else publisher,
+    )
+    foreign = "9" * 40
+    before = f"  ALERTMANAGER_CONTROLLER_SOURCE: '{source._ALERT_COPY_INCUMBENT}'\n".encode()
+    after = before.replace(source._ALERT_COPY_INCUMBENT.encode(), controller.encode())
+
+    def blob(data: bytes) -> str:
+        return hashlib.sha1(
+            b"blob " + str(len(data)).encode() + b"\0" + data, usedforsecurity=False
+        ).hexdigest()
+
+    callers = dict.fromkeys(source._ALERT_CALLERS, after)
+    if fault == "wrong-pin":
+        callers[source._ALERT_CALLERS[0]] = before
+    elif fault == "matching-foreign-pin":
+        callers = dict.fromkeys(
+            source._ALERT_CALLERS, after.replace(controller.encode(), foreign.encode())
+        )
+
+    trees = {}
+    for tree, raw in (("a" * 40, before), ("b" * 40, after), ("c" * 40, after)):
+        trees[tree] = {p: ("100644", blob(raw)) for p in source._ALERT_CALLERS}
+    for entries in trees.values():
+        entries["scripts/ci/fetch_docker_source_artifacts.py"] = (
+            "100644",
+            blob(b"reviewed publisher"),
+        )
+    trees["c" * 40][mapping] = ("100644", blob(b"mapping"))
+    if fault == "wrong-mapping":
+        trees["c" * 40]["unrelated"] = ("100644", blob(b"extra"))
+    for tree in ("b" * 40, "c" * 40):
+        for path, raw in callers.items():
+            trees[tree][path] = ("100644", blob(raw))
+        if fault == "symlink-final-caller":
+            trees[tree][source._ALERT_CALLERS[0]] = ("120000", blob(after))
+    if fault == "extra-W-file":
+        for tree in ("b" * 40, "c" * 40):
+            trees[tree]["extra"] = ("100644", blob(b"extra"))
+    if fault == "wrong-controller-mode":
+        trees["a" * 40][source._ALERT_CALLERS[0]] = ("120000", blob(before))
+    head_tree = "b" * 40 if fault == "no-closeout" else "c" * 40
+    commits = {
+        publisher: (head_tree, merged),
+        controller: ("a" * 40, base),
+        pins: ("b" * 40, controller),
+        final: ("c" * 40, pins),
+        merged: (
+            "d" * 40 if fault == "different-tree" else head_tree,
+            publisher if fault == "wrong-parent" else base,
+        ),
+    }
+    required_edges = {
+        (source._ALERT_TRANSITION_BASE, base),
+        (base, merged),
+        (merged, publisher),
+    }
+    seen: list[tuple[str, str]] = []
+
+    def ancestor(api: Any, root: Path, a: str, b: str) -> None:
+        assert root == tmp_path
+        assert (a, b) in required_edges
+        if fault == "stale-publisher" and a == merged:
+            raise RuntimeError("publisher predates correction")
+        seen.append((a, b))
+
+    monkeypatch.setattr(source, "_alertmanager_native_ancestor", ancestor)
+
+    def history(api: Any, root: Path, start: str, end: str, active: str) -> str:
+        assert root == tmp_path and start == merged and end == publisher
+        # The real first-parent recognizer has separate immutable Git fixtures.
+        return active
+
+    monkeypatch.setattr(source, "_alertmanager_publisher_history", history)
+
+    class API:
+        def json(self, endpoint: str) -> Any:
+            path = endpoint.removeprefix("/repos/" + prometheus_source.GHCR_REPOSITORY)
+            if path.startswith("/pulls?"):
+                assert (
+                    path
+                    == "/pulls?state=all&head=Katsiarynakavaleuskaya%3Acodex%2Falertmanager-oras-copy-fix&base=main&per_page=2"
+                )
+                if fault == "no-PR":
+                    return []
+                if fault == "two-PRs":
+                    return [pr, pr]
+                listed = dict(pr)
+                if fault == "wrong-owner":
+                    listed["head"] = {**pr["head"], "repo": {**repo, "full_name": "foreign/fork"}}
+                if fault == "stale-list":
+                    listed["head"] = {**pr["head"], "sha": "9" * 40}
+                return [listed]
+            if path == f"/pulls/{number}":
+                return pr
+            if path == "/pulls/2501":
+                return {
+                    **pr,
+                    "number": 2501,
+                    "head": {**pr["head"], "ref": source._ALERT_TRANSITION_BRANCH},
+                    "merge_commit_sha": base,
+                }
+            if path == f"/compare/{base}...{foreign}":
+                return {"status": "diverged"}
+            if path == f"/compare/{base}...{controller}":
+                return {
+                    "base_commit": {"sha": base},
+                    "merge_base_commit": {"sha": base},
+                    "status": "ahead",
+                    "behind_by": 0,
+                    "total_commits": 1,
+                    "ahead_by": 1,
+                    "commits": [{"sha": controller, "parents": [{"sha": base}]}],
+                }
+            revision = path.rsplit("/", 1)[1]
+            if path.startswith("/git/commits/"):
+                tree, parent = commits[revision]
+                return {"sha": revision, "tree": {"sha": tree}, "parents": [{"sha": parent}]}
+            if path.startswith("/git/trees/"):
+                tree = revision.removesuffix("?recursive=1")
+                return {
+                    "sha": tree,
+                    "truncated": False,
+                    "tree": [
+                        {"path": k, "type": "blob", "mode": m, "sha": oid}
+                        for k, (m, oid) in trees[tree].items()
+                    ],
+                }
+            name = path.removeprefix("/contents/").removesuffix("?ref=" + merged)
+            raw = before if fault == "unbound-content" else callers[name]
+            assert name in source._ALERT_CALLERS
+            return {
+                "type": "file",
+                "path": name,
+                "encoding": "base64",
+                "size": len(raw),
+                "sha": blob(raw),
+                "content": base64.b64encode(raw).decode(),
+            }
+
+    if fault in (None, "no-closeout", "approved-executing-PR"):
+        source._alertmanager_copy_merge(API(), tmp_path, publisher)
+        assert set(seen) == required_edges
+    else:
+        diagnostic = {
+            "old-failure": "AM_corrective_merged_PR_and_controller",
+            "wrong-parent": "AM_corrective_exact_squash",
+            "different-tree": "AM_corrective_exact_squash",
+            "wrong-mapping": "AM_corrective_final_mapping_only",
+            "wrong-pin": "AM_corrective_matching_merged_pins",
+            "matching-foreign-pin": "native_ancestor_relation",
+            "wrong-executing-PR": "AM_corrective_PR_executing_controller",
+            "unbound-content": "AM_corrective_merged_caller_pin",
+            "symlink-final-caller": "AM_corrective_merged_caller_pin",
+            "extra-W-file": "AM_corrective_two_exact_caller_pins",
+            "wrong-controller-mode": "AM_corrective_original_pin",
+            "wrong-owner": "AM_corrective_native_PR_binding",
+            "no-PR": "AM_corrective_unique_PR",
+            "two-PRs": "AM_corrective_unique_PR",
+            "reserved": "AM_corrective_PR_number",
+            "stale-list": "AM_corrective_native_PR_binding",
+            "stale-publisher": "publisher predates correction",
+        }
+        with pytest.raises(RuntimeError, match=diagnostic[fault]):
+            source._alertmanager_copy_merge(API(), tmp_path, publisher)
+
+
+def _exercise_publisher_history(
+    root: Path,
+    overlay: dict[str, tuple[bytes, bytes]],
+    *,
+    fault: str | None = None,
+    cab_workflow: tuple[bytes, bytes] = (b"prior frontend CI", b"CAB ordinary web lint"),
+) -> dict[str, str]:
+    """Replay exact supplied #2495 bytes, unrelated main material and a second owner-designated repair."""
+    from scripts.ci.prometheus_source_image import GHCR_REPOSITORY
+
+    source = alertmanager_source
+    git = shutil.which("git")
+    assert git is not None
+    root.mkdir()
+
+    def cmd(*args: str, data: bytes | None = None) -> bytes:
+        env = git_env_without_parent_state()
+        env.update(
+            GIT_AUTHOR_NAME="Native fixture",
+            GIT_COMMITTER_NAME="Native fixture",
+            GIT_AUTHOR_EMAIL="git@example.invalid",
+            GIT_COMMITTER_EMAIL="git@example.invalid",
+        )
+        return subprocess.run(
+            [git, *safe_git_config_args(), "-C", str(root), *args],
+            input=data,
+            capture_output=True,
+            check=True,
+            env=env,
+        ).stdout
+
+    def commit(msg: str) -> str:
+        cmd("add", ".")
+        cmd("commit", "-qm", msg)
+        return cmd("rev-parse", "HEAD").decode().strip()
+
+    from tests.test_docker_runtime_dependency_surface import (
+        _DispatchNativeFixture,
+        _repair_subject_fixture,
+    )
+
+    subject, original_accepted = _repair_subject_fixture()
+    declaration = ("_ALERT_ACCEPTED_CANDIDATE: dict = " + repr(original_accepted) + "\n").encode()
+    helper = "scripts/ci/fetch_docker_source_artifacts.py"
+
+    def write(name: str, raw: bytes) -> None:
+        if name == helper and not raw.startswith(declaration):
+            raw = declaration + b"# " + raw
+        if fault == "wrong-base-compose" and name == "deploy/docker-compose.production.yaml":
+            raw = raw.replace(subject["manifest"].encode(), b"sha256:" + b"f" * 64)
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(raw)
+
+    cmd("init", "-q")
+    callers = source._ALERT_CALLERS
+    synthetic_pin = "a" * 40
+    raw_callers = (
+        f"  ALERTMANAGER_CONTROLLER_SOURCE: '{synthetic_pin}'\n"
+        + "".join(
+            f"--alertmanager-{kind}-run {subject[label].split('/')[0]} --alertmanager-{kind}-artifact {subject[label].split('/')[1]} "
+            + chr(92)
+            + "\n"
+            + f"    --alertmanager-{kind}-source {subject['source']} \n"
+            for kind, label in (("qualification", "q"), ("support", "s"), ("candidate", "c"))
+        )
+    ).encode()
+    am_image = f"  alertmanager:\n    image: ghcr.io/katsiarynakavaleuskaya/pulseplate@{subject['manifest']}\n".encode()
+    for path in source._ALERT_SELECTION_FILES[:3]:
+        write(path, am_image)
+    overlay = {
+        path: tuple(
+            (
+                raw + am_image
+                if path in source._ALERT_SELECTION_FILES[:3] and b"  alertmanager:\n" not in raw
+                else raw
+            )
+            for raw in pair
+        )
+        for path, pair in overlay.items()
+    }
+    for path in callers:
+        write(path, raw_callers)
+    for path, (old, _) in overlay.items():
+        write(path, old)
+    helper = "scripts/ci/fetch_docker_source_artifacts.py"
+    write(helper, b"independently checked first repair")
+    write(".github/workflows/frontend-ci.yml", cab_workflow[0])
+    publisher = commit("First repair publication source")
+    incumbent = (
+        re.search(
+            rb"ALERTMANAGER_CONTROLLER_SOURCE: '([0-9a-f]{40})'", (root / callers[0]).read_bytes()
+        )
+        .group(1)
+        .decode()
+    )
+    for path, (_, new) in overlay.items():
+        write(path, new)
+    n = commit("Exact #2495 projected squash")
+    # Native Git builds 300 unrelated first-parent commits in one local process.
+    branch = "refs/heads/long-lived-main-fixture"
+    changes = []
+    churn_path = helper if fault == "protected-overflow" else "ordinary.txt"
+    previous = n
+    for index in range(300):
+        body = f"ordinary file change {index}".encode()
+        changes.append(
+            f"commit {branch}\nmark :{index+1}\ncommitter Native Fixture <git@example.invalid> 1770000000 +0000\ndata 7\nchurned\nfrom {previous}\nM 100644 inline {churn_path}\ndata {len(body)}\n".encode()
+            + body
+            + b"\n"
+        )
+        previous = ":" + str(index + 1)
+    cmd("fast-import", "--quiet", data=b"".join(changes) + b"done\n")
+    cmd("checkout", "-q", "--detach", branch)
+    if fault == "edit-revert":
+        original = (root / helper).read_bytes()
+        write(helper, b"unapproved intermediate controller")
+        changed = commit("Unapproved protected edit")
+        write(helper, original)
+        reverted = commit("Revert to identical protected input")
+    if fault in ("protected-merge", "second-parent-only"):
+        first = cmd("rev-parse", "HEAD").decode().strip()
+        write(helper, b"side branch changes protected material")
+        side = commit("Side change")
+        merged = (
+            cmd(
+                "commit-tree",
+                side + "^{tree}",
+                "-p",
+                first,
+                "-p",
+                side,
+                "-m",
+                "Merge side material",
+            )
+            .decode()
+            .strip()
+        )
+        cmd("checkout", "-q", "--detach", merged)
+    write("ordinary.txt", b"independent change")
+    descendant = commit("Unrelated main commit")
+    corrected = fault in ("corrected-same-pr", "old-native-only", "same-pr-stale-grant")
+    if corrected:
+        write(helper, b"first reviewed iteration on the second maintenance PR")
+        k1 = commit("K1 before review correction")
+        for path in callers:
+            write(path, (root / path).read_bytes().replace(incumbent.encode(), k1.encode()))
+        w1 = commit("W1 before review correction")
+        for path in callers:
+            write(path, (root / path).read_bytes().replace(k1.encode(), incumbent.encode()))
+    write(
+        helper,
+        b"second independently reviewed controller" if fault != "missing" else b"unauthorized",
+    )
+    write("docs/security/CVE-2026-84445-alertmanager.md", b"reviewed historical qualification note")
+    if fault in ("mixed-squash", "mixed-native"):
+        write("app/routers/ordinary.py", b"foreign application change")
+    controller = commit("Second controller")
+    for path in callers:
+        raw = (root / path).read_bytes()
+        assert raw.count(incumbent.encode()) >= 1
+        pin = f"  ALERTMANAGER_CONTROLLER_SOURCE: '{incumbent}'".encode()
+        write(path, raw.replace(pin, pin.replace(incumbent.encode(), controller.encode())))
+    if fault in ("extra-W-caller-byte", "extra-W-CD-byte"):
+        path = callers[1] if fault == "extra-W-CD-byte" else callers[0]
+        write(path, (root / path).read_bytes() + b"# not an immutable pin substitution\n")
+    w = commit("Pin second controller K")
+    final_head = w
+    mapping = "docs/review/PR_81_FIXED_MAPPING.md"
+    if fault == "mapping-successor":
+        write(mapping, b"sole regular mapping successor")
+        final_head = commit("Mapping only")
+    squash = (
+        cmd("commit-tree", final_head + "^{tree}", "-p", descendant, "-m", "Second repair squash")
+        .decode()
+        .strip()
+    )
+    cmd("checkout", "-q", "--detach", squash)
+    write(".github/workflows/frontend-ci.yml", cab_workflow[1])
+    cab_main = commit("Ordinary CAB web lint squash")
+    write("ordinary.txt", b"a later ordinary consumer")
+    end = commit("Subsequent ordinary consumer")
+    expected = source._alertmanager_accepted_producer()
+    owner_name = GHCR_REPOSITORY.split("/")[0]
+    github_repo = {
+        "id": 1043311030,
+        "full_name": GHCR_REPOSITORY,
+        "owner": {"id": 169792616, "type": "User"},
+    }
+
+    def pr(number: int, head: str, merged: str, base: str, branch: str) -> dict[str, Any]:
+        return {
+            "number": number,
+            "state": "closed",
+            "merged": True,
+            "merge_commit_sha": merged,
+            "merged_at": "2026-02-01T00:00:00Z",
+            "created_at": "2025-12-01T00:00:00Z",
+            "closed_at": "2026-02-01T00:00:00Z",
+            "comments": 1,
+            "head": {"sha": head, "ref": branch, "repo": github_repo},
+            "base": {"sha": base, "ref": "main", "repo": github_repo},
+        }
+
+    api_prefix = "/repos/" + GHCR_REPOSITORY
+    repair = pr(81, final_head, squash, descendant, "a-distinct-repair")
+    if fault == "post-merge-before-expiry":
+        repair["merged_at"] = "2026-01-01T01:45:00Z"
+    material = {"pr": "81", "base": descendant, "controller": controller, "callers": w, **subject}
+    dispatch = _DispatchNativeFixture(
+        repair,
+        material,
+        fault if fault in ("wrong-original-C", "wrong-original-Q", "wrong-original-S") else None,
+    )
+    if fault not in ("missing", "same-pr-stale-grant"):
+        dispatch.add(dispatch.projection())
+    if corrected:
+        earlier = dispatch.projection(75, started="2025-12-29T00:00:00Z", producer=75)
+        earlier.update(controller=k1, callers=w1)
+        dispatch.add(earlier)
+
+    class API:
+        gh = "/synthetic/gh"
+
+        def _capture(
+            self, argv: list[str], maximum: int, *, environment: dict[str, str] | None = None
+        ) -> bytes:
+            assert argv[0] == git and "--no-replace-objects" in argv
+            return subprocess.run(argv, check=True, capture_output=True, env=environment).stdout
+
+        def raw(self, path: str, *, maximum: int) -> bytes:
+            assert re.fullmatch(re.escape(api_prefix) + r"/actions/artifacts/[1-9][0-9]*/zip", path)
+            raw = dispatch.read(path.removeprefix(api_prefix))
+            assert isinstance(raw, bytes) and len(raw) <= maximum
+            return raw
+
+        def json(self, path: str) -> Any:
+            assert path.startswith(api_prefix)
+            path = path.removeprefix(api_prefix)
+            records = {
+                "": github_repo,
+                "/pulls/81": repair,
+                "/pulls/2495": pr(2495, n, n, publisher, source._ALERT_2495_BRANCH),
+                f"/commits/{n}/pulls?per_page=2": [{"number": 2495}],
+                f"/commits/{squash}/pulls?per_page=2": [{"number": 81}],
+            }
+            if fault == "edit-revert" and path in {
+                f"/commits/{changed}/pulls?per_page=2",
+                f"/commits/{reverted}/pulls?per_page=2",
+            }:
+                return []
+            if path == f"/commits/{w}/pulls?per_page=2":
+                return [repair] if fault != "unassociated" else []
+            if path.startswith("/pulls?state=all&head="):
+                assert "&base=" not in path
+                return (
+                    [repair]
+                    if fault != "ambiguous-original"
+                    else [repair, {**repair, "number": 87}]
+                )
+            if final_head != w:
+                if path == f"/commits/{final_head}?per_page=100&page=1":
+                    return {
+                        "sha": final_head,
+                        "parents": [{"sha": w}],
+                        "files": [
+                            {
+                                "filename": mapping,
+                                "status": "added",
+                                "sha": cmd("rev-parse", final_head + ":" + mapping)
+                                .decode()
+                                .strip(),
+                            }
+                        ],
+                        "commit": {
+                            "tree": {
+                                "sha": cmd("rev-parse", final_head + "^{tree}").decode().strip()
+                            }
+                        },
+                    }
+                if (
+                    path.startswith("/actions/workflows/")
+                    and f"event=pull_request&head_sha={final_head}&" in path
+                ):
+                    return {"total_count": 0, "workflow_runs": []}
+            if path in records:
+                return records[path]
+            try:
+                return dispatch.read(path)
+            except KeyError:
+                pass
+            for filename, job_name, run_id, required in (
+                (
+                    "ci.yml",
+                    "lint",
+                    22,
+                    (
+                        "Prepare exact AM subject before material execution",
+                        "Native OBS2A checkpoint lifecycle and owned-task challenge",
+                    ),
+                ),
+                (
+                    "cd.yml",
+                    "prometheus-image-security-pr",
+                    23,
+                    (
+                        "Prepare exact AM subject before material execution",
+                        "Scan accepted AM and execute all four current controls",
+                        "Run full accepted AM native controls on this runner",
+                    ),
+                ),
+            ):
+                if (
+                    path
+                    == f"/actions/workflows/{filename}/runs?event=pull_request&head_sha={w}&per_page=100&page=1"
+                ):
+                    original_event = {
+                        "id": run_id,
+                        "run_attempt": 2,
+                        "event": "pull_request",
+                        "head_sha": w,
+                        "workflow_id": run_id + 100,
+                        "repository": github_repo,
+                        "head_repository": github_repo,
+                        "path": ".github/workflows/" + filename,
+                        "head_branch": repair["head"]["ref"],
+                        "pull_requests": [],
+                        "created_at": (
+                            "2025-11-01T00:00:00Z"
+                            if fault == "original-before-PR"
+                            else (
+                                "2025-12-31T23:59:59Z"
+                                if fault == "original-before-dispatch"
+                                else "2026-01-01T00:30:00Z"
+                            )
+                        ),
+                    }
+                    runs = (
+                        []
+                        if fault == "old-native-only"
+                        or (fault == "missing-native" and run_id == 23)
+                        else [original_event]
+                    )
+                    if fault and fault.startswith("run-list-"):
+                        # Both repositories contain the selected commit. Only the canonical
+                        # destination + canonical head can supply original CI or CD evidence.
+                        fork = {
+                            **original_event,
+                            "id": run_id + 900,
+                            "head_repository": {"id": 9042},
+                        }
+                        if fault == "run-list-foreign-first":
+                            runs = [fork, original_event]
+                        elif fault == "run-list-foreign-only":
+                            runs = [fork]
+                        else:
+                            if fault == "run-list-missing-head":
+                                del fork["head_repository"]
+                            elif fault == "run-list-null-head":
+                                fork["head_repository"] = None
+                            elif fault == "run-list-bool-id":
+                                fork["head_repository"] = {"id": True}
+                            elif fault == "run-list-nonpositive-id":
+                                fork["head_repository"] = {"id": 0}
+                            elif fault == "run-list-other-destination":
+                                fork["repository"] = {"id": 9042}
+                            elif fault == "run-list-wrong-workflow":
+                                fork["workflow_id"] = 9998
+                            elif fault == "run-list-wrong-head":
+                                fork["head_sha"] = "f" * 40
+                            elif fault == "run-list-bad-attempt":
+                                fork["run_attempt"] = True
+                            runs = [original_event, fork]
+                    return {"total_count": len(runs), "workflow_runs": runs}
+                if path == "/actions/workflows/" + filename:
+                    return {"id": run_id + 100, "path": ".github/workflows/" + filename}
+                for attempt in (1, 2):
+                    attempt_path = f"/actions/runs/{run_id}/attempts/{attempt}"
+                    if path.startswith(f"/actions/runs/{run_id + 900}/attempts/"):
+                        raise AssertionError(
+                            "a foreign listed run must never be read as local job evidence"
+                        )
+                    if path == attempt_path:
+                        return {
+                            "id": run_id,
+                            "run_attempt": attempt,
+                            "workflow_id": run_id + 100,
+                            "path": ".github/workflows/" + filename,
+                            "event": "pull_request",
+                            "status": "completed",
+                            "repository": github_repo,
+                            "head_repository": (
+                                {"id": 9042} if fault == "attempt-foreign-head" else github_repo
+                            ),
+                            "head_sha": w,
+                            "head_branch": repair["head"]["ref"],
+                            "pull_requests": (
+                                []
+                                if attempt == 2
+                                else [{**repair, "head": {**repair["head"], "sha": w}}]
+                            ),
+                            "created_at": "2026-01-01T01:00:01Z",
+                            "run_started_at": (
+                                "2025-12-31T00:00:00Z"
+                                if attempt == 1 or fault == "pre-grant"
+                                else "2026-01-01T01:00:00Z"
+                            ),
+                        }
+                    if path == attempt_path + "/jobs?per_page=100&page=1":
+                        completed = (
+                            "2026-01-03T02:00:00Z"
+                            if fault == "late-native"
+                            else "2026-01-01T02:00:00Z"
+                        )
+                        row_job = {
+                            "id": run_id + 1,
+                            "name": job_name,
+                            "run_id": run_id,
+                            "run_attempt": attempt,
+                            "head_sha": w,
+                            "started_at": "2026-01-01T01:01:00Z",
+                            "completed_at": completed,
+                            "status": "completed",
+                            "conclusion": "success",
+                            "steps": [
+                                {
+                                    "name": name,
+                                    "started_at": "2026-01-01T01:02:00Z",
+                                    "completed_at": "2026-01-01T01:15:00Z",
+                                    "status": "completed",
+                                    "conclusion": (
+                                        "skipped"
+                                        if fault == "skipped-native" and name == required[-1]
+                                        else "success"
+                                    ),
+                                }
+                                for name in required
+                            ],
+                        }
+                        return {"total_count": 1, "jobs": [row_job]}
+            if path in records:
+                return records[path]
+            if corrected and path.startswith("/actions/workflows/") and f"head_sha={w1}&" in path:
+                # Authentic original receipts on W1 would exist, but cannot answer a query for W2.
+                raise AssertionError("selected historical native receipt from W1")
+            if path.startswith("/compare/"):
+                assert path == f"/compare/{descendant}...{controller}"
+                commits = [
+                    {"sha": line.split()[0], "parents": [{"sha": p} for p in line.split()[1:]]}
+                    for line in cmd(
+                        "rev-list", "--reverse", "--parents", descendant + ".." + controller
+                    )
+                    .decode()
+                    .splitlines()
+                ]
+                return {
+                    "status": "ahead",
+                    "base_commit": {"sha": descendant},
+                    "merge_base_commit": {"sha": descendant},
+                    "ahead_by": len(commits),
+                    "behind_by": 0,
+                    "total_commits": len(commits),
+                    "commits": commits,
+                }
+            if path.startswith("/git/commits/"):
+                rev = path.split("/")[-1]
+                return {
+                    "sha": rev,
+                    "parents": [
+                        {"sha": x} for x in cmd("show", "-s", "--format=%P", rev).decode().split()
+                    ],
+                    "tree": {"sha": cmd("rev-parse", rev + "^{tree}").decode().strip()},
+                }
+            if path.startswith("/git/blobs/"):
+                oid = path.rsplit("/", 1)[1]
+                raw = cmd("cat-file", "blob", oid)
+                return {
+                    "sha": oid,
+                    "size": len(raw),
+                    "encoding": "base64",
+                    "content": base64.b64encode(raw).decode(),
+                }
+            if path.startswith("/git/trees/"):
+                tree = path.split("/")[-1].split("?")[0]
+                rows = []
+                depth = ["-r"] if path.endswith("?recursive=1") else []
+                for line in cmd("ls-tree", *depth, tree).decode().splitlines():
+                    mode, kind, rest = line.split(" ", 2)
+                    blob, name = rest.split("\t")
+                    rows.append({"mode": mode, "type": kind, "sha": blob, "path": name})
+                return {"sha": tree, "truncated": False, "tree": rows}
+            if path.startswith("/contents/"):
+                name, ref = path.removeprefix("/contents/").split("?ref=")
+                content = cmd("show", f"{ref}:{name}")
+                return {
+                    "type": "file",
+                    "path": name,
+                    "encoding": "base64",
+                    "content": base64.b64encode(content).decode(),
+                    "size": len(content),
+                    "sha": cmd("rev-parse", f"{ref}:{name}").decode().strip(),
+                }
+            assert path == f"/commits/{w}?per_page=100&page=1"
+            return {
+                "sha": w,
+                "parents": [{"sha": controller}],
+                "files": [{"filename": p, "status": "modified"} for p in callers],
+            }
+
+    api = API()
+    if fault == "second-parent-only":
+        source._alertmanager_publisher_history(api, root, side, end, incumbent)
+    assert (
+        source._alertmanager_publisher_history(api, root, publisher, descendant, incumbent)
+        == incumbent
+    )
+    assert (
+        source._alertmanager_publisher_history(api, root, publisher, end, incumbent) == controller
+    )
+    return {
+        "original_publisher": publisher,
+        "consumer_2495": n,
+        "unrelated": descendant,
+        "second_controller": controller,
+        "second_callers": w,
+        "second_squash": squash,
+        "CAB_main": cab_main,
+        "ordinary": end,
+    }
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        None,
+        "missing",
+        "edit-revert",
+        "protected-merge",
+        "protected-overflow",
+        "second-parent-only",
+        "missing-native",
+        "pre-grant",
+        "skipped-native",
+        "late-native",
+        "post-merge-before-expiry",
+        "extra-W-caller-byte",
+        "extra-W-CD-byte",
+        "wrong-base-compose",
+        "wrong-original-C",
+        "wrong-original-Q",
+        "wrong-original-S",
+        "unassociated",
+        "ambiguous-original",
+        "mixed-squash",
+        "original-before-PR",
+        "original-before-dispatch",
+        "corrected-same-pr",
+        "mapping-successor",
+        "old-native-only",
+        "same-pr-stale-grant",
+        "run-list-foreign-first",
+        "run-list-foreign-last",
+        "run-list-foreign-only",
+        "run-list-missing-head",
+        "run-list-null-head",
+        "run-list-bool-id",
+        "run-list-nonpositive-id",
+        "run-list-other-destination",
+        "run-list-wrong-workflow",
+        "run-list-wrong-head",
+        "run-list-bad-attempt",
+        "attempt-foreign-head",
+        "mixed-native",
+    ],
+)
+def test_publisher_history_keeps_2495_and_unrelated_descendant_before_repair(
+    tmp_path: Path, fault: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prefix = b"    image: ghcr.io/katsiarynakavaleuskaya/pulseplate:postgres-"
+    old = (
+        prefix
+        + b"15.19-pgvector0.8.6-alpine3.23@sha256:d4437ad4970b4099e4cb7d05b7fa625c7e6959949d1374f1f2d4bd4149ae5fa3\n"
+    )
+    new = (
+        prefix
+        + b"15.20-pgvector0.8.6-alpine3.23@sha256:5b81202040bbcfbf4fc29ee32c6e6a8c824c27c50aa41c80e62418c5c2ec3adc\n"
+    )
+    overlay = {alertmanager_source._ALERT_SELECTION_FILES[i]: (old, new) for i in (0, 2)}
+    if fault == "mixed-native":
+        # Isolate the local squash check; a mixed K also fails the independent GitHub tree proof.
+        from scripts.ci import check_docker_runtime_dependency_surface as authority
+
+        monkeypatch.setattr(authority, "_publisher_repair_material", lambda *a, **kw: None)
+    if fault == "missing":
+        with pytest.raises(
+            prometheus_source.QualificationError, match="AM_history_protected_repair_dispatch"
+        ):
+            _exercise_publisher_history(tmp_path / "native", overlay, fault=fault)
+    elif fault and fault not in (
+        "corrected-same-pr",
+        "mapping-successor",
+        "run-list-foreign-first",
+        "run-list-foreign-last",
+    ):
+        expected = {
+            "edit-revert": "AM_history_exact_PR",
+            "protected-merge": "AM_history_protected_squash",
+            "protected-overflow": "AM_history_protected_change_bound",
+            "unassociated": "publisher_repair_missing_authorized_native_lint",
+            "old-native-only": "publisher_repair_missing_authorized_native_lint",
+            "same-pr-stale-grant": "AM_history_protected_repair_dispatch",
+            "original-before-dispatch": "publisher_repair_missing_authorized_native_lint",
+            "original-before-PR": "publisher_repair_missing_authorized_native_lint",
+            "mixed-squash": "publisher_repair_complete_maintenance_delta",
+            "run-list-foreign-only": "publisher_repair_missing_authorized_native_lint",
+            "run-list-missing-head": "publisher_repair_original_run_identity",
+            "run-list-null-head": "publisher_repair_original_run_identity",
+            "run-list-bool-id": "publisher_repair_original_run_identity",
+            "run-list-nonpositive-id": "publisher_repair_original_run_identity",
+            "run-list-other-destination": "publisher_repair_original_run_identity",
+            "run-list-wrong-workflow": "publisher_repair_original_run_identity",
+            "run-list-wrong-head": "publisher_repair_original_run_identity",
+            "run-list-bad-attempt": "publisher_repair_attempt_inventory",
+            "attempt-foreign-head": "publisher_repair_actual_run_attempt",
+            "mixed-native": "publisher_repair_complete_maintenance_delta",
+            "ambiguous-original": "publisher_repair_missing_authorized_native_lint",
+            "missing-native": "publisher_repair_missing_authorized_native_prometheus-image-security-pr",
+            "pre-grant": "publisher_repair_missing_authorized_native_lint",
+            "skipped-native": "publisher_repair_missing_authorized_native_lint",
+            "extra-W-CD-byte": "publisher_repair_exact_caller_pin_bytes",
+            "extra-W-caller-byte": "publisher_repair_exact_caller_pin_bytes",
+            "wrong-base-compose": "publisher_repair_base_compose_manifest",
+            "wrong-original-C": "publisher_repair_original_candidate_zip",
+            "wrong-original-S": "publisher_repair_original_artifact",
+            "wrong-original-Q": "publisher_repair_original_artifact",
+            "post-merge-before-expiry": "publisher_repair_missing_authorized_native_lint",
+            "late-native": "publisher_repair_missing_authorized_native_lint",
+            "second-parent-only": "AM_history_first_parent",
+        }
+        with pytest.raises(prometheus_source.QualificationError, match=expected[fault]):
+            _exercise_publisher_history(tmp_path / "native", overlay, fault=fault)
+    else:
+        observed = _exercise_publisher_history(tmp_path / "native", overlay, fault=fault)
+        assert len(set(observed.values())) == 8

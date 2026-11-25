@@ -1,0 +1,68 @@
+# -----------------------------------------------------------------------------
+# PulsePlate backend image: strict Docker build context
+# Keeps only files that are actually copied by the current Dockerfile.
+# -----------------------------------------------------------------------------
+
+# Ignore everything by default
+**
+
+# Docker metadata
+!.dockerignore
+!Dockerfile
+
+# Dependency manifests used during build
+!requirements.txt
+!requirements-ci-lite.txt
+!requirements-docker-runtime.in
+!requirements-docker-runtime.txt
+!requirements-dev.txt
+!requirements-lock.txt
+!constraints.txt
+
+# CI installer surfaces copied by Dockerfile
+!scripts/
+!scripts/ci/
+!scripts/ci/check_python_startup_hooks.py
+!scripts/ci/emergency_python_wheels.json
+!scripts/ci/docker_source_artifacts.json
+!scripts/ci/fetch_docker_source_artifacts.py
+!scripts/ci/install_locked_python_requirements.py
+
+# Pre-fetched, checksum-verified source artifacts used by Docker build stages.
+!build/
+!build/docker-sources/
+!build/docker-sources/sqlite-autoconf-*.tar.gz
+!build/docker-sources/util-linux-2.42.3.tar.gz
+
+# Runtime application directories copied by Dockerfile
+!app/
+!app/**
+!core/
+!core/**
+!alembic/
+!alembic/**
+!alembic.ini
+
+# Root-level Python modules copied by Dockerfile
+!legacy_app.py
+!main.py
+!settings.py
+!bmi_core.py
+!bmi_visualization.py
+!nutrition_core.py
+!signed_links.py
+!bodyfat.py
+
+# Exclude local Python bytecode after the runtime allowlist has been reopened.
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+
+!build/docker-sources/pcre2-10.49.tar.gz
+!build/docker-sources/sljit-de0259c7aaf36aa40cba8014f3fad3edde9307f9.tar.gz
+
+!scripts/ci/check_private_python_proxy_health.py
+!build/docker-sources/zlib-71747d1d39168833e0cae8ed84b8ce77cb049699.tar.gz
+!build/docker-sources/ncurses-snapshots-dc909d77781ef5c2a0684e9ad9eb9f0c0baf5ecc.tar.gz
+!build/docker-sources/openssl-3.5.9.tar.gz
+!build/docker-sources/postgresql-18.6.tar.gz

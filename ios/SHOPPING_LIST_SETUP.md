@@ -1,0 +1,127 @@
+# Shopping List Integration Setup
+
+## 🎯 Overview
+
+Shopping List Generator больше не является чисто debug-only экраном.
+Сейчас он смонтирован в **Home → Pro Tools** вместе с Weekly Plan Reader и
+скрыт за тем же feature flag: `FeatureFlags.weeklyPlanReaderEnabled`.
+
+Важно:
+- в `DEBUG` сборках экран можно открыть из Home с bootstrap stub plan;
+- в `RELEASE` rollout по умолчанию выключен;
+- production source-of-plan path ещё не доведён до конца.
+
+## 📱 Access
+
+### Runtime path
+
+1. Убедитесь, что `FeatureFlags.weeklyPlanReaderEnabled == true`
+2. Откройте **Home**
+3. Перейдите в секцию **Pro Tools**
+4. Выберите **Shopping List**
+
+### Debug-specific note
+
+- В `DEBUG` сборках Home entrypoint bootstrap-ит `ShoppingListStubPlan.minimal()`
+  и позволяет проверить UI без реального weekly-plan handoff.
+- Экран Debug Tools по-прежнему может использоваться для локальной диагностики,
+  но он больше не является единственным путём доступа.
+
+## ⚙️ Configuration
+
+### Backend URL
+
+**Development:**
+- Default: `http://localhost:8000`
+- Настраивается через Xcode environment variables:
+  - Product → Scheme → Edit Scheme → Run → Environment Variables
+  - Добавьте: `BASE_URL` = `http://<your-local-ip>:8000`
+
+**Production:**
+- Hardcoded: `https://api.pulseplate.com`
+- Автоматически используется в Release builds
+
+### PRO API Key
+
+**Development / Production:**
+- Runtime source: **Keychain only**
+- Xcode `PRO_API_KEY` environment variable is **not** used for runtime access
+- Load the key via the in-app path:
+  - **PRO Settings → Debug Tools → Keychain**
+- Tests and previews may still use explicitly injected providers, but app runtime does not fall back to env vars
+
+## 📋 Files Structure
+
+```text
+ios/PulsePlate/
+├── Services/
+│   ├── AppConfig.swift                     # Base URL configuration
+│   ├── ProKeyProvider.swift                # Keychain-only API key provider
+│   └── DefaultShoppingListService.swift    # Network service
+├── Models/ShoppingList/
+│   ├── ShoppingListDTO.swift               # Backend contract DTOs
+│   ├── ShoppingListAdapter.swift           # DTO → ViewData adapter
+│   └── ShoppingListStubPlan.swift          # Minimal test plan data
+├── ViewModels/
+│   └── ShoppingListReaderViewModel.swift   # @MainActor state management
+├── Views/
+│   └── DebugToolsScreen.swift              # Debug menu with config display
+└── Screens/
+    └── ShoppingListReaderScreen.swift      # Shopping list UI
+```
+
+## 🧪 Testing Locally
+
+1. **Start backend:**
+   ```bash
+   cd backend
+   uvicorn app:app --reload --port 8000
+   ```
+
+2. **Configure Xcode scheme:**
+   - Edit Scheme → Environment Variables
+   - `BASE_URL` = `http://localhost:8000` (or your local IP for device testing)
+
+3. **Load a PRO key in app runtime:**
+   - Open **PRO Settings → Debug Tools → Keychain**
+   - Add your test PRO key there
+
+4. **Run app:**
+   - Home → Pro Tools → Shopping List
+
+5. **Expected response in DEBUG bootstrap path:**
+   - Should show 3 items (oats, banana, milk)
+   - Categories: grains, fruits, dairy
+   - No warnings (valid stub data)
+
+6. **Expected current limitation in RELEASE-equivalent path:**
+   - If no canonical plan handoff is wired, the screen opens without `plan_data`
+   - UI falls into `shopping_list_no_plan_error`
+   - `weekly_plan_id` backend path is still not implemented server-side
+
+## 🔍 Debugging
+
+**Check configuration:**
+- Open Debug Tools screen
+- Configuration section shows current BASE_URL and API key status
+
+**Common issues:**
+- Missing API key → Shows "Not configured" (orange); load a key via **PRO Settings → Debug Tools → Keychain**
+- Invalid URL → App crashes with clear fatalError message (DEBUG only)
+- Backend unreachable → Network error displayed in UI
+
+## 🚀 Next Steps
+
+- [ ] Wire canonical release source-of-plan path (`weekly_plan_id` or carried `plan_data`)
+- [ ] Remove dependency on DEBUG bootstrap stub for normal runtime usage
+- [ ] Add paywall / VIP CTA behavior for blocked shopping-list follow-up flow
+- [ ] Decide whether warnings need dedicated sheet UI beyond current footer rendering
+- [ ] Add pull-to-refresh only if product scope still requires it
+
+## 📝 Notes
+
+- Home → Pro Tools runtime path is the canonical entrypoint for this surface
+- Debug вкладка **автоматически скрывается** в Release builds (`#if DEBUG`)
+- Stub plan data соответствует backend contract (minimal valid daily_menus)
+- Все localization keys уже добавлены (EN/RU/ES)
+- Runtime PRO access is Keychain-backed; do not rely on Xcode environment variables for secrets

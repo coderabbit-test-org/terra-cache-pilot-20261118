@@ -1,0 +1,196 @@
+# -*- coding: utf-8 -*-
+"""Tests for VIP shoplist weekly endpoint.
+
+RU: Тесты для endpoint /api/v1/vip/shoplist/weekly.
+EN: Tests for /api/v1/vip/shoplist/weekly endpoint.
+
+This test suite ensures weekly endpoint matches /generate contract:
+- Same gating (VIP_MODULE_ENABLED, VIP tier)
+- Same mapping (invalid enum → 422)
+- Same response format per day (reasons + analytics)
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import pytest
+from fastapi import status
+from fastapi.testclient import TestClient
+
+from tests.conftest import _disable_vip, _enable_vip
+
+
+def _payload_one_day() -> dict[str, Any]:
+    """Minimal valid payload with one day."""
+    return {
+        "days": [
+            {
+                "items": [
+                    {"food_id": "chicken", "qty": {"value": "1200", "unit": "G"}, "form": "RAW"},
+                ],
+                "packaging_rules": [
+                    {
+                        "food_id": "chicken",
+                        "pack_size": {"value": "500", "unit": "G"},
+                        "rounding": "CEIL",
+                        "min_packs": 1,
+                    },
+                ],
+            },
+        ],
+    }
+
+
+def test_weekly_success_200_contains_days(
+    client_with_vip_access: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Weekly endpoint should return 200 with days list (same contract as /generate per day)."""
+    _enable_vip(monkeypatch)
+
+    payload = _payload_one_day()
+    r = client_with_vip_access.post("/api/v1/vip/shoplist/weekly", json=payload)
+
+    assert r.status_code == status.HTTP_200_OK, r.text
+    assert r.headers["content-type"].startswith("application/json")
+    data = r.json()
+
+    # Verify response structure
+    assert "days" in data
+    assert isinstance(data["days"], list)
+    assert len(data["days"]) == 1
+
+    # Verify each day has same structure as /generate
+    day = data["days"][0]
+    assert "packed" in day
+    assert "unpacked" in day
+    assert "analytics" in day
+
+    # Verify deterministic results
+    assert len(day["packed"]) == 1
+    assert day["packed"][0]["food_id"] == "chicken"
+    assert day["packed"][0]["packs"] == 3  # ceil(1200/500) = 3
+    assert "reasons" in day["packed"][0]
+    assert len(day["packed"][0]["reasons"]) > 0
+
+
+def test_weekly_multiple_days_returns_all_days(
+    client_with_vip_access: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Weekly endpoint should process all days independently."""
+    _enable_vip(monkeypatch)
+
+    payload = {
+        "days": [
+            {
+                "items": [
+                    {"food_id": "chicken", "qty": {"value": "1200", "unit": "G"}, "form": "RAW"},
+                ],
+                "packaging_rules": [
+                    {
+                        "food_id": "chicken",
+                        "pack_size": {"value": "500", "unit": "G"},
+                        "rounding": "CEIL",
+                        "min_packs": 1,
+                    },
+                ],
+            },
+            {
+                "items": [
+                    {"food_id": "rice", "qty": {"value": "2000", "unit": "G"}, "form": "RAW"},
+                ],
+                "packaging_rules": [
+                    {
+                        "food_id": "rice",
+                        "pack_size": {"value": "1000", "unit": "G"},
+                        "rounding": "CEIL",
+                        "min_packs": 1,
+                    },
+                ],
+            },
+        ],
+    }
+
+    r = client_with_vip_access.post("/api/v1/vip/shoplist/weekly", json=payload)
+
+    assert r.status_code == status.HTTP_200_OK, r.text
+    assert r.headers["content-type"].startswith("application/json")
+    data = r.json()
+    assert len(data["days"]) == 2
+
+    # Verify first day
+    assert data["days"][0]["packed"][0]["food_id"] == "chicken"
+    # Verify second day
+    assert data["days"][1]["packed"][0]["food_id"] == "rice"
+
+
+def test_weekly_vip_module_disabled_returns_404(
+    client_with_vip_access: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """VIP module disabled (feature flag off) should return 404."""
+    _disable_vip(monkeypatch)
+
+    payload = _payload_one_day()
+    r = client_with_vip_access.post("/api/v1/vip/shoplist/weekly", json=payload)
+
+    assert r.status_code == status.HTTP_404_NOT_FOUND, r.text
+    assert r.headers["content-type"].startswith("application/json")
+    data = r.json()
+    assert "not found" in str(data["detail"]).lower()
+
+
+def test_weekly_insufficient_vip_tier_returns_403(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Valid API key but insufficient VIP tier must return 403."""
+    _enable_vip(monkeypatch)
+
+    payload = _payload_one_day()
+
+    # Use PRO key (insufficient for VIP endpoint) without a VIP override.
+    r = client.post(
+        "/api/v1/vip/shoplist/weekly",
+        json=payload,
+        headers={"X-API-Key": "test_pro_key"},
+    )
+
+    assert r.status_code == status.HTTP_403_FORBIDDEN, r.text
+    assert r.headers["content-type"].startswith("application/json")
+    assert r.json() == {
+        "detail": ("API key does not have VIP tier access. Upgrade to VIP to access this feature.")
+    }
+
+
+def test_weekly_missing_api_key_returns_403(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Missing API key must use the stable VIP 403 boundary."""
+    _enable_vip(monkeypatch)
+
+    payload = _payload_one_day()
+    r = client.post("/api/v1/vip/shoplist/weekly", json=payload)
+
+    assert r.status_code == status.HTTP_403_FORBIDDEN, r.text
+    assert r.headers["content-type"].startswith("application/json")
+    assert r.json() == {"detail": "VIP access required"}
+
+
+def test_weekly_empty_days_returns_200(
+    client_with_vip_access: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Empty days list should return 200 with empty days."""
+    _enable_vip(monkeypatch)
+
+    payload = {"days": []}
+    r = client_with_vip_access.post("/api/v1/vip/shoplist/weekly", json=payload)
+
+    assert r.status_code == status.HTTP_200_OK, r.text
+    assert r.headers["content-type"].startswith("application/json")
+    data = r.json()
+    assert data["days"] == []

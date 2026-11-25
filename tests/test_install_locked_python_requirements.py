@@ -1,0 +1,10023 @@
+"""Deterministic tests for locked Python requirement installation helpers."""
+
+from __future__ import annotations
+
+import base64
+import http.client
+import io
+import json
+import os
+import re
+import ssl
+import threading
+import subprocess
+import struct
+import sys
+import tempfile
+import types
+import zipfile
+from contextlib import contextmanager
+from collections.abc import Callable, Iterator
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from textwrap import dedent
+from typing import Any
+from unittest.mock import patch
+from urllib.parse import urlparse
+
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
+from packaging.version import Version
+import pytest
+from pip._internal.network.session import InsecureHTTPAdapter, PipSession
+from pip._vendor import certifi
+from pip._vendor.requests import Request
+from pip._vendor.requests.adapters import HTTPAdapter
+from pip._vendor.urllib3.connectionpool import HTTPConnectionPool
+from pip._vendor.urllib3.response import HTTPResponse
+
+import scripts.ci.install_locked_python_requirements as installer
+
+APPROVED_PROXY_URL = "https://packages.example.internal/simple"
+DEVPI_SIMPLE_USER = "ci-reader"
+DEVPI_SIMPLE_TOKEN = "token-123"
+DEVPI_SIMPLE_URL = "https://packages.pulseplate.app/root/pulseplate/+simple/"
+DEVPI_ROOT_USER = "root"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+RAG_VECTOR_EXPECTED_FASTEMBED_VERSION = "0.8.0+pulseplate.1"
+MAIN_PREFLIGHT_TESTS = {
+    "test_main_preflight_only_skips_requirements_file_resolution",
+}
+MAIN_EXECUTABLE_RESOLUTION_TESTS = {
+    "test_main_normalizes_python_executable_once_before_dispatch",
+}
+
+
+@pytest.fixture(autouse=True)
+def _isolate_default_netrc_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Anonymous and CLI tests must never read the operator's default netrc."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+
+@pytest.fixture(autouse=True)
+def _stub_dependency_floor_preflight_for_main_tests(
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    """Keep main-flow tests deterministic; dedicated tests cover floor preflight."""
+    if request.node.name.startswith("test_main_") and request.node.name not in MAIN_PREFLIGHT_TESTS:
+        monkeypatch.setattr(installer, "run_dependency_floor_preflight", lambda **_kwargs: None)
+
+
+@pytest.fixture(autouse=True)
+def _stub_python_executable_resolution_for_unrelated_main_tests(
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    """Keep existing main-flow tests focused on their original dispatch contracts."""
+    if (
+        request.node.name.startswith("test_main_")
+        and request.node.name not in MAIN_EXECUTABLE_RESOLUTION_TESTS
+    ):
+        monkeypatch.setattr(installer, "resolve_python_executable", lambda value: value)
+
+
+def _write_executable(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+def _symlink_or_skip(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is unavailable on this platform: {exc}")
+
+
+def _repo_emergency_manifest_path() -> Path:
+    return REPO_ROOT / "scripts/ci/emergency_python_wheels.json"
+
+
+def _repo_active_emergency_artifacts() -> list[dict[str, str]]:
+    return installer.load_emergency_wheel_manifest(_repo_emergency_manifest_path())
+
+
+def _repo_emergency_manifest_payload() -> dict[str, object]:
+    payload = json.loads(_repo_emergency_manifest_path().read_text(encoding="utf-8"))
+    assert isinstance(payload, dict)
+    return payload
+
+
+def _exact_requirement_pairs(contents: str) -> set[tuple[str, str]]:
+    pairs: set[tuple[str, str]] = set()
+    for raw_line in contents.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line or "==" not in line:
+            continue
+        package, version_and_markers = line.split("==", 1)
+        version = version_and_markers.split(";", 1)[0].strip()
+        pairs.add((package.strip(), version))
+    return pairs
+
+
+def test_psycopg_source_url_admits_only_the_reviewed_archive() -> None:
+    project = DEVPI_SIMPLE_URL + "psycopg-c/"
+    href = f"../../+f/source/{installer.PSYCOPG_C_SOURCE_NAME}#sha256={installer.PSYCOPG_C_SOURCE_SHA256}"
+    body = f'<a href="{href}">source</a>'.encode()
+    assert installer.admitted_psycopg_source_url(body=body, project_url=project) == (
+        "https://packages.pulseplate.app/root/pulseplate/+f/source/"
+        + installer.PSYCOPG_C_SOURCE_NAME
+    )
+
+
+@pytest.mark.parametrize(
+    "variation", ("missing_hash", "wrong_hash", "foreign_origin", "duplicate", "different_version")
+)
+def test_psycopg_source_url_rejects_unadmitted_input(variation: str) -> None:
+    href = f"../../+f/source/{installer.PSYCOPG_C_SOURCE_NAME}#sha256={installer.PSYCOPG_C_SOURCE_SHA256}"
+    if variation == "missing_hash":
+        href = href.split("#", 1)[0]
+    elif variation == "wrong_hash":
+        href = href.split("#", 1)[0] + "#sha256=" + "0" * 64
+    elif variation == "foreign_origin":
+        href = "https://packages.example.invalid/" + href.rsplit("/", 1)[-1]
+    elif variation == "different_version":
+        href = href.replace("3.3.4", "3.3.5")
+    body = f'<a href="{href}">source</a>'.encode()
+    if variation == "duplicate":
+        body += body
+    with pytest.raises(RuntimeError):
+        installer.admitted_psycopg_source_url(
+            body=body, project_url=DEVPI_SIMPLE_URL + "psycopg-c/"
+        )
+
+
+def test_psycopg_source_refuses_other_names_and_changed_release_bytes(tmp_path: Path) -> None:
+    with pytest.raises(RuntimeError, match="exact reviewed Psycopg C source name"):
+        installer.inspect_psycopg_source(tmp_path / "another-source.tar.gz")
+    archive = tmp_path / installer.PSYCOPG_C_SOURCE_NAME
+    archive.write_bytes(b"unrecognized release bytes")
+    with pytest.raises(RuntimeError, match="original source SHA-256 mismatch"):
+        installer.inspect_psycopg_source(archive)
+
+
+def test_regular_input_accepts_read_induced_atime_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "input"
+    path.write_bytes(b"controlled input")
+    real_fstat = os.fstat
+    calls = 0
+
+    def observe_read(descriptor: int) -> os.stat_result:
+        nonlocal calls
+        calls += 1
+        value = real_fstat(descriptor)
+        if calls == 2:
+            fields = list(value)
+            fields[7] += 10
+            return os.stat_result(
+                fields,
+                {
+                    "st_atime_ns": value.st_atime_ns + 10_000_000_000,
+                    "st_mtime_ns": value.st_mtime_ns,
+                    "st_ctime_ns": value.st_ctime_ns,
+                },
+            )
+        return value
+
+    monkeypatch.setattr(installer.os, "fstat", observe_read)
+    assert installer._read_regular_input(path, maximum=64) == b"controlled input"
+    assert calls == 2
+
+
+def test_regular_input_rejects_path_replacement_after_descriptor_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "input"
+    path.write_bytes(b"original input")
+    replacement = tmp_path / "replacement"
+    replacement.write_bytes(b"different input")
+    real_fstat = os.fstat
+    calls = 0
+
+    def replace_after_read(descriptor: int) -> os.stat_result:
+        nonlocal calls
+        calls += 1
+        value = real_fstat(descriptor)
+        if calls == 2:
+            os.replace(replacement, path)
+        return value
+
+    monkeypatch.setattr(installer.os, "fstat", replace_after_read)
+    with pytest.raises(RuntimeError, match="Input identity changed"):
+        installer._read_regular_input(path, maximum=64)
+    assert path.read_bytes() == b"different input"
+
+
+@pytest.mark.parametrize("changed_field", (0, 1, 2, 3, 4, 5, 6, 8, 9))
+def test_regular_input_rejects_identity_or_nonaccess_metadata_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed_field: int
+) -> None:
+    path = tmp_path / "input"
+    path.write_bytes(b"controlled input")
+    real_fstat = os.fstat
+    calls = 0
+
+    def observe_changed_metadata(descriptor: int) -> os.stat_result:
+        nonlocal calls
+        calls += 1
+        value = real_fstat(descriptor)
+        if calls == 2:
+            fields = list(value)
+            fields[changed_field] += 1
+            return os.stat_result(
+                fields,
+                {
+                    "st_atime_ns": value.st_atime_ns,
+                    "st_mtime_ns": value.st_mtime_ns + (changed_field == 8),
+                    "st_ctime_ns": value.st_ctime_ns + (changed_field == 9),
+                },
+            )
+        return value
+
+    monkeypatch.setattr(installer.os, "fstat", observe_changed_metadata)
+    with pytest.raises(RuntimeError, match="Input identity changed"):
+        installer._read_regular_input(path, maximum=64)
+
+
+@pytest.mark.parametrize(
+    "selectors",
+    (
+        ["--prefetch-psycopg-source", "source", "--prefetch-psycopg-build-wheels", "wheels"],
+        ["--prefetch-psycopg-source", "source", "--preflight-only"],
+        ["--prefetch-psycopg-build-wheels", "wheels", "--preflight-only"],
+        ["--build-psycopg-c", "--prefetch-psycopg-source", "source"],
+        ["--build-psycopg-c", "--preflight-only"],
+        ["--build-psycopg-c", "--prefetch-only"],
+        ["--build-psycopg-c", "--consume-only"],
+        ["--build-psycopg-c", "--upgrade-pip-only"],
+    ),
+)
+def test_main_rejects_mixed_operations_before_any_acquisition_build_or_preflight(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], selectors: list[str]
+) -> None:
+    def forbidden(**kwargs: object) -> None:
+        raise AssertionError("No operation may execute for conflicting selectors")
+
+    for name in (
+        "prefetch_psycopg_source",
+        "prefetch_psycopg_build_wheels",
+        "build_psycopg_c_sdk",
+        "run_dependency_floor_preflight",
+    ):
+        monkeypatch.setattr(installer, name, forbidden)
+    assert installer.main(selectors) == 1
+    assert "operation selectors are mutually exclusive" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "modifier",
+    (
+        ["--install-dev"],
+        ["--install-test"],
+        ["--requirements-profile", "ci-lite"],
+        ["--requirements-profile=ci-test"],
+        ["--requirements-file", "requirements.txt"],
+        ["--constraints-file", "constraints.txt"],
+        ["--install-mode", "wheelhouse"],
+        ["--psycopg-sdk", "sdk"],
+        ["--index-url", APPROVED_PROXY_URL],
+        ["--upgrade-pip"],
+        ["--require-virtualenv"],
+        ["--python-executable", sys.executable],
+    ),
+)
+def test_main_source_build_rejects_install_modifiers_even_at_default_values(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], modifier: list[str]
+) -> None:
+    def forbidden(**kwargs: object) -> None:
+        raise AssertionError("Source backend must not run with install modifiers")
+
+    monkeypatch.setattr(installer, "build_psycopg_c_sdk", forbidden)
+    argv = [
+        "--build-psycopg-c",
+        "--psycopg-source-archive",
+        "source.tar.gz",
+        "--psycopg-build-wheels",
+        "build-wheels",
+        "--psycopg-native-root",
+        "native",
+        "--psycopg-wheel-output",
+        "output",
+        *modifier,
+    ]
+    assert installer.main(argv) == 1
+    assert "no acquisition/install mode" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("abbreviation", ("--requirements-prof=ci-lite", "--const=constraints.txt"))
+def test_main_source_build_rejects_abbreviated_install_options_before_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    abbreviation: str,
+) -> None:
+    def forbidden(**kwargs: object) -> None:
+        raise AssertionError("Source backend must not run for unrecognized options")
+
+    monkeypatch.setattr(installer, "build_psycopg_c_sdk", forbidden)
+    with pytest.raises(SystemExit) as rejected:
+        installer.main(
+            [
+                "--build-psycopg-c",
+                "--psycopg-source-archive",
+                "source.tar.gz",
+                "--psycopg-build-wheels",
+                "build-wheels",
+                "--psycopg-native-root",
+                "native",
+                "--psycopg-wheel-output",
+                "output",
+                abbreviation,
+            ]
+        )
+    assert rejected.value.code == 2
+    assert "unrecognized arguments" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "operation", ([], ["--preflight-only"], ["--prefetch-psycopg-source", "prefetch"])
+)
+@pytest.mark.parametrize(
+    "build_input",
+    (
+        "--psycopg-source-archive",
+        "--psycopg-build-wheels",
+        "--psycopg-native-root",
+        "--psycopg-wheel-output",
+    ),
+)
+def test_main_rejects_build_inputs_without_build_operation_before_effects(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    operation: list[str],
+    build_input: str,
+) -> None:
+    def forbidden(**kwargs: object) -> None:
+        raise AssertionError("No operation may consume stray source-build inputs")
+
+    for name in (
+        "prefetch_psycopg_source",
+        "prefetch_psycopg_build_wheels",
+        "build_psycopg_c_sdk",
+        "run_dependency_floor_preflight",
+        "install_with_guard",
+        "resolve_private_proxy_settings",
+    ):
+        monkeypatch.setattr(installer, name, forbidden)
+    assert installer.main([*operation, build_input, "input"]) == 1
+    assert "build inputs require the explicit --build-psycopg-c" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "selector", ("--prefetch-psycopg-source", "--prefetch-psycopg-build-wheels")
+)
+@pytest.mark.parametrize(
+    "modifier",
+    (
+        ["--requirements-file", "requirements.txt"],
+        ["--dev-requirements-file", "requirements-dev.txt"],
+        ["--test-requirements-file", "requirements-test.txt"],
+        ["--ci-lite-requirements-file", "requirements-ci-lite.txt"],
+        ["--rag-vector-requirements-file", "requirements-rag-vector.txt"],
+        ["--constraints-file", "constraints.txt"],
+        ["--requirements-profile=ci-test"],
+        ["--install-dev"],
+        ["--install-test"],
+        ["--require-virtualenv"],
+        ["--upgrade-pip"],
+        ["--upgrade-pip-spec", "pip"],
+        ["--guard-script", "guard.py"],
+        ["--emergency-wheel-manifest", "manifest.json"],
+        ["--install-mode=wheelhouse"],
+        ["--psycopg-sdk", "sdk"],
+        ["--wheelhouse-dir=wheels"],
+    ),
+)
+def test_main_psycopg_prefetch_rejects_install_modifiers_before_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    selector: str,
+    modifier: list[str],
+) -> None:
+    def forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("Rejected prefetch modifiers must cause no acquisition or resolution")
+
+    for name in (
+        "resolve_python_executable",
+        "resolve_private_proxy_settings",
+        "prefetch_psycopg_source",
+        "prefetch_psycopg_build_wheels",
+        "upgrade_pip",
+        "read_psycopg_c_sdk",
+        "install_with_guard",
+        "run_command",
+    ):
+        monkeypatch.setattr(installer, name, forbidden)
+    assert installer.main([selector, "new-input", *modifier]) == 1
+    assert "do not accept install modifiers" in capsys.readouterr().out
+
+
+def test_main_psycopg_source_prefetch_rejects_unused_explicit_python(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("Source prefetch must reject its unused target before effects")
+
+    for name in (
+        "resolve_python_executable",
+        "resolve_private_proxy_settings",
+        "prefetch_psycopg_source",
+    ):
+        monkeypatch.setattr(installer, name, forbidden)
+    assert (
+        installer.main(
+            [
+                "--prefetch-psycopg-source",
+                "source",
+                "--python-executable=" + sys.executable,
+            ]
+        )
+        == 1
+    )
+    assert "unused target Python" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("operation", ("source", "build-wheels"))
+def test_main_psycopg_prefetch_preserves_acquisition_inputs_and_used_target(
+    monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    observed: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        installer,
+        "resolve_private_proxy_settings",
+        lambda **kwargs: (kwargs["index_url"], kwargs["trusted_host"]),
+    )
+    monkeypatch.setattr(
+        installer,
+        "prefetch_psycopg_" + operation.replace("-", "_"),
+        lambda **kwargs: observed.append(kwargs),
+    )
+    argv = [
+        "--prefetch-psycopg-" + operation,
+        "output",
+        "--index-url",
+        APPROVED_PROXY_URL,
+        "--trusted-host",
+        "packages.example.internal",
+    ]
+    expected: dict[str, object] = {
+        "output": Path("output"),
+        "index_url": APPROVED_PROXY_URL,
+        "trusted_host": "packages.example.internal",
+    }
+    if operation == "build-wheels":
+        argv.extend(("--python-executable", sys.executable))
+        expected["python_executable"] = sys.executable
+    assert installer.main(argv) == 0
+    assert observed == [expected]
+
+
+def test_main_single_source_build_preserves_the_four_explicit_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[dict[str, object]] = []
+    monkeypatch.setattr(installer, "build_psycopg_c_sdk", lambda **kwargs: observed.append(kwargs))
+    assert (
+        installer.main(
+            [
+                "--build-psycopg-c",
+                "--psycopg-source-archive",
+                "source.tar.gz",
+                "--psycopg-build-wheels",
+                "build-wheels",
+                "--psycopg-native-root",
+                "native",
+                "--psycopg-wheel-output",
+                "output",
+            ]
+        )
+        == 0
+    )
+    assert observed == [
+        {
+            "source": Path("source.tar.gz"),
+            "build_wheels": Path("build-wheels"),
+            "native_root": Path("native"),
+            "output": Path("output"),
+        }
+    ]
+
+
+def test_psycopg_build_tools_include_only_the_actual_binary_closure() -> None:
+    assert installer.PSYCOPG_C_BUILD_PINS == frozenset(
+        {
+            ("setuptools", "84.1.0"),
+            ("wheel", "0.47.0"),
+            ("packaging", "25.0"),
+        }
+    )
+    assert set(installer.PSYCOPG_C_BUILD_ARTIFACTS) == {
+        "setuptools-84.1.0-py3-none-any.whl",
+        "wheel-0.47.0-py3-none-any.whl",
+        "packaging-25.0-py3-none-any.whl",
+    }
+    with pytest.raises(RuntimeError, match="inventory is incomplete"):
+        installer._validate_psycopg_build_closure([])
+
+
+def test_psycopg_profile_requires_a_genuine_sdk_before_acquisition(tmp_path: Path) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("psycopg[c]==3.3.4\npsycopg-c==3.3.4\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="genuine matching Psycopg C SDK"):
+        installer.acquire_locked_wheelhouse(
+            python_executable=sys.executable,
+            requirement_files=[requirements],
+            constraints_file=None,
+            wheelhouse=tmp_path / "wheels",
+            index_url=APPROVED_PROXY_URL,
+            trusted_host=None,
+            sdk=None,
+        )
+    assert not (tmp_path / "wheels").exists()
+
+
+def test_exact_prefetch_requests_only_declared_pins_and_preserves_legacy_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("tool==1.0.0\n", encoding="utf-8")
+    wheelhouse = tmp_path / "wheels"
+    commands: list[list[str]] = []
+
+    def download(command: list[str], **kwargs: object) -> None:
+        assert "--no-deps" in command
+        assert "--only-binary" in command
+        commands.append(command)
+        with zipfile.ZipFile(wheelhouse / "tool-1.0.0-py3-none-any.whl", "w") as wheel:
+            wheel.writestr(
+                "tool-1.0.0.dist-info/METADATA",
+                "Metadata-Version: 2.4\nName: tool\nVersion: 1.0.0\nRequires-Dist: pip>=22.2\n\n",
+            )
+
+    monkeypatch.setattr(installer, "run_command", download)
+    installer.acquire_locked_wheelhouse(
+        python_executable=sys.executable,
+        requirement_files=[requirements],
+        constraints_file=None,
+        wheelhouse=wheelhouse,
+        index_url=APPROVED_PROXY_URL,
+        trusted_host=None,
+        sdk=None,
+    )
+    assert len(commands) == 1
+    assert [path.name for path in wheelhouse.iterdir()] == ["tool-1.0.0-py3-none-any.whl"]
+    legacy = installer.build_pip_download_command(
+        python_executable=sys.executable,
+        requirement_file=requirements,
+        constraints_file=None,
+        wheelhouse_dir=wheelhouse,
+        index_url=APPROVED_PROXY_URL,
+        trusted_host=None,
+    )
+    assert "--no-deps" not in legacy
+
+
+@pytest.mark.parametrize(
+    "line",
+    (
+        "example>=1",
+        "example==1; python_version>'3.10'",
+        "example @ https://packages.example.invalid/example-1-py3-none-any.whl",
+        "example==1.*",
+        "psycopg==3.3.4",
+        "psycopg[binary]==3.3.4",
+        "psycopg[c,binary]==3.3.4",
+        "psycopg[other]==3.3.4",
+        "psycopg-c[other]==3.3.4",
+    ),
+)
+def test_exact_sdk_profiles_reject_noncanonical_pins(tmp_path: Path, line: str) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text(line + "\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="ordinary unmarked compiled pins"):
+        installer._exact_locked_artifacts([requirements])
+
+
+@pytest.mark.parametrize(
+    "name,extra,version",
+    (("cachecontrol", "filecache", "0.14.4"), ("coverage", "toml", "7.15.4")),
+)
+def test_exact_prefetch_admits_compiled_binary_extras_through_wheel_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, extra: str, version: str
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    pin = f"{name}[{extra}]=={version}"
+    requirements.write_text(pin + "\n", encoding="utf-8")
+    wheelhouse = tmp_path / "wheels"
+    commands: list[list[str]] = []
+
+    def download(command: list[str], **kwargs: object) -> None:
+        commands.append(command)
+        assert command[command.index("--only-binary") + 1] == ":all:"
+        assert "--no-deps" in command
+        selected = Path(command[command.index("--requirement") + 1])
+        assert selected.read_text(encoding="utf-8").strip() == pin
+        with zipfile.ZipFile(wheelhouse / f"{name}-{version}-py3-none-any.whl", "w") as wheel:
+            wheel.writestr(
+                f"{name}-{version}.dist-info/METADATA",
+                f"Metadata-Version: 2.4\nName: {name}\nVersion: {version}\n"
+                f"Provides-Extra: {extra}\n\n",
+            )
+
+    monkeypatch.setattr(installer, "run_command", download)
+    installer.acquire_locked_wheelhouse(
+        python_executable=sys.executable,
+        requirement_files=[requirements],
+        constraints_file=None,
+        wheelhouse=wheelhouse,
+        index_url=APPROVED_PROXY_URL,
+        trusted_host=None,
+        sdk=None,
+    )
+    assert len(commands) == 1
+    assert installer._exact_locked_artifacts([requirements]) == frozenset({(name, version)})
+    assert installer._validate_exact_wheelhouse(
+        wheelhouse=wheelhouse, expected=frozenset({(name, version)})
+    )[0].artifact_key == (name, version)
+
+
+def test_real_compiled_ci_test_pins_keep_extras_and_exact_sdk_requirement(tmp_path: Path) -> None:
+    selected = [REPO_ROOT / "requirements-ci-lite.txt", REPO_ROOT / "requirements-test.txt"]
+    pins = installer._exact_locked_artifacts(selected)
+    assert {("cachecontrol", "0.14.4"), ("coverage", "7.15.4"), ("psycopg-c", "3.3.4")} <= pins
+    with pytest.raises(RuntimeError, match="genuine matching Psycopg C SDK"):
+        installer.acquire_locked_wheelhouse(
+            python_executable=sys.executable,
+            requirement_files=selected,
+            constraints_file=REPO_ROOT / "constraints.txt",
+            wheelhouse=tmp_path / "wheels",
+            index_url=APPROVED_PROXY_URL,
+            trusted_host=None,
+            sdk=None,
+        )
+    assert not (tmp_path / "wheels").exists()
+
+
+def test_exact_source_leaf_still_rejects_unadmitted_version_before_acquisition(
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("psycopg[c]==3.3.4\npsycopg-c==3.3.5\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="Only the admitted Psycopg C version"):
+        installer.acquire_locked_wheelhouse(
+            python_executable=sys.executable,
+            requirement_files=[requirements],
+            constraints_file=None,
+            wheelhouse=tmp_path / "wheels",
+            index_url=APPROVED_PROXY_URL,
+            trusted_host=None,
+            sdk=None,
+        )
+    assert not (tmp_path / "wheels").exists()
+
+
+def test_consume_only_has_no_acquisition_dispatch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("example==1.0\n", encoding="utf-8")
+    wheelhouse = tmp_path / "wheels"
+    wheelhouse.mkdir()
+    constraints = tmp_path / "constraints.txt"
+    constraints.write_text("", encoding="utf-8")
+    observed: list[dict[str, object]] = []
+    monkeypatch.setattr(installer, "_validate_exact_wheelhouse", lambda **kwargs: ())
+    monkeypatch.setattr(installer, "resolve_python_executable", lambda value: value)
+
+    def reject_acquisition(**kwargs: object) -> None:
+        raise AssertionError("Consume-only must not dispatch proxy or prefetch work")
+
+    monkeypatch.setattr(installer, "resolve_private_proxy_settings", reject_acquisition)
+    monkeypatch.setattr(installer, "acquire_locked_wheelhouse", reject_acquisition)
+
+    def consume(**kwargs: object) -> int:
+        observed.append(kwargs)
+        return 0
+
+    monkeypatch.setattr(installer, "install_with_guard", consume)
+    assert (
+        installer.main(
+            [
+                "--consume-only",
+                "--wheelhouse-dir",
+                str(wheelhouse),
+                "--requirements-file",
+                str(requirements),
+                "--constraints-file",
+                str(constraints),
+            ]
+        )
+        == 0
+    )
+    assert observed[0]["consume_only"] is True
+    assert observed[0]["index_url"] == ""
+
+
+def test_consume_only_rejects_mixed_modes_and_missing_store() -> None:
+    assert installer.main(["--consume-only", "--prefetch-only"]) == 1
+    assert installer.main(["--consume-only"]) == 1
+
+
+@pytest.mark.parametrize("sdk_source", ("environment", "argument"))
+@pytest.mark.parametrize("operation", ("install", "prefetch", "consume", "install-upgrade"))
+def test_main_rejects_sdk_without_c_consumer_before_side_effects(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    sdk_source: str,
+    operation: str,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("example==1.0\n", encoding="utf-8")
+    constraints = tmp_path / "constraints.txt"
+    constraints.write_text("", encoding="utf-8")
+    sdk = tmp_path / "unread-sdk"
+    wheelhouse = tmp_path / "uncreated-wheelhouse"
+    arguments = [
+        "--requirements-file",
+        str(requirements),
+        "--constraints-file",
+        str(constraints),
+    ]
+    if sdk_source == "environment":
+        monkeypatch.setenv(installer.PSYCOPG_SDK_ENV, str(sdk))
+    else:
+        arguments.extend(("--psycopg-sdk", str(sdk)))
+    if operation in ("prefetch", "consume"):
+        arguments.extend((f"--{operation}-only", "--wheelhouse-dir", str(wheelhouse)))
+    elif operation == "install-upgrade":
+        arguments.append("--upgrade-pip")
+    monkeypatch.setattr(
+        installer, "resolve_private_proxy_settings", lambda **kwargs: (APPROVED_PROXY_URL, None)
+    )
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError(
+            "A profile without a C consumer must reject its SDK before side effects"
+        )
+
+    for name in (
+        "run_dependency_floor_preflight",
+        "upgrade_pip",
+        "acquire_locked_wheelhouse",
+        "_validate_exact_wheelhouse",
+        "read_psycopg_c_sdk",
+        "install_with_guard",
+        "install_with_guard_from_proxy",
+        "run_command",
+    ):
+        monkeypatch.setattr(installer, name, forbidden)
+
+    assert installer.main(arguments) == 1
+    assert capsys.readouterr().out == (
+        "ERROR: locked install failed: The selected profile has no Psycopg C SDK consumer.\n"
+    )
+    assert not sdk.exists()
+    assert not wheelhouse.exists()
+
+
+@pytest.mark.parametrize("sdk_source", ("environment", "argument"))
+@pytest.mark.parametrize("operation", ("install", "prefetch", "consume", "install-upgrade"))
+def test_main_psycopg_sdk_rejects_other_interpreter_before_sdk_effects(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    sdk_source: str,
+    operation: str,
+) -> None:
+    _select_sdk_test_loader(monkeypatch)
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("psycopg[c]==3.3.4\npsycopg-c==3.3.4\n", encoding="utf-8")
+    constraints = tmp_path / "constraints.txt"
+    constraints.write_text("", encoding="utf-8")
+    target = _write_executable(tmp_path / "different-python")
+    sdk = tmp_path / "unread-sdk"
+    wheelhouse = tmp_path / "uncreated-wheelhouse"
+    arguments = [
+        "--python-executable",
+        str(target),
+        "--requirements-file",
+        str(requirements),
+        "--constraints-file",
+        str(constraints),
+    ]
+    if sdk_source == "environment":
+        monkeypatch.setenv(installer.PSYCOPG_SDK_ENV, str(sdk))
+    else:
+        arguments.extend(("--psycopg-sdk", str(sdk)))
+    if operation in ("prefetch", "consume"):
+        arguments.extend(("--" + operation + "-only", "--wheelhouse-dir", str(wheelhouse)))
+    elif operation == "install-upgrade":
+        arguments.append("--upgrade-pip")
+    monkeypatch.setattr(
+        installer, "resolve_private_proxy_settings", lambda **kwargs: (APPROVED_PROXY_URL, None)
+    )
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError(
+            "Cross-interpreter SDK input must fail before source or install effects"
+        )
+
+    for name in (
+        "read_psycopg_c_sdk",
+        "_stage_psycopg_sdk_wheel",
+        "acquire_locked_wheelhouse",
+        "_validate_exact_wheelhouse",
+        "upgrade_pip",
+        "install_with_guard",
+        "run_command",
+    ):
+        monkeypatch.setattr(installer, name, forbidden)
+    assert installer.main(arguments) == 1
+    assert "require the installer interpreter or its venv symlink" in capsys.readouterr().out
+    assert not sdk.exists()
+    assert not wheelhouse.exists()
+
+
+def test_psycopg_sdk_direct_acquisition_rejects_other_interpreter_before_directory_creation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _select_sdk_test_loader(monkeypatch)
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("psycopg[c]==3.3.4\npsycopg-c==3.3.4\n", encoding="utf-8")
+    target = _write_executable(tmp_path / "different-python")
+    wheelhouse = tmp_path / "new-wheelhouse"
+    sdk = tmp_path / "unread-sdk"
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("Direct SDK acquisition must reject before staging or download")
+
+    monkeypatch.setattr(installer, "_stage_psycopg_sdk_wheel", forbidden)
+    monkeypatch.setattr(installer, "build_wheelhouse", forbidden)
+    with pytest.raises(RuntimeError, match="require the installer interpreter or its venv symlink"):
+        installer.acquire_locked_wheelhouse(
+            python_executable=str(target),
+            requirement_files=[requirements],
+            constraints_file=None,
+            wheelhouse=wheelhouse,
+            index_url=APPROVED_PROXY_URL,
+            trusted_host=None,
+            sdk=sdk,
+        )
+    assert not wheelhouse.exists()
+    assert not sdk.exists()
+
+
+def test_psycopg_sdk_disappearing_target_is_runtime_error_before_acquisition(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _select_sdk_test_loader(monkeypatch)
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("psycopg[c]==3.3.4\npsycopg-c==3.3.4\n", encoding="utf-8")
+    target = _write_executable(tmp_path / "disappearing-python")
+    sdk = tmp_path / "unread-sdk"
+    wheelhouse = tmp_path / "uncreated-wheelhouse"
+    real_resolve = installer.resolve_python_executable
+    resolutions: list[str] = []
+
+    def resolve_then_remove(value: str) -> str:
+        resolved = real_resolve(value)
+        resolutions.append(resolved)
+        target.unlink()
+        return resolved
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("Disappearing SDK target must fail before SDK read or acquisition")
+
+    monkeypatch.setattr(installer, "resolve_python_executable", resolve_then_remove)
+    monkeypatch.setattr(installer, "read_psycopg_c_sdk", forbidden)
+    monkeypatch.setattr(installer, "_stage_psycopg_sdk_wheel", forbidden)
+    monkeypatch.setattr(installer, "build_wheelhouse", forbidden)
+    with pytest.raises(RuntimeError, match="Unable to compare the Psycopg SDK target interpreter"):
+        installer.acquire_locked_wheelhouse(
+            python_executable=str(target),
+            requirement_files=[requirements],
+            constraints_file=None,
+            wheelhouse=wheelhouse,
+            index_url=APPROVED_PROXY_URL,
+            trusted_host=None,
+            sdk=sdk,
+        )
+    assert resolutions == [str(target)]
+    assert not target.exists()
+    assert not sdk.exists()
+    assert not wheelhouse.exists()
+
+
+def test_psycopg_sdk_accepts_the_loader_interpreters_real_venv_symlink(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _select_sdk_test_loader(monkeypatch)
+    invocation = tmp_path / "venv" / "bin" / "python"
+    invocation.parent.mkdir(parents=True)
+    invocation.symlink_to(sys.executable)
+    installer._require_psycopg_sdk_interpreter(str(invocation))
+
+
+def test_main_without_sdk_preserves_a_different_target_interpreter(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("example==1.0\n", encoding="utf-8")
+    constraints = tmp_path / "constraints.txt"
+    constraints.write_text("", encoding="utf-8")
+    target = _write_executable(tmp_path / "different-python")
+    observed: list[str] = []
+    monkeypatch.setattr(
+        installer, "resolve_private_proxy_settings", lambda **kwargs: (APPROVED_PROXY_URL, None)
+    )
+    monkeypatch.setattr(
+        installer,
+        "install_with_guard_from_proxy",
+        lambda **kwargs: observed.append(kwargs["python_executable"]) or 0,
+    )
+    assert (
+        installer.main(
+            [
+                "--python-executable",
+                str(target),
+                "--requirements-file",
+                str(requirements),
+                "--constraints-file",
+                str(constraints),
+                "--install-mode",
+                "direct-proxy",
+            ]
+        )
+        == 0
+    )
+    assert observed == [str(target)]
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected"),
+    (
+        (["--preflight-only"], ["preflight"]),
+        (["--preflight-only", "--upgrade-pip"], ["upgrade", "preflight"]),
+        (["--upgrade-pip-only"], ["upgrade"]),
+    ),
+)
+def test_main_sdk_target_guard_does_not_widen_standalone_operations(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    operation: list[str],
+    expected: list[str],
+) -> None:
+    target = _write_executable(tmp_path / "different-python")
+    observed: list[str] = []
+    monkeypatch.setattr(
+        installer, "resolve_private_proxy_settings", lambda **kwargs: (APPROVED_PROXY_URL, None)
+    )
+    monkeypatch.setattr(
+        installer, "upgrade_pip", lambda *args, **kwargs: observed.append("upgrade")
+    )
+    monkeypatch.setattr(
+        installer, "run_dependency_floor_preflight", lambda **kwargs: observed.append("preflight")
+    )
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("Standalone operations must not resolve ordinary install profiles")
+
+    monkeypatch.setattr(installer, "resolve_requirement_files", forbidden)
+    monkeypatch.setattr(installer, "read_psycopg_c_sdk", forbidden)
+    assert (
+        installer.main(
+            [
+                "--python-executable",
+                str(target),
+                "--psycopg-sdk",
+                str(tmp_path / "unread-sdk"),
+                *operation,
+            ]
+        )
+        == 0
+    )
+    assert observed == expected
+
+
+@pytest.mark.parametrize(
+    "condition",
+    (
+        "dormant",
+        "missing_loopback",
+        "active",
+        "ipv4_address",
+        "ipv4_route",
+        "ipv6_address",
+        "ipv6_route",
+        "malformed_ipv6_address",
+        "malformed_ipv6_route",
+    ),
+)
+@pytest.mark.parametrize("ipv4_inventory", ("empty", "header", "loopback"))
+def test_psycopg_backend_checks_native_network_state(
+    monkeypatch: pytest.MonkeyPatch, condition: str, ipv4_inventory: str
+) -> None:
+    interfaces = {"lo": (73, b"\x7f\x00\x00\x01"), "default-device": (128, None)}
+    tables = {
+        "/proc/net/route": [
+            [
+                "Iface",
+                "Destination",
+                "Gateway",
+                "Flags",
+                "RefCnt",
+                "Use",
+                "Metric",
+                "Mask",
+                "MTU",
+                "Window",
+                "IRTT",
+            ]
+        ],
+        "/proc/net/if_inet6": [["0" * 31 + "1", "01", "80", "10", "80", "lo"]],
+        "/proc/net/ipv6_route": [[*(["0"] * 9), "lo"]],
+    }
+    if ipv4_inventory == "empty":
+        tables["/proc/net/route"] = []
+    elif ipv4_inventory == "loopback":
+        tables["/proc/net/route"].append(["lo", *(["0"] * 10)])
+    if condition == "missing_loopback":
+        interfaces.pop("lo")
+    elif condition == "active":
+        interfaces["default-device"] = (129, None)
+    elif condition == "ipv4_address":
+        interfaces["default-device"] = (128, b"\x0a\x00\x00\x01")
+    elif condition == "ipv4_route":
+        # Preserve a valid header so this case reaches the external-route guard.
+        if ipv4_inventory == "empty":
+            tables["/proc/net/route"] = [
+                "Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT".split()
+            ]
+        tables["/proc/net/route"].append(["default-device", *(["0"] * 10)])
+    elif condition == "ipv6_address":
+        tables["/proc/net/if_inet6"][0][-1] = "default-device"
+    elif condition == "ipv6_route":
+        tables["/proc/net/ipv6_route"][0][-1] = "default-device"
+    elif condition == "malformed_ipv6_address":
+        tables["/proc/net/if_inet6"][0].pop(0)
+    elif condition == "malformed_ipv6_route":
+        tables["/proc/net/ipv6_route"][0].pop(0)
+    monkeypatch.setattr(installer, "_process_network_inventory", lambda: interfaces)
+    monkeypatch.setattr(installer, "_network_table_lines", lambda path: tables[path])
+    if condition == "dormant":
+        installer._assert_backend_network_isolated()
+    else:
+        with pytest.raises(RuntimeError, match="network isolation|external or malformed"):
+            installer._assert_backend_network_isolated()
+
+
+@pytest.mark.parametrize(
+    "ipv4_payload",
+    (
+        b"",
+        b" \t\n\n",
+        b"Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\n",
+        b"Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\n"
+        b"lo 0 0 0 0 0 0 0 0 0 0\n",
+    ),
+)
+def test_psycopg_backend_accepts_readable_empty_or_loopback_route_tables(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ipv4_payload: bytes
+) -> None:
+    route = tmp_path / "route"
+    route.write_bytes(ipv4_payload)
+    reader = installer._network_table_lines
+    observed: list[str] = []
+
+    def read_table(path: str) -> list[list[str]]:
+        observed.append(path)
+        if path == "/proc/net/route":
+            return reader(str(route))
+        if path == "/proc/net/if_inet6":
+            return []
+        assert path == "/proc/net/ipv6_route"
+        return [[*(["0"] * 9), "lo"], [*(["0"] * 9), "lo"]]
+
+    monkeypatch.setattr(installer, "_process_network_inventory", lambda: {"lo": (0, None)})
+    monkeypatch.setattr(installer, "_network_table_lines", read_table)
+    installer._assert_backend_network_isolated()
+    assert observed == ["/proc/net/route", "/proc/net/if_inet6", "/proc/net/ipv6_route"]
+
+
+@pytest.mark.parametrize(
+    "ipv4_payload",
+    (
+        b"wrong header\n",
+        b"lo 0 0 0 0 0 0 0 0 0 0\n",
+        b"Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\nlo 0\n",
+    ),
+)
+def test_psycopg_backend_rejects_malformed_nonempty_route_tables(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ipv4_payload: bytes
+) -> None:
+    route = tmp_path / "route"
+    route.write_bytes(ipv4_payload)
+    reader = installer._network_table_lines
+    monkeypatch.setattr(installer, "_process_network_inventory", lambda: {"lo": (0, None)})
+    monkeypatch.setattr(installer, "_network_table_lines", lambda path: reader(str(route)))
+    with pytest.raises(RuntimeError, match="IPv4 route"):
+        installer._assert_backend_network_isolated()
+
+
+@pytest.mark.parametrize(
+    ("payload", "error"),
+    ((None, FileNotFoundError), (b"\xff", UnicodeDecodeError), (b" " * 65537, RuntimeError)),
+)
+def test_psycopg_backend_route_read_errors_never_become_empty_inventory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    payload: bytes | None,
+    error: type[Exception],
+) -> None:
+    route = tmp_path / "route"
+    if payload is not None:
+        route.write_bytes(payload)
+    reader = installer._network_table_lines
+    monkeypatch.setattr(installer, "_process_network_inventory", lambda: {"lo": (0, None)})
+    monkeypatch.setattr(installer, "_network_table_lines", lambda path: reader(str(route)))
+    with pytest.raises(error):
+        installer._assert_backend_network_isolated()
+
+
+def _ci_linux_cp313_tags() -> set[str]:
+    return {
+        "py3-none-any",
+        "py2-none-any",
+        "cp39-abi3-manylinux2014_x86_64",
+        "cp311-abi3-manylinux2014_x86_64",
+        "cp311-abi3-manylinux_2_17_x86_64",
+        "cp311-abi3-manylinux_2_34_x86_64",
+        "cp313-cp313-manylinux2014_x86_64",
+        "cp313-cp313-manylinux_2_17_x86_64",
+        "cp313-cp313-manylinux_2_27_x86_64",
+        "cp313-cp313-manylinux_2_28_x86_64",
+    }
+
+
+def _compatible_release_version(contents: str, package: str) -> str | None:
+    pattern = re.compile(rf"^{re.escape(package)}(?:\[[^]]+\])?\s*~=\s*([^\s;#]+)(?:\s*;.*)?$")
+    matched_versions: list[str] = []
+    for raw_line in contents.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        match = pattern.match(line)
+        if match is None:
+            continue
+        matched_versions.append(match.group(1).strip())
+
+    if not matched_versions:
+        return None
+
+    assert (
+        len(set(matched_versions)) == 1
+    ), f"Expected a single compatible-release pin for {package!r}, found {matched_versions!r}."
+    return matched_versions[0]
+
+
+def _minimum_requirement_version(contents: str, package: str) -> str | None:
+    pattern = re.compile(rf"^{re.escape(package)}(?:\[[^]]+\])?\s*>=\s*([^,<\s;#]+)")
+    matched_versions: list[str] = []
+    for raw_line in contents.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        match = pattern.match(line)
+        if match is None:
+            continue
+        matched_versions.append(match.group(1).strip())
+
+    if not matched_versions:
+        return None
+
+    assert (
+        len(set(matched_versions)) == 1
+    ), f"Expected a single minimum pin for {package!r}, found {matched_versions!r}."
+    return matched_versions[0]
+
+
+def _resolver_miss_runtimeerror_like_run_command(package: str, version: str) -> RuntimeError:
+    """Shape like :func:`run_command` on pip failure (``exit 1`` plus stderr text)."""
+    requirement = f"{package}=={version}"
+    return installer._CompletedPipFailure(
+        1, "", f"No matching distribution found for {requirement}"
+    )
+
+
+class _FakeSimpleIndexResponse:
+    def __init__(
+        self,
+        status: int = 200,
+        body: bytes = b'<html><a href="pip-26.1.1-py3-none-any.whl">pip</a></html>',
+    ) -> None:
+        self._status = status
+        self._body = body
+
+    def __enter__(self) -> "_FakeSimpleIndexResponse":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+    def getcode(self) -> int:
+        return self._status
+
+    @property
+    def status(self) -> int:
+        return self._status
+
+    def read(self, size: int | None = None) -> bytes:
+        if size is None:
+            return self._body
+        return self._body[:size]
+
+
+def test_simple_project_page_has_version_requires_exact_version_boundary() -> None:
+    assert installer._simple_project_page_has_version(
+        package="pip",
+        version="26.1.1",
+        body=b'<a href="pip-26.1.1-py3-none-any.whl">pip</a>',
+    )
+    assert installer._simple_project_page_has_version(
+        package="pydantic-core",
+        version="2.46.4",
+        body=b'<a href="pydantic_core-2.46.4-cp313-cp313-manylinux.whl">pydantic</a>',
+    )
+    assert not installer._simple_project_page_has_version(
+        package="pip",
+        version="26.1.1",
+        body=b'<a href="pip-26.1.10-py3-none-any.whl">pip</a>',
+    )
+    assert not installer._simple_project_page_has_version(
+        package="pip",
+        version="26.1.1",
+        body=b'<a href="pip-26.1.1.post1-py3-none-any.whl">pip</a>',
+    )
+    assert not installer._simple_project_page_has_version(
+        package="pydantic-core",
+        version="2.46.4",
+        body=b'<a href="pydantic_core-2.46.4_rc1-cp313-cp313-manylinux.whl">pydantic</a>',
+    )
+
+
+def _allow_private_index_project_health(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[tuple[str, str, int]]:
+    observed_requests: list[tuple[str, str, int]] = []
+
+    class FakeHTTPSConnection:
+        def __init__(
+            self,
+            host: str,
+            *,
+            port: int | None = None,
+            timeout: int,
+            context: object | None = None,
+        ) -> None:
+            assert context is None
+            self.host = host if port is None else f"{host}:{port}"
+            self.timeout = timeout
+
+        def request(
+            self,
+            _method: str,
+            path: str,
+            *,
+            headers: dict[str, str],
+        ) -> None:
+            assert headers == {}
+            observed_requests.append((self.host, path, self.timeout))
+
+        def getresponse(self) -> _FakeSimpleIndexResponse:
+            return _FakeSimpleIndexResponse()
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(installer.http.client, "HTTPSConnection", FakeHTTPSConnection)
+    return observed_requests
+
+
+def test_private_index_project_health_keeps_default_tls_for_matching_trusted_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_contexts: list[object | None] = []
+
+    class FakeHTTPSConnection:
+        def __init__(
+            self,
+            _host: str,
+            *,
+            port: int | None = None,
+            timeout: int,
+            context: object | None = None,
+        ) -> None:
+            assert port is None
+            assert timeout == installer.PRIVATE_INDEX_HEALTH_TIMEOUT_SECONDS
+            observed_contexts.append(context)
+
+        def request(
+            self,
+            _method: str,
+            path: str,
+            *,
+            headers: dict[str, str],
+        ) -> None:
+            assert path == "/simple/pip/"
+            assert "Authorization" not in headers
+
+        def getresponse(self) -> _FakeSimpleIndexResponse:
+            return _FakeSimpleIndexResponse()
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(installer.http.client, "HTTPSConnection", FakeHTTPSConnection)
+
+    installer._require_private_index_project_health(
+        index_url=APPROVED_PROXY_URL,
+        package="pip",
+        trusted_host="packages.example.internal",
+    )
+
+    assert observed_contexts == [None]
+
+
+def test_private_index_project_health_uses_default_tls_for_mismatched_trusted_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_contexts: list[object | None] = []
+
+    class FakeHTTPSConnection:
+        def __init__(
+            self,
+            _host: str,
+            *,
+            port: int | None = None,
+            timeout: int,
+            context: object | None = None,
+        ) -> None:
+            assert port is None
+            assert timeout == installer.PRIVATE_INDEX_HEALTH_TIMEOUT_SECONDS
+            observed_contexts.append(context)
+
+        def request(
+            self,
+            _method: str,
+            path: str,
+            *,
+            headers: dict[str, str],
+        ) -> None:
+            assert path == "/simple/pip/"
+            assert "Authorization" not in headers
+
+        def getresponse(self) -> _FakeSimpleIndexResponse:
+            return _FakeSimpleIndexResponse()
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(installer.http.client, "HTTPSConnection", FakeHTTPSConnection)
+
+    installer._require_private_index_project_health(
+        index_url=APPROVED_PROXY_URL,
+        package="pip",
+        trusted_host="other.example.internal",
+    )
+
+    assert observed_contexts == [None]
+
+
+def test_private_index_project_health_supports_approved_http_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[tuple[str, int | None, int]] = []
+
+    class FakeHTTPConnection:
+        def __init__(self, host: str, *, port: int | None = None, timeout: int) -> None:
+            observed.append((host, port, timeout))
+
+        def request(
+            self,
+            _method: str,
+            path: str,
+            *,
+            headers: dict[str, str],
+        ) -> None:
+            assert path == "/simple/pip/"
+            assert headers == {}
+
+        def getresponse(self) -> _FakeSimpleIndexResponse:
+            return _FakeSimpleIndexResponse()
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(installer.http.client, "HTTPConnection", FakeHTTPConnection)
+
+    installer._require_private_index_project_health(
+        index_url="http://packages.example.internal/simple",
+        package="pip",
+        trusted_host=None,
+    )
+
+    assert observed == [
+        ("packages.example.internal", None, installer.PRIVATE_INDEX_HEALTH_TIMEOUT_SECONDS)
+    ]
+
+
+def test_private_index_project_health_reads_bounded_project_page_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_read_sizes: list[int | None] = []
+
+    class FakeResponse:
+        status = 200
+
+        def read(self, size: int | None = None) -> bytes:
+            observed_read_sizes.append(size)
+            body = b'<html><a href="pip-26.1.1-py3-none-any.whl">pip</a></html>'
+            return body + (b"x" * installer.PRIVATE_INDEX_PROJECT_PAGE_BYTES)
+
+    class FakeHTTPSConnection:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        def request(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        def getresponse(self) -> FakeResponse:
+            return FakeResponse()
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(installer.http.client, "HTTPSConnection", FakeHTTPSConnection)
+
+    installer._require_private_index_project_health(
+        index_url=APPROVED_PROXY_URL,
+        package="pip",
+        trusted_host=None,
+    )
+
+    assert observed_read_sizes == [installer.PRIVATE_INDEX_PROJECT_PAGE_BYTES]
+
+
+def test_private_index_project_health_retries_transient_probe_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = {"count": 0}
+    closes = {"count": 0}
+    observed_sleeps: list[float] = []
+
+    class FakeHTTPSConnection:
+        def __init__(
+            self,
+            _host: str,
+            *,
+            port: int | None = None,
+            timeout: int,
+            context: object | None = None,
+        ) -> None:
+            assert port is None
+            assert timeout == installer.PRIVATE_INDEX_HEALTH_TIMEOUT_SECONDS
+            assert context is None
+
+        def request(
+            self,
+            _method: str,
+            path: str,
+            *,
+            headers: dict[str, str],
+        ) -> None:
+            assert path == "/simple/pip/"
+            assert headers == {}
+
+        def getresponse(self) -> _FakeSimpleIndexResponse:
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise TimeoutError("read operation timed out")
+            return _FakeSimpleIndexResponse()
+
+        def close(self) -> None:
+            closes["count"] += 1
+
+    monkeypatch.setattr(installer.http.client, "HTTPSConnection", FakeHTTPSConnection)
+    monkeypatch.setattr(installer.time, "sleep", lambda seconds: observed_sleeps.append(seconds))
+
+    installer._require_private_index_project_health(
+        index_url=APPROVED_PROXY_URL,
+        package="pip",
+        trusted_host=None,
+    )
+
+    assert attempts["count"] == 2
+    assert closes["count"] == 2
+    assert observed_sleeps == [1.0]
+
+
+def test_private_index_project_health_retries_transient_http_5xx(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = {"count": 0}
+    closes = {"count": 0}
+    observed_sleeps: list[float] = []
+
+    class FakeHTTPSConnection:
+        def __init__(
+            self,
+            _host: str,
+            *,
+            port: int | None = None,
+            timeout: int,
+            context: object | None = None,
+        ) -> None:
+            assert port is None
+            assert timeout == installer.PRIVATE_INDEX_HEALTH_TIMEOUT_SECONDS
+            assert context is None
+
+        def request(
+            self,
+            _method: str,
+            path: str,
+            *,
+            headers: dict[str, str],
+        ) -> None:
+            assert path == "/simple/pip/"
+            assert headers == {}
+
+        def getresponse(self) -> _FakeSimpleIndexResponse:
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                return _FakeSimpleIndexResponse(status=502, body=b"bad gateway")
+            return _FakeSimpleIndexResponse()
+
+        def close(self) -> None:
+            closes["count"] += 1
+
+    monkeypatch.setattr(installer.http.client, "HTTPSConnection", FakeHTTPSConnection)
+    monkeypatch.setattr(installer.time, "sleep", lambda seconds: observed_sleeps.append(seconds))
+
+    installer._require_private_index_project_health(
+        index_url=APPROVED_PROXY_URL,
+        package="pip",
+        trusted_host=None,
+    )
+
+    assert attempts["count"] == 2
+    assert closes["count"] == 2
+    assert observed_sleeps == [1.0]
+
+
+def test_private_index_project_health_supports_devpi_netrc_auth(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    observed_requests: list[tuple[str, str, dict[str, str]]] = []
+    netrc_path = tmp_path / ".netrc"
+    netrc_path.write_text(
+        "\n".join(
+            [
+                "machine packages.pulseplate.app",
+                f"  login {DEVPI_SIMPLE_USER}",
+                f"  password {DEVPI_SIMPLE_TOKEN}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    netrc_path.chmod(0o600)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    class FakeHTTPSConnection:
+        def __init__(
+            self,
+            host: str,
+            *,
+            port: int | None = None,
+            timeout: int,
+            context: object | None = None,
+        ) -> None:
+            assert host == "packages.pulseplate.app"
+            assert port is None
+            assert timeout == installer.PRIVATE_INDEX_HEALTH_TIMEOUT_SECONDS
+            assert context is None
+
+        def request(
+            self,
+            method: str,
+            path: str,
+            *,
+            headers: dict[str, str],
+        ) -> None:
+            observed_requests.append((method, path, headers))
+
+        def getresponse(self) -> _FakeSimpleIndexResponse:
+            return _FakeSimpleIndexResponse()
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(installer.http.client, "HTTPSConnection", FakeHTTPSConnection)
+
+    installer._require_private_index_project_health(
+        index_url=DEVPI_SIMPLE_URL,
+        package="pip",
+        trusted_host=None,
+    )
+
+    assert observed_requests == [
+        (
+            "GET",
+            "/root/pulseplate/+simple/pip/",
+            {"Authorization": "Basic Y2ktcmVhZGVyOnRva2VuLTEyMw=="},
+        )
+    ]
+
+
+def test_private_index_project_health_rejects_credentialed_http(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_if_called(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("credentialed HTTP must fail before opening a connection")
+
+    monkeypatch.setattr(installer.http.client, "HTTPConnection", fail_if_called)
+
+    credentialed_http_url = (
+        f"http://{DEVPI_SIMPLE_USER}:{DEVPI_SIMPLE_TOKEN}" "@packages.example.internal/simple"
+    )
+    with pytest.raises(RuntimeError, match="URLs are forbidden") as excinfo:
+        installer._require_private_index_project_health(
+            index_url=credentialed_http_url,
+            package="pip",
+            trusted_host=None,
+        )
+
+    message = str(excinfo.value)
+    assert "token-123" not in message
+    assert "ci-reader" not in message
+    assert "http://packages.example.internal/simple/pip/" in message
+
+
+def test_private_index_project_health_rejects_devpi_root_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_if_called(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("root credentials must fail before opening a connection")
+
+    monkeypatch.setattr(installer.http.client, "HTTPSConnection", fail_if_called)
+    encoded_root_url = "".join(
+        [
+            "https://",
+            "ro%6ft",
+            ":",
+            DEVPI_SIMPLE_TOKEN,
+            "@packages.pulseplate.app/root/pulseplate/+simple/",
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="URLs are forbidden") as excinfo:
+        installer._require_private_index_project_health(
+            index_url=encoded_root_url,
+            package="pip",
+            trusted_host=None,
+        )
+
+    message = str(excinfo.value)
+    assert DEVPI_SIMPLE_TOKEN not in message
+    assert "https://packages.pulseplate.app/root/pulseplate/+simple/pip/" in message
+
+
+def test_private_index_project_health_rejects_root_netrc_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def fail_if_called(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("root .netrc credentials must fail before opening a connection")
+
+    netrc_path = tmp_path / ".netrc"
+    netrc_path.write_text(
+        "\n".join(
+            [
+                "machine packages.pulseplate.app",
+                f"  login {DEVPI_ROOT_USER}",
+                f"  password {DEVPI_SIMPLE_TOKEN}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    netrc_path.chmod(0o600)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(installer.http.client, "HTTPSConnection", fail_if_called)
+
+    with pytest.raises(RuntimeError, match="Root devpi credentials are forbidden"):
+        installer._require_private_index_project_health(
+            index_url=DEVPI_SIMPLE_URL,
+            package="pip",
+            trusted_host=None,
+        )
+
+
+def test_netrc_credentials_ignores_empty_hostname(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_if_called() -> None:
+        raise AssertionError("empty hostname must not read .netrc")
+
+    monkeypatch.setattr(installer.netrc, "netrc", fail_if_called)
+
+    assert installer._netrc_credentials(None) is None
+    assert installer._netrc_credentials("") is None
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "match"),
+    [
+        (302, b'<html><a href="pip-26.1.1-py3-none-any.whl">pip</a></html>', "HTTP 302"),
+        (200, b"<html>login required</html>", "invalid simple-index project page"),
+    ],
+)
+def test_private_index_project_health_rejects_redirects_and_non_project_pages(
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+    body: bytes,
+    match: str,
+) -> None:
+    class FakeHTTPSConnection:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        def request(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        def getresponse(self) -> _FakeSimpleIndexResponse:
+            return _FakeSimpleIndexResponse(status=status, body=body)
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(installer.http.client, "HTTPSConnection", FakeHTTPSConnection)
+
+    with pytest.raises(RuntimeError, match=match):
+        installer._require_private_index_project_health(
+            index_url=APPROVED_PROXY_URL,
+            package="pip",
+            trusted_host=None,
+        )
+
+
+def test_private_index_project_health_omits_netrc_credentials_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    netrc_path = tmp_path / ".netrc"
+    netrc_path.write_text(
+        "\n".join(
+            [
+                "machine packages.pulseplate.app",
+                f"  login {DEVPI_SIMPLE_USER}",
+                f"  password {DEVPI_SIMPLE_TOKEN}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    netrc_path.chmod(0o600)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    class FakeHTTPSConnection:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        def request(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        def getresponse(self) -> _FakeSimpleIndexResponse:
+            return _FakeSimpleIndexResponse(status=503)
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(installer.http.client, "HTTPSConnection", FakeHTTPSConnection)
+
+    with pytest.raises(RuntimeError, match="HTTP 503") as excinfo:
+        installer._require_private_index_project_health(
+            index_url=DEVPI_SIMPLE_URL,
+            package="pip",
+            trusted_host=None,
+        )
+
+    message = str(excinfo.value)
+    assert "token-123" not in message
+    assert "ci-reader" not in message
+    assert "https://packages.pulseplate.app/root/pulseplate/+simple/pip/" in message
+
+
+def test_private_index_project_health_accepts_underscore_wheel_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeHTTPSConnection:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        def request(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        def getresponse(self) -> _FakeSimpleIndexResponse:
+            return _FakeSimpleIndexResponse(
+                body=b'<html><a href="python_multipart-0.0.31-py3-none-any.whl">wheel</a></html>'
+            )
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(installer.http.client, "HTTPSConnection", FakeHTTPSConnection)
+
+    installer._require_private_index_project_health(
+        index_url=APPROVED_PROXY_URL,
+        package="python-multipart",
+        trusted_host=None,
+    )
+
+
+def _write_admission_netrc(tmp_path: Path, entry: str, *, filename: str = ".netrc") -> None:
+    path = tmp_path / filename
+    path.write_text(entry + "\n", encoding="utf-8")
+    path.chmod(0o600)
+
+
+@pytest.mark.parametrize("filename", [".netrc", "_netrc"])
+@pytest.mark.parametrize("selector", ["machine packages.example.internal", "default"])
+@pytest.mark.parametrize("principal", ["login ci-reader", "account ci-reader"])
+@pytest.mark.parametrize("password_clause", ['password ""', ""])
+def test_default_netrc_empty_password_blocks_settings_reader_and_cli(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    filename: str,
+    selector: str,
+    principal: str,
+    password_clause: str,
+) -> None:
+    for key in (
+        *installer.AMBIENT_INDEX_OVERRIDE_ENV_VARS,
+        installer.APPROVED_INDEX_ENV_VAR,
+        installer.TRUSTED_HOST_ENV_VAR,
+        "NETRC",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GHCR_READ_TOKEN",
+        "GHCR_TOKEN",
+        "DEVPI_CI_USER",
+        "DEVPI_CI_PASSWORD",
+        "PIP_CONFIG_FILE",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    _write_admission_netrc(tmp_path, f"{selector} {principal} {password_clause}", filename=filename)
+    if filename == ".netrc":
+        _write_admission_netrc(
+            tmp_path,
+            "default login alternate-reader password alternate-synthetic-marker",
+            filename="_netrc",
+        )
+    calls: list[str] = []
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        calls.append("authorization/connection/context/command/downstream")
+        raise AssertionError("empty selected password must stop before downstream effects")
+
+    monkeypatch.setattr(installer.base64, "b64encode", forbidden)
+    monkeypatch.setattr(installer.http.client, "HTTPConnection", forbidden)
+    monkeypatch.setattr(installer.http.client, "HTTPSConnection", forbidden)
+    monkeypatch.setattr(installer.ssl, "_create_unverified_context", forbidden)
+    monkeypatch.setattr(installer.ssl, "create_default_context", forbidden)
+    monkeypatch.setattr(installer.subprocess, "run", forbidden)
+    for name in (
+        "upgrade_pip",
+        "run_dependency_floor_preflight",
+        "run_command",
+        "resolve_requirement_files",
+        "install_with_guard_from_proxy",
+    ):
+        monkeypatch.setattr(installer, name, forbidden)
+    diagnostic = "Indeterminate default netrc credentials are forbidden."
+    for action in (
+        lambda: installer._netrc_credentials("packages.example.internal"),
+        lambda: installer.resolve_private_proxy_settings(
+            index_url=APPROVED_PROXY_URL, trusted_host=None
+        ),
+        lambda: installer._read_private_index_project_page(
+            index_url=APPROVED_PROXY_URL, package="pip", trusted_host=None
+        ),
+    ):
+        with pytest.raises(RuntimeError) as failure:
+            action()
+        assert str(failure.value) == diagnostic
+    for flags in ([], ["--preflight-only"], ["--upgrade-pip"], ["--upgrade-pip-only"]):
+        assert installer.main(["--index-url", APPROVED_PROXY_URL, *flags]) == 1
+        output = capsys.readouterr()
+        assert output.out == "ERROR: locked install failed: " + diagnostic + "\n"
+        assert output.err == ""
+        assert all(
+            value not in output.out
+            for value in ("ci-reader", "alternate-reader", "alternate-synthetic-marker", "Basic ")
+        )
+    assert calls == []
+
+
+@pytest.mark.parametrize("filename", [".netrc", "_netrc"])
+@pytest.mark.parametrize("selector", ["machine packages.example.internal", "default"])
+@pytest.mark.parametrize("principal", ["login", "account"])
+@pytest.mark.parametrize("password", [" opaque synthetic value ", "   "])
+def test_default_netrc_preserves_nonempty_opaque_password(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    selector: str,
+    principal: str,
+    password: str,
+) -> None:
+    for key in (
+        *installer.AMBIENT_INDEX_OVERRIDE_ENV_VARS,
+        installer.APPROVED_INDEX_ENV_VAR,
+        installer.TRUSTED_HOST_ENV_VAR,
+        "NETRC",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GHCR_READ_TOKEN",
+        "GHCR_TOKEN",
+        "DEVPI_CI_USER",
+        "DEVPI_CI_PASSWORD",
+        "PIP_CONFIG_FILE",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    _write_admission_netrc(
+        tmp_path, f'{selector} {principal} ci-reader password "{password}"', filename=filename
+    )
+    assert installer._netrc_credentials("packages.example.internal") == ("ci-reader", password)
+    observed: list[dict[str, str]] = []
+
+    class Connection:
+        def __init__(self, *_args: object, **kwargs: object) -> None:
+            assert "context" not in kwargs
+
+        def request(self, _method: str, _path: str, *, headers: dict[str, str]) -> None:
+            observed.append(headers)
+
+        def getresponse(self) -> _FakeSimpleIndexResponse:
+            return _FakeSimpleIndexResponse()
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(installer.http.client, "HTTPSConnection", Connection)
+    assert installer.resolve_private_proxy_settings(
+        index_url=APPROVED_PROXY_URL, trusted_host=None
+    ) == (APPROVED_PROXY_URL, None)
+    installer._read_private_index_project_page(
+        index_url=APPROVED_PROXY_URL, package="pip", trusted_host=None
+    )
+    assert len(observed) == 1
+    assert (
+        base64.b64decode(observed[0]["Authorization"].removeprefix("Basic "))
+        == ("ci-reader:" + password).encode()
+    )
+    admitted: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        installer, "run_dependency_floor_preflight", lambda **kwargs: admitted.append(kwargs)
+    )
+    assert installer.main(["--index-url", APPROVED_PROXY_URL, "--preflight-only"]) == 0
+    assert len(admitted) == 1 and admitted[0]["index_url"] == APPROVED_PROXY_URL
+    assert installer._netrc_credentials("packages.example.internal") == ("ci-reader", password)
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "machine packages.example.internal login ci-reader password synthetic-marker",
+        "machine packages.example.internal account ci-reader password synthetic-marker",
+        "default login ci-reader password synthetic-marker",
+        "default account ci-reader password synthetic-marker",
+    ],
+)
+@pytest.mark.parametrize("transport", ["http", "trusted-https"])
+@pytest.mark.parametrize("filename", [".netrc", "_netrc"])
+@pytest.mark.parametrize(
+    "flags", [[], ["--preflight-only"], ["--upgrade-pip"], ["--upgrade-pip-only"]]
+)
+def test_main_rejects_insecure_default_netrc_before_any_cli_branch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    entry: str,
+    transport: str,
+    flags: list[str],
+    filename: str,
+) -> None:
+    _write_admission_netrc(tmp_path, entry, filename=filename)
+    index = (
+        APPROVED_PROXY_URL
+        if transport == "trusted-https"
+        else APPROVED_PROXY_URL.replace("https:", "http:")
+    )
+    args = ["--index-url", index, *flags]
+    if transport == "trusted-https":
+        args += ["--trusted-host", "packages.example.internal"]
+    calls: list[str] = []
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        calls.append("downstream")
+        raise AssertionError("unsafe admission must stop before downstream execution")
+
+    for name in (
+        "upgrade_pip",
+        "run_dependency_floor_preflight",
+        "run_command",
+        "resolve_requirement_files",
+    ):
+        monkeypatch.setattr(installer, name, forbidden)
+    monkeypatch.setattr(installer.http.client, "HTTPConnection", forbidden)
+    monkeypatch.setattr(installer.http.client, "HTTPSConnection", forbidden)
+    monkeypatch.setattr(installer.ssl, "_create_unverified_context", forbidden)
+
+    assert installer.main(args) == 1
+    output = capsys.readouterr()
+    assert "require verified HTTPS" in output.out
+    assert "synthetic-marker" not in output.out + output.err
+    assert "ci-reader" not in output.out + output.err
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "entry,message",
+    [
+        ("machine packages.example.internal password synthetic-marker", "Indeterminate"),
+        ("machine packages.example.internal", "Indeterminate"),
+        ("default account root password synthetic-marker", "Root devpi"),
+        ("machine packages.example.internal login root password synthetic-marker", "Root devpi"),
+        ("machine packages.example.internal account root password synthetic-marker", "Root devpi"),
+        (
+            "machine packages.example.internal login ci-reader password synthetic-marker",
+            "require verified HTTPS",
+        ),
+        (
+            "machine packages.example.internal account ci-reader password synthetic-marker",
+            "require verified HTTPS",
+        ),
+        ("default login ci-reader password synthetic-marker", "require verified HTTPS"),
+        ("default account ci-reader password synthetic-marker", "require verified HTTPS"),
+    ],
+)
+@pytest.mark.parametrize("filename", [".netrc", "_netrc"])
+@pytest.mark.parametrize(
+    "transport", ["http", "trusted-https", "trusted-https-dot", "trusted-https-prepared-port"]
+)
+def test_default_netrc_direct_reader_and_settings_fail_before_connection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entry: str,
+    message: str,
+    transport: str,
+    filename: str,
+) -> None:
+    index = (
+        APPROVED_PROXY_URL if transport != "http" else APPROVED_PROXY_URL.replace("https:", "http:")
+    )
+    if transport == "trusted-https-dot":
+        index = "https://packages.example.internal./simple"
+        entry = entry.replace("packages.example.internal", "packages.example.internal.")
+    _write_admission_netrc(tmp_path, entry, filename=filename)
+    trusted = urlparse(index).hostname if transport != "http" else None
+    if transport == "trusted-https-prepared-port":
+        index = "https://packages.example.internal:0443/simple"
+        trusted = "packages.example.internal:443"
+    calls: list[str] = []
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        calls.append("connection/context")
+        raise AssertionError("inadmissible credentials must stop before connection/context")
+
+    monkeypatch.setattr(installer.http.client, "HTTPConnection", forbidden)
+    monkeypatch.setattr(installer.http.client, "HTTPSConnection", forbidden)
+    monkeypatch.setattr(installer.ssl, "_create_unverified_context", forbidden)
+    for action in (
+        lambda: installer.resolve_private_proxy_settings(index_url=index, trusted_host=trusted),
+        lambda: installer._read_private_index_project_page(
+            index_url=index, package="pip", trusted_host=trusted
+        ),
+    ):
+        with pytest.raises(RuntimeError, match=message) as error:
+            action()
+        assert "synthetic-marker" not in str(error.value)
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "machine packages.example.internal login ci-reader password synthetic-marker",
+        "machine packages.example.internal account ci-reader password synthetic-marker",
+        "default login ci-reader password synthetic-marker",
+        "default account ci-reader password synthetic-marker",
+    ],
+)
+@pytest.mark.parametrize("filename", [".netrc", "_netrc"])
+@pytest.mark.parametrize(
+    "index,trusted",
+    [
+        (APPROVED_PROXY_URL, None),
+        (APPROVED_PROXY_URL, "other.example.internal"),
+        (APPROVED_PROXY_URL, "packages.example.internal:443"),
+        (APPROVED_PROXY_URL, "PACKAGES.EXAMPLE.INTERNAL."),
+        ("https://packages.example.internal./simple", "packages.example.internal"),
+        ("https://packages.example.internal:443/simple", "packages.example.internal:0443"),
+        ("https://[2001:db8::1]:443/simple", "[2001:db8::1]:0443"),
+    ],
+)
+def test_verified_https_admits_real_default_netrc_selection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entry: str,
+    index: str,
+    trusted: str | None,
+    filename: str,
+) -> None:
+    entry = entry.replace("packages.example.internal", str(urlparse(index).hostname))
+    _write_admission_netrc(tmp_path, entry, filename=filename)
+    observed: list[dict[str, str]] = []
+
+    class Connection:
+        def __init__(self, *_args: object, **kwargs: object) -> None:
+            assert "context" not in kwargs
+
+        def request(self, _method: str, _path: str, *, headers: dict[str, str]) -> None:
+            observed.append(headers)
+
+        def getresponse(self) -> _FakeSimpleIndexResponse:
+            return _FakeSimpleIndexResponse()
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(installer.http.client, "HTTPSConnection", Connection)
+    assert installer.resolve_private_proxy_settings(index_url=index, trusted_host=trusted) == (
+        index,
+        trusted,
+    )
+    installer._read_private_index_project_page(index_url=index, package="pip", trusted_host=trusted)
+    assert len(observed) == 1
+    assert (
+        base64.b64decode(observed[0]["Authorization"].removeprefix("Basic "))
+        == b"ci-reader:synthetic-marker"
+    )
+
+
+@pytest.mark.parametrize(
+    "entry", [None, "machine other.example.internal login reader password synthetic-marker"]
+)
+@pytest.mark.parametrize("filename", [".netrc", "_netrc"])
+@pytest.mark.parametrize(
+    "index,trusted",
+    [
+        ("http://packages.example.internal/simple", None),
+        (APPROVED_PROXY_URL, "packages.example.internal"),
+    ],
+)
+def test_anonymous_admission_requires_absent_applicable_authenticator(
+    tmp_path: Path, entry: str | None, index: str, trusted: str | None, filename: str
+) -> None:
+    if entry is not None:
+        _write_admission_netrc(tmp_path, entry, filename=filename)
+    assert installer.resolve_private_proxy_settings(index_url=index, trusted_host=trusted) == (
+        index,
+        trusted,
+    )
+    assert (
+        installer._admit_private_proxy_netrc_auth(parsed_url=urlparse(index), trusted_host=trusted)
+        is None
+    )
+
+
+@pytest.mark.parametrize("first_applies", [False, True])
+def test_default_netrc_first_existing_candidate_has_native_precedence(
+    tmp_path: Path, first_applies: bool
+) -> None:
+    first_host = "packages.example.internal" if first_applies else "other.example.internal"
+    _write_admission_netrc(tmp_path, f"machine {first_host} login first password first-marker")
+    _write_admission_netrc(
+        tmp_path,
+        "default account fallback password fallback-marker",
+        filename="_netrc",
+    )
+
+    assert installer._netrc_credentials("packages.example.internal") == (
+        ("first", "first-marker") if first_applies else None
+    )
+
+
+@pytest.mark.parametrize("filename", [".netrc", "_netrc"])
+@pytest.mark.parametrize("failure", ["read", "parse", "disappeared"])
+def test_selected_default_netrc_failure_does_not_fall_through_or_leak(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    failure: str,
+) -> None:
+    _write_admission_netrc(
+        tmp_path, "default login reader password synthetic-marker", filename=filename
+    )
+    if filename == ".netrc":
+        _write_admission_netrc(
+            tmp_path, "default login alternate password alternate-marker", filename="_netrc"
+        )
+    calls: list[object] = []
+
+    def fail_selected(file: object = None) -> None:
+        calls.append(file)
+        if failure == "parse":
+            raise installer.netrc.NetrcParseError("synthetic-secret-exception-marker")
+        if failure == "disappeared":
+            raise FileNotFoundError("synthetic-secret-exception-marker")
+        raise PermissionError("synthetic-secret-exception-marker")
+
+    monkeypatch.setattr(installer.netrc, "netrc", fail_selected)
+    with pytest.raises(RuntimeError, match="Unable to read default netrc credentials") as error:
+        installer._netrc_credentials("packages.example.internal")
+
+    assert calls == [None if filename == ".netrc" else tmp_path / "_netrc"]
+    assert error.value.__suppress_context__ is True
+    assert "synthetic-secret-exception-marker" not in str(error.value)
+
+
+def test_primary_default_netrc_preserves_stdlib_permission_rejection(tmp_path: Path) -> None:
+    _write_admission_netrc(tmp_path, "default login reader password synthetic-marker")
+    (tmp_path / ".netrc").chmod(0o644)
+    _write_admission_netrc(
+        tmp_path, "default login fallback password fallback-marker", filename="_netrc"
+    )
+
+    with pytest.raises(RuntimeError, match="NetrcParseError") as error:
+        installer._netrc_credentials("packages.example.internal")
+    assert error.value.__suppress_context__ is True
+    assert "synthetic-marker" not in str(error.value)
+
+
+def test_default_netrc_selection_uncertainty_is_not_anonymous(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_stat = Path.stat
+
+    def uncertain_stat(path: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+        if path == tmp_path / ".netrc":
+            raise PermissionError("synthetic-secret-exception-marker")
+        return original_stat(path, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(Path, "stat", uncertain_stat)
+    with pytest.raises(RuntimeError, match="PermissionError") as error:
+        installer._netrc_credentials("packages.example.internal")
+    assert error.value.__suppress_context__ is True
+    assert "synthetic-secret-exception-marker" not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "trusted,url,expected",
+    [
+        (None, APPROVED_PROXY_URL, False),
+        ("PACKAGES.EXAMPLE.INTERNAL", APPROVED_PROXY_URL, True),
+        ("PACKAGES.EXAMPLE.INTERNAL.", APPROVED_PROXY_URL, False),
+        ("packages.example.internal", "https://packages.example.internal./simple", False),
+        ("packages.example.internal.", "https://packages.example.internal./simple", True),
+        ("packages.example.internal.:443", "https://packages.example.internal:443/simple", False),
+        ("packages.example.internal:443", "https://packages.example.internal:443/simple", True),
+        ("packages.example.internal:0443", "https://packages.example.internal:443/simple", False),
+        ("packages.example.internal:443", "https://packages.example.internal:0443/simple", True),
+        ("packages.example.internal:0443", "https://packages.example.internal:0443/simple", False),
+        ("packages.example.internal:443", APPROVED_PROXY_URL, False),
+        ("packages.example.internal", "https://packages.example.internal:8443/simple", True),
+        ("packages.example.internal:443", "https://packages.example.internal:8443/simple", False),
+        ("other.example.internal", APPROVED_PROXY_URL, False),
+        ("[2001:DB8::1]", "https://[2001:db8::1]:8443/simple", True),
+        ("[2001:db8::1]:443", "https://[2001:db8::1]/simple", False),
+        ("[2001:db8::1]:443", "https://[2001:db8::1]:443/simple", True),
+        ("[2001:db8::1]:0443", "https://[2001:db8::1]:443/simple", False),
+        ("[2001:db8::1]:443", "https://[2001:db8::1]:8443/simple", False),
+    ],
+)
+def test_trusted_authority_matches_native_explicit_port_semantics(
+    trusted: str | None, url: str, expected: bool
+) -> None:
+    prepared = Request("GET", url).prepare()
+    assert prepared.url is not None
+    with PipSession(trusted_hosts=[trusted] if trusted is not None else []) as session:
+        assert (type(session.get_adapter(prepared.url)) is InsecureHTTPAdapter) is expected
+    assert (
+        installer._trusted_host_matches_url(trusted_host=trusted, parsed_url=urlparse(url))
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
+    "trusted",
+    [
+        "https://packages.example.internal",
+        "reader@packages.example.internal",
+        "packages.example.internal:",
+        "packages.example.internal:no",
+        "packages.example.internal:65536",
+        "packages.example.internal/path",
+        "packages.example.internal?query",
+        "packages.example.internal?",
+        "packages.example.internal#fragment",
+        "packages.example.internal#",
+        "[2001:db8::1]?",
+        "[2001:db8::1]#",
+        "packages.example.internal\x00",
+        "pack ages.example.internal",
+        "[2001:db8::1",
+        "2001:db8::1",
+        "[2001:db8::1]:",
+    ],
+)
+def test_malformed_trusted_authority_fails_settings_and_direct_admission(trusted: str) -> None:
+    with pytest.raises(RuntimeError, match="trusted-host authority"):
+        installer.resolve_private_proxy_settings(index_url=APPROVED_PROXY_URL, trusted_host=trusted)
+    with pytest.raises(RuntimeError, match="trusted-host authority"):
+        installer._read_private_index_project_page(
+            index_url=APPROVED_PROXY_URL, package="pip", trusted_host=trusted
+        )
+
+
+@pytest.mark.parametrize(
+    "credentials",
+    [
+        ("", "", "synthetic-marker"),
+        ("", "", ""),
+        ("reader", "", None),
+        ("reader",),
+        ("reader", "", "value", "extra"),
+    ],
+)
+def test_indeterminate_netrc_shape_is_never_anonymous(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, credentials: object
+) -> None:
+    _write_admission_netrc(tmp_path, "default login reader password synthetic-marker")
+
+    class AmbiguousNetrc:
+        def authenticators(self, _hostname: str) -> object:
+            return credentials
+
+    monkeypatch.setattr(installer.netrc, "netrc", AmbiguousNetrc)
+    with pytest.raises(RuntimeError, match="Indeterminate"):
+        installer.resolve_private_proxy_settings(index_url=APPROVED_PROXY_URL, trusted_host=None)
+    with pytest.raises(RuntimeError, match="Indeterminate"):
+        installer._read_private_index_project_page(
+            index_url=APPROVED_PROXY_URL, package="pip", trusted_host=None
+        )
+
+
+@pytest.mark.parametrize("kind", ["parse", "read", "decode"])
+def test_main_netrc_failures_display_only_constant_and_class(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str], kind: str
+) -> None:
+    _write_admission_netrc(tmp_path, "default login reader password synthetic-marker")
+
+    def failing_netrc() -> None:
+        if kind == "parse":
+            raise installer.netrc.NetrcParseError("synthetic-secret-exception-marker")
+        if kind == "decode":
+            raise UnicodeDecodeError("utf-8", b"synthetic-secret-exception-marker", 0, 1, "invalid")
+        raise OSError("synthetic-secret-exception-marker")
+
+    monkeypatch.setattr(installer.netrc, "netrc", failing_netrc)
+    assert installer.main(["--index-url", APPROVED_PROXY_URL, "--upgrade-pip-only"]) == 1
+    output = capsys.readouterr()
+    assert "Unable to read default netrc credentials" in output.out
+    assert "synthetic-secret-exception-marker" not in output.out + output.err
+    with pytest.raises(RuntimeError) as error:
+        installer._read_private_index_project_page(
+            index_url=APPROVED_PROXY_URL, package="pip", trusted_host=None
+        )
+    assert error.value.__suppress_context__ is True
+    assert "synthetic-secret-exception-marker" not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "stage",
+    [
+        "constructor",
+        "tls",
+        "tls-close",
+        "request",
+        "response",
+        "read",
+        "close",
+        "request-and-close",
+    ],
+)
+def test_project_probe_failure_and_cleanup_share_sanitized_bounded_budget(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], stage: str
+) -> None:
+    counts = {"constructed": 0, "closed": 0}
+    sleeps: list[float] = []
+
+    def fail() -> None:
+        raise OSError("synthetic-secret-exception-marker")
+
+    class Response:
+        status = 200
+
+        def read(self, _limit: int) -> bytes:
+            if stage == "read":
+                fail()
+            return b"simple project"
+
+    class Connection:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            counts["constructed"] += 1
+            if stage == "constructor":
+                fail()
+            if stage == "tls":
+                raise installer.ssl.SSLError("synthetic-secret-exception-marker")
+
+        def request(self, *_args: object, **_kwargs: object) -> None:
+            if stage in {"request", "request-and-close"}:
+                fail()
+
+        def getresponse(self) -> Response:
+            if stage == "response":
+                fail()
+            return Response()
+
+        def close(self) -> None:
+            counts["closed"] += 1
+            if stage == "tls-close":
+                raise installer.ssl.SSLError("synthetic-secret-exception-marker")
+            if stage in {"close", "request-and-close"}:
+                fail()
+
+    monkeypatch.setattr(installer.http.client, "HTTPSConnection", Connection)
+    monkeypatch.setattr(installer.time, "sleep", sleeps.append)
+    trusted = "packages.example.internal" if stage == "tls" else None
+    with pytest.raises(
+        RuntimeError, match="SSLError" if stage in {"tls", "tls-close"} else "OSError"
+    ) as error:
+        installer._read_private_index_project_page(
+            index_url=APPROVED_PROXY_URL, package="pip", trusted_host=trusted
+        )
+    assert error.value.__suppress_context__ is True
+    assert "synthetic-secret-exception-marker" not in str(error.value)
+    assert len(sleeps) == installer.PIP_NETWORK_RETRIES - 1
+    expected_connections = installer.PIP_NETWORK_RETRIES
+    assert counts["constructed"] == expected_connections
+    assert counts["closed"] == (0 if stage in {"constructor", "tls"} else expected_connections)
+    monkeypatch.setattr(
+        installer,
+        "upgrade_pip",
+        lambda *_args, **_kwargs: installer._read_private_index_project_page(
+            index_url=APPROVED_PROXY_URL, package="pip", trusted_host=trusted
+        ),
+    )
+    assert installer.main(["--index-url", APPROVED_PROXY_URL, "--upgrade-pip-only"]) == 1
+    output = capsys.readouterr()
+    assert "synthetic-secret-exception-marker" not in output.out + output.err
+
+
+@pytest.fixture(scope="module")
+def project_page_tls_material(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path]:
+    """Synthetic trust only: no committed key or production trust-store modification."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+
+    directory = tmp_path_factory.mktemp("private-project-tls")
+    now = datetime.now(timezone.utc)
+    ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Synthetic project-page CA")])
+    ca = (
+        x509.CertificateBuilder()
+        .subject_name(ca_name)
+        .issuer_name(ca_name)
+        .public_key(ca_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(days=1))
+        .not_valid_after(now + timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=True,
+                crl_sign=True,
+                encipher_only=None,
+                decipher_only=None,
+            ),
+            critical=True,
+        )
+        .add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(ca_key.public_key()), critical=False
+        )
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()), critical=False
+        )
+        .sign(ca_key, hashes.SHA256())
+    )
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    key_path = directory / "server.key"
+    key_path.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    key_path.chmod(0o600)
+    ca_path = directory / "ca.pem"
+    ca_path.write_bytes(ca.public_bytes(serialization.Encoding.PEM))
+    result = {"key": key_path, "ca": ca_path}
+    for label, start, end in (
+        ("valid", now - timedelta(hours=1), now + timedelta(hours=1)),
+        ("wheel-host", now - timedelta(hours=1), now + timedelta(hours=1)),
+        ("expired", now - timedelta(days=3), now - timedelta(days=2)),
+    ):
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")]))
+            .issuer_name(ca_name)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(start)
+            .not_valid_after(end)
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .add_extension(
+                x509.SubjectAlternativeName(
+                    [
+                        x509.DNSName(
+                            "files.pythonhosted.org" if label == "wheel-host" else "localhost"
+                        )
+                    ]
+                ),
+                critical=False,
+            )
+            .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+            .add_extension(
+                x509.KeyUsage(
+                    digital_signature=True,
+                    content_commitment=False,
+                    key_encipherment=True,
+                    data_encipherment=False,
+                    key_agreement=False,
+                    key_cert_sign=False,
+                    crl_sign=False,
+                    encipher_only=None,
+                    decipher_only=None,
+                ),
+                critical=True,
+            )
+            .add_extension(
+                x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False
+            )
+            .add_extension(
+                x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()),
+                critical=False,
+            )
+            .sign(ca_key, hashes.SHA256())
+        )
+        path = directory / (label + ".pem")
+        path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+        result[label] = path
+    return result
+
+
+@contextmanager
+def _project_page_tls_server(cert: Path, key: Path) -> Iterator[tuple[int, list[str]]]:
+    requests: list[str] = []
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert, key)
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            requests.append(self.path)
+            body = b'<a href="mako-1.4.2-py3-none-any.whl">mako wheel</a>'
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args: object) -> None:
+            return None
+
+    class Server(HTTPServer):
+        def get_request(self) -> tuple[ssl.SSLSocket, tuple[str, int]]:
+            connection, address = super().get_request()
+            connection.settimeout(2)
+            try:
+                secured = context.wrap_socket(connection, server_side=True)
+            except BaseException:
+                connection.close()
+                raise
+            return secured, address
+
+    server = Server(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
+    try:
+        thread.start()
+        try:
+            yield server.server_port, requests
+        finally:
+            server.shutdown()
+    finally:
+        server.server_close()
+        if thread.ident is not None:
+            thread.join(5)
+            assert not thread.is_alive(), "synthetic TLS server did not terminate"
+
+
+@pytest.mark.parametrize("consumer", ("health", "version", "floor"))
+@pytest.mark.parametrize("trusted", (None, "matching", "other"))
+@pytest.mark.parametrize(
+    "certificate", ("trusted", "untrusted", "hostname", "expired", "missing-ca", "broken-ca")
+)
+def test_private_project_real_tls_is_verified_and_terminal_before_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    project_page_tls_material: dict[str, Path],
+    consumer: str,
+    trusted: str | None,
+    certificate: str,
+) -> None:
+    material = project_page_tls_material
+    trust_directory = tmp_path / "trust-directory"
+    trust_directory.mkdir()
+    monkeypatch.setenv("SSL_CERT_DIR", str(trust_directory))
+    monkeypatch.delenv("NETRC", raising=False)
+    for name in ("REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"):
+        monkeypatch.delenv(name, raising=False)
+    if certificate == "untrusted":
+        monkeypatch.setenv("SSL_CERT_FILE", os.devnull)
+    elif certificate in {"missing-ca", "broken-ca"}:
+        ca = tmp_path / "unusable-ca.pem"
+        if certificate == "broken-ca":
+            ca.write_text("synthetic-invalid-certificate")
+        monkeypatch.setenv("SSL_CERT_FILE", str(ca))
+    else:
+        monkeypatch.setenv("SSL_CERT_FILE", str(material["ca"]))
+    monkeypatch.setattr(installer, "PIP_NETWORK_RETRIES", 2)
+    monkeypatch.setattr(installer, "PRIVATE_INDEX_HEALTH_TIMEOUT_SECONDS", 2)
+    monkeypatch.setattr(installer, "_sleep_before_private_index_retry", lambda _attempt: None)
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("TLS failure or a verified present version must not reach fallback")
+
+    monkeypatch.setattr(ssl, "_create_unverified_context", forbidden)
+    monkeypatch.setattr(installer.http.client, "HTTPConnection", forbidden)
+    monkeypatch.setattr(installer, "verify_emergency_artifact_for_floor", forbidden)
+    monkeypatch.setattr(installer, "_download_with_sha256", forbidden)
+    monkeypatch.setattr(installer, "load_dependency_security_floors", lambda: {"mako": "1.4.2"})
+    emergency = tmp_path / "emergency.json"
+    emergency.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "expires_at": "2099-12-31",
+                "artifacts": [
+                    {
+                        "package": "mako",
+                        "version": "1.4.2",
+                        "filename": "mako-1.4.2.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/mako-1.4.2.whl",
+                        "sha256": "a" * 64,
+                    }
+                ],
+            }
+        )
+    )
+    leaf = material["expired"] if certificate == "expired" else material["valid"]
+    with _project_page_tls_server(leaf, material["key"]) as (port, requests):
+        hostname = "127.0.0.1" if certificate == "hostname" else "localhost"
+        index = f"https://{hostname}:{port}/simple/"
+        trusted_host = hostname if trusted == "matching" else "other.invalid" if trusted else None
+
+        def consume() -> object:
+            if consumer == "health":
+                return installer._require_private_index_project_health(
+                    index_url=index, package="mako", trusted_host=trusted_host
+                )
+            if consumer == "version":
+                return installer._private_index_project_has_version(
+                    index_url=index, package="mako", version="1.4.2", trusted_host=trusted_host
+                )
+            return installer.run_dependency_floor_preflight(
+                python_executable=sys.executable,
+                index_url=index,
+                trusted_host=trusted_host,
+                emergency_wheel_manifest=emergency,
+            )
+
+        if certificate == "trusted":
+            assert consume() is (True if consumer == "version" else None)
+            assert requests == ["/simple/mako/"]
+        else:
+            with pytest.raises(installer._PrivateIndexTLSRejected) as error:
+                consume()
+            assert error.value.__suppress_context__ is True
+            assert "TLS verification failed before emergency fallback" in str(error.value)
+            assert "synthetic-invalid-certificate" not in str(error.value)
+            assert requests == []
+
+
+def test_private_project_tls_failure_is_not_downgraded_by_later_transport_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+
+    def connection(*_args: object, **_kwargs: object) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise ssl.SSLCertVerificationError("synthetic-secret-first-error")
+        raise OSError("synthetic-secret-last-error")
+
+    monkeypatch.setattr(installer.http.client, "HTTPSConnection", connection)
+    monkeypatch.setattr(installer, "PIP_NETWORK_RETRIES", 2)
+    monkeypatch.setattr(installer, "_sleep_before_private_index_retry", lambda _attempt: None)
+    with pytest.raises(installer._PrivateIndexTLSRejected) as error:
+        installer._private_index_project_has_version(
+            index_url=APPROVED_PROXY_URL, package="mako", version="1.4.2", trusted_host=None
+        )
+    assert attempts == 2
+    assert "SSLCertVerificationError" in str(error.value)
+    assert "synthetic-secret" not in str(error.value)
+
+
+def test_repo_emergency_manifest_is_retired_empty_compatibility_marker() -> None:
+    payload = _repo_emergency_manifest_payload()
+    requirements_ci_lite = (REPO_ROOT / "requirements-ci-lite.txt").read_text(encoding="utf-8")
+    requirements_ci_lite_pins = _exact_requirement_pairs(requirements_ci_lite)
+
+    assert payload["schema_version"] == 1
+    assert payload["generated_at"] == "2026-06-29"
+    assert isinstance(payload["reason"], str)
+    assert payload["reason"].startswith("Retired:")
+    assert payload["artifacts"] == []
+    assert _repo_active_emergency_artifacts() == []
+    assert ("python-multipart", "0.0.31") in requirements_ci_lite_pins
+
+
+def test_repo_ci_lite_retired_manifest_selects_no_emergency_wheels(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    observed_downloads: list[tuple[str, str, str]] = []
+
+    def fake_download(*, url: str, destination: Path, expected_sha256: str) -> None:
+        observed_downloads.append((url, destination.name, expected_sha256))
+        destination.write_bytes(b"wheel-bytes")
+
+    monkeypatch.setattr(installer, "_download_with_sha256", fake_download)
+    monkeypatch.setattr(
+        installer,
+        "_supported_wheel_tags_for_python",
+        lambda _python_executable: _ci_linux_cp313_tags(),
+    )
+
+    staged = installer.stage_emergency_wheels(
+        requirement_files=[REPO_ROOT / "requirements-ci-lite.txt"],
+        constraints_file=REPO_ROOT / "constraints.txt",
+        wheelhouse_dir=tmp_path / "wheelhouse",
+        manifest_path=_repo_emergency_manifest_path(),
+    )
+
+    observed_by_filename = {filename: (url, sha256) for url, filename, sha256 in observed_downloads}
+    staged_by_filename = {path.name for path in staged}
+
+    assert staged_by_filename == set()
+    assert observed_by_filename == {}
+
+
+@pytest.mark.parametrize("python_tag", ["cp311", "cp312", "cp313"])
+def test_repo_pydantic_core_emergency_fallback_is_retired_for_main_python_matrix(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    python_tag: str,
+) -> None:
+    # Matrix names label paths only; each alias uses the current test interpreter.
+    invocation = tmp_path / python_tag / "bin" / "python"
+    invocation.parent.mkdir(parents=True)
+    invocation.symlink_to(sys.executable)
+    assert installer.resolve_python_executable(str(invocation)) == str(invocation)
+    assert invocation.is_symlink()
+
+    def unexpected_tag_probe(_python_executable: str | None) -> set[str]:
+        pytest.fail("Retired empty manifest must not query a wheel-tag provider")
+
+    monkeypatch.setattr(installer, "_supported_wheel_tags_for_python", unexpected_tag_probe)
+    artifacts = installer.emergency_artifacts_requested_by_surfaces(
+        requirement_files=[REPO_ROOT / "requirements-ci-lite.txt"],
+        constraints_file=REPO_ROOT / "constraints.txt",
+        manifest_path=_repo_emergency_manifest_path(),
+        python_executable=str(invocation),
+    )
+    assert artifacts == []
+
+
+def test_emergency_artifacts_requested_by_surfaces_filters_incompatible_wheel_tags(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements-ci-lite.txt"
+    requirements.write_text("jiter==0.12.0\n", encoding="utf-8")
+    manifest = tmp_path / "emergency.json"
+    compatible_filename = "jiter-0.12.0-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
+    incompatible_filename = "jiter-0.12.0-cp312-cp312-manylinux2014_x86_64.whl"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "expires_at": "2099-12-31",
+                "artifacts": [
+                    {
+                        "package": "jiter",
+                        "version": "0.12.0",
+                        "filename": incompatible_filename,
+                        "url": f"https://files.pythonhosted.org/packages/example/{incompatible_filename}",
+                        "sha256": "a" * 64,
+                    },
+                    {
+                        "package": "jiter",
+                        "version": "0.12.0",
+                        "filename": compatible_filename,
+                        "url": f"https://files.pythonhosted.org/packages/example/{compatible_filename}",
+                        "sha256": "b" * 64,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        installer,
+        "_current_supported_wheel_tags",
+        lambda: {"cp313-cp313-manylinux_2_17_x86_64"},
+    )
+
+    artifacts = installer.emergency_artifacts_requested_by_surfaces(
+        requirement_files=[requirements],
+        constraints_file=None,
+        manifest_path=manifest,
+    )
+
+    assert [artifact["filename"] for artifact in artifacts] == [compatible_filename]
+
+
+def test_emergency_artifacts_requested_by_surfaces_uses_target_python_tags(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements-ci-lite.txt"
+    requirements.write_text("jiter==0.12.0\n", encoding="utf-8")
+    manifest = tmp_path / "emergency.json"
+    cp313_filename = "jiter-0.12.0-cp313-cp313-manylinux2014_x86_64.whl"
+    cp312_filename = "jiter-0.12.0-cp312-cp312-manylinux2014_x86_64.whl"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "expires_at": "2099-12-31",
+                "artifacts": [
+                    {
+                        "package": "jiter",
+                        "version": "0.12.0",
+                        "filename": cp312_filename,
+                        "url": f"https://files.pythonhosted.org/packages/example/{cp312_filename}",
+                        "sha256": "a" * 64,
+                    },
+                    {
+                        "package": "jiter",
+                        "version": "0.12.0",
+                        "filename": cp313_filename,
+                        "url": f"https://files.pythonhosted.org/packages/example/{cp313_filename}",
+                        "sha256": "b" * 64,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    observed_python_executables: list[str | None] = []
+
+    def fake_supported_tags(python_executable: str | None) -> set[str]:
+        observed_python_executables.append(python_executable)
+        if python_executable == "/opt/python/3.13/bin/python":
+            return {"cp313-cp313-manylinux2014_x86_64"}
+        return {"cp312-cp312-manylinux2014_x86_64"}
+
+    monkeypatch.setattr(installer, "_supported_wheel_tags_for_python", fake_supported_tags)
+
+    artifacts = installer.emergency_artifacts_requested_by_surfaces(
+        requirement_files=[requirements],
+        constraints_file=None,
+        manifest_path=manifest,
+        python_executable="/opt/python/3.13/bin/python",
+    )
+
+    assert [artifact["filename"] for artifact in artifacts] == [cp313_filename]
+    assert observed_python_executables == ["/opt/python/3.13/bin/python"]
+
+
+def test_resolve_python_executable_resolves_bare_name_through_which(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    executable = _write_executable(tmp_path / "bin" / "python-custom")
+    observed_names: list[str] = []
+
+    def fake_which(name: str) -> str:
+        observed_names.append(name)
+        return str(executable)
+
+    monkeypatch.setattr(installer.shutil, "which", fake_which)
+
+    assert installer.resolve_python_executable("python-custom") == str(executable)
+    assert observed_names == ["python-custom"]
+
+
+def test_resolve_python_executable_preserves_final_symlink(
+    tmp_path: Path,
+) -> None:
+    target = _write_executable(tmp_path / "targets" / "python-real")
+    invocation = tmp_path / "bin" / "python-link"
+    invocation.parent.mkdir(parents=True)
+    _symlink_or_skip(invocation, target)
+
+    assert installer.resolve_python_executable(str(invocation)) == str(invocation)
+
+
+@pytest.mark.parametrize("candidate", ["", "   ", "python\x00malicious"])
+def test_resolve_python_executable_rejects_empty_or_nul(candidate: str) -> None:
+    with pytest.raises(RuntimeError, match="non-empty path or command name"):
+        installer.resolve_python_executable(candidate)
+
+
+def test_resolve_python_executable_rejects_invalid_targets(tmp_path: Path) -> None:
+    missing = tmp_path / "missing-python"
+    dangling = tmp_path / "dangling-python"
+    _symlink_or_skip(dangling, tmp_path / "missing-target")
+    directory = tmp_path / "python-directory"
+    directory.mkdir()
+    nonexecutable = tmp_path / "python-nonexec"
+    nonexecutable.write_text("#!/bin/sh\n", encoding="utf-8")
+    nonexecutable.chmod(0o644)
+
+    invalid_candidates = [missing, dangling, directory, nonexecutable]
+    if hasattr(os, "mkfifo"):
+        nonregular = tmp_path / "python-fifo"
+        os.mkfifo(nonregular)
+        invalid_candidates.append(nonregular)
+
+    for candidate in invalid_candidates:
+        with pytest.raises(RuntimeError, match="Python executable"):
+            installer.resolve_python_executable(str(candidate))
+
+
+def test_supported_wheel_tags_resolves_current_python_alias_through_which(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A command resolving to this invocation uses this runtime's supported tags."""
+    observed_names: list[str] = []
+
+    def fake_which(name: str) -> str:
+        observed_names.append(name)
+        return sys.executable
+
+    def reject_external_probe(*args: object, **kwargs: object) -> None:
+        raise AssertionError("the current interpreter must not use an external probe")
+
+    monkeypatch.setattr(installer.shutil, "which", fake_which)
+    monkeypatch.setattr(installer.subprocess, "run", reject_external_probe)
+    expected = installer._supported_wheel_tags_for_python(None)
+
+    assert installer._supported_wheel_tags_for_python("python") == expected
+    assert observed_names == ["python"]
+
+
+def test_supported_wheel_tags_reuses_current_tags_for_sibling_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    current = _write_executable(tmp_path.resolve() / "bin" / "python")
+    alias = current.with_name("python3.13")
+    _symlink_or_skip(alias, current)
+    assert installer.resolve_python_executable(str(alias)) == str(alias)
+    assert alias != current and alias.parent == current.parent
+    assert alias.samefile(current)
+    monkeypatch.setattr(installer, "sys", types.SimpleNamespace(executable=str(current)))
+    current_tags = {"py3-none-any"}
+    monkeypatch.setattr(installer, "_current_supported_wheel_tags", lambda: current_tags)
+    monkeypatch.setattr(
+        installer, "_target_python_wheel_tag_payload", lambda _: pytest.fail("probed sibling alias")
+    )
+
+    assert installer._supported_wheel_tags_for_python(str(alias)) == current_tags
+
+
+@pytest.mark.parametrize("difference", ["invocation-directory", "backing-file"])
+def test_supported_wheel_tags_qualifies_distinct_invocations_externally(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, difference: str
+) -> None:
+    root = tmp_path.resolve()
+    current = _write_executable(root / "current" / "bin" / "python")
+    if difference == "invocation-directory":
+        target = root / "external" / "bin" / "python"
+        target.parent.mkdir(parents=True)
+        _symlink_or_skip(target, current)
+        assert target.parent != current.parent and target.samefile(current)
+    else:
+        target = _write_executable(current.with_name("python3.13"))
+        assert target.parent == current.parent and not target.samefile(current)
+    assert installer.resolve_python_executable(str(target)) == str(target)
+    monkeypatch.setattr(installer, "sys", types.SimpleNamespace(executable=str(current)))
+    monkeypatch.setattr(
+        installer, "_current_supported_wheel_tags", lambda: pytest.fail("used current tags")
+    )
+    observed_targets: list[str] = []
+
+    def external_probe(selected: str) -> dict[str, object]:
+        observed_targets.append(selected)
+        return {"tags": ["py3-none-any"]}
+
+    monkeypatch.setattr(installer, "_target_python_wheel_tag_payload", external_probe)
+
+    assert installer._supported_wheel_tags_for_python(str(target)) == {"py3-none-any"}
+    assert observed_targets == [str(target)]
+
+
+def test_supported_wheel_tags_rejects_indeterminate_sibling_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    current = _write_executable(tmp_path.resolve() / "bin" / "python")
+    alias = current.with_name("python3.13")
+    _symlink_or_skip(alias, current)
+    assert installer.resolve_python_executable(str(current)) == str(current)
+    assert installer.resolve_python_executable(str(alias)) == str(alias)
+    assert alias.samefile(current)
+    monkeypatch.setattr(installer, "sys", types.SimpleNamespace(executable=str(current)))
+    monkeypatch.setattr(
+        installer, "_current_supported_wheel_tags", lambda: pytest.fail("used current tags")
+    )
+    monkeypatch.setattr(
+        installer,
+        "_target_python_wheel_tag_payload",
+        lambda _: pytest.fail("probed uncertain alias"),
+    )
+
+    def fail_comparison(target: str, running: str) -> bool:
+        assert (target, running) == (str(alias), str(current))
+        raise PermissionError("synthetic inability to stat the alias")
+
+    monkeypatch.setattr(installer.os.path, "samefile", fail_comparison)
+
+    with pytest.raises(RuntimeError, match="Unable to compare wheel-tag target"):
+        installer._supported_wheel_tags_for_python(str(alias))
+
+
+def test_supported_wheel_tags_rejects_unknown_bare_target_python_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_subprocess_run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise AssertionError(
+            "unknown bare Python executable must be rejected before subprocess.run"
+        )
+
+    monkeypatch.setattr(installer.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(installer.subprocess, "run", fail_subprocess_run)
+
+    with pytest.raises(RuntimeError, match="Unable to resolve Python executable"):
+        installer._supported_wheel_tags_for_python("python9.99")
+
+
+def test_supported_wheel_tags_normalizes_path_qualified_relative_python(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    observed_commands: list[list[str]] = []
+
+    def fake_subprocess_run(
+        command: list[str],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        assert 0 < _kwargs["timeout"] <= 30
+        observed_commands.append(command)
+        payload = {
+            "tags": None,
+            "major": 3,
+            "minor": 13,
+            "implementation_name": "cpython",
+            "platform_name": "linux",
+            "sysconfig_platform": "linux-x86_64",
+            "machine_name": "x86_64",
+        }
+        return subprocess.CompletedProcess(command, 0, stdout=json.dumps(payload), stderr="")
+
+    executable = _write_executable(tmp_path / ".venv" / "bin" / "python")
+    monkeypatch.chdir(tmp_path)
+    for key in tuple(os.environ):
+        if key.startswith("PYTHON") or key == "__PYVENV_LAUNCHER__":
+            monkeypatch.delenv(key)
+    monkeypatch.setattr(installer.subprocess, "run", fake_subprocess_run)
+
+    assert "py3-none-any" in installer._supported_wheel_tags_for_python(".venv/bin/python")
+    assert observed_commands[0][0] == str(executable)
+
+
+def test_stage_emergency_artifacts_skips_incompatible_parseable_wheels(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    compatible_filename = "jiter-0.12.0-cp313-cp313-manylinux2014_x86_64.whl"
+    artifacts = [
+        {
+            "package": "jiter",
+            "version": "0.12.0",
+            "filename": "jiter-0.12.0-cp312-cp312-manylinux2014_x86_64.whl",
+            "url": "https://files.pythonhosted.org/packages/example/jiter-0.12.0-cp312-cp312-manylinux2014_x86_64.whl",
+            "sha256": "a" * 64,
+        },
+        {
+            "package": "jiter",
+            "version": "0.12.0",
+            "filename": compatible_filename,
+            "url": f"https://files.pythonhosted.org/packages/example/{compatible_filename}",
+            "sha256": "b" * 64,
+        },
+    ]
+    observed_downloads: list[str] = []
+
+    def fake_download(*, url: str, destination: Path, expected_sha256: str) -> None:
+        observed_downloads.append(destination.name)
+        destination.write_bytes(expected_sha256.encode("ascii"))
+
+    monkeypatch.setattr(
+        installer,
+        "_current_supported_wheel_tags",
+        lambda: {"cp313-cp313-manylinux2014_x86_64"},
+    )
+    monkeypatch.setattr(installer, "_download_with_sha256", fake_download)
+
+    staged = installer._stage_emergency_artifacts(
+        artifacts=artifacts,
+        wheelhouse_dir=tmp_path / "wheelhouse",
+    )
+
+    assert [path.name for path in staged] == [compatible_filename]
+    assert observed_downloads == [compatible_filename]
+
+
+def test_emergency_artifact_filter_dedupes_exact_filename_digest_and_rejects_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements-ci-lite.txt"
+    requirements.write_text("jiter==0.12.0\n", encoding="utf-8")
+    manifest = tmp_path / "emergency.json"
+    filename = "jiter-0.12.0-cp313-cp313-manylinux2014_x86_64.whl"
+    base_artifact = {
+        "package": "jiter",
+        "version": "0.12.0",
+        "filename": filename,
+        "url": f"https://files.pythonhosted.org/packages/example/{filename}",
+    }
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "expires_at": "2099-12-31",
+                "artifacts": [
+                    {**base_artifact, "sha256_parts": ["a" * 32, "b" * 32]},
+                    {**base_artifact, "sha256": "a" * 32 + "b" * 32},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        installer,
+        "_current_supported_wheel_tags",
+        lambda: {"cp313-cp313-manylinux2014_x86_64"},
+    )
+
+    artifacts = installer.emergency_artifacts_requested_by_surfaces(
+        requirement_files=[requirements],
+        constraints_file=None,
+        manifest_path=manifest,
+    )
+
+    assert [artifact["filename"] for artifact in artifacts] == [filename]
+
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "expires_at": "2099-12-31",
+                "artifacts": [
+                    {**base_artifact, "sha256": "a" * 64},
+                    {**base_artifact, "sha256": "b" * 64},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        RuntimeError, match=f"Conflicting emergency artifact digests for {filename}"
+    ):
+        installer.emergency_artifacts_requested_by_surfaces(
+            requirement_files=[requirements],
+            constraints_file=None,
+            manifest_path=manifest,
+        )
+
+
+def test_repo_idna_has_no_active_emergency_fallback() -> None:
+    """Exclude idna from the real loader's active emergency fallback artifacts."""
+    artifact_packages = {item["package"] for item in _repo_active_emergency_artifacts()}
+    assert "idna" not in artifact_packages
+
+
+def test_repo_ruff_private_proxy_pin_is_not_stale_emergency_fallback() -> None:
+    artifacts = {(item["package"], item["version"]) for item in _repo_active_emergency_artifacts()}
+    requirements_dev_in = (REPO_ROOT / "requirements-dev.in").read_text(encoding="utf-8")
+    requirements_dev_txt = (REPO_ROOT / "requirements-dev.txt").read_text(encoding="utf-8")
+    requirements_lock_txt = (REPO_ROOT / "requirements-lock.txt").read_text(encoding="utf-8")
+    expected_ruff_version = _compatible_release_version(requirements_dev_in, "ruff")
+    assert expected_ruff_version is not None
+    assert ("ruff", expected_ruff_version) in _exact_requirement_pairs(requirements_dev_txt)
+    assert ("ruff", expected_ruff_version) in _exact_requirement_pairs(requirements_lock_txt)
+    assert not any(package == "ruff" for package, _version in artifacts)
+
+
+def test_repo_mypy_dev_requirement_surfaces_no_longer_need_emergency_fallback() -> None:
+    requirements_dev_in = (REPO_ROOT / "requirements-dev.in").read_text(encoding="utf-8")
+    requirements_dev_txt = (REPO_ROOT / "requirements-dev.txt").read_text(encoding="utf-8")
+    artifacts = {(item["package"], item["version"]) for item in _repo_active_emergency_artifacts()}
+
+    assert ("mypy", "2.3.1") in _exact_requirement_pairs(requirements_dev_in)
+    assert ("mypy", "2.3.1") in _exact_requirement_pairs(requirements_dev_txt)
+    assert not any(package == "mypy" for package, _version in artifacts)
+
+
+def _assert_black_install_profile(repo_root: Path) -> None:
+    """Use live artifact pins and source membership, without a second security floor."""
+    selected: str | None = None
+    for filename in (
+        "requirements-dev.txt",
+        "requirements-lock.txt",
+        "requirements-dev.in",
+        "constraints.txt",
+        "requirements-all.txt",
+    ):
+        path = repo_root / filename
+        entries = [
+            Requirement(line)
+            for raw in path.read_text(encoding="utf-8").splitlines()
+            if (line := raw.split("#", 1)[0].strip()) and not line.startswith("-")
+        ]
+        matching = [entry for entry in entries if canonicalize_name(entry.name) == "black"]
+        assert len(matching) == 1, f"{filename}: expected one Black owner"
+        requirement = matching[0]
+        assert requirement.marker is None and requirement.url is None and not requirement.extras
+        if filename in {"requirements-dev.txt", "requirements-lock.txt"}:
+            specifiers = tuple(requirement.specifier)
+            assert len(specifiers) == 1 and specifiers[0].operator == "=="
+            assert "*" not in specifiers[0].version
+            version = str(Version(specifiers[0].version))
+            assert ("black", version) in installer._exact_locked_artifacts([path])
+            if selected is None:
+                selected = version
+            else:
+                assert version == selected, "Black installed profile locks disagree"
+        else:
+            assert selected is not None and requirement.specifier
+            assert requirement.specifier.contains(selected), "Black is outside owning input range"
+
+
+def test_repo_quality_tooling_profile_matches_dependabot_replacement_contract() -> None:
+    _assert_black_install_profile(REPO_ROOT)
+    artifacts = {(item["package"], item["version"]) for item in _repo_active_emergency_artifacts()}
+    constraints_text = (REPO_ROOT / "constraints.txt").read_text(encoding="utf-8")
+    requirements_all_text = (REPO_ROOT / "requirements-all.txt").read_text(encoding="utf-8")
+    requirements_dev_in = (REPO_ROOT / "requirements-dev.in").read_text(encoding="utf-8")
+    requirements_dev_txt = (REPO_ROOT / "requirements-dev.txt").read_text(encoding="utf-8")
+    requirements_lock_txt = (REPO_ROOT / "requirements-lock.txt").read_text(encoding="utf-8")
+    expected_ruff_version = _compatible_release_version(requirements_dev_in, "ruff")
+    assert expected_ruff_version is not None
+    assert _minimum_requirement_version(constraints_text, "mypy") == "2.3.1"
+    assert _minimum_requirement_version(constraints_text, "ruff") == expected_ruff_version
+    assert _minimum_requirement_version(requirements_all_text, "mypy") == "2.3.1"
+    assert _minimum_requirement_version(requirements_all_text, "ruff") == expected_ruff_version
+
+    assert ("mypy", "2.3.1") in _exact_requirement_pairs(requirements_dev_in)
+    assert ("mypy", "2.3.1") in _exact_requirement_pairs(requirements_dev_txt)
+    assert ("ruff", expected_ruff_version) in _exact_requirement_pairs(requirements_dev_txt)
+    assert ("ast-serialize", "0.6.0") in _exact_requirement_pairs(requirements_dev_txt)
+    assert ("ast-serialize", "0.6.0") in _exact_requirement_pairs(requirements_lock_txt)
+    assert ("librt", "0.13.0") in _exact_requirement_pairs(requirements_dev_txt)
+    assert ("librt", "0.13.0") in _exact_requirement_pairs(requirements_lock_txt)
+    assert ("ruff", expected_ruff_version) in _exact_requirement_pairs(requirements_lock_txt)
+
+    assert not any(package == "mypy" for package, _version in artifacts)
+    assert not any(package == "ruff" for package, _version in artifacts)
+    assert not any(package == "black" for package, _version in artifacts)
+
+
+def test_repo_ds3_test_quality_inputs_locks_and_emergency_manifest_align() -> None:
+    _assert_black_install_profile(REPO_ROOT)
+    artifacts = {(item["package"], item["version"]) for item in _repo_active_emergency_artifacts()}
+    assert not any(package == "black" for package, _version in artifacts)
+    exact_targets = {
+        "bandit": ("bandit", "1.9.4"),
+        "coverage": ("coverage[toml]", "7.15.4"),
+        "faker": ("faker", "40.37.0"),
+        "hypothesis": ("hypothesis", "6.165.10"),
+        "mypy": ("mypy", "2.3.1"),
+        "pip-audit": ("pip-audit", "2.10.1"),
+        "ruff": ("ruff", "0.16.4"),
+        "types-pyyaml": ("types-pyyaml", "6.0.12.20260815"),
+        "yamllint": ("yamllint", "1.38.0"),
+    }
+    dev_pairs = _exact_requirement_pairs(
+        (REPO_ROOT / "requirements-dev.txt").read_text(encoding="utf-8")
+    )
+    aggregate_pairs = _exact_requirement_pairs(
+        (REPO_ROOT / "requirements-lock.txt").read_text(encoding="utf-8")
+    )
+
+    for package, (lock_name, version) in exact_targets.items():
+        assert (lock_name, version) in dev_pairs
+        assert (lock_name, version) in aggregate_pairs
+        assert (package, version) not in artifacts
+
+    requirements_dev_in = (REPO_ROOT / "requirements-dev.in").read_text(encoding="utf-8")
+    requirements_test_in = (REPO_ROOT / "requirements-test.in").read_text(encoding="utf-8")
+    requirements_ci_lite_in = (REPO_ROOT / "requirements-ci-lite.in").read_text(encoding="utf-8")
+    for package, version in {
+        "coverage": "7.15.4",
+        "faker": "40.37.0",
+        "hypothesis": "6.165.10",
+    }.items():
+        assert _compatible_release_version(requirements_dev_in, package) == version
+        assert _compatible_release_version(requirements_test_in, package) == version
+    assert _compatible_release_version(requirements_dev_in, "types-pyyaml") == ("6.0.12.20260815")
+    assert _minimum_requirement_version(requirements_ci_lite_in, "coverage") == "7.15.4"
+    assert "coverage>=7.15.4,<7.15.5" in requirements_ci_lite_in
+
+    test_pairs = _exact_requirement_pairs(
+        (REPO_ROOT / "requirements-test.txt").read_text(encoding="utf-8")
+    )
+    assert ("coverage[toml]", "7.15.4") in test_pairs
+    assert ("faker", "40.37.0") in test_pairs
+    assert ("hypothesis", "6.165.10") in test_pairs
+
+    ci_lite_pairs = _exact_requirement_pairs(
+        (REPO_ROOT / "requirements-ci-lite.txt").read_text(encoding="utf-8")
+    )
+    assert ("coverage", "7.15.4") in ci_lite_pairs
+
+    runtime_pairs = _exact_requirement_pairs(
+        (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8")
+    )
+    docker_runtime_pairs = _exact_requirement_pairs(
+        (REPO_ROOT / "requirements-docker-runtime.txt").read_text(encoding="utf-8")
+    )
+    for package in (*exact_targets, "black"):
+        assert not any(candidate == package for candidate, _version in runtime_pairs)
+        assert not any(candidate == package for candidate, _version in docker_runtime_pairs)
+
+
+def test_repo_dev_quality_emergency_wheels_are_retired_from_repo_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    observed_downloads: list[tuple[str, str, str]] = []
+
+    def fake_download(*, url: str, destination: Path, expected_sha256: str) -> None:
+        observed_downloads.append((url, destination.name, expected_sha256))
+        destination.write_bytes(b"wheel-bytes")
+
+    monkeypatch.setattr(installer, "_download_with_sha256", fake_download)
+    monkeypatch.setattr(installer, "_current_supported_wheel_tags", _ci_linux_cp313_tags)
+
+    staged = installer.stage_emergency_wheels(
+        requirement_files=[REPO_ROOT / "requirements-dev.txt"],
+        constraints_file=REPO_ROOT / "constraints.txt",
+        wheelhouse_dir=tmp_path / "wheelhouse",
+        manifest_path=_repo_emergency_manifest_path(),
+    )
+
+    observed_by_filename = {filename: (url, sha256) for url, filename, sha256 in observed_downloads}
+    assert staged == []
+    assert observed_by_filename == {}
+
+
+def _assert_uses_default_constraints(command: list[str]) -> None:
+    assert "--constraint" in command
+    constraint_path = Path(command[command.index("--constraint") + 1])
+    if constraint_path == installer.DEFAULT_CONSTRAINTS_FILE:
+        return
+    assert constraint_path.parent == installer.DEFAULT_CONSTRAINTS_FILE.parent
+    assert constraint_path.name.startswith(".constraints.effective-")
+    assert constraint_path.suffix == installer.DEFAULT_CONSTRAINTS_FILE.suffix
+
+
+def _pip26_no_candidate_runtimeerror_like_run_command(package: str, version: str) -> RuntimeError:
+    """Shape like pip 26 when a private index lacks the exact requested artifact."""
+    requirement = f"{package}=={version}"
+    return installer._CompletedPipFailure(
+        1,
+        "",
+        f"ERROR: Cannot install {requirement} because these package versions have "
+        "conflicting dependencies.\n"
+        "ERROR: ResolutionImpossible: for help visit "
+        "https://pip.pypa.io/en/latest/topics/dependency-resolution/#dealing-with-dependency-conflicts\n"
+        "The conflict is caused by:\n"
+        f"    The user requested {requirement}\n"
+        f"    The user requested (constraint) {package}>={version}\n"
+        "Additionally, some packages in these conflicts have no matching distributions "
+        "available for your environment:\n"
+        f"    {package}\n",
+    )
+
+
+def test_repo_rag_vector_profiles_use_fastembed_without_torch_backend() -> None:
+    retired_packages = {
+        "sentence-transformers",
+        "torch",
+        "transformers",
+    }
+    for package in retired_packages | {"fastembed"}:
+        fallback_versions = [
+            item["version"].strip()
+            for item in _repo_active_emergency_artifacts()
+            if item["package"] == package
+        ]
+        assert not fallback_versions
+
+    observed_fastembed_versions: set[str] = set()
+    for requirement_path in (
+        "requirements-rag-vector.in",
+        "requirements-rag-vector.txt",
+        "requirements-rag-vector-cpu.in",
+        "requirements-rag-vector-cpu.txt",
+    ):
+        requirement_text = (REPO_ROOT / requirement_path).read_text(encoding="utf-8")
+        requirement_pairs = _exact_requirement_pairs(requirement_text)
+        observed_fastembed_versions.update(
+            version for package, version in requirement_pairs if package == "fastembed"
+        )
+        assert any(package == "pgvector" for package, _version in requirement_pairs)
+        for package in retired_packages:
+            assert package not in {name for name, _version in requirement_pairs}
+        assert "download.pytorch.org" not in requirement_text
+
+    assert observed_fastembed_versions == {RAG_VECTOR_EXPECTED_FASTEMBED_VERSION}
+
+
+def test_repo_docker_pip_upgrade_uses_locked_installer_fallback() -> None:
+    dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert 'ARG PIP_VERSION_RANGE="pip>=26.2.2,<27.0"' in dockerfile
+    builder_stage = _dockerfile_stage(dockerfile, "builder")
+    runtime_stage = _dockerfile_stage(dockerfile, "runtime-base")
+
+    banned_direct_upgrade = re.compile(
+        r"(?:python|/opt/venv/bin/python)\s+-m\s+pip\s+install(?:\s+[^\s\\]+)*"
+        r'\s+--upgrade\s+"?\$\{PIP_VERSION_RANGE\}"?',
+        re.MULTILINE,
+    )
+
+    for stage in (builder_stage, runtime_stage):
+        assert "--upgrade-pip-only" in stage
+        assert '--upgrade-pip-spec "${PIP_VERSION_RANGE}"' in stage
+        assert re.search(
+            r"/tmp/pulseplate-ci/install_locked_python_requirements\.py\s+\\\n"
+            r"\s*--python-executable (?:/opt/venv/bin/python|python)\s+\\\n"
+            r"\s*--upgrade-pip-only\s+\\\n"
+            r'\s*--upgrade-pip-spec "\$\{PIP_VERSION_RANGE\}"',
+            stage,
+        )
+        assert not banned_direct_upgrade.search(stage)
+
+
+def _dockerfile_stage(dockerfile: str, stage_name: str) -> str:
+    stage_pattern = re.compile(
+        rf"^FROM\s+\S+\s+AS\s+{re.escape(stage_name)}\s*$",
+        re.MULTILINE | re.IGNORECASE,
+    )
+    stage_match = stage_pattern.search(dockerfile)
+    assert stage_match is not None, f"Dockerfile stage not found: {stage_name}"
+    next_stage_match = re.search(r"^FROM\s+", dockerfile[stage_match.end() :], re.MULTILINE)
+    stage_end = (
+        stage_match.end() + next_stage_match.start()
+        if next_stage_match is not None
+        else len(dockerfile)
+    )
+    return dockerfile[stage_match.start() : stage_end]
+
+
+def test_repo_docker_runtime_install_uses_locked_installer_fallback() -> None:
+    dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    builder = _dockerfile_stage(dockerfile, "builder")
+
+    assert (
+        "COPY scripts/ci/check_python_startup_hooks.py "
+        "scripts/ci/install_locked_python_requirements.py "
+        "scripts/ci/emergency_python_wheels.json "
+        "scripts/ci/check_private_python_proxy_health.py /tmp/pulseplate-ci/"
+    ) in builder
+    assert re.search(
+        r"/tmp/pulseplate-ci/install_locked_python_requirements\.py\s+\\\n"
+        r"\s*--python-executable (?:/opt/venv/bin/python|python)\s+\\\n"
+        r'\s*--requirements-file "\$\{PULSEPLATE_REQUIREMENTS_FILE\}"\s+\\\n'
+        r"\s*--guard-script /tmp/pulseplate-ci/check_python_startup_hooks\.py",
+        builder,
+    )
+
+
+def test_compatible_release_version_accepts_environment_markers() -> None:
+    contents = 'ruff~=0.15.11 ; python_version >= "3.13"\n'
+
+    assert _compatible_release_version(contents, "ruff") == "0.15.11"
+
+
+def test_exact_requirement_pairs_ignores_environment_markers() -> None:
+    contents = 'ruff==0.15.11 ; python_version >= "3.13"\n'
+
+    assert ("ruff", "0.15.11") in _exact_requirement_pairs(contents)
+
+
+@pytest.fixture(autouse=True)
+def isolate_proxy_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(installer.APPROVED_INDEX_ENV_VAR, raising=False)
+    monkeypatch.delenv(installer.TRUSTED_HOST_ENV_VAR, raising=False)
+    monkeypatch.delenv(installer.DOCKER_SINGLE_PASS_LOCKED_INSTALL_ENV, raising=False)
+    monkeypatch.delenv(installer.DOCKER_PIP_LAYER_CACHE_ENV, raising=False)
+    monkeypatch.delenv(installer.PSYCOPG_SDK_ENV, raising=False)
+    for env_var in installer.AMBIENT_INDEX_OVERRIDE_ENV_VARS:
+        monkeypatch.delenv(env_var, raising=False)
+
+
+def test_resolve_requirement_files_prefers_dev_only_when_requested(tmp_path: Path) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("openai==2.29.0\n", encoding="utf-8")
+    requirements_dev = tmp_path / "requirements-dev.txt"
+    requirements_dev.write_text("pytest==8.4.2\n", encoding="utf-8")
+    requirements_test = tmp_path / "requirements-test.txt"
+    requirements_test.write_text("pytest==8.4.2\n", encoding="utf-8")
+    requirements_ci_lite = tmp_path / "requirements-ci-lite.txt"
+    requirements_rag_vector = tmp_path / "requirements-rag-vector.txt"
+    requirements_rag_vector.write_text("sentence-transformers==5.4.1\n", encoding="utf-8")
+
+    files = installer.resolve_requirement_files(
+        requirements_file=requirements,
+        dev_requirements_file=requirements_dev,
+        test_requirements_file=requirements_test,
+        ci_lite_requirements_file=requirements_ci_lite,
+        rag_vector_requirements_file=requirements_rag_vector,
+        install_dev=True,
+        install_test=False,
+        requirements_profile=None,
+    )
+
+    assert files == [requirements, requirements_dev]
+
+
+def test_resolve_requirement_files_includes_test_surface_when_requested(tmp_path: Path) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("openai==2.29.0\n", encoding="utf-8")
+    requirements_dev = tmp_path / "requirements-dev.txt"
+    requirements_dev.write_text("bandit==1.9.4\n", encoding="utf-8")
+    requirements_test = tmp_path / "requirements-test.txt"
+    requirements_test.write_text("pytest==8.4.2\n", encoding="utf-8")
+    requirements_ci_lite = tmp_path / "requirements-ci-lite.txt"
+    requirements_rag_vector = tmp_path / "requirements-rag-vector.txt"
+    requirements_rag_vector.write_text("sentence-transformers==5.4.1\n", encoding="utf-8")
+
+    files = installer.resolve_requirement_files(
+        requirements_file=requirements,
+        dev_requirements_file=requirements_dev,
+        test_requirements_file=requirements_test,
+        ci_lite_requirements_file=requirements_ci_lite,
+        rag_vector_requirements_file=requirements_rag_vector,
+        install_dev=False,
+        install_test=True,
+        requirements_profile=None,
+    )
+
+    assert files == [requirements, requirements_test]
+
+
+def test_resolve_requirement_files_supports_explicit_ci_lite_profile(tmp_path: Path) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("openai==2.29.0\n", encoding="utf-8")
+    requirements_dev = tmp_path / "requirements-dev.txt"
+    requirements_dev.write_text("pre-commit==4.5.1\n", encoding="utf-8")
+    requirements_test = tmp_path / "requirements-test.txt"
+    requirements_test.write_text("pytest==8.4.2\n", encoding="utf-8")
+    requirements_ci_lite = tmp_path / "requirements-ci-lite.txt"
+    requirements_ci_lite.write_text("pre-commit==4.5.1\n", encoding="utf-8")
+    requirements_rag_vector = tmp_path / "requirements-rag-vector.txt"
+    requirements_rag_vector.write_text("sentence-transformers==5.4.1\n", encoding="utf-8")
+
+    files = installer.resolve_requirement_files(
+        requirements_file=requirements,
+        dev_requirements_file=requirements_dev,
+        test_requirements_file=requirements_test,
+        ci_lite_requirements_file=requirements_ci_lite,
+        rag_vector_requirements_file=requirements_rag_vector,
+        install_dev=False,
+        install_test=False,
+        requirements_profile="ci-lite",
+    )
+
+    assert files == [requirements_ci_lite]
+
+
+def test_resolve_requirement_files_supports_explicit_ci_test_profile(tmp_path: Path) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("openai==2.29.0\n", encoding="utf-8")
+    requirements_dev = tmp_path / "requirements-dev.txt"
+    requirements_dev.write_text("pre-commit==4.5.1\n", encoding="utf-8")
+    requirements_test = tmp_path / "requirements-test.txt"
+    requirements_test.write_text("pytest==9.0.3\n", encoding="utf-8")
+    requirements_ci_lite = tmp_path / "requirements-ci-lite.txt"
+    requirements_ci_lite.write_text("pre-commit==4.5.1\n", encoding="utf-8")
+    requirements_rag_vector = tmp_path / "requirements-rag-vector.txt"
+    requirements_rag_vector.write_text("sentence-transformers==5.4.1\n", encoding="utf-8")
+
+    files = installer.resolve_requirement_files(
+        requirements_file=requirements,
+        dev_requirements_file=requirements_dev,
+        test_requirements_file=requirements_test,
+        ci_lite_requirements_file=requirements_ci_lite,
+        rag_vector_requirements_file=requirements_rag_vector,
+        install_dev=False,
+        install_test=False,
+        requirements_profile="ci-test",
+    )
+
+    assert files == [requirements_ci_lite, requirements_test]
+
+
+def test_resolve_requirement_files_supports_explicit_rag_vector_profile(tmp_path: Path) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("openai==2.29.0\n", encoding="utf-8")
+    requirements_dev = tmp_path / "requirements-dev.txt"
+    requirements_dev.write_text("pre-commit==4.5.1\n", encoding="utf-8")
+    requirements_test = tmp_path / "requirements-test.txt"
+    requirements_test.write_text("pytest==9.0.3\n", encoding="utf-8")
+    requirements_ci_lite = tmp_path / "requirements-ci-lite.txt"
+    requirements_ci_lite.write_text("pre-commit==4.5.1\n", encoding="utf-8")
+    requirements_rag_vector = tmp_path / "requirements-rag-vector.txt"
+    requirements_rag_vector.write_text("sentence-transformers==5.4.1\n", encoding="utf-8")
+
+    files = installer.resolve_requirement_files(
+        requirements_file=requirements,
+        dev_requirements_file=requirements_dev,
+        test_requirements_file=requirements_test,
+        ci_lite_requirements_file=requirements_ci_lite,
+        rag_vector_requirements_file=requirements_rag_vector,
+        install_dev=False,
+        install_test=False,
+        requirements_profile="rag-vector",
+    )
+
+    assert files == [requirements, requirements_rag_vector]
+
+
+def test_resolve_requirement_files_fails_when_runtime_file_is_missing(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError, match="Requirements file not found"):
+        installer.resolve_requirement_files(
+            requirements_file=tmp_path / "requirements.txt",
+            dev_requirements_file=tmp_path / "requirements-dev.txt",
+            test_requirements_file=tmp_path / "requirements-test.txt",
+            ci_lite_requirements_file=tmp_path / "requirements-ci-lite.txt",
+            rag_vector_requirements_file=tmp_path / "requirements-rag-vector.txt",
+            install_dev=False,
+            install_test=False,
+            requirements_profile=None,
+        )
+
+
+def test_resolve_requirement_files_fails_when_dev_file_is_requested_but_missing(
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("openai==2.29.0\n", encoding="utf-8")
+
+    with pytest.raises(FileNotFoundError, match="Dev requirements file not found"):
+        installer.resolve_requirement_files(
+            requirements_file=requirements,
+            dev_requirements_file=tmp_path / "requirements-dev.txt",
+            test_requirements_file=tmp_path / "requirements-test.txt",
+            ci_lite_requirements_file=tmp_path / "requirements-ci-lite.txt",
+            rag_vector_requirements_file=tmp_path / "requirements-rag-vector.txt",
+            install_dev=True,
+            install_test=False,
+            requirements_profile=None,
+        )
+
+
+def test_resolve_requirement_files_fails_when_test_file_is_requested_but_missing(
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("openai==2.29.0\n", encoding="utf-8")
+    requirements_dev = tmp_path / "requirements-dev.txt"
+    requirements_dev.write_text("bandit==1.9.4\n", encoding="utf-8")
+
+    with pytest.raises(FileNotFoundError, match="Test requirements file not found"):
+        installer.resolve_requirement_files(
+            requirements_file=requirements,
+            dev_requirements_file=requirements_dev,
+            test_requirements_file=tmp_path / "requirements-test.txt",
+            ci_lite_requirements_file=tmp_path / "requirements-ci-lite.txt",
+            rag_vector_requirements_file=tmp_path / "requirements-rag-vector.txt",
+            install_dev=False,
+            install_test=True,
+            requirements_profile=None,
+        )
+
+
+def test_resolve_requirement_files_fails_when_ci_lite_profile_is_requested_but_missing(
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("openai==2.29.0\n", encoding="utf-8")
+    requirements_dev = tmp_path / "requirements-dev.txt"
+    requirements_dev.write_text("pre-commit==4.5.1\n", encoding="utf-8")
+    requirements_test = tmp_path / "requirements-test.txt"
+    requirements_test.write_text("pytest==8.4.2\n", encoding="utf-8")
+
+    with pytest.raises(FileNotFoundError, match="CI lite requirements file not found"):
+        installer.resolve_requirement_files(
+            requirements_file=requirements,
+            dev_requirements_file=requirements_dev,
+            test_requirements_file=requirements_test,
+            ci_lite_requirements_file=tmp_path / "requirements-ci-lite.txt",
+            rag_vector_requirements_file=tmp_path / "requirements-rag-vector.txt",
+            install_dev=False,
+            install_test=False,
+            requirements_profile="ci-lite",
+        )
+
+
+def test_resolve_requirement_files_fails_when_ci_test_profile_is_requested_but_missing(
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("openai==2.29.0\n", encoding="utf-8")
+    requirements_dev = tmp_path / "requirements-dev.txt"
+    requirements_dev.write_text("pre-commit==4.5.1\n", encoding="utf-8")
+
+    with pytest.raises(FileNotFoundError, match="CI lite requirements file not found"):
+        installer.resolve_requirement_files(
+            requirements_file=requirements,
+            dev_requirements_file=requirements_dev,
+            test_requirements_file=tmp_path / "requirements-test.txt",
+            ci_lite_requirements_file=tmp_path / "requirements-ci-lite.txt",
+            rag_vector_requirements_file=tmp_path / "requirements-rag-vector.txt",
+            install_dev=False,
+            install_test=False,
+            requirements_profile="ci-test",
+        )
+
+
+def test_resolve_requirement_files_fails_when_ci_test_test_file_is_missing(
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("openai==2.29.0\n", encoding="utf-8")
+    requirements_dev = tmp_path / "requirements-dev.txt"
+    requirements_dev.write_text("pre-commit==4.5.1\n", encoding="utf-8")
+    requirements_ci_lite = tmp_path / "requirements-ci-lite.txt"
+    requirements_ci_lite.write_text("pre-commit==4.5.1\n", encoding="utf-8")
+
+    with pytest.raises(FileNotFoundError, match="CI test requirements file not found"):
+        installer.resolve_requirement_files(
+            requirements_file=requirements,
+            dev_requirements_file=requirements_dev,
+            test_requirements_file=tmp_path / "requirements-test.txt",
+            ci_lite_requirements_file=requirements_ci_lite,
+            rag_vector_requirements_file=tmp_path / "requirements-rag-vector.txt",
+            install_dev=False,
+            install_test=False,
+            requirements_profile="ci-test",
+        )
+
+
+def test_resolve_requirement_files_fails_when_rag_vector_profile_is_requested_but_missing(
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("openai==2.29.0\n", encoding="utf-8")
+    requirements_dev = tmp_path / "requirements-dev.txt"
+    requirements_dev.write_text("pre-commit==4.5.1\n", encoding="utf-8")
+    requirements_test = tmp_path / "requirements-test.txt"
+    requirements_test.write_text("pytest==9.0.3\n", encoding="utf-8")
+    requirements_ci_lite = tmp_path / "requirements-ci-lite.txt"
+    requirements_ci_lite.write_text("pre-commit==4.5.1\n", encoding="utf-8")
+
+    with pytest.raises(FileNotFoundError, match="RAG vector requirements file not found"):
+        installer.resolve_requirement_files(
+            requirements_file=requirements,
+            dev_requirements_file=requirements_dev,
+            test_requirements_file=requirements_test,
+            ci_lite_requirements_file=requirements_ci_lite,
+            rag_vector_requirements_file=tmp_path / "requirements-rag-vector.txt",
+            install_dev=False,
+            install_test=False,
+            requirements_profile="rag-vector",
+        )
+
+
+def test_build_pip_download_command_uses_constraint_when_present(tmp_path: Path) -> None:
+    constraints = tmp_path / "constraints.txt"
+    constraints.write_text("openai>=2.29.0\n", encoding="utf-8")
+
+    command = installer.build_pip_download_command(
+        python_executable="python",
+        requirement_file=tmp_path / "requirements.txt",
+        wheelhouse_dir=tmp_path / "wheelhouse",
+        constraints_file=constraints,
+        index_url=APPROVED_PROXY_URL,
+        trusted_host="packages.example.internal",
+    )
+
+    assert command[:4] == ["python", "-m", "pip", "download"]
+    download_idx = command.index("download")
+    assert command[download_idx + 1 : download_idx + 5] == [
+        "--retries",
+        str(installer.PIP_NETWORK_RETRIES),
+        "--timeout",
+        str(installer.PIP_NETWORK_TIMEOUT_SECONDS),
+    ]
+    assert "--only-binary" in command
+    assert ":all:" in command
+    assert "--find-links" in command
+    assert str(tmp_path / "wheelhouse") in command
+    assert "--dest" in command
+    assert "--index-url" in command
+    assert APPROVED_PROXY_URL in command
+    assert "--trusted-host" in command
+    assert "--constraint" in command
+
+
+def test_build_pip_install_command_is_hermetic(tmp_path: Path) -> None:
+    command = installer.build_pip_install_command(
+        python_executable="python",
+        requirement_file=tmp_path / "requirements.txt",
+        wheelhouse_dir=tmp_path / "wheelhouse",
+        constraints_file=None,
+    )
+
+    assert command[:4] == ["python", "-m", "pip", "install"]
+    assert "--no-index" in command
+    assert "--find-links" in command
+
+
+def test_effective_constraints_file_for_requirement_filters_duplicate_exact_pin(
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("pillow==12.2.0\nopenai==2.8.1\n", encoding="utf-8")
+    constraints = tmp_path / "constraints.txt"
+    constraints.write_text(
+        "pillow==12.2.0  # Security floor\nhttpx>=0.28.1\n",
+        encoding="utf-8",
+    )
+
+    with installer.effective_constraints_file_for_requirement(
+        requirements,
+        constraints,
+    ) as effective_constraints:
+        assert effective_constraints is not None
+        assert effective_constraints != constraints
+        assert effective_constraints.read_text(encoding="utf-8") == "httpx>=0.28.1\n"
+
+
+def test_effective_constraints_file_for_requirement_drops_satisfied_floor_for_exact_pin(
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("openai==2.29.0\n", encoding="utf-8")
+    constraints = tmp_path / "constraints.txt"
+    constraints.write_text(
+        "openai>=2.8.1\nhttpx>=0.28.1\n",
+        encoding="utf-8",
+    )
+
+    with installer.effective_constraints_file_for_requirement(
+        requirements,
+        constraints,
+    ) as effective_constraints:
+        assert effective_constraints is not None
+        assert effective_constraints != constraints
+        assert effective_constraints.read_text(encoding="utf-8") == "httpx>=0.28.1\n"
+
+
+def test_effective_constraints_file_for_requirement_drops_higher_exact_pin_floor(
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("alembic==1.18.4\n", encoding="utf-8")
+    constraints = tmp_path / "constraints.txt"
+    constraints.write_text(
+        "alembic>=1.17.2\nmako>=1.3.12\n",
+        encoding="utf-8",
+    )
+
+    with installer.effective_constraints_file_for_requirement(
+        requirements,
+        constraints,
+    ) as effective_constraints:
+        assert effective_constraints is not None
+        assert effective_constraints != constraints
+        assert effective_constraints.read_text(encoding="utf-8") == "mako>=1.3.12\n"
+
+
+def test_effective_constraints_file_for_requirement_drops_equal_min_floor_for_exact_pin(
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("aiosqlite==0.22.1\n", encoding="utf-8")
+    constraints = tmp_path / "constraints.txt"
+    constraints.write_text(
+        "aiosqlite>=0.22.1\nmako>=1.3.12\n",
+        encoding="utf-8",
+    )
+
+    with installer.effective_constraints_file_for_requirement(
+        requirements,
+        constraints,
+    ) as effective_constraints:
+        assert effective_constraints is not None
+        assert effective_constraints != constraints
+        assert effective_constraints.read_text(encoding="utf-8") == "mako>=1.3.12\n"
+
+
+def test_effective_constraints_file_for_requirement_keeps_security_floor_for_lower_exact_pin(
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("cryptography==47.0.0\n", encoding="utf-8")
+    constraints = tmp_path / "constraints.txt"
+    constraints.write_text(
+        "cryptography>=48.0.1\nrequests>=2.33.0\n",
+        encoding="utf-8",
+    )
+
+    with installer.effective_constraints_file_for_requirement(
+        requirements,
+        constraints,
+    ) as effective_constraints:
+        assert effective_constraints == constraints
+        assert effective_constraints.read_text(encoding="utf-8") == (
+            "cryptography>=48.0.1\nrequests>=2.33.0\n"
+        )
+
+
+def test_effective_constraints_file_keeps_floor_for_marker_qualified_exact_pin(
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text('uvloop==0.20.0 ; sys_platform != "win32"\n', encoding="utf-8")
+    constraints = tmp_path / "constraints.txt"
+    constraints.write_text(
+        "uvloop>=0.20.0\nhttpx>=0.28.1\n",
+        encoding="utf-8",
+    )
+
+    with installer.effective_constraints_file_for_requirement(
+        requirements,
+        constraints,
+    ) as effective_constraints:
+        assert effective_constraints == constraints
+
+
+def test_effective_constraints_file_for_requirement_keeps_relative_includes_resolvable(
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("pillow==12.2.0\n", encoding="utf-8")
+    constraints = tmp_path / "constraints.txt"
+    nested_constraints = tmp_path / "nested.txt"
+    nested_constraints.write_text("httpx>=0.28.1\n", encoding="utf-8")
+    constraints.write_text("-c nested.txt\npillow==12.2.0\n", encoding="utf-8")
+
+    with installer.effective_constraints_file_for_requirement(
+        requirements,
+        constraints,
+    ) as effective_constraints:
+        assert effective_constraints is not None
+        assert effective_constraints != constraints
+        assert effective_constraints.parent == constraints.parent
+        assert (effective_constraints.parent / "nested.txt").exists()
+        assert effective_constraints.read_text(encoding="utf-8") == "-c nested.txt\n"
+
+
+def test_effective_constraints_file_for_requirement_drops_constraint_when_only_duplicate_pin(
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("pillow==12.2.0\n", encoding="utf-8")
+    constraints = tmp_path / "constraints.txt"
+    constraints.write_text("pillow==12.2.0\n", encoding="utf-8")
+
+    with installer.effective_constraints_file_for_requirement(
+        requirements,
+        constraints,
+    ) as effective_constraints:
+        assert effective_constraints is None
+
+
+def test_install_from_proxy_omits_duplicate_exact_constraint_for_same_requirement_surface(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("pillow==12.2.0\n", encoding="utf-8")
+    constraints = tmp_path / "constraints.txt"
+    constraints.write_text("pillow==12.2.0\n", encoding="utf-8")
+    observed_commands: list[list[str]] = []
+
+    def fake_run_command(command: list[str]) -> None:
+        observed_commands.append(command)
+
+    monkeypatch.setattr(installer, "run_command", fake_run_command)
+
+    installer.install_from_proxy(
+        python_executable="python",
+        requirement_files=[requirements],
+        constraints_file=constraints,
+        index_url=APPROVED_PROXY_URL,
+        trusted_host="packages.example.internal",
+    )
+
+    assert len(observed_commands) == 1
+    assert "--constraint" not in observed_commands[0]
+
+
+def test_install_from_proxy_omits_satisfied_floor_constraint_for_exact_pin(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("openai==2.29.0\n", encoding="utf-8")
+    constraints = tmp_path / "constraints.txt"
+    constraints.write_text("openai>=2.8.1\n", encoding="utf-8")
+    observed_commands: list[list[str]] = []
+
+    def fake_run_command(command: list[str]) -> None:
+        observed_commands.append(command)
+
+    monkeypatch.setattr(installer, "run_command", fake_run_command)
+
+    installer.install_from_proxy(
+        python_executable="python",
+        requirement_files=[requirements],
+        constraints_file=constraints,
+        index_url=APPROVED_PROXY_URL,
+        trusted_host="packages.example.internal",
+    )
+
+    assert len(observed_commands) == 1
+    assert "--constraint" not in observed_commands[0]
+
+
+def test_install_from_proxy_omits_equal_min_floor_for_exact_pin(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("aiosqlite==0.22.1\n", encoding="utf-8")
+    constraints = tmp_path / "constraints.txt"
+    constraints.write_text("aiosqlite>=0.22.1\nmako>=1.3.12\n", encoding="utf-8")
+    observed_commands: list[list[str]] = []
+    observed_constraint_texts: list[str] = []
+
+    def fake_run_command(command: list[str]) -> None:
+        observed_commands.append(command)
+        if "--constraint" not in command:
+            return
+        constraint_path = Path(command[command.index("--constraint") + 1])
+        observed_constraint_texts.append(constraint_path.read_text(encoding="utf-8"))
+
+    monkeypatch.setattr(installer, "run_command", fake_run_command)
+
+    installer.install_from_proxy(
+        python_executable="python",
+        requirement_files=[requirements],
+        constraints_file=constraints,
+        index_url=APPROVED_PROXY_URL,
+        trusted_host="packages.example.internal",
+    )
+
+    assert len(observed_commands) == 1
+    assert "--constraint" in observed_commands[0]
+    constraint_path = Path(observed_commands[0][observed_commands[0].index("--constraint") + 1])
+    assert constraint_path != constraints
+    assert observed_constraint_texts == ["mako>=1.3.12\n"]
+
+
+def test_build_wheelhouse_preserves_non_duplicate_constraints(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("pillow==12.2.0\n", encoding="utf-8")
+    constraints = tmp_path / "constraints.txt"
+    constraints.write_text("httpx>=0.28.1\n", encoding="utf-8")
+    observed_commands: list[list[str]] = []
+
+    def fake_run_command(command: list[str]) -> None:
+        observed_commands.append(command)
+
+    monkeypatch.setattr(installer, "run_command", fake_run_command)
+
+    installer.build_wheelhouse(
+        python_executable="python",
+        requirement_files=[requirements],
+        constraints_file=constraints,
+        wheelhouse_dir=tmp_path / "wheelhouse",
+        index_url=APPROVED_PROXY_URL,
+        trusted_host="packages.example.internal",
+    )
+
+    assert len(observed_commands) == 1
+    assert "--constraint" in observed_commands[0]
+    constraint_path = Path(observed_commands[0][observed_commands[0].index("--constraint") + 1])
+    assert constraint_path == constraints
+    assert constraint_path.read_text(encoding="utf-8") == "httpx>=0.28.1\n"
+
+
+def test_install_from_wheelhouse_omits_duplicate_exact_constraint_for_same_requirement_surface(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("pillow==12.2.0\n", encoding="utf-8")
+    constraints = tmp_path / "constraints.txt"
+    constraints.write_text("pillow==12.2.0\n", encoding="utf-8")
+    observed_commands: list[list[str]] = []
+
+    def fake_run_command(command: list[str]) -> None:
+        observed_commands.append(command)
+
+    monkeypatch.setattr(installer, "run_command", fake_run_command)
+
+    installer.install_from_wheelhouse(
+        python_executable="python",
+        requirement_files=[requirements],
+        constraints_file=constraints,
+        wheelhouse_dir=tmp_path / "wheelhouse",
+    )
+
+    assert len(observed_commands) == 1
+    assert "--constraint" not in observed_commands[0]
+
+
+def test_install_from_wheelhouse_preserves_non_duplicate_constraints(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("pillow==12.2.0\n", encoding="utf-8")
+    constraints = tmp_path / "constraints.txt"
+    constraints.write_text("httpx>=0.28.1\n", encoding="utf-8")
+    observed_commands: list[list[str]] = []
+
+    def fake_run_command(command: list[str]) -> None:
+        observed_commands.append(command)
+
+    monkeypatch.setattr(installer, "run_command", fake_run_command)
+
+    installer.install_from_wheelhouse(
+        python_executable="python",
+        requirement_files=[requirements],
+        constraints_file=constraints,
+        wheelhouse_dir=tmp_path / "wheelhouse",
+    )
+
+    assert len(observed_commands) == 1
+    assert "--constraint" in observed_commands[0]
+    constraint_path = Path(observed_commands[0][observed_commands[0].index("--constraint") + 1])
+    assert constraint_path == constraints
+    assert constraint_path.read_text(encoding="utf-8") == "httpx>=0.28.1\n"
+
+
+def test_build_pip_proxy_install_command_uses_approved_proxy_without_cache(
+    tmp_path: Path,
+) -> None:
+    constraints = tmp_path / "constraints.txt"
+    constraints.write_text("openai>=2.29.0\n", encoding="utf-8")
+
+    command = installer.build_pip_proxy_install_command(
+        python_executable="python",
+        requirement_file=tmp_path / "requirements.txt",
+        constraints_file=constraints,
+        index_url=APPROVED_PROXY_URL,
+        trusted_host="packages.example.internal",
+    )
+
+    assert command[:4] == ["python", "-m", "pip", "install"]
+    install_idx = command.index("install")
+    assert command[install_idx + 1 : install_idx + 6] == [
+        "--no-cache-dir",
+        "--no-deps",
+        "--retries",
+        str(installer.PIP_NETWORK_RETRIES),
+        "--timeout",
+    ]
+    assert command[install_idx + 6] == str(installer.PIP_NETWORK_TIMEOUT_SECONDS)
+    assert "--only-binary" in command
+    assert ":all:" in command
+    assert "--index-url" in command
+    assert APPROVED_PROXY_URL in command
+    assert "--trusted-host" in command
+    assert "--constraint" in command
+
+
+def test_build_pip_proxy_install_command_omits_no_cache_dir_when_cache_allowed(
+    tmp_path: Path,
+) -> None:
+    constraints = tmp_path / "constraints.txt"
+    constraints.write_text("openai>=2.29.0\n", encoding="utf-8")
+
+    command = installer.build_pip_proxy_install_command(
+        python_executable="python",
+        requirement_file=tmp_path / "requirements.txt",
+        constraints_file=constraints,
+        index_url=APPROVED_PROXY_URL,
+        trusted_host="packages.example.internal",
+        allow_pip_download_cache=True,
+    )
+
+    assert "--no-cache-dir" not in command
+    install_idx = command.index("install")
+    assert command[install_idx + 1 : install_idx + 6] == [
+        "--no-deps",
+        "--retries",
+        str(installer.PIP_NETWORK_RETRIES),
+        "--timeout",
+        str(installer.PIP_NETWORK_TIMEOUT_SECONDS),
+    ]
+
+
+def test_build_pip_proxy_install_command_supports_find_links(tmp_path: Path) -> None:
+    command = installer.build_pip_proxy_install_command(
+        python_executable="python",
+        requirement_file=tmp_path / "requirements.txt",
+        constraints_file=None,
+        index_url=APPROVED_PROXY_URL,
+        trusted_host=None,
+        find_links_dir=tmp_path / "wheelhouse",
+    )
+
+    assert "--find-links" in command
+    assert str(tmp_path / "wheelhouse") in command
+
+
+def test_validate_private_proxy_url_rejects_public_hosts() -> None:
+    with pytest.raises(RuntimeError, match="must not point to public host"):
+        installer.validate_private_proxy_url("https://pypi.org/simple")
+
+
+def test_validate_private_proxy_url_rejects_credentialed_http() -> None:
+    with pytest.raises(RuntimeError, match="Credentialed Python package proxy URLs are forbidden"):
+        installer.validate_private_proxy_url(
+            f"http://{DEVPI_SIMPLE_USER}:{DEVPI_SIMPLE_TOKEN}" "@packages.example.internal/simple"
+        )
+
+
+def test_validate_private_proxy_url_requires_https_for_packages_host() -> None:
+    with pytest.raises(RuntimeError, match="must use https"):
+        installer.validate_private_proxy_url(
+            "http://packages.pulseplate.app/root/pulseplate/+simple/"
+        )
+
+
+def test_validate_private_proxy_url_rejects_devpi_root_credentials() -> None:
+    encoded_root_url = "".join(
+        [
+            "https://",
+            "ro%6ft",
+            ":",
+            DEVPI_SIMPLE_TOKEN,
+            "@packages.pulseplate.app/root/pulseplate/+simple/",
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="Credentialed Python package proxy URLs are forbidden"):
+        installer.validate_private_proxy_url(encoded_root_url)
+
+
+def test_validate_private_proxy_url_strips_whitespace_and_trailing_dot() -> None:
+    normalized = installer.validate_private_proxy_url(
+        "  https://packages.example.internal/simple  "
+    )
+
+    assert normalized == "https://packages.example.internal/simple"
+
+    with pytest.raises(RuntimeError, match="must not point to public host"):
+        installer.validate_private_proxy_url("https://pypi.org./simple")
+
+
+def test_resolve_private_proxy_settings_requires_explicit_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(RuntimeError, match="Approved Python package proxy is required"):
+        installer.resolve_private_proxy_settings(index_url=None, trusted_host=None)
+
+
+def test_resolve_private_proxy_settings_rejects_ambient_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PIP_EXTRA_INDEX_URL", "https://malicious.example/simple")
+
+    with pytest.raises(RuntimeError, match="Ambient Python package index overrides are forbidden"):
+        installer.resolve_private_proxy_settings(
+            index_url=APPROVED_PROXY_URL,
+            trusted_host=None,
+        )
+
+
+def test_run_command_redacts_url_credentials_from_failure_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token_with_at_sign = "tok@en-123"
+    credentialed_url = (
+        f"https://{DEVPI_SIMPLE_USER}:{token_with_at_sign}"
+        "@packages.pulseplate.app/root/pulseplate/+simple/"
+    )
+
+    class FailedResult:
+        returncode = 1
+        stderr = f"Could not fetch {credentialed_url}pip/"
+        stdout = f"Looking in indexes: {credentialed_url}"
+
+    def fake_run(*_args: object, **_kwargs: object) -> FailedResult:
+        return FailedResult()
+
+    monkeypatch.setattr(installer.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="Command failed") as excinfo:
+        installer.run_command(
+            [
+                installer.sys.executable,
+                "-m",
+                "pip",
+                "download",
+                "--index-url",
+                credentialed_url,
+            ]
+        )
+
+    message = str(excinfo.value)
+    assert token_with_at_sign not in message
+    assert "tok@en" not in message
+    assert "ci-reader" not in message
+    assert "packages.pulseplate.app" not in message
+
+
+def test_load_emergency_wheel_manifest_rejects_expired_file(tmp_path: Path) -> None:
+    manifest = tmp_path / "emergency.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "expires_at": "2026-04-01",
+                "artifacts": [
+                    {
+                        "package": "cryptography",
+                        "version": "46.0.7",
+                        "filename": "cryptography.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/cryptography.whl",
+                        "sha256": "a" * 64,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="expired"):
+        installer.load_emergency_wheel_manifest(manifest)
+
+
+def test_load_emergency_wheel_manifest_accepts_retired_empty_marker(tmp_path: Path) -> None:
+    manifest = tmp_path / "emergency.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "generated_at": "2026-06-29",
+                "reason": "Retired: all emergency wheels are mirrored privately.",
+                "artifacts": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert installer.load_emergency_wheel_manifest(manifest) == []
+
+
+def test_load_emergency_wheel_manifest_rejects_malformed_empty_marker(tmp_path: Path) -> None:
+    manifest = tmp_path / "emergency.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "generated_at": "2026-06-29",
+                "reason": "empty but not retired",
+                "artifacts": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="retired compatibility marker"):
+        installer.load_emergency_wheel_manifest(manifest)
+
+
+def test_load_emergency_wheel_manifest_rejects_non_canonical_iso_date_format(
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / "emergency.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "expires_at": "20991231",
+                "artifacts": [
+                    {
+                        "package": "cryptography",
+                        "version": "46.0.7",
+                        "filename": "cryptography.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/cryptography.whl",
+                        "sha256": "a" * 64,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="must use YYYY-MM-DD"):
+        installer.load_emergency_wheel_manifest(manifest)
+
+
+def test_load_emergency_wheel_manifest_keeps_active_artifact_specific_override(
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / "emergency.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "expires_at": "2026-04-01",
+                "artifacts": [
+                    {
+                        "package": "cryptography",
+                        "version": "46.0.7",
+                        "filename": "cryptography.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/cryptography.whl",
+                        "sha256": "a" * 64,
+                    },
+                    {
+                        "package": "mako",
+                        "version": "1.3.12",
+                        "expires_at": "2099-12-31",
+                        "filename": "mako.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/mako.whl",
+                        "sha256": "b" * 64,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    artifacts = installer.load_emergency_wheel_manifest(manifest)
+
+    assert [(item["package"], item["version"]) for item in artifacts] == [("mako", "1.3.12")]
+
+
+def test_load_emergency_wheel_manifest_rejects_invalid_artifact_specific_iso_date(
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / "emergency.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "expires_at": "2099-12-31",
+                "artifacts": [
+                    {
+                        "package": "mako",
+                        "version": "1.3.12",
+                        "expires_at": "20991231",
+                        "filename": "mako.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/mako.whl",
+                        "sha256": "a" * 64,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match=r"artifacts\[0\]\.expires_at"):
+        installer.load_emergency_wheel_manifest(manifest)
+
+
+def test_load_emergency_wheel_manifest_filters_past_artifact_specific_expiries(
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / "emergency.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "expires_at": "2099-12-31",
+                "artifacts": [
+                    {
+                        "package": "expired-pkg",
+                        "version": "1.0.0",
+                        "expires_at": "2000-01-01",
+                        "filename": "expired.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/expired.whl",
+                        "sha256": "a" * 64,
+                    },
+                    {
+                        "package": "valid-pkg",
+                        "version": "2.0.0",
+                        "expires_at": "2099-12-31",
+                        "filename": "valid.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/valid.whl",
+                        "sha256": "b" * 64,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    artifacts = installer.load_emergency_wheel_manifest(manifest)
+
+    assert [(item["package"], item["version"]) for item in artifacts] == [("valid-pkg", "2.0.0")]
+
+
+def test_load_emergency_wheel_manifest_raises_when_all_artifacts_expire_individually(
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / "emergency.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "expires_at": "2099-12-31",
+                "artifacts": [
+                    {
+                        "package": "expired-pkg-1",
+                        "version": "1.0.0",
+                        "expires_at": "2000-01-01",
+                        "filename": "expired-1.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/expired-1.whl",
+                        "sha256": "a" * 64,
+                    },
+                    {
+                        "package": "expired-pkg-2",
+                        "version": "2.0.0",
+                        "expires_at": "2000-01-02",
+                        "filename": "expired-2.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/expired-2.whl",
+                        "sha256": "b" * 64,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="manifest is expired"):
+        installer.load_emergency_wheel_manifest(manifest)
+
+
+def test_stage_emergency_wheels_downloads_only_requested_exact_artifacts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("cryptography==46.0.7\nopenai==2.29.0\n", encoding="utf-8")
+    manifest = tmp_path / "emergency.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "expires_at": "2099-12-31",
+                "artifacts": [
+                    {
+                        "package": "cryptography",
+                        "version": "46.0.7",
+                        "filename": "cryptography-46.0.7.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/cryptography-46.0.7.whl",
+                        "sha256": "b" * 64,
+                    },
+                    {
+                        "package": "cryptography",
+                        "version": "46.0.8",
+                        "filename": "cryptography-46.0.8.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/cryptography-46.0.8.whl",
+                        "sha256": "c" * 64,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    observed_downloads: list[tuple[str, Path, str]] = []
+
+    def fake_download(*, url: str, destination: Path, expected_sha256: str) -> None:
+        observed_downloads.append((url, destination, expected_sha256))
+        destination.write_bytes(b"wheel-bytes")
+
+    monkeypatch.setattr(installer, "_download_with_sha256", fake_download)
+
+    staged = installer.stage_emergency_wheels(
+        requirement_files=[requirements],
+        constraints_file=None,
+        wheelhouse_dir=tmp_path / "wheelhouse",
+        manifest_path=manifest,
+    )
+
+    assert [path.name for path in staged] == ["cryptography-46.0.7.whl"]
+    assert observed_downloads == [
+        (
+            "https://files.pythonhosted.org/packages/example/cryptography-46.0.7.whl",
+            tmp_path / "wheelhouse" / "cryptography-46.0.7.whl",
+            "b" * 64,
+        )
+    ]
+
+
+def test_stage_emergency_wheels_accepts_split_sha256_parts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("regex==2026.5.9\n", encoding="utf-8")
+    manifest = tmp_path / "emergency.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "expires_at": "2099-12-31",
+                "artifacts": [
+                    {
+                        "package": "regex",
+                        "version": "2026.5.9",
+                        "filename": "regex-2026.5.9.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/regex-2026.5.9.whl",
+                        "sha256_parts": ["a" * 32, "b" * 32],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    observed_downloads: list[tuple[str, Path, str]] = []
+
+    def fake_download(*, url: str, destination: Path, expected_sha256: str) -> None:
+        observed_downloads.append((url, destination, expected_sha256))
+        destination.write_bytes(b"wheel-bytes")
+
+    monkeypatch.setattr(installer, "_download_with_sha256", fake_download)
+
+    staged = installer.stage_emergency_wheels(
+        requirement_files=[requirements],
+        constraints_file=None,
+        wheelhouse_dir=tmp_path / "wheelhouse",
+        manifest_path=manifest,
+    )
+
+    assert [path.name for path in staged] == ["regex-2026.5.9.whl"]
+    assert observed_downloads == [
+        (
+            "https://files.pythonhosted.org/packages/example/regex-2026.5.9.whl",
+            tmp_path / "wheelhouse" / "regex-2026.5.9.whl",
+            "a" * 32 + "b" * 32,
+        )
+    ]
+
+
+def test_verify_emergency_artifact_for_floor_accepts_split_sha256_parts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / "emergency.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "expires_at": "2099-12-31",
+                "artifacts": [
+                    {
+                        "package": "regex",
+                        "version": "2026.5.9",
+                        "filename": "regex-2026.5.9.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/regex-2026.5.9.whl",
+                        "sha256_parts": ["a" * 32, "b" * 32],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    observed_downloads: list[tuple[str, Path, str]] = []
+
+    def fake_download(*, url: str, destination: Path, expected_sha256: str) -> None:
+        observed_downloads.append((url, destination, expected_sha256))
+        destination.write_bytes(b"wheel-bytes")
+
+    monkeypatch.setattr(installer, "_download_with_sha256", fake_download)
+
+    assert (
+        installer.verify_emergency_artifact_for_floor(
+            manifest_path=manifest,
+            package="regex",
+            version="2026.5.9",
+        )
+        is True
+    )
+    assert observed_downloads == [
+        (
+            "https://files.pythonhosted.org/packages/example/regex-2026.5.9.whl",
+            observed_downloads[0][1],
+            "a" * 32 + "b" * 32,
+        )
+    ]
+
+
+def test_verify_emergency_artifact_for_floor_requires_compatible_wheel_tags(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / "emergency.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "expires_at": "2099-12-31",
+                "artifacts": [
+                    {
+                        "package": "jiter",
+                        "version": "0.12.0",
+                        "filename": "jiter-0.12.0-cp312-cp312-manylinux2014_x86_64.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/jiter-cp312.whl",
+                        "sha256": "a" * 64,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        installer,
+        "_current_supported_wheel_tags",
+        lambda: {"cp313-cp313-manylinux2014_x86_64"},
+    )
+    monkeypatch.setattr(
+        installer,
+        "_download_with_sha256",
+        lambda **_kwargs: pytest.fail("incompatible emergency artifact was downloaded"),
+    )
+
+    assert (
+        installer.verify_emergency_artifact_for_floor(
+            manifest_path=manifest,
+            package="jiter",
+            version="0.12.0",
+        )
+        is False
+    )
+
+
+def test_load_emergency_wheel_manifest_mentions_split_sha256_contract(tmp_path: Path) -> None:
+    manifest = tmp_path / "emergency.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "expires_at": "2099-12-31",
+                "artifacts": [
+                    {
+                        "package": "regex",
+                        "version": "2026.5.9",
+                        "filename": "regex-2026.5.9.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/regex-2026.5.9.whl",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="sha256_parts"):
+        installer.load_emergency_wheel_manifest(manifest)
+
+
+def test_stage_emergency_wheels_downloads_requested_artifacts_across_multiple_packages(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements-dev.txt"
+    requirements.write_text(
+        "cryptography==46.0.7\nruff==0.15.11\ntypes-pyyaml==6.0.12.20260408\nopenai==2.29.0\n",
+        encoding="utf-8",
+    )
+    manifest = tmp_path / "emergency.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "expires_at": "2099-12-31",
+                "artifacts": [
+                    {
+                        "package": "cryptography",
+                        "version": "46.0.7",
+                        "filename": "cryptography-46.0.7.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/cryptography-46.0.7.whl",
+                        "sha256": "b" * 64,
+                    },
+                    {
+                        "package": "ruff",
+                        "version": "0.15.11",
+                        "filename": "ruff-0.15.11-manylinux.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/ruff-0.15.11-manylinux.whl",
+                        "sha256": "c" * 64,
+                    },
+                    {
+                        "package": "types-pyyaml",
+                        "version": "6.0.12.20260408",
+                        "filename": "types_pyyaml-6.0.12.20260408-py3-none-any.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/types_pyyaml-6.0.12.20260408-py3-none-any.whl",
+                        "sha256": "d" * 64,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    observed_downloads: list[tuple[str, Path, str]] = []
+
+    def fake_download(*, url: str, destination: Path, expected_sha256: str) -> None:
+        observed_downloads.append((url, destination, expected_sha256))
+        destination.write_bytes(b"wheel-bytes")
+
+    monkeypatch.setattr(installer, "_download_with_sha256", fake_download)
+
+    staged = installer.stage_emergency_wheels(
+        requirement_files=[requirements],
+        constraints_file=None,
+        wheelhouse_dir=tmp_path / "wheelhouse",
+        manifest_path=manifest,
+    )
+
+    assert [path.name for path in staged] == [
+        "cryptography-46.0.7.whl",
+        "ruff-0.15.11-manylinux.whl",
+        "types_pyyaml-6.0.12.20260408-py3-none-any.whl",
+    ]
+    assert observed_downloads == [
+        (
+            "https://files.pythonhosted.org/packages/example/cryptography-46.0.7.whl",
+            tmp_path / "wheelhouse" / "cryptography-46.0.7.whl",
+            "b" * 64,
+        ),
+        (
+            "https://files.pythonhosted.org/packages/example/ruff-0.15.11-manylinux.whl",
+            tmp_path / "wheelhouse" / "ruff-0.15.11-manylinux.whl",
+            "c" * 64,
+        ),
+        (
+            "https://files.pythonhosted.org/packages/example/types_pyyaml-6.0.12.20260408-py3-none-any.whl",
+            tmp_path / "wheelhouse" / "types_pyyaml-6.0.12.20260408-py3-none-any.whl",
+            "d" * 64,
+        ),
+    ]
+
+
+def test_stage_emergency_wheels_downloads_artifacts_requested_via_constraints(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements-dev.txt"
+    requirements.write_text("openai==2.29.0\n", encoding="utf-8")
+    constraints = tmp_path / "constraints.txt"
+    constraints.write_text("types-pyyaml==6.0.12.20260408\n", encoding="utf-8")
+    manifest = tmp_path / "emergency.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "expires_at": "2099-12-31",
+                "artifacts": [
+                    {
+                        "package": "types-pyyaml",
+                        "version": "6.0.12.20260408",
+                        "filename": "types_pyyaml-6.0.12.20260408-py3-none-any.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/types_pyyaml-6.0.12.20260408-py3-none-any.whl",
+                        "sha256": "d" * 64,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    observed_downloads: list[tuple[str, Path, str]] = []
+
+    def fake_download(*, url: str, destination: Path, expected_sha256: str) -> None:
+        observed_downloads.append((url, destination, expected_sha256))
+        destination.write_bytes(b"wheel-bytes")
+
+    monkeypatch.setattr(installer, "_download_with_sha256", fake_download)
+
+    staged = installer.stage_emergency_wheels(
+        requirement_files=[requirements],
+        constraints_file=constraints,
+        wheelhouse_dir=tmp_path / "wheelhouse",
+        manifest_path=manifest,
+    )
+
+    assert [path.name for path in staged] == ["types_pyyaml-6.0.12.20260408-py3-none-any.whl"]
+    assert observed_downloads == [
+        (
+            "https://files.pythonhosted.org/packages/example/types_pyyaml-6.0.12.20260408-py3-none-any.whl",
+            tmp_path / "wheelhouse" / "types_pyyaml-6.0.12.20260408-py3-none-any.whl",
+            "d" * 64,
+        )
+    ]
+
+
+def test_stage_emergency_wheels_reads_constraints_surface_once_for_multiple_artifacts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements-dev.txt"
+    requirements.write_text("openai==2.29.0\n", encoding="utf-8")
+    constraints = tmp_path / "constraints.txt"
+    constraints.write_text(
+        "ruff==0.15.11\ntypes-pyyaml==6.0.12.20260408\n",
+        encoding="utf-8",
+    )
+    manifest = tmp_path / "emergency.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "expires_at": "2099-12-31",
+                "artifacts": [
+                    {
+                        "package": "ruff",
+                        "version": "0.15.11",
+                        "filename": "ruff-0.15.11-manylinux.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/ruff-0.15.11-manylinux.whl",
+                        "sha256": "c" * 64,
+                    },
+                    {
+                        "package": "types-pyyaml",
+                        "version": "6.0.12.20260408",
+                        "filename": "types_pyyaml-6.0.12.20260408-py3-none-any.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/types_pyyaml-6.0.12.20260408-py3-none-any.whl",
+                        "sha256": "d" * 64,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    observed_downloads: list[tuple[str, Path, str]] = []
+    constraint_reads = 0
+    original_read_text = Path.read_text
+
+    def fake_download(*, url: str, destination: Path, expected_sha256: str) -> None:
+        observed_downloads.append((url, destination, expected_sha256))
+        destination.write_bytes(b"wheel-bytes")
+
+    def counting_read_text(self: Path, *args: object, **kwargs: object) -> str:
+        nonlocal constraint_reads
+        if self == constraints:
+            constraint_reads += 1
+        return original_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(installer, "_download_with_sha256", fake_download)
+    monkeypatch.setattr(Path, "read_text", counting_read_text)
+
+    staged = installer.stage_emergency_wheels(
+        requirement_files=[requirements],
+        constraints_file=constraints,
+        wheelhouse_dir=tmp_path / "wheelhouse",
+        manifest_path=manifest,
+    )
+
+    assert [path.name for path in staged] == [
+        "ruff-0.15.11-manylinux.whl",
+        "types_pyyaml-6.0.12.20260408-py3-none-any.whl",
+    ]
+    assert constraint_reads == 1
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        None,
+        "connect",
+        "stream",
+        "redirect",
+        "digest",
+        "partial",
+        "late",
+        "temp-gone",
+        "temp-foreign",
+        "destination-gone",
+        "destination-foreign",
+    ],
+)
+def test_emergency_download_verifies_direct_stream_and_cleans_partial_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str | None
+) -> None:
+    filename = "fixture-1+local-py3-none-any.whl"
+    destination = tmp_path / "wheelhouse" / filename
+    content = b"verified wheel bytes"
+    events: list[str] = []
+    now = 100.0
+    monkeypatch.setattr(installer.time, "monotonic", lambda: now)
+
+    class Response(io.BytesIO):
+        status = 302 if fault == "redirect" else 200
+        chunked = False
+
+        def isclosed(self) -> bool:
+            return False
+
+        def getheader(self, name: str) -> str | None:
+            return str(len(content) + (fault == "partial")) if name == "Content-Length" else None
+
+        def read1(self, size: int = -1) -> bytes:
+            nonlocal now
+            assert size == 1024**2
+            if fault in ("temp-gone", "temp-foreign"):
+                (temp,) = destination.parent.glob(".*.tmp")
+                temp.unlink()
+                if fault == "temp-foreign":
+                    temp.write_bytes(b"foreign")
+                raise OSError("original transfer failure")
+            if self.tell() and fault == "stream":
+                raise OSError("network dropped")
+            if fault == "late":
+                now += 61
+            return super().read1(size)
+
+    class Connection:
+        sock = types.SimpleNamespace(settimeout=lambda remaining: None)
+
+        def __init__(self, host: str, *, timeout: float) -> None:
+            assert host == "files.pythonhosted.org" and 0 < timeout <= 60
+
+        def request(self, method: str, path: str) -> None:
+            assert method == "GET" and path == "/packages/example/" + filename.replace("+", "%2B")
+            events.append(method)
+            if fault == "connect":
+                raise OSError("connect failed")
+
+        def getresponse(self) -> Response:
+            return Response(content)
+
+        def close(self) -> None:
+            events.append("closed")
+
+    monkeypatch.setattr(installer.http.client, "HTTPSConnection", Connection)
+    descriptors = []
+    original_fdopen = installer.os.fdopen
+
+    def observe_fd(fd: int, mode: str, *args: Any, **kwargs: Any) -> Any:
+        descriptors.append(fd)
+        return original_fdopen(fd, mode, *args, **kwargs)
+
+    monkeypatch.setattr(installer.os, "fdopen", observe_fd)
+    url = "https://files.pythonhosted.org/packages/example/" + filename.replace("+", "%2B")
+    digest = installer.hashlib.sha256(content).hexdigest() if fault != "digest" else "0" * 64
+    if fault in ("destination-gone", "destination-foreign"):
+        link = os.link
+
+        def publish_then_change(src: str, dst: str, **kwargs: Any) -> None:
+            link(src, dst, **kwargs)
+            destination.unlink()
+            if fault == "destination-foreign":
+                destination.write_bytes(b"foreign")
+
+        monkeypatch.setattr(installer.os, "link", publish_then_change)
+    if fault is None:
+        installer._download_with_sha256(url=url, destination=destination, expected_sha256=digest)
+        assert destination.read_bytes() == content
+        assert installer._cached_emergency_sha256(destination) == digest
+    else:
+        with pytest.raises((OSError, RuntimeError)) as failure:
+            installer._download_with_sha256(
+                url=url, destination=destination, expected_sha256=digest
+            )
+        if fault in ("temp-gone", "temp-foreign"):
+            assert str(failure.value) == "original transfer failure"
+        if fault in ("temp-foreign", "destination-foreign"):
+            (foreign,) = destination.parent.iterdir()
+            assert foreign.read_bytes() == b"foreign"
+            assert any("cleanup" in note for note in failure.value.__notes__)
+        else:
+            assert list(destination.parent.iterdir()) == []
+    assert events == ["GET", "closed"]
+    assert descriptors
+    for descriptor in descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://files.pythonhosted.org/packages/f.whl",
+        "https://example.invalid/packages/f.whl",
+        "https://name@files.pythonhosted.org/packages/f.whl",
+        "https://files.pythonhosted.org:443/packages/f.whl",
+        "https://files.pythonhosted.org/packages/../f.whl",
+        "https://files.pythonhosted.org/packages/%2e%2e/f.whl",
+        "https://files.pythonhosted.org/packages/%2fx/f.whl",
+        "https://files.pythonhosted.org/packages/other.whl",
+        "https://files.pythonhosted.org/packages/f.whl?",
+        "https://files.pythonhosted.org/packages/f.whl#",
+    ],
+)
+def test_emergency_artifact_rejects_unbound_route_before_effect(tmp_path: Path, url: str) -> None:
+    target = tmp_path / "unused" / "f.whl"
+    with pytest.raises(RuntimeError):
+        installer._download_with_sha256(url=url, destination=target, expected_sha256="0" * 64)
+    assert not target.parent.exists()
+
+
+@pytest.mark.parametrize("kind", ["symlink", "dangling", "hardlink", "fifo", "directory"])
+def test_emergency_cache_rejects_nonregular_or_aliased_leaf(tmp_path: Path, kind: str) -> None:
+    source = tmp_path / "source"
+    source.write_bytes(b"private")
+    leaf = tmp_path / "f.whl"
+    if kind == "symlink":
+        leaf.symlink_to(source)
+    elif kind == "dangling":
+        leaf.symlink_to(tmp_path / "missing")
+    elif kind == "hardlink":
+        os.link(source, leaf)
+    elif kind == "fifo":
+        os.mkfifo(leaf)
+    else:
+        leaf.mkdir()
+    with pytest.raises((OSError, RuntimeError)):
+        installer._cached_emergency_sha256(leaf)
+    assert source.read_bytes() == b"private"
+
+
+def test_build_wheelhouse_with_emergency_fallback_retries_only_after_proxy_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    shadow_python = _write_executable(tmp_path / "bin" / "python")
+    monkeypatch.setenv("PATH", str(shadow_python.parent))
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path / "untrusted-import-root"))
+    assert installer.resolve_python_executable("python") == str(shadow_python)
+    assert installer.resolve_python_executable(sys.executable) != str(shadow_python)
+
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("cryptography==46.0.7\n", encoding="utf-8")
+    manifest = tmp_path / "emergency.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "generated_at": "2026-04-09",
+                "expires_at": "2099-12-31",
+                "artifacts": [
+                    {
+                        "package": "cryptography",
+                        "version": "46.0.7",
+                        "filename": "cryptography-46.0.7.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/cryptography-46.0.7.whl",
+                        "sha256": "b" * 64,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    observed_calls: list[Path] = []
+    build_attempts = {"count": 0}
+
+    def fake_build_wheelhouse(**kwargs: object) -> None:
+        assert kwargs["python_executable"] == sys.executable
+        build_attempts["count"] += 1
+        observed_calls.append(Path(kwargs["wheelhouse_dir"]))
+        if build_attempts["count"] == 1:
+            raise _resolver_miss_runtimeerror_like_run_command("cryptography", "46.0.7")
+
+    def allow_health(*, index_url: str, package: str, trusted_host: str | None) -> None:
+        assert index_url == APPROVED_PROXY_URL
+        assert package == "cryptography"
+        assert trusted_host is None
+
+    def fake_stage_emergency_artifacts(**kwargs: object) -> list[Path]:
+        assert kwargs["python_executable"] == sys.executable
+        assert [artifact["package"] for artifact in kwargs["artifacts"]] == ["cryptography"]
+        wheelhouse_dir = Path(kwargs["wheelhouse_dir"])
+        destination = wheelhouse_dir / "cryptography-46.0.7.whl"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"wheel-bytes")
+        return [destination]
+
+    monkeypatch.setattr(installer, "build_wheelhouse", fake_build_wheelhouse)
+    monkeypatch.setattr(installer, "_require_private_index_project_health", allow_health)
+    monkeypatch.setattr(installer, "_stage_emergency_artifacts", fake_stage_emergency_artifacts)
+
+    installer.build_wheelhouse_with_emergency_fallback(
+        python_executable=sys.executable,
+        requirement_files=[requirements],
+        constraints_file=None,
+        wheelhouse_dir=tmp_path / "wheelhouse",
+        index_url=APPROVED_PROXY_URL,
+        trusted_host=None,
+        emergency_wheel_manifest=manifest,
+    )
+
+    assert observed_calls == [tmp_path / "wheelhouse", tmp_path / "wheelhouse"]
+    assert build_attempts["count"] == 2
+
+
+def test_build_wheelhouse_with_emergency_fallback_stages_only_resolver_miss_artifacts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("requests==2.33.0\ncryptography==46.0.7\n", encoding="utf-8")
+    manifest = tmp_path / "emergency.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "generated_at": "2026-04-09",
+                "expires_at": "2099-12-31",
+                "artifacts": [
+                    {
+                        "package": "requests",
+                        "version": "2.33.0",
+                        "filename": "requests-2.33.0-py3-none-any.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/requests-2.33.0.whl",
+                        "sha256": "b" * 64,
+                    },
+                    {
+                        "package": "cryptography",
+                        "version": "46.0.7",
+                        "filename": "cryptography-46.0.7.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/cryptography-46.0.7.whl",
+                        "sha256": "c" * 64,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    build_attempts = {"count": 0}
+    health_packages: list[str] = []
+
+    def fake_build_wheelhouse(**_kwargs: object) -> None:
+        build_attempts["count"] += 1
+        if build_attempts["count"] == 1:
+            raise _resolver_miss_runtimeerror_like_run_command("requests", "2.33.0")
+
+    def allow_health(*, index_url: str, package: str, trusted_host: str | None) -> None:
+        assert index_url == APPROVED_PROXY_URL
+        assert trusted_host is None
+        health_packages.append(package)
+
+    def fake_stage_emergency_artifacts(**kwargs: object) -> list[Path]:
+        assert [artifact["package"] for artifact in kwargs["artifacts"]] == ["requests"]
+        wheelhouse_dir = Path(kwargs["wheelhouse_dir"])
+        destination = wheelhouse_dir / "requests-2.33.0-py3-none-any.whl"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"wheel-bytes")
+        return [destination]
+
+    monkeypatch.setattr(installer, "build_wheelhouse", fake_build_wheelhouse)
+    monkeypatch.setattr(installer, "_require_private_index_project_health", allow_health)
+    monkeypatch.setattr(installer, "_stage_emergency_artifacts", fake_stage_emergency_artifacts)
+
+    installer.build_wheelhouse_with_emergency_fallback(
+        python_executable=sys.executable,
+        requirement_files=[requirements],
+        constraints_file=None,
+        wheelhouse_dir=tmp_path / "wheelhouse",
+        index_url=APPROVED_PROXY_URL,
+        trusted_host=None,
+        emergency_wheel_manifest=manifest,
+    )
+
+    assert health_packages == ["requests"]
+    assert build_attempts["count"] == 2
+
+
+def test_build_wheelhouse_with_emergency_fallback_continues_for_second_requested_miss(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("requests==2.33.0\ncryptography==46.0.7\n", encoding="utf-8")
+    manifest = tmp_path / "emergency.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "generated_at": "2026-04-09",
+                "expires_at": "2099-12-31",
+                "artifacts": [
+                    {
+                        "package": "requests",
+                        "version": "2.33.0",
+                        "filename": "requests-2.33.0-py3-none-any.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/requests-2.33.0.whl",
+                        "sha256": "b" * 64,
+                    },
+                    {
+                        "package": "cryptography",
+                        "version": "46.0.7",
+                        "filename": "cryptography-46.0.7.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/cryptography-46.0.7.whl",
+                        "sha256": "c" * 64,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    build_attempts = {"count": 0}
+    health_packages: list[str] = []
+    staged_packages: list[list[str]] = []
+
+    def fake_build_wheelhouse(**_kwargs: object) -> None:
+        build_attempts["count"] += 1
+        if build_attempts["count"] == 1:
+            raise _resolver_miss_runtimeerror_like_run_command("requests", "2.33.0")
+        if build_attempts["count"] == 2:
+            raise _resolver_miss_runtimeerror_like_run_command("cryptography", "46.0.7")
+
+    def allow_health(*, index_url: str, package: str, trusted_host: str | None) -> None:
+        assert index_url == APPROVED_PROXY_URL
+        assert trusted_host is None
+        health_packages.append(package)
+
+    def fake_stage_emergency_artifacts(**kwargs: object) -> list[Path]:
+        packages = [artifact["package"] for artifact in kwargs["artifacts"]]
+        staged_packages.append(packages)
+        wheelhouse_dir = Path(kwargs["wheelhouse_dir"])
+        staged = [wheelhouse_dir / f"{package}.whl" for package in packages]
+        for destination in staged:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(b"wheel-bytes")
+        return staged
+
+    monkeypatch.setattr(installer, "build_wheelhouse", fake_build_wheelhouse)
+    monkeypatch.setattr(installer, "_require_private_index_project_health", allow_health)
+    monkeypatch.setattr(installer, "_stage_emergency_artifacts", fake_stage_emergency_artifacts)
+
+    installer.build_wheelhouse_with_emergency_fallback(
+        python_executable=sys.executable,
+        requirement_files=[requirements],
+        constraints_file=None,
+        wheelhouse_dir=tmp_path / "wheelhouse",
+        index_url=APPROVED_PROXY_URL,
+        trusted_host=None,
+        emergency_wheel_manifest=manifest,
+    )
+
+    assert health_packages == ["requests", "cryptography"]
+    assert staged_packages == [["requests"], ["cryptography"]]
+    assert build_attempts["count"] == 3
+
+
+def test_install_from_proxy_with_emergency_fallback_retries_with_find_links_after_proxy_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("cryptography==46.0.7\n", encoding="utf-8")
+    manifest = tmp_path / "emergency.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "generated_at": "2026-04-09",
+                "expires_at": "2099-12-31",
+                "artifacts": [
+                    {
+                        "package": "cryptography",
+                        "version": "46.0.7",
+                        "filename": "cryptography-46.0.7.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/cryptography-46.0.7.whl",
+                        "sha256": "b" * 64,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    observed_find_links: list[Path | None] = []
+    health_packages: list[str] = []
+
+    def fake_install_from_proxy(**kwargs: object) -> None:
+        find_links_dir = kwargs["find_links_dir"]
+        observed_find_links.append(None if find_links_dir is None else Path(find_links_dir))
+        if find_links_dir is None:
+            raise _resolver_miss_runtimeerror_like_run_command("cryptography", "46.0.7")
+
+    def allow_health(*, index_url: str, package: str, trusted_host: str | None) -> None:
+        assert index_url == APPROVED_PROXY_URL
+        assert package == "cryptography"
+        assert trusted_host is None
+        health_packages.append(package)
+
+    def fake_stage_emergency_artifacts(**kwargs: object) -> list[Path]:
+        assert [artifact["package"] for artifact in kwargs["artifacts"]] == ["cryptography"]
+        wheelhouse_dir = Path(kwargs["wheelhouse_dir"])
+        destination = wheelhouse_dir / "cryptography-46.0.7.whl"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"wheel-bytes")
+        return [destination]
+
+    monkeypatch.setattr(installer, "install_from_proxy", fake_install_from_proxy)
+    monkeypatch.setattr(installer, "_require_private_index_project_health", allow_health)
+    monkeypatch.setattr(installer, "_stage_emergency_artifacts", fake_stage_emergency_artifacts)
+
+    installer.install_from_proxy_with_emergency_fallback(
+        python_executable=sys.executable,
+        requirement_files=[requirements],
+        constraints_file=None,
+        index_url=APPROVED_PROXY_URL,
+        trusted_host=None,
+        emergency_wheelhouse_dir=tmp_path / "wheelhouse",
+        emergency_wheel_manifest=manifest,
+    )
+
+    assert health_packages == ["cryptography"]
+    assert observed_find_links == [None, tmp_path / "wheelhouse"]
+
+
+def test_install_from_proxy_with_emergency_fallback_accepts_one_requested_resolver_miss(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("requests==2.33.0\ncryptography==46.0.7\n", encoding="utf-8")
+    manifest = tmp_path / "emergency.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "generated_at": "2026-04-09",
+                "expires_at": "2099-12-31",
+                "artifacts": [
+                    {
+                        "package": "requests",
+                        "version": "2.33.0",
+                        "filename": "requests-2.33.0-py3-none-any.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/requests-2.33.0.whl",
+                        "sha256": "b" * 64,
+                    },
+                    {
+                        "package": "cryptography",
+                        "version": "46.0.7",
+                        "filename": "cryptography-46.0.7.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/cryptography-46.0.7.whl",
+                        "sha256": "c" * 64,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    observed_find_links: list[Path | None] = []
+    health_packages: list[str] = []
+
+    def fake_install_from_proxy(**kwargs: object) -> None:
+        find_links_dir = kwargs["find_links_dir"]
+        observed_find_links.append(None if find_links_dir is None else Path(find_links_dir))
+        if find_links_dir is None:
+            raise _resolver_miss_runtimeerror_like_run_command("requests", "2.33.0")
+
+    def allow_health(*, index_url: str, package: str, trusted_host: str | None) -> None:
+        assert index_url == APPROVED_PROXY_URL
+        assert trusted_host is None
+        health_packages.append(package)
+
+    def fake_stage_emergency_artifacts(**kwargs: object) -> list[Path]:
+        assert [artifact["package"] for artifact in kwargs["artifacts"]] == ["requests"]
+        wheelhouse_dir = Path(kwargs["wheelhouse_dir"])
+        staged = [wheelhouse_dir / "requests-2.33.0-py3-none-any.whl"]
+        for destination in staged:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(b"wheel-bytes")
+        return staged
+
+    monkeypatch.setattr(installer, "install_from_proxy", fake_install_from_proxy)
+    monkeypatch.setattr(installer, "_require_private_index_project_health", allow_health)
+    monkeypatch.setattr(installer, "_stage_emergency_artifacts", fake_stage_emergency_artifacts)
+
+    installer.install_from_proxy_with_emergency_fallback(
+        python_executable=sys.executable,
+        requirement_files=[requirements],
+        constraints_file=None,
+        index_url=APPROVED_PROXY_URL,
+        trusted_host=None,
+        emergency_wheelhouse_dir=tmp_path / "wheelhouse",
+        emergency_wheel_manifest=manifest,
+    )
+
+    assert health_packages == ["requests"]
+    assert observed_find_links == [None, tmp_path / "wheelhouse"]
+
+
+def test_install_from_proxy_with_emergency_fallback_accepts_pip26_no_candidate_shape(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("aiosqlite==0.22.1\n", encoding="utf-8")
+    manifest = tmp_path / "emergency.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "generated_at": "2026-06-24",
+                "expires_at": "2099-12-31",
+                "artifacts": [
+                    {
+                        "package": "aiosqlite",
+                        "version": "0.22.1",
+                        "filename": "aiosqlite-0.22.1-py3-none-any.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/aiosqlite-0.22.1.whl",
+                        "sha256": "b" * 64,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    observed_find_links: list[Path | None] = []
+    health_packages: list[str] = []
+
+    def fake_install_from_proxy(**kwargs: object) -> None:
+        find_links_dir = kwargs["find_links_dir"]
+        observed_find_links.append(None if find_links_dir is None else Path(find_links_dir))
+        if find_links_dir is None:
+            raise _pip26_no_candidate_runtimeerror_like_run_command("aiosqlite", "0.22.1")
+
+    def allow_health(*, index_url: str, package: str, trusted_host: str | None) -> None:
+        assert index_url == APPROVED_PROXY_URL
+        assert trusted_host is None
+        health_packages.append(package)
+
+    def fake_stage_emergency_artifacts(**kwargs: object) -> list[Path]:
+        assert [artifact["package"] for artifact in kwargs["artifacts"]] == ["aiosqlite"]
+        wheelhouse_dir = Path(kwargs["wheelhouse_dir"])
+        staged = [wheelhouse_dir / "aiosqlite-0.22.1-py3-none-any.whl"]
+        for destination in staged:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(b"wheel-bytes")
+        return staged
+
+    monkeypatch.setattr(installer, "install_from_proxy", fake_install_from_proxy)
+    monkeypatch.setattr(installer, "_require_private_index_project_health", allow_health)
+    monkeypatch.setattr(installer, "_stage_emergency_artifacts", fake_stage_emergency_artifacts)
+
+    installer.install_from_proxy_with_emergency_fallback(
+        python_executable=sys.executable,
+        requirement_files=[requirements],
+        constraints_file=None,
+        index_url=APPROVED_PROXY_URL,
+        trusted_host=None,
+        emergency_wheelhouse_dir=tmp_path / "wheelhouse",
+        emergency_wheel_manifest=manifest,
+    )
+
+    assert health_packages == ["aiosqlite"]
+    assert observed_find_links == [None, tmp_path / "wheelhouse"]
+
+
+def test_install_from_proxy_with_emergency_fallback_accepts_package_scoped_retry_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("aiosqlite==0.22.1\n", encoding="utf-8")
+    manifest = tmp_path / "emergency.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "generated_at": "2026-06-27",
+                "expires_at": "2099-12-31",
+                "artifacts": [
+                    {
+                        "package": "aiosqlite",
+                        "version": "0.22.1",
+                        "filename": "aiosqlite-0.22.1-py3-none-any.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/aiosqlite-0.22.1.whl",
+                        "sha256": "b" * 64,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    observed_find_links: list[Path | None] = []
+    health_packages: list[str] = []
+
+    def fake_install_from_proxy(**kwargs: object) -> None:
+        find_links_dir = kwargs["find_links_dir"]
+        observed_find_links.append(None if find_links_dir is None else Path(find_links_dir))
+        if find_links_dir is None:
+            raise installer._CompletedPipFailure(
+                1,
+                "",
+                "WARNING: Retrying after CONNECTION BROKEN by "
+                "'MaxRetriesExceeded(\"HTTPSConnectionPool(host='packages.pulseplate.app', "
+                "port=443)\")': "
+                "/root/pulseplate/+simple/aiosqlite/\n"
+                "ERROR: Could not find a version that satisfies the requirement "
+                "aiosqlite==0.22.1 (from versions: none)\n"
+                "ERROR: No matching distribution found for aiosqlite==0.22.1",
+            )
+
+    def allow_health(*, index_url: str, package: str, trusted_host: str | None) -> None:
+        assert index_url == APPROVED_PROXY_URL
+        assert trusted_host is None
+        health_packages.append(package)
+
+    def fake_stage_emergency_artifacts(**kwargs: object) -> list[Path]:
+        assert [artifact["package"] for artifact in kwargs["artifacts"]] == ["aiosqlite"]
+        wheelhouse_dir = Path(kwargs["wheelhouse_dir"])
+        staged = [wheelhouse_dir / "aiosqlite-0.22.1-py3-none-any.whl"]
+        for destination in staged:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(b"wheel-bytes")
+        return staged
+
+    monkeypatch.setattr(installer, "install_from_proxy", fake_install_from_proxy)
+    monkeypatch.setattr(installer, "_require_private_index_project_health", allow_health)
+    monkeypatch.setattr(installer, "_stage_emergency_artifacts", fake_stage_emergency_artifacts)
+
+    installer.install_from_proxy_with_emergency_fallback(
+        python_executable=sys.executable,
+        requirement_files=[requirements],
+        constraints_file=None,
+        index_url=APPROVED_PROXY_URL,
+        trusted_host=None,
+        emergency_wheelhouse_dir=tmp_path / "wheelhouse",
+        emergency_wheel_manifest=manifest,
+    )
+
+    assert health_packages == []
+    assert observed_find_links == [None, tmp_path / "wheelhouse"]
+
+
+def test_install_from_proxy_with_emergency_fallback_keeps_health_gate_for_plain_resolver_miss(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("aiosqlite==0.22.1\n", encoding="utf-8")
+    manifest = tmp_path / "emergency.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "generated_at": "2026-06-27",
+                "expires_at": "2099-12-31",
+                "artifacts": [
+                    {
+                        "package": "aiosqlite",
+                        "version": "0.22.1",
+                        "filename": "aiosqlite-0.22.1-py3-none-any.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/aiosqlite-0.22.1.whl",
+                        "sha256": "b" * 64,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    stage_calls = {"count": 0}
+
+    def fail_plain_resolver_miss(**kwargs: object) -> None:
+        assert kwargs["find_links_dir"] is None
+        raise _resolver_miss_runtimeerror_like_run_command("aiosqlite", "0.22.1")
+
+    def fail_health(*, index_url: str, package: str, trusted_host: str | None) -> None:
+        assert index_url == APPROVED_PROXY_URL
+        assert package == "aiosqlite"
+        assert trusted_host is None
+        raise RuntimeError("proxy health check failed after retry budget")
+
+    def fake_stage_emergency_artifacts(**_kwargs: object) -> list[Path]:
+        stage_calls["count"] += 1
+        return [tmp_path / "wheelhouse" / "aiosqlite-0.22.1-py3-none-any.whl"]
+
+    monkeypatch.setattr(installer, "install_from_proxy", fail_plain_resolver_miss)
+    monkeypatch.setattr(installer, "_require_private_index_project_health", fail_health)
+    monkeypatch.setattr(installer, "_stage_emergency_artifacts", fake_stage_emergency_artifacts)
+
+    with pytest.raises(RuntimeError, match="proxy health check failed"):
+        installer.install_from_proxy_with_emergency_fallback(
+            python_executable=sys.executable,
+            requirement_files=[requirements],
+            constraints_file=None,
+            index_url=APPROVED_PROXY_URL,
+            trusted_host=None,
+            emergency_wheelhouse_dir=tmp_path / "wheelhouse",
+            emergency_wheel_manifest=manifest,
+        )
+
+    assert stage_calls["count"] == 0
+
+
+@pytest.mark.parametrize("health_detail", ["The read operation timed out", "HTTP 521"])
+def test_install_from_proxy_with_emergency_fallback_rejects_failed_health_probe(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    health_detail: str,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("aiosqlite==0.22.1\n", encoding="utf-8")
+    manifest = tmp_path / "emergency.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "generated_at": "2026-06-28",
+                "expires_at": "2099-12-31",
+                "artifacts": [
+                    {
+                        "package": "aiosqlite",
+                        "version": "0.22.1",
+                        "filename": "aiosqlite-0.22.1-py3-none-any.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/aiosqlite-0.22.1.whl",
+                        "sha256": "b" * 64,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    observed_find_links: list[Path | None] = []
+    stage_calls = {"count": 0}
+
+    def fail_then_succeed(**kwargs: object) -> None:
+        find_links_dir = kwargs["find_links_dir"]
+        observed_find_links.append(None if find_links_dir is None else Path(find_links_dir))
+        if find_links_dir is None:
+            raise _resolver_miss_runtimeerror_like_run_command("aiosqlite", "0.22.1")
+
+    def fail_package_health(*, index_url: str, package: str, trusted_host: str | None) -> None:
+        assert index_url == APPROVED_PROXY_URL
+        assert package == "aiosqlite"
+        assert trusted_host is None
+        raise RuntimeError(
+            "Approved Python package proxy health check failed before emergency fallback: "
+            "aiosqlite: https://packages.pulseplate.app/root/pulseplate/+simple/aiosqlite/: "
+            f"{health_detail}"
+        )
+
+    def fake_stage_emergency_artifacts(**_kwargs: object) -> list[Path]:
+        stage_calls["count"] += 1
+        return [tmp_path / "wheelhouse" / "aiosqlite-0.22.1-py3-none-any.whl"]
+
+    monkeypatch.setattr(installer, "install_from_proxy", fail_then_succeed)
+    monkeypatch.setattr(installer, "_require_private_index_project_health", fail_package_health)
+    monkeypatch.setattr(installer, "_stage_emergency_artifacts", fake_stage_emergency_artifacts)
+
+    with pytest.raises(RuntimeError, match=re.escape(health_detail)):
+        installer.install_from_proxy_with_emergency_fallback(
+            python_executable=sys.executable,
+            requirement_files=[requirements],
+            constraints_file=None,
+            index_url=APPROVED_PROXY_URL,
+            trusted_host=None,
+            emergency_wheelhouse_dir=tmp_path / "wheelhouse",
+            emergency_wheel_manifest=manifest,
+        )
+
+    assert observed_find_links == [None]
+    assert stage_calls["count"] == 0
+
+
+def test_install_from_proxy_with_emergency_fallback_rejects_same_line_server_error_resolver_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("requests==2.33.0\n", encoding="utf-8")
+    manifest = tmp_path / "emergency.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "generated_at": "2026-06-27",
+                "expires_at": "2099-12-31",
+                "artifacts": [
+                    {
+                        "package": "requests",
+                        "version": "2.33.0",
+                        "filename": "requests-2.33.0-py3-none-any.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/requests-2.33.0.whl",
+                        "sha256": "b" * 64,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    stage_calls = {"count": 0}
+
+    def fail_same_line_network_resolver(**kwargs: object) -> None:
+        assert kwargs["find_links_dir"] is None
+        raise installer._CompletedPipFailure(
+            1,
+            "",
+            "ERROR: 521 Server Error while resolving requests==2.33.0; "
+            "No matching distribution found for requests==2.33.0",
+        )
+
+    def fake_stage_emergency_artifacts(**_kwargs: object) -> list[Path]:
+        stage_calls["count"] += 1
+        return [tmp_path / "wheelhouse" / "requests-2.33.0-py3-none-any.whl"]
+
+    monkeypatch.setattr(installer, "install_from_proxy", fail_same_line_network_resolver)
+    monkeypatch.setattr(installer, "_stage_emergency_artifacts", fake_stage_emergency_artifacts)
+
+    with pytest.raises(RuntimeError, match="pip exited with status 1"):
+        installer.install_from_proxy_with_emergency_fallback(
+            python_executable=sys.executable,
+            requirement_files=[requirements],
+            constraints_file=None,
+            index_url=APPROVED_PROXY_URL,
+            trusted_host=None,
+            emergency_wheelhouse_dir=tmp_path / "wheelhouse",
+            emergency_wheel_manifest=manifest,
+        )
+
+    assert stage_calls["count"] == 0
+
+
+def test_install_from_proxy_with_emergency_fallback_does_not_treat_package_name_as_network(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("pyopenssl==26.0.0\n", encoding="utf-8")
+    manifest = tmp_path / "emergency.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "generated_at": "2026-06-24",
+                "expires_at": "2099-12-31",
+                "artifacts": [
+                    {
+                        "package": "pyopenssl",
+                        "version": "26.0.0",
+                        "filename": "pyOpenSSL-26.0.0-py3-none-any.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/pyOpenSSL-26.0.0.whl",
+                        "sha256": "c" * 64,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    observed_find_links: list[Path | None] = []
+    health_packages: list[str] = []
+
+    def fake_install_from_proxy(**kwargs: object) -> None:
+        find_links_dir = kwargs["find_links_dir"]
+        observed_find_links.append(None if find_links_dir is None else Path(find_links_dir))
+        if find_links_dir is None:
+            raise _pip26_no_candidate_runtimeerror_like_run_command("pyopenssl", "26.0.0")
+
+    def allow_health(*, index_url: str, package: str, trusted_host: str | None) -> None:
+        assert index_url == APPROVED_PROXY_URL
+        assert package == "pyopenssl"
+        assert trusted_host is None
+        health_packages.append(package)
+
+    def fake_stage_emergency_artifacts(**kwargs: object) -> list[Path]:
+        assert [artifact["package"] for artifact in kwargs["artifacts"]] == ["pyopenssl"]
+        wheelhouse_dir = Path(kwargs["wheelhouse_dir"])
+        staged = [wheelhouse_dir / "pyOpenSSL-26.0.0-py3-none-any.whl"]
+        for destination in staged:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(b"wheel-bytes")
+        return staged
+
+    monkeypatch.setattr(installer, "install_from_proxy", fake_install_from_proxy)
+    monkeypatch.setattr(installer, "_require_private_index_project_health", allow_health)
+    monkeypatch.setattr(installer, "_stage_emergency_artifacts", fake_stage_emergency_artifacts)
+
+    installer.install_from_proxy_with_emergency_fallback(
+        python_executable=sys.executable,
+        requirement_files=[requirements],
+        constraints_file=None,
+        index_url=APPROVED_PROXY_URL,
+        trusted_host=None,
+        emergency_wheelhouse_dir=tmp_path / "wheelhouse",
+        emergency_wheel_manifest=manifest,
+    )
+
+    assert health_packages == ["pyopenssl"]
+    assert observed_find_links == [None, tmp_path / "wheelhouse"]
+
+
+def test_install_from_proxy_with_emergency_fallback_continues_for_second_requested_miss(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("requests==2.33.0\ncryptography==46.0.7\n", encoding="utf-8")
+    manifest = tmp_path / "emergency.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "generated_at": "2026-04-09",
+                "expires_at": "2099-12-31",
+                "artifacts": [
+                    {
+                        "package": "requests",
+                        "version": "2.33.0",
+                        "filename": "requests-2.33.0-py3-none-any.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/requests-2.33.0.whl",
+                        "sha256": "b" * 64,
+                    },
+                    {
+                        "package": "cryptography",
+                        "version": "46.0.7",
+                        "filename": "cryptography-46.0.7.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/cryptography-46.0.7.whl",
+                        "sha256": "c" * 64,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    install_attempts = {"count": 0}
+    observed_find_links: list[Path | None] = []
+    health_packages: list[str] = []
+    staged_packages: list[list[str]] = []
+
+    def fake_install_from_proxy(**kwargs: object) -> None:
+        install_attempts["count"] += 1
+        find_links_dir = kwargs["find_links_dir"]
+        observed_find_links.append(None if find_links_dir is None else Path(find_links_dir))
+        if install_attempts["count"] == 1:
+            raise _resolver_miss_runtimeerror_like_run_command("requests", "2.33.0")
+        if install_attempts["count"] == 2:
+            raise _resolver_miss_runtimeerror_like_run_command("cryptography", "46.0.7")
+
+    def allow_health(*, index_url: str, package: str, trusted_host: str | None) -> None:
+        assert index_url == APPROVED_PROXY_URL
+        assert trusted_host is None
+        health_packages.append(package)
+
+    def fake_stage_emergency_artifacts(**kwargs: object) -> list[Path]:
+        packages = [artifact["package"] for artifact in kwargs["artifacts"]]
+        staged_packages.append(packages)
+        wheelhouse_dir = Path(kwargs["wheelhouse_dir"])
+        staged = [wheelhouse_dir / f"{package}.whl" for package in packages]
+        for destination in staged:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(b"wheel-bytes")
+        return staged
+
+    monkeypatch.setattr(installer, "install_from_proxy", fake_install_from_proxy)
+    monkeypatch.setattr(installer, "_require_private_index_project_health", allow_health)
+    monkeypatch.setattr(installer, "_stage_emergency_artifacts", fake_stage_emergency_artifacts)
+
+    installer.install_from_proxy_with_emergency_fallback(
+        python_executable=sys.executable,
+        requirement_files=[requirements],
+        constraints_file=None,
+        index_url=APPROVED_PROXY_URL,
+        trusted_host=None,
+        emergency_wheelhouse_dir=tmp_path / "wheelhouse",
+        emergency_wheel_manifest=manifest,
+    )
+
+    assert health_packages == ["requests", "cryptography"]
+    assert staged_packages == [["requests"], ["cryptography"]]
+    assert observed_find_links == [None, tmp_path / "wheelhouse", tmp_path / "wheelhouse"]
+    assert install_attempts["count"] == 3
+
+
+def test_install_from_proxy_with_emergency_fallback_ignores_staged_package_retry_for_next_miss(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("aiosqlite==0.22.1\nalembic==1.18.4\n", encoding="utf-8")
+    manifest = tmp_path / "emergency.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "generated_at": "2026-06-28",
+                "expires_at": "2099-12-31",
+                "artifacts": [
+                    {
+                        "package": "aiosqlite",
+                        "version": "0.22.1",
+                        "filename": "aiosqlite-0.22.1-py3-none-any.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/aiosqlite-0.22.1.whl",
+                        "sha256": "b" * 64,
+                    },
+                    {
+                        "package": "alembic",
+                        "version": "1.18.4",
+                        "filename": "alembic-1.18.4-py3-none-any.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/alembic-1.18.4.whl",
+                        "sha256": "c" * 64,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    install_attempts = {"count": 0}
+    observed_find_links: list[Path | None] = []
+    health_packages: list[str] = []
+    staged_packages: list[list[str]] = []
+
+    def fake_install_from_proxy(**kwargs: object) -> None:
+        install_attempts["count"] += 1
+        find_links_dir = kwargs["find_links_dir"]
+        observed_find_links.append(None if find_links_dir is None else Path(find_links_dir))
+        if install_attempts["count"] == 1:
+            raise installer._CompletedPipFailure(
+                1,
+                "",
+                "WARNING: Retrying after connection broken by "
+                "'ReadTimeoutError(\"HTTPSConnectionPool(host='packages.pulseplate.app', "
+                "port=443): Read timed out\")': /root/pulseplate/+simple/aiosqlite/\n"
+                "ERROR: Could not find a version that satisfies the requirement "
+                "aiosqlite==0.22.1 (from versions: none)\n"
+                "ERROR: No matching distribution found for aiosqlite==0.22.1",
+            )
+        if install_attempts["count"] == 2:
+            raise installer._CompletedPipFailure(
+                1,
+                "",
+                "WARNING: Retrying after connection broken by "
+                "'ReadTimeoutError(\"HTTPSConnectionPool(host='packages.pulseplate.app', "
+                "port=443): Read timed out\")': /root/pulseplate/+simple/aiosqlite/\n"
+                "ERROR: Could not find a version that satisfies the requirement "
+                "alembic==1.18.4 (from versions: none)\n"
+                "ERROR: No matching distribution found for alembic==1.18.4",
+            )
+
+    def allow_health(*, index_url: str, package: str, trusted_host: str | None) -> None:
+        assert index_url == APPROVED_PROXY_URL
+        assert trusted_host is None
+        health_packages.append(package)
+
+    def fake_stage_emergency_artifacts(**kwargs: object) -> list[Path]:
+        packages = [artifact["package"] for artifact in kwargs["artifacts"]]
+        staged_packages.append(packages)
+        wheelhouse_dir = Path(kwargs["wheelhouse_dir"])
+        staged = [wheelhouse_dir / f"{package}.whl" for package in packages]
+        for destination in staged:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(b"wheel-bytes")
+        return staged
+
+    monkeypatch.setattr(installer, "install_from_proxy", fake_install_from_proxy)
+    monkeypatch.setattr(installer, "_require_private_index_project_health", allow_health)
+    monkeypatch.setattr(installer, "_stage_emergency_artifacts", fake_stage_emergency_artifacts)
+
+    installer.install_from_proxy_with_emergency_fallback(
+        python_executable=sys.executable,
+        requirement_files=[requirements],
+        constraints_file=None,
+        index_url=APPROVED_PROXY_URL,
+        trusted_host=None,
+        emergency_wheelhouse_dir=tmp_path / "wheelhouse",
+        emergency_wheel_manifest=manifest,
+    )
+
+    assert health_packages == ["alembic"]
+    assert staged_packages == [["aiosqlite"], ["alembic"]]
+    assert observed_find_links == [None, tmp_path / "wheelhouse", tmp_path / "wheelhouse"]
+    assert install_attempts["count"] == 3
+
+
+def test_repo_ci_lite_direct_proxy_retry_rejects_retired_emergency_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    install_attempts = {"count": 0}
+    observed_find_links: list[Path | None] = []
+    health_packages: list[str] = []
+    staged_filenames: list[list[str]] = []
+
+    def fake_install_from_proxy(**kwargs: object) -> None:
+        install_attempts["count"] += 1
+        find_links_dir = kwargs["find_links_dir"]
+        observed_find_links.append(None if find_links_dir is None else Path(find_links_dir))
+        if install_attempts["count"] == 1:
+            raise _resolver_miss_runtimeerror_like_run_command("protobuf", "6.33.5")
+        if install_attempts["count"] == 2:
+            raise _resolver_miss_runtimeerror_like_run_command("wrapt", "2.0.1")
+
+    def allow_health(*, index_url: str, package: str, trusted_host: str | None) -> None:
+        assert index_url == APPROVED_PROXY_URL
+        assert trusted_host is None
+        health_packages.append(package)
+
+    def fake_stage_emergency_artifacts(**kwargs: object) -> list[Path]:
+        artifacts = kwargs["artifacts"]
+        assert isinstance(artifacts, list)
+        filenames = [str(artifact["filename"]) for artifact in artifacts]
+        staged_filenames.append(filenames)
+        wheelhouse_dir = Path(kwargs["wheelhouse_dir"])
+        staged = [wheelhouse_dir / filename for filename in filenames]
+        for destination in staged:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(b"wheel-bytes")
+        return staged
+
+    monkeypatch.setattr(installer, "install_from_proxy", fake_install_from_proxy)
+    monkeypatch.setattr(installer, "_require_private_index_project_health", allow_health)
+    monkeypatch.setattr(installer, "_stage_emergency_artifacts", fake_stage_emergency_artifacts)
+    monkeypatch.setattr(
+        installer,
+        "_supported_wheel_tags_for_python",
+        lambda _python_executable: _ci_linux_cp313_tags(),
+    )
+
+    with pytest.raises(RuntimeError, match="pip exited with status 1"):
+        installer.install_from_proxy_with_emergency_fallback(
+            python_executable="python",
+            requirement_files=[REPO_ROOT / "requirements-ci-lite.txt"],
+            constraints_file=REPO_ROOT / "constraints.txt",
+            index_url=APPROVED_PROXY_URL,
+            trusted_host=None,
+            emergency_wheelhouse_dir=tmp_path / "wheelhouse",
+            emergency_wheel_manifest=_repo_emergency_manifest_path(),
+        )
+
+    assert health_packages == []
+    assert staged_filenames == []
+    assert observed_find_links == [None]
+    assert install_attempts["count"] == 1
+
+
+def test_install_from_proxy_with_emergency_fallback_rejects_mixed_network_resolver_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("requests==2.33.0\n", encoding="utf-8")
+    manifest = tmp_path / "emergency.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "generated_at": "2026-04-09",
+                "expires_at": "2099-12-31",
+                "artifacts": [
+                    {
+                        "package": "requests",
+                        "version": "2.33.0",
+                        "filename": "requests-2.33.0-py3-none-any.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/requests-2.33.0.whl",
+                        "sha256": "b" * 64,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    stage_calls = {"count": 0}
+
+    def fail_mixed_network_resolver(**kwargs: object) -> None:
+        assert kwargs["find_links_dir"] is None
+        raise installer._CompletedPipFailure(
+            1,
+            "",
+            "WARNING: Retrying after Cloudflare 521 connection timed out\n"
+            "ERROR: Could not find a version that satisfies the requirement requests==2.33.0\n"
+            "ERROR: No matching distribution found for requests==2.33.0",
+        )
+
+    def fake_stage_emergency_artifacts(**_kwargs: object) -> list[Path]:
+        stage_calls["count"] += 1
+        return [tmp_path / "wheelhouse" / "requests-2.33.0-py3-none-any.whl"]
+
+    monkeypatch.setattr(installer, "install_from_proxy", fail_mixed_network_resolver)
+    monkeypatch.setattr(installer, "_stage_emergency_artifacts", fake_stage_emergency_artifacts)
+
+    with pytest.raises(RuntimeError, match="pip exited with status 1"):
+        installer.install_from_proxy_with_emergency_fallback(
+            python_executable=sys.executable,
+            requirement_files=[requirements],
+            constraints_file=None,
+            index_url=APPROVED_PROXY_URL,
+            trusted_host=None,
+            emergency_wheelhouse_dir=tmp_path / "wheelhouse",
+            emergency_wheel_manifest=manifest,
+        )
+
+    assert stage_calls["count"] == 0
+
+
+def test_install_from_proxy_with_emergency_fallback_rejects_same_line_network_resolver_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("requests==2.33.0\n", encoding="utf-8")
+    manifest = tmp_path / "emergency.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "generated_at": "2026-04-09",
+                "expires_at": "2099-12-31",
+                "artifacts": [
+                    {
+                        "package": "requests",
+                        "version": "2.33.0",
+                        "filename": "requests-2.33.0-py3-none-any.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/requests-2.33.0.whl",
+                        "sha256": "b" * 64,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    stage_calls = {"count": 0}
+
+    def fail_same_line_mixed_network_resolver(**kwargs: object) -> None:
+        assert kwargs["find_links_dir"] is None
+        raise installer._CompletedPipFailure(
+            1,
+            "",
+            "ERROR: Cloudflare 521 while resolving requests==2.33.0; "
+            "No matching distribution found for requests==2.33.0",
+        )
+
+    def fake_stage_emergency_artifacts(**_kwargs: object) -> list[Path]:
+        stage_calls["count"] += 1
+        return [tmp_path / "wheelhouse" / "requests-2.33.0-py3-none-any.whl"]
+
+    monkeypatch.setattr(installer, "install_from_proxy", fail_same_line_mixed_network_resolver)
+    monkeypatch.setattr(installer, "_stage_emergency_artifacts", fake_stage_emergency_artifacts)
+
+    with pytest.raises(RuntimeError, match="pip exited with status 1"):
+        installer.install_from_proxy_with_emergency_fallback(
+            python_executable=sys.executable,
+            requirement_files=[requirements],
+            constraints_file=None,
+            index_url=APPROVED_PROXY_URL,
+            trusted_host=None,
+            emergency_wheelhouse_dir=tmp_path / "wheelhouse",
+            emergency_wheel_manifest=manifest,
+        )
+
+    assert stage_calls["count"] == 0
+
+
+def test_install_from_proxy_with_emergency_fallback_rejects_non_resolver_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("requests==2.33.0\n", encoding="utf-8")
+    manifest = tmp_path / "emergency.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "generated_at": "2026-04-09",
+                "expires_at": "2099-12-31",
+                "artifacts": [
+                    {
+                        "package": "requests",
+                        "version": "2.33.0",
+                        "filename": "requests-2.33.0-py3-none-any.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/requests-2.33.0.whl",
+                        "sha256": "b" * 64,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    stage_calls = {"count": 0}
+
+    def fail_transport(**kwargs: object) -> None:
+        assert kwargs["find_links_dir"] is None
+        raise installer._CompletedPipFailure(1, "", "connection timed out")
+
+    def fake_stage_emergency_artifacts(**_kwargs: object) -> list[Path]:
+        stage_calls["count"] += 1
+        return [tmp_path / "wheelhouse" / "requests-2.33.0-py3-none-any.whl"]
+
+    monkeypatch.setattr(installer, "install_from_proxy", fail_transport)
+    monkeypatch.setattr(installer, "_stage_emergency_artifacts", fake_stage_emergency_artifacts)
+
+    with pytest.raises(RuntimeError, match="pip exited with status 1"):
+        installer.install_from_proxy_with_emergency_fallback(
+            python_executable=sys.executable,
+            requirement_files=[requirements],
+            constraints_file=None,
+            index_url=APPROVED_PROXY_URL,
+            trusted_host=None,
+            emergency_wheelhouse_dir=tmp_path / "wheelhouse",
+            emergency_wheel_manifest=manifest,
+        )
+
+    assert stage_calls["count"] == 0
+
+
+def test_upgrade_pip_uses_emergency_wheel_after_proxy_resolver_miss(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / "emergency.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "expires_at": "2099-12-31",
+                "artifacts": [
+                    {
+                        "package": "pip",
+                        "version": "26.1.1",
+                        "filename": "pip-26.1.1-py3-none-any.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/pip-26.1.1-py3-none-any.whl",
+                        "sha256": "b" * 64,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    observed_commands: list[list[str]] = []
+    observed_downloads: list[tuple[str, str, Path]] = []
+    observed_index_health_urls = _allow_private_index_project_health(monkeypatch)
+
+    def fake_run_command(command: list[str], *, timeout: int) -> None:
+        assert timeout == (120 if "--no-index" in command else 300)
+        observed_commands.append(command)
+        if "--index-url" in command:
+            raise installer._CompletedPipFailure(
+                1, "", "No matching distribution found for pip<27.0,>=26.0"
+            )
+
+    def fake_download(*, url: str, destination: Path, expected_sha256: str) -> None:
+        observed_downloads.append((url, expected_sha256, destination))
+        destination.write_bytes(b"wheel-bytes")
+
+    monkeypatch.setattr(installer, "run_command", fake_run_command)
+    monkeypatch.setattr(installer, "_download_with_sha256", fake_download)
+
+    installer.upgrade_pip(
+        sys.executable,
+        pip_spec="pip>=26.0,<27.0",
+        index_url=APPROVED_PROXY_URL,
+        trusted_host=None,
+        emergency_wheel_manifest=manifest,
+    )
+
+    assert len(observed_commands) == 2
+    assert "--index-url" in observed_commands[0]
+    assert APPROVED_PROXY_URL in observed_commands[0]
+    assert "--no-index" in observed_commands[1]
+    assert "--find-links" in observed_commands[1]
+    assert "--index-url" not in observed_commands[1]
+    assert observed_commands[1][-1] == "pip>=26.0,<27.0"
+    assert observed_index_health_urls == [
+        (
+            "packages.example.internal",
+            "/simple/pip/",
+            installer.PRIVATE_INDEX_HEALTH_TIMEOUT_SECONDS,
+        )
+    ]
+    assert observed_downloads == [
+        (
+            "https://files.pythonhosted.org/packages/example/pip-26.1.1-py3-none-any.whl",
+            "b" * 64,
+            observed_downloads[0][2],
+        )
+    ]
+    assert observed_downloads[0][2].name == "pip-26.1.1-py3-none-any.whl"
+
+
+def test_upgrade_pip_does_not_use_emergency_wheel_for_non_resolver_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / "emergency.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "expires_at": "2099-12-31",
+                "artifacts": [
+                    {
+                        "package": "pip",
+                        "version": "26.1.1",
+                        "filename": "pip-26.1.1-py3-none-any.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/pip-26.1.1-py3-none-any.whl",
+                        "sha256": "b" * 64,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    downloads = {"count": 0}
+
+    def proxy_outage(_command: list[str], *, timeout: int) -> None:
+        raise installer._CompletedPipFailure(1, "", "TLS handshake timed out")
+
+    def fake_download(**_kwargs: object) -> None:
+        downloads["count"] += 1
+
+    monkeypatch.setattr(installer, "run_command", proxy_outage)
+    monkeypatch.setattr(installer, "_download_with_sha256", fake_download)
+
+    with pytest.raises(RuntimeError, match="pip exited with status 1"):
+        installer.upgrade_pip(
+            "python",
+            pip_spec="pip>=26.0,<27.0",
+            index_url=APPROVED_PROXY_URL,
+            trusted_host=None,
+            emergency_wheel_manifest=manifest,
+        )
+
+    assert downloads["count"] == 0
+
+
+def test_upgrade_pip_does_not_use_emergency_wheel_for_mixed_network_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / "emergency.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "expires_at": "2099-12-31",
+                "artifacts": [
+                    {
+                        "package": "pip",
+                        "version": "26.1.1",
+                        "filename": "pip-26.1.1-py3-none-any.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/pip-26.1.1-py3-none-any.whl",
+                        "sha256": "b" * 64,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    downloads = {"count": 0}
+
+    def proxy_outage_with_final_resolver_text(_command: list[str], *, timeout: int) -> None:
+        raise installer._CompletedPipFailure(
+            1,
+            "",
+            "WARNING: Retrying after connection error: TLS handshake timed out\n"
+            "ERROR: Could not find a version that satisfies the requirement pip<27.0,>=26.0\n"
+            "ERROR: No matching distribution found for pip<27.0,>=26.0",
+        )
+
+    def fake_download(**_kwargs: object) -> None:
+        downloads["count"] += 1
+
+    monkeypatch.setattr(installer, "run_command", proxy_outage_with_final_resolver_text)
+    monkeypatch.setattr(installer, "_download_with_sha256", fake_download)
+
+    with pytest.raises(RuntimeError, match="pip exited with status 1"):
+        installer.upgrade_pip(
+            "python",
+            pip_spec="pip>=26.0,<27.0",
+            index_url=APPROVED_PROXY_URL,
+            trusted_host=None,
+            emergency_wheel_manifest=manifest,
+        )
+
+    assert downloads["count"] == 0
+
+
+def test_upgrade_pip_does_not_use_emergency_wheel_for_521_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / "emergency.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "expires_at": "2099-12-31",
+                "artifacts": [
+                    {
+                        "package": "pip",
+                        "version": "26.1.1",
+                        "filename": "pip-26.1.1-py3-none-any.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/pip-26.1.1-py3-none-any.whl",
+                        "sha256": "b" * 64,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    downloads = {"count": 0}
+
+    def cloudflare_521_with_final_resolver_text(_command: list[str], *, timeout: int) -> None:
+        raise installer._CompletedPipFailure(
+            1,
+            "",
+            "ERROR: 521 Server Error: Web Server Is Down for url\n"
+            "ERROR: Could not find a version that satisfies the requirement pip<27.0,>=26.0\n"
+            "ERROR: No matching distribution found for pip<27.0,>=26.0",
+        )
+
+    def fake_download(**_kwargs: object) -> None:
+        downloads["count"] += 1
+
+    monkeypatch.setattr(installer, "run_command", cloudflare_521_with_final_resolver_text)
+    monkeypatch.setattr(installer, "_download_with_sha256", fake_download)
+
+    with pytest.raises(RuntimeError, match="pip exited with status 1"):
+        installer.upgrade_pip(
+            "python",
+            pip_spec="pip>=26.0,<27.0",
+            index_url=APPROVED_PROXY_URL,
+            trusted_host=None,
+            emergency_wheel_manifest=manifest,
+        )
+
+    assert downloads["count"] == 0
+
+
+def test_upgrade_pip_does_not_use_emergency_wheel_when_proxy_521_is_suppressed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / "emergency.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "expires_at": "2099-12-31",
+                "artifacts": [
+                    {
+                        "package": "pip",
+                        "version": "26.1.1",
+                        "filename": "pip-26.1.1-py3-none-any.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/pip-26.1.1-py3-none-any.whl",
+                        "sha256": "b" * 64,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    downloads = {"count": 0}
+
+    def generic_resolver_miss_from_proxy_outage(_command: list[str], *, timeout: int) -> None:
+        raise installer._CompletedPipFailure(
+            1,
+            "",
+            "ERROR: Could not find a version that satisfies the requirement pip<27.0,>=26.0\n"
+            "ERROR: No matching distribution found for pip<27.0,>=26.0",
+        )
+
+    class Cloudflare521Connection:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        def request(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        def getresponse(self) -> _FakeSimpleIndexResponse:
+            return _FakeSimpleIndexResponse(status=521)
+
+        def close(self) -> None:
+            return None
+
+    def fake_download(**_kwargs: object) -> None:
+        downloads["count"] += 1
+
+    monkeypatch.setattr(installer, "run_command", generic_resolver_miss_from_proxy_outage)
+    monkeypatch.setattr(installer.http.client, "HTTPSConnection", Cloudflare521Connection)
+    monkeypatch.setattr(installer, "_download_with_sha256", fake_download)
+
+    with pytest.raises(RuntimeError, match="proxy health check failed.*521"):
+        installer.upgrade_pip(
+            "python",
+            pip_spec="pip>=26.0,<27.0",
+            index_url=APPROVED_PROXY_URL,
+            trusted_host=None,
+            emergency_wheel_manifest=manifest,
+        )
+
+    assert downloads["count"] == 0
+
+
+def test_upgrade_pip_rejects_emergency_artifact_outside_requested_range(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / "emergency.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "expires_at": "2099-12-31",
+                "artifacts": [
+                    {
+                        "package": "pip",
+                        "version": "25.3.0",
+                        "filename": "pip-25.3.0-py3-none-any.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/pip-25.3.0-py3-none-any.whl",
+                        "sha256": "b" * 64,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def resolver_miss(_command: list[str], *, timeout: int) -> None:
+        raise installer._CompletedPipFailure(
+            1, "", "Could not find a version that satisfies the requirement pip<27.0,>=26.0"
+        )
+
+    _allow_private_index_project_health(monkeypatch)
+    monkeypatch.setattr(installer, "run_command", resolver_miss)
+
+    with pytest.raises(RuntimeError, match="No active emergency pip artifact"):
+        installer.upgrade_pip(
+            "python",
+            pip_spec="pip>=26.0,<27.0",
+            index_url=APPROVED_PROXY_URL,
+            trusted_host=None,
+            emergency_wheel_manifest=manifest,
+        )
+
+
+def test_build_pip_download_command_fails_when_constraints_file_is_missing(
+    tmp_path: Path,
+) -> None:
+    missing_constraints = tmp_path / "missing-constraints.txt"
+
+    with pytest.raises(FileNotFoundError, match="Constraints file not found"):
+        installer.build_pip_download_command(
+            python_executable="python",
+            requirement_file=tmp_path / "requirements.txt",
+            wheelhouse_dir=tmp_path / "wheelhouse",
+            constraints_file=missing_constraints,
+            index_url=APPROVED_PROXY_URL,
+            trusted_host=None,
+        )
+
+
+def test_is_virtualenv_python_detects_virtualenv(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Result:
+        stdout = json.dumps(
+            {"executable": sys.executable, "prefix": "/tmp/.venv", "base_prefix": "/usr/local"}
+        )
+
+    monkeypatch.setattr(installer, "resolve_python_executable", lambda value: value)
+    monkeypatch.setattr(installer.subprocess, "run", lambda *a, **k: Result())
+
+    assert installer.is_virtualenv_python(sys.executable) is True
+
+
+def test_is_virtualenv_python_wraps_probe_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def raise_called_process_error(*args: object, **kwargs: object) -> object:
+        raise subprocess.CalledProcessError(returncode=1, cmd=["python", "-c", "probe"])
+
+    monkeypatch.setattr(installer, "resolve_python_executable", lambda value: value)
+    monkeypatch.setattr(installer.subprocess, "run", raise_called_process_error)
+
+    with pytest.raises(RuntimeError, match="Unable to probe virtualenv state"):
+        installer.is_virtualenv_python(sys.executable)
+
+
+def test_run_command_wraps_subprocess_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            args=list(args[0]) if args else [],
+            returncode=1,
+            stdout="",
+            stderr="pip stderr here",
+        )
+
+    monkeypatch.setattr(installer, "resolve_python_executable", lambda value: value)
+    monkeypatch.setattr(installer.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="Command failed: pip exited with status 1") as excinfo:
+        installer.run_command(["python", "-m", "pip"])
+    assert "pip stderr here" not in str(excinfo.value)
+
+
+def test_python_subprocess_sinks_reject_invalid_interpreter_before_subprocess(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    missing = tmp_path / "missing-python"
+
+    def fail_subprocess(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("invalid interpreter must be rejected before subprocess.run")
+
+    monkeypatch.setattr(installer.subprocess, "run", fail_subprocess)
+
+    operations = (
+        lambda: installer.is_virtualenv_python(str(missing)),
+        lambda: installer.run_command([str(missing), "-m", "pip"]),
+        lambda: installer.collect_startup_hook_failure_lines(
+            guard_script=tmp_path / "check_python_startup_hooks.py",
+            python_executable=str(missing),
+        ),
+    )
+    for operation in operations:
+        with pytest.raises(RuntimeError, match="Python executable"):
+            operation()
+
+
+def test_is_virtualenv_python_uses_absolute_symlink_invocation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    target = _write_executable(tmp_path / "target" / "python-real")
+    invocation = tmp_path / "bin" / "python-link"
+    invocation.parent.mkdir(parents=True)
+    _symlink_or_skip(invocation, target)
+    observed_commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        observed_commands.append(command)
+        payload = {"executable": command[0], "prefix": "/tmp/.venv", "base_prefix": "/usr/local"}
+        return subprocess.CompletedProcess(command, 0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(installer.subprocess, "run", fake_run)
+
+    assert installer.is_virtualenv_python(str(invocation)) is True
+    assert observed_commands[0][0] == str(invocation)
+
+
+def test_run_command_uses_absolute_symlink_invocation_without_mutating_caller(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    target = _write_executable(tmp_path / "target" / "python-real")
+    invocation = tmp_path / "bin" / "python-link"
+    invocation.parent.mkdir(parents=True)
+    _symlink_or_skip(invocation, target)
+    caller_command = [str(invocation), "-m", "pip"]
+    original_command = list(caller_command)
+    observed_commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        observed_commands.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(installer.subprocess, "run", fake_run)
+
+    installer.run_command(caller_command)
+
+    assert caller_command == original_command
+    assert observed_commands[0] is not caller_command
+    assert observed_commands[0][0] == str(invocation)
+
+
+def test_run_command_rejects_empty_argv_before_subprocess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_subprocess(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("empty argv must be rejected before subprocess.run")
+
+    monkeypatch.setattr(installer.subprocess, "run", fail_subprocess)
+
+    with pytest.raises(RuntimeError, match="Command failed: empty command"):
+        installer.run_command([])
+
+
+def test_main_normalizes_python_executable_once_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    resolved_python = str(_write_executable(tmp_path / "bin" / "python-resolved"))
+    observed_resolution_inputs: list[str] = []
+    observed_preflight: dict[str, object] = {}
+
+    def fake_resolve(value: str) -> str:
+        observed_resolution_inputs.append(value)
+        return resolved_python
+
+    monkeypatch.setattr(installer, "resolve_python_executable", fake_resolve)
+    monkeypatch.setattr(
+        installer,
+        "resolve_private_proxy_settings",
+        lambda **_kwargs: (APPROVED_PROXY_URL, None),
+    )
+    monkeypatch.setattr(
+        installer,
+        "run_dependency_floor_preflight",
+        lambda **kwargs: observed_preflight.update(kwargs),
+    )
+
+    result = installer.main(["--python-executable", "python-alias", "--preflight-only"])
+
+    assert result == 0
+    assert observed_resolution_inputs == ["python-alias"]
+    assert observed_preflight["python_executable"] == resolved_python
+
+
+def test_main_fails_when_virtualenv_is_required(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("openai==2.29.0\n", encoding="utf-8")
+    constraints = tmp_path / "constraints.txt"
+    constraints.write_text("openai==2.29.0\n", encoding="utf-8")
+    monkeypatch.setattr(installer, "DEFAULT_REQUIREMENTS_FILE", requirements)
+    monkeypatch.setattr(installer, "DEFAULT_DEV_REQUIREMENTS_FILE", tmp_path / "missing-dev.txt")
+    monkeypatch.setattr(installer, "DEFAULT_TEST_REQUIREMENTS_FILE", tmp_path / "missing-test.txt")
+    monkeypatch.setattr(installer, "DEFAULT_CONSTRAINTS_FILE", constraints)
+    monkeypatch.setattr(installer, "is_virtualenv_python", lambda python_executable: False)
+    monkeypatch.setenv(installer.APPROVED_INDEX_ENV_VAR, APPROVED_PROXY_URL)
+
+    result = installer.main(
+        [
+            "--requirements-file",
+            str(requirements),
+            "--require-virtualenv",
+        ]
+    )
+
+    assert result == 1
+    assert (
+        "refusing to install packages with a non-virtualenv interpreter" in capsys.readouterr().out
+    )
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "clean",
+        "finding",
+        "mixed",
+        "empty-findings",
+        "missing-clean",
+        "extra-clean",
+        "bad-bytes",
+        "failure",
+        "timeout",
+        "launch",
+    ],
+)
+def test_collect_startup_hook_failure_lines_uses_guard_subprocess(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case: str
+) -> None:
+    secret = "private-installer-guard-canary"
+    for name in (
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "PYTHONPATH",
+        "PYTHONSTARTUP",
+        "PIP_INDEX_URL",
+        "HTTPS_PROXY",
+        "NODE_OPTIONS",
+        "LD_PRELOAD",
+        "DYLD_INSERT_LIBRARIES",
+    ):
+        monkeypatch.setenv(name, secret)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("PYTHONUSERBASE", "relative-userbase")
+    monkeypatch.setenv("PYTHONNOUSERSITE", "1")
+    guard = Path(installer.__file__).resolve().with_name("check_python_startup_hooks.py")
+    python = installer.resolve_python_executable(sys.executable)
+    clean = (
+        b"startup-hook-guard: no unexpected executable .pth files detected." + os.linesep.encode()
+    )
+
+    def fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        assert argv == [python, "-P", "-S", str(guard), "--python-executable", python]
+        assert kwargs["timeout"] == 60 and kwargs["stdin"] == kwargs["stderr"] == subprocess.DEVNULL
+        env = kwargs["env"]
+        assert env["HOME"] == str(tmp_path) and env["PYTHONUSERBASE"] == "relative-userbase"
+        assert env["PYTHONNOUSERSITE"] == "1" and secret not in env.values()
+        if case == "timeout":
+            raise subprocess.TimeoutExpired([secret], 60, output=secret, stderr=secret)
+        if case == "launch":
+            raise OSError(secret)
+        data = {
+            "clean": clean,
+            "finding": b"unexpected: " + secret.encode(),
+            "mixed": b"- /fixture.pth:1 :: import private\n" + secret.encode(),
+            "empty-findings": b"",
+            "missing-clean": b"",
+            "extra-clean": clean + secret.encode(),
+            "bad-bytes": b"\xff",
+            "failure": secret.encode(),
+        }[case]
+        code = (
+            1 if case in {"finding", "mixed", "empty-findings"} else 2 if case == "failure" else 0
+        )
+        return subprocess.CompletedProcess(argv, code, stdout=data, stderr=secret.encode())
+
+    monkeypatch.setattr(installer.subprocess, "run", fake_run)
+
+    def check() -> list[str]:
+        return installer.collect_startup_hook_failure_lines(
+            guard_script=guard, python_executable=python
+        )
+
+    if case == "clean":
+        assert check() == []
+    elif case in {"finding", "mixed", "empty-findings"}:
+        assert check() == [
+            "ERROR: startup-hook guard reported findings or an incomplete finding response."
+        ]
+    else:
+        with pytest.raises(RuntimeError) as failed:
+            check()
+        assert secret not in str(failed.value) + repr(failed.value.args)
+        assert failed.value.__cause__ is None and failed.value.__context__ is None
+
+
+def test_collect_startup_hook_failure_lines_uses_resolved_python_for_both_argv_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    target = _write_executable(tmp_path / "target" / "python-real")
+    invocation = tmp_path / "bin" / "python-link"
+    invocation.parent.mkdir(parents=True)
+    _symlink_or_skip(invocation, target)
+    (tmp_path / "check_python_startup_hooks.py").write_text("# custom fixture")
+    observed_commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        observed_commands.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(installer.subprocess, "run", fake_run)
+
+    assert (
+        installer.collect_startup_hook_failure_lines(
+            guard_script=tmp_path / "check_python_startup_hooks.py",
+            python_executable=str(invocation),
+        )
+        == []
+    )
+    assert observed_commands[0][0] == str(invocation)
+    assert observed_commands[0][-1] == str(invocation)
+
+
+def test_main_runs_download_install_and_static_guard_without_pip_self_upgrade(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("openai==2.29.0\n", encoding="utf-8")
+    wheelhouse_dir = tmp_path / "wheelhouse"
+    guard_script = tmp_path / "check_python_startup_hooks.py"
+    guard_script.write_text("# test guard\n", encoding="utf-8")
+    observed_commands: list[list[str]] = []
+    observed_guard_python: list[str] = []
+
+    @contextmanager
+    def fake_staging_environment(target_python: str) -> str:
+        assert target_python == "python"
+        yield "staging-python"
+
+    monkeypatch.setattr(
+        installer, "run_command", lambda command, **kwargs: observed_commands.append(list(command))
+    )
+    monkeypatch.setattr(
+        installer,
+        "collect_startup_hook_failure_lines",
+        lambda **kwargs: observed_guard_python.append(kwargs["python_executable"]) or [],
+    )
+    monkeypatch.setattr(installer, "staged_python_environment", fake_staging_environment)
+    monkeypatch.setenv(installer.APPROVED_INDEX_ENV_VAR, APPROVED_PROXY_URL)
+
+    result = installer.main(
+        [
+            "--python-executable",
+            "python",
+            "--requirements-file",
+            str(requirements),
+            "--wheelhouse-dir",
+            str(wheelhouse_dir),
+            "--guard-script",
+            str(guard_script),
+        ]
+    )
+
+    assert result == 0
+    download_command = observed_commands[0]
+    assert download_command[:4] == ["python", "-m", "pip", "download"]
+    assert "--only-binary" in download_command
+    assert ":all:" in download_command
+    assert "--dest" in download_command
+    assert str(wheelhouse_dir) in download_command
+    assert "--requirement" in download_command
+    assert str(requirements) in download_command
+    assert "--index-url" in download_command
+    assert APPROVED_PROXY_URL in download_command
+    _assert_uses_default_constraints(download_command)
+
+    staging_install_command = observed_commands[1]
+    assert staging_install_command[:4] == ["staging-python", "-m", "pip", "install"]
+    assert "--no-index" in staging_install_command
+    assert "--find-links" in staging_install_command
+    assert str(wheelhouse_dir) in staging_install_command
+    _assert_uses_default_constraints(staging_install_command)
+
+    install_command = observed_commands[2]
+    assert install_command[:4] == ["python", "-m", "pip", "install"]
+    assert "--no-index" in install_command
+    assert "--find-links" in install_command
+    assert str(wheelhouse_dir) in install_command
+    _assert_uses_default_constraints(install_command)
+    assert observed_guard_python == ["staging-python"]
+
+
+@pytest.mark.parametrize(
+    "explicit_spec,expected_spec",
+    [(None, "pip>=26.2.2,<27.0"), ("pip>=26.0,<27.0", "pip>=26.0,<27.0")],
+)
+def test_main_runs_optional_pip_upgrade_only_when_requested(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    explicit_spec: str | None,
+    expected_spec: str,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("openai==2.29.0\n", encoding="utf-8")
+    wheelhouse_dir = tmp_path / "wheelhouse"
+    observed_commands: list[list[str]] = []
+
+    @contextmanager
+    def fake_staging_environment(target_python: str) -> str:
+        yield "staging-python"
+
+    monkeypatch.setattr(
+        installer, "run_command", lambda command, **kwargs: observed_commands.append(list(command))
+    )
+    monkeypatch.setattr(installer, "collect_startup_hook_failure_lines", lambda **kwargs: [])
+    monkeypatch.setattr(installer, "staged_python_environment", fake_staging_environment)
+    monkeypatch.setenv(installer.APPROVED_INDEX_ENV_VAR, APPROVED_PROXY_URL)
+
+    result = installer.main(
+        [
+            "--python-executable",
+            "python",
+            "--requirements-file",
+            str(requirements),
+            "--wheelhouse-dir",
+            str(wheelhouse_dir),
+            "--upgrade-pip",
+            *([] if explicit_spec is None else ["--upgrade-pip-spec", explicit_spec]),
+        ]
+    )
+
+    assert result == 0
+    assert observed_commands[0] == [
+        "python",
+        "-m",
+        "pip",
+        "install",
+        "--no-cache-dir",
+        "--upgrade",
+        "--retries",
+        str(installer.PIP_NETWORK_RETRIES),
+        "--timeout",
+        str(installer.PIP_NETWORK_TIMEOUT_SECONDS),
+        "--only-binary",
+        ":all:",
+        "--index-url",
+        APPROVED_PROXY_URL,
+        expected_spec,
+    ]
+
+
+@pytest.mark.parametrize(
+    "explicit_spec,expected_spec",
+    [(None, "pip>=26.2.2,<27.0"), ("pip>=26.0,<27.0", "pip>=26.0,<27.0")],
+)
+def test_main_upgrade_pip_only_skips_requirements_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    explicit_spec: str | None,
+    expected_spec: str,
+) -> None:
+    missing_requirements = tmp_path / "missing-requirements.txt"
+    observed_calls: list[dict[str, object]] = []
+
+    def fake_upgrade_pip(python_executable: str, **kwargs: object) -> None:
+        kwargs["python_executable"] = python_executable
+        observed_calls.append(kwargs)
+
+    monkeypatch.setattr(installer, "upgrade_pip", fake_upgrade_pip)
+
+    result = installer.main(
+        [
+            "--python-executable",
+            "python",
+            "--requirements-file",
+            str(missing_requirements),
+            "--upgrade-pip-only",
+            *([] if explicit_spec is None else ["--upgrade-pip-spec", explicit_spec]),
+            "--index-url",
+            APPROVED_PROXY_URL,
+        ]
+    )
+
+    assert result == 0
+    assert observed_calls == [
+        {
+            "python_executable": "python",
+            "pip_spec": expected_spec,
+            "index_url": APPROVED_PROXY_URL,
+            "trusted_host": None,
+            "emergency_wheel_manifest": None,
+        }
+    ]
+
+
+def test_main_fails_when_static_startup_hook_scan_finds_malicious_pth(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("openai==2.29.0\n", encoding="utf-8")
+    wheelhouse_dir = tmp_path / "wheelhouse"
+    guard_script = tmp_path / "check_python_startup_hooks.py"
+    guard_script.write_text("# test guard\n", encoding="utf-8")
+    observed_commands: list[list[str]] = []
+
+    @contextmanager
+    def fake_staging_environment(target_python: str) -> str:
+        yield "staging-python"
+
+    monkeypatch.setattr(
+        installer, "run_command", lambda command, **kwargs: observed_commands.append(list(command))
+    )
+    monkeypatch.setattr(
+        installer,
+        "collect_startup_hook_failure_lines",
+        lambda **kwargs: [
+            "ERROR: startup-hook guard reported findings or an incomplete finding response.",
+        ],
+    )
+    monkeypatch.setattr(installer, "staged_python_environment", fake_staging_environment)
+    monkeypatch.setenv(installer.APPROVED_INDEX_ENV_VAR, APPROVED_PROXY_URL)
+
+    result = installer.main(
+        [
+            "--python-executable",
+            "python",
+            "--requirements-file",
+            str(requirements),
+            "--wheelhouse-dir",
+            str(wheelhouse_dir),
+            "--guard-script",
+            str(guard_script),
+        ]
+    )
+
+    assert result == 1
+    assert (
+        "startup-hook guard reported findings or an incomplete finding response"
+        in capsys.readouterr().out
+    )
+    assert observed_commands[0][:4] == ["python", "-m", "pip", "download"]
+    assert observed_commands[1][:4] == ["staging-python", "-m", "pip", "install"]
+    assert not any(
+        command[:4] == ["python", "-m", "pip", "install"] for command in observed_commands[2:]
+    )
+
+
+def test_main_reports_missing_requirements_file_cleanly(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    missing_requirements = tmp_path / "missing-requirements.txt"
+
+    result = installer.main(
+        [
+            "--requirements-file",
+            str(missing_requirements),
+            "--index-url",
+            APPROVED_PROXY_URL,
+        ]
+    )
+
+    assert result == 1
+    assert (
+        f"ERROR: locked install failed: Requirements file not found: {missing_requirements}"
+        in capsys.readouterr().out
+    )
+
+
+def test_main_reports_missing_constraints_file_cleanly(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("openai==2.29.0\n", encoding="utf-8")
+    missing_constraints = tmp_path / "missing-constraints.txt"
+
+    result = installer.main(
+        [
+            "--requirements-file",
+            str(requirements),
+            "--constraints-file",
+            str(missing_constraints),
+            "--index-url",
+            APPROVED_PROXY_URL,
+        ]
+    )
+
+    assert result == 1
+    assert (
+        f"ERROR: locked install failed: Constraints file not found: {missing_constraints}"
+        in capsys.readouterr().out
+    )
+
+
+def test_main_reports_guard_runtime_error_cleanly(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("openai==2.29.0\n", encoding="utf-8")
+    wheelhouse_dir = tmp_path / "wheelhouse"
+    guard_script = tmp_path / "missing-guard.py"
+
+    monkeypatch.setattr(installer, "run_command", lambda command, **kwargs: None)
+    monkeypatch.setattr(
+        installer,
+        "collect_startup_hook_failure_lines",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("guard subprocess failed")),
+    )
+    monkeypatch.setenv(installer.APPROVED_INDEX_ENV_VAR, APPROVED_PROXY_URL)
+
+    result = installer.main(
+        [
+            "--python-executable",
+            "python",
+            "--requirements-file",
+            str(requirements),
+            "--wheelhouse-dir",
+            str(wheelhouse_dir),
+            "--guard-script",
+            str(guard_script),
+        ]
+    )
+
+    assert result == 1
+    assert "ERROR: locked install failed: guard subprocess failed" in capsys.readouterr().out
+
+
+def test_main_runs_direct_proxy_install_and_static_guard(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("openai==2.29.0\n", encoding="utf-8")
+    guard_script = tmp_path / "check_python_startup_hooks.py"
+    guard_script.write_text("# test guard\n", encoding="utf-8")
+    observed_commands: list[list[str]] = []
+    observed_guard_python: list[str] = []
+
+    @contextmanager
+    def fake_staging_environment(target_python: str) -> str:
+        assert target_python == "python"
+        yield "staging-python"
+
+    monkeypatch.setattr(
+        installer, "run_command", lambda command, **kwargs: observed_commands.append(list(command))
+    )
+    monkeypatch.setattr(
+        installer,
+        "collect_startup_hook_failure_lines",
+        lambda **kwargs: observed_guard_python.append(kwargs["python_executable"]) or [],
+    )
+    monkeypatch.setattr(installer, "staged_python_environment", fake_staging_environment)
+    monkeypatch.setenv(installer.APPROVED_INDEX_ENV_VAR, APPROVED_PROXY_URL)
+
+    result = installer.main(
+        [
+            "--python-executable",
+            "python",
+            "--requirements-file",
+            str(requirements),
+            "--guard-script",
+            str(guard_script),
+            "--install-mode",
+            "direct-proxy",
+        ]
+    )
+
+    assert result == 0
+    assert len(observed_commands) == 2
+
+    staging_install_command = observed_commands[0]
+    assert staging_install_command[:4] == ["staging-python", "-m", "pip", "install"]
+    assert "--no-cache-dir" in staging_install_command
+    assert "--no-deps" in staging_install_command
+    assert "--index-url" in staging_install_command
+    assert APPROVED_PROXY_URL in staging_install_command
+    assert str(requirements) in staging_install_command
+    _assert_uses_default_constraints(staging_install_command)
+
+    install_command = observed_commands[1]
+    assert install_command[:4] == ["python", "-m", "pip", "install"]
+    assert "--no-cache-dir" in install_command
+    assert "--no-deps" in install_command
+    assert "--index-url" in install_command
+    assert APPROVED_PROXY_URL in install_command
+    assert str(requirements) in install_command
+    assert observed_guard_python == ["staging-python", "python"]
+
+
+def test_main_direct_proxy_mode_fails_when_target_guard_finds_startup_hook(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("openai==2.29.0\n", encoding="utf-8")
+    guard_script = tmp_path / "check_python_startup_hooks.py"
+    guard_script.write_text("# test guard\n", encoding="utf-8")
+    observed_commands: list[list[str]] = []
+    observed_guard_python: list[str] = []
+
+    @contextmanager
+    def fake_staging_environment(target_python: str) -> str:
+        yield "staging-python"
+
+    def fake_collect_startup_hook_failure_lines(**kwargs: object) -> list[str]:
+        python_executable = str(kwargs["python_executable"])
+        observed_guard_python.append(python_executable)
+        if python_executable == "python":
+            return [
+                "ERROR: startup-hook guard reported findings or an incomplete finding response.",
+            ]
+        return []
+
+    monkeypatch.setattr(
+        installer, "run_command", lambda command, **kwargs: observed_commands.append(list(command))
+    )
+    monkeypatch.setattr(
+        installer,
+        "collect_startup_hook_failure_lines",
+        fake_collect_startup_hook_failure_lines,
+    )
+    monkeypatch.setattr(installer, "staged_python_environment", fake_staging_environment)
+    monkeypatch.setenv(installer.APPROVED_INDEX_ENV_VAR, APPROVED_PROXY_URL)
+
+    result = installer.main(
+        [
+            "--python-executable",
+            "python",
+            "--requirements-file",
+            str(requirements),
+            "--guard-script",
+            str(guard_script),
+            "--install-mode",
+            "direct-proxy",
+        ]
+    )
+
+    assert result == 1
+    assert (
+        "startup-hook guard reported findings or an incomplete finding response"
+        in capsys.readouterr().out
+    )
+    assert len(observed_commands) == 2
+    assert observed_commands[0][:4] == ["staging-python", "-m", "pip", "install"]
+    assert observed_commands[1][:4] == ["python", "-m", "pip", "install"]
+    assert observed_guard_python == ["staging-python", "python"]
+
+
+def test_main_direct_proxy_docker_layer_cache_skips_no_cache_dir_on_target_only(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("openai==2.29.0\n", encoding="utf-8")
+    guard_script = tmp_path / "check_python_startup_hooks.py"
+    guard_script.write_text("# test guard\n", encoding="utf-8")
+    observed_commands: list[list[str]] = []
+
+    @contextmanager
+    def fake_staging_environment(target_python: str) -> str:
+        yield "staging-python"
+
+    monkeypatch.setattr(
+        installer, "run_command", lambda command, **kwargs: observed_commands.append(list(command))
+    )
+    monkeypatch.setattr(
+        installer,
+        "collect_startup_hook_failure_lines",
+        lambda **kwargs: [],
+    )
+    monkeypatch.setattr(installer, "staged_python_environment", fake_staging_environment)
+    monkeypatch.setenv(installer.APPROVED_INDEX_ENV_VAR, APPROVED_PROXY_URL)
+    monkeypatch.setenv(installer.DOCKER_PIP_LAYER_CACHE_ENV, "1")
+
+    result = installer.main(
+        [
+            "--python-executable",
+            "python",
+            "--requirements-file",
+            str(requirements),
+            "--guard-script",
+            str(guard_script),
+            "--install-mode",
+            "direct-proxy",
+        ]
+    )
+
+    assert result == 0
+    assert len(observed_commands) == 2
+    assert "--no-cache-dir" in observed_commands[0]
+    assert "--no-cache-dir" not in observed_commands[1]
+
+
+def test_main_direct_proxy_docker_single_pass_runs_one_target_install_and_guard(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("openai==2.29.0\n", encoding="utf-8")
+    guard_script = tmp_path / "check_python_startup_hooks.py"
+    guard_script.write_text("# test guard\n", encoding="utf-8")
+    observed_commands: list[list[str]] = []
+    observed_guard_python: list[str] = []
+
+    monkeypatch.setattr(
+        installer, "run_command", lambda command, **kwargs: observed_commands.append(list(command))
+    )
+    monkeypatch.setattr(
+        installer,
+        "collect_startup_hook_failure_lines",
+        lambda **kwargs: observed_guard_python.append(kwargs["python_executable"]) or [],
+    )
+    monkeypatch.setenv(installer.APPROVED_INDEX_ENV_VAR, APPROVED_PROXY_URL)
+    monkeypatch.setenv(installer.DOCKER_SINGLE_PASS_LOCKED_INSTALL_ENV, "1")
+    monkeypatch.setenv(installer.DOCKER_PIP_LAYER_CACHE_ENV, "1")
+
+    result = installer.main(
+        [
+            "--python-executable",
+            "python",
+            "--requirements-file",
+            str(requirements),
+            "--guard-script",
+            str(guard_script),
+            "--install-mode",
+            "direct-proxy",
+        ]
+    )
+
+    assert result == 0
+    assert len(observed_commands) == 1
+    assert observed_commands[0][:4] == ["python", "-m", "pip", "install"]
+    assert "--no-deps" in observed_commands[0]
+    assert "--no-cache-dir" not in observed_commands[0]
+    assert observed_guard_python == ["python"]
+
+
+def test_main_direct_proxy_docker_single_pass_rejects_multiple_requirement_files(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("openai==2.29.0\n", encoding="utf-8")
+    dev_requirements = tmp_path / "requirements-dev.txt"
+    dev_requirements.write_text("pytest\n", encoding="utf-8")
+    guard_script = tmp_path / "check_python_startup_hooks.py"
+    guard_script.write_text("# test guard\n", encoding="utf-8")
+
+    def _fail_run_command(_command: list[str]) -> None:
+        pytest.fail("run_command should not run when single-pass preflight rejects")
+
+    monkeypatch.setattr(installer, "run_command", _fail_run_command)
+    monkeypatch.setenv(installer.APPROVED_INDEX_ENV_VAR, APPROVED_PROXY_URL)
+    monkeypatch.setenv(installer.DOCKER_SINGLE_PASS_LOCKED_INSTALL_ENV, "1")
+
+    result = installer.main(
+        [
+            "--python-executable",
+            "python",
+            "--requirements-file",
+            str(requirements),
+            "--dev-requirements-file",
+            str(dev_requirements),
+            "--install-dev",
+            "--guard-script",
+            str(guard_script),
+            "--install-mode",
+            "direct-proxy",
+        ]
+    )
+
+    assert result == 1
+    assert "exactly one requirements file" in capsys.readouterr().err
+
+
+def test_main_direct_proxy_mode_stops_before_target_install_when_guard_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("openai==2.29.0\n", encoding="utf-8")
+    guard_script = tmp_path / "check_python_startup_hooks.py"
+    guard_script.write_text("# test guard\n", encoding="utf-8")
+    observed_commands: list[list[str]] = []
+
+    @contextmanager
+    def fake_staging_environment(target_python: str) -> str:
+        yield "staging-python"
+
+    monkeypatch.setattr(
+        installer, "run_command", lambda command, **kwargs: observed_commands.append(list(command))
+    )
+    monkeypatch.setattr(
+        installer,
+        "collect_startup_hook_failure_lines",
+        lambda **kwargs: [
+            "ERROR: startup-hook guard reported findings or an incomplete finding response.",
+        ],
+    )
+    monkeypatch.setattr(installer, "staged_python_environment", fake_staging_environment)
+    monkeypatch.setenv(installer.APPROVED_INDEX_ENV_VAR, APPROVED_PROXY_URL)
+
+    result = installer.main(
+        [
+            "--python-executable",
+            "python",
+            "--requirements-file",
+            str(requirements),
+            "--guard-script",
+            str(guard_script),
+            "--install-mode",
+            "direct-proxy",
+        ]
+    )
+
+    assert result == 1
+    assert (
+        "startup-hook guard reported findings or an incomplete finding response"
+        in capsys.readouterr().out
+    )
+    assert len(observed_commands) == 1
+    assert observed_commands[0][:4] == ["staging-python", "-m", "pip", "install"]
+
+
+def test_main_reports_missing_private_proxy_cleanly(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("openai==2.29.0\n", encoding="utf-8")
+
+    result = installer.main(["--requirements-file", str(requirements)])
+
+    assert result == 1
+    assert "Approved Python package proxy is required" in capsys.readouterr().out
+
+
+def test_main_rejects_mixing_explicit_profile_with_legacy_flags(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("openai==2.29.0\n", encoding="utf-8")
+
+    result = installer.main(
+        [
+            "--requirements-file",
+            str(requirements),
+            "--requirements-profile",
+            "runtime-test",
+            "--install-test",
+            "--index-url",
+            APPROVED_PROXY_URL,
+        ]
+    )
+
+    assert result == 1
+    assert "requirements-profile cannot be combined" in capsys.readouterr().out
+
+
+def test_run_dependency_floor_preflight_checks_each_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_checks: list[tuple[str, str, str, str | None]] = []
+    monkeypatch.setattr(
+        installer,
+        "load_dependency_security_floors",
+        lambda: {"cryptography": "46.0.7", "pillow": "12.2.0"},
+    )
+
+    def exact_version_present(
+        *,
+        index_url: str,
+        package: str,
+        version: str,
+        trusted_host: str | None,
+    ) -> bool:
+        observed_checks.append((index_url, package, version, trusted_host))
+        return True
+
+    monkeypatch.setattr(installer, "_private_index_project_has_version", exact_version_present)
+
+    installer.run_dependency_floor_preflight(
+        python_executable="python",
+        index_url=APPROVED_PROXY_URL,
+        trusted_host="packages.example.internal",
+        emergency_wheel_manifest=None,
+    )
+
+    assert observed_checks == [
+        (APPROVED_PROXY_URL, "cryptography", "46.0.7", "packages.example.internal"),
+        (APPROVED_PROXY_URL, "pillow", "12.2.0", "packages.example.internal"),
+    ]
+
+
+def test_run_dependency_floor_preflight_allows_exact_emergency_artifact(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / "emergency.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "expires_at": "2099-12-31",
+                "artifacts": [
+                    {
+                        "package": "cryptography",
+                        "version": "46.0.7",
+                        "filename": "cryptography-46.0.7.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/cryptography-46.0.7.whl",
+                        "sha256": "b" * 64,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        installer,
+        "load_dependency_security_floors",
+        lambda: {"cryptography": "46.0.7"},
+    )
+    monkeypatch.setattr(
+        installer,
+        "_download_with_sha256",
+        lambda **kwargs: Path(kwargs["destination"]).write_bytes(b"wheel-bytes"),
+    )
+
+    observed_checks: list[tuple[str, str, str, str | None]] = []
+
+    def exact_version_missing(
+        *,
+        index_url: str,
+        package: str,
+        version: str,
+        trusted_host: str | None,
+    ) -> bool:
+        observed_checks.append((index_url, package, version, trusted_host))
+        return False
+
+    monkeypatch.setattr(installer, "_private_index_project_has_version", exact_version_missing)
+
+    installer.run_dependency_floor_preflight(
+        python_executable=sys.executable,
+        index_url=APPROVED_PROXY_URL,
+        trusted_host=None,
+        emergency_wheel_manifest=manifest,
+    )
+
+    assert observed_checks == [(APPROVED_PROXY_URL, "cryptography", "46.0.7", None)]
+
+
+def test_run_dependency_floor_preflight_allows_exact_emergency_artifact_after_proxy_probe_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / "emergency.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "expires_at": "2099-12-31",
+                "artifacts": [
+                    {
+                        "package": "cryptography",
+                        "version": "46.0.7",
+                        "filename": "cryptography-46.0.7.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/cryptography-46.0.7.whl",
+                        "sha256": "b" * 64,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        installer,
+        "load_dependency_security_floors",
+        lambda: {"cryptography": "46.0.7"},
+    )
+    observed_downloads: list[tuple[str, str]] = []
+
+    def fail_version_check(
+        *,
+        index_url: str,
+        package: str,
+        version: str,
+        trusted_host: str | None,
+    ) -> bool:
+        assert (index_url, package, version, trusted_host) == (
+            APPROVED_PROXY_URL,
+            "cryptography",
+            "46.0.7",
+            None,
+        )
+        raise RuntimeError("proxy health check failed after retry budget")
+
+    def fake_download(*, url: str, destination: Path, expected_sha256: str) -> None:
+        observed_downloads.append((url, expected_sha256))
+        destination.write_bytes(b"wheel-bytes")
+
+    monkeypatch.setattr(installer, "_private_index_project_has_version", fail_version_check)
+    monkeypatch.setattr(installer, "_download_with_sha256", fake_download)
+
+    installer.run_dependency_floor_preflight(
+        python_executable=sys.executable,
+        index_url=APPROVED_PROXY_URL,
+        trusted_host=None,
+        emergency_wheel_manifest=manifest,
+    )
+
+    assert observed_downloads == [
+        ("https://files.pythonhosted.org/packages/example/cryptography-46.0.7.whl", "b" * 64)
+    ]
+
+
+def test_repo_starlette_floor_preflight_rejects_proxy_miss_with_retired_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        installer,
+        "load_dependency_security_floors",
+        lambda: {"starlette": "1.3.1"},
+    )
+    observed_downloads: list[tuple[str, str]] = []
+
+    def fail_version_check(
+        *,
+        index_url: str,
+        package: str,
+        version: str,
+        trusted_host: str | None,
+    ) -> bool:
+        assert (index_url, package, version, trusted_host) == (
+            APPROVED_PROXY_URL,
+            "starlette",
+            "1.3.1",
+            None,
+        )
+        raise RuntimeError("proxy health check failed after read timeout")
+
+    def fake_download(*, url: str, destination: Path, expected_sha256: str) -> None:
+        observed_downloads.append((url, expected_sha256))
+        destination.write_bytes(b"wheel-bytes")
+
+    monkeypatch.setattr(installer, "_private_index_project_has_version", fail_version_check)
+    monkeypatch.setattr(installer, "_download_with_sha256", fake_download)
+
+    with pytest.raises(
+        RuntimeError,
+        match=("Dependency floor preflight failed for approved proxy: " "starlette==1.3.1"),
+    ):
+        installer.run_dependency_floor_preflight(
+            python_executable="python",
+            index_url=APPROVED_PROXY_URL,
+            trusted_host=None,
+            emergency_wheel_manifest=_repo_emergency_manifest_path(),
+        )
+
+    assert observed_downloads == []
+
+
+def test_run_dependency_floor_preflight_rejects_resolver_miss_when_proxy_health_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / "emergency.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "expires_at": "2099-12-31",
+                "artifacts": [
+                    {
+                        "package": "cryptography",
+                        "version": "46.0.8",
+                        "filename": "cryptography-46.0.8.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/cryptography-46.0.8.whl",
+                        "sha256": "b" * 64,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    downloads = {"count": 0}
+    monkeypatch.setattr(
+        installer,
+        "load_dependency_security_floors",
+        lambda: {"cryptography": "46.0.7"},
+    )
+    monkeypatch.setattr(
+        installer,
+        "_download_with_sha256",
+        lambda **_kwargs: downloads.__setitem__("count", downloads["count"] + 1),
+    )
+
+    def fail_version_check(
+        *,
+        index_url: str,
+        package: str,
+        version: str,
+        trusted_host: str | None,
+    ) -> bool:
+        assert version == "46.0.7"
+        raise RuntimeError(f"proxy health check failed: {package}: {index_url}: {trusted_host}")
+
+    monkeypatch.setattr(installer, "_private_index_project_has_version", fail_version_check)
+
+    with pytest.raises(RuntimeError, match="proxy health check failed"):
+        installer.run_dependency_floor_preflight(
+            python_executable="python",
+            index_url=APPROVED_PROXY_URL,
+            trusted_host=None,
+            emergency_wheel_manifest=manifest,
+        )
+
+    assert downloads["count"] == 0
+
+
+def test_run_dependency_floor_preflight_rejects_missing_floor_without_emergency(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / "emergency.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "expires_at": "2099-12-31",
+                "artifacts": [
+                    {
+                        "package": "cryptography",
+                        "version": "46.0.8",
+                        "filename": "cryptography-46.0.8.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/cryptography-46.0.8.whl",
+                        "sha256": "b" * 64,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    downloads = {"count": 0}
+    monkeypatch.setattr(
+        installer,
+        "load_dependency_security_floors",
+        lambda: {"cryptography": "46.0.7"},
+    )
+    monkeypatch.setattr(installer, "_private_index_project_has_version", lambda **_kwargs: False)
+    monkeypatch.setattr(
+        installer,
+        "_download_with_sha256",
+        lambda **_kwargs: downloads.__setitem__("count", downloads["count"] + 1),
+    )
+
+    with pytest.raises(RuntimeError, match="exact version is not advertised"):
+        installer.run_dependency_floor_preflight(
+            python_executable="python",
+            index_url=APPROVED_PROXY_URL,
+            trusted_host=None,
+            emergency_wheel_manifest=manifest,
+        )
+
+    assert downloads["count"] == 0
+
+
+def test_run_dependency_floor_preflight_verifies_emergency_artifact_download(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / "emergency.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "expires_at": "2099-12-31",
+                "artifacts": [
+                    {
+                        "package": "cryptography",
+                        "version": "46.0.7",
+                        "filename": "cryptography-46.0.7.whl",
+                        "url": "https://files.pythonhosted.org/packages/example/cryptography-46.0.7.whl",
+                        "sha256": "b" * 64,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        installer,
+        "load_dependency_security_floors",
+        lambda: {"cryptography": "46.0.7"},
+    )
+    observed_downloads: list[tuple[str, str]] = []
+
+    def fake_download(*, url: str, destination: Path, expected_sha256: str) -> None:
+        observed_downloads.append((url, expected_sha256))
+        destination.write_bytes(b"wheel-bytes")
+
+    monkeypatch.setattr(installer, "_private_index_project_has_version", lambda **_kwargs: False)
+    monkeypatch.setattr(installer, "_download_with_sha256", fake_download)
+
+    installer.run_dependency_floor_preflight(
+        python_executable=sys.executable,
+        index_url=APPROVED_PROXY_URL,
+        trusted_host=None,
+        emergency_wheel_manifest=manifest,
+    )
+
+    assert observed_downloads == [
+        ("https://files.pythonhosted.org/packages/example/cryptography-46.0.7.whl", "b" * 64)
+    ]
+
+
+def test_main_preflight_only_skips_requirements_file_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    missing_requirements = tmp_path / "missing-requirements.txt"
+    preflight_called = {"count": 0}
+
+    def fake_preflight(**_kwargs: object) -> None:
+        preflight_called["count"] += 1
+
+    monkeypatch.setattr(installer, "run_dependency_floor_preflight", fake_preflight)
+
+    result = installer.main(
+        [
+            "--requirements-file",
+            str(missing_requirements),
+            "--index-url",
+            APPROVED_PROXY_URL,
+            "--preflight-only",
+        ]
+    )
+
+    assert result == 0
+    assert preflight_called["count"] == 1
+
+
+SYNTHETIC_MARKERS = ("PHASE0_SYNTH_USER", "PHASE0_SYNTH_PASSWORD", "PHASE0_SYNTH_EXCEPTION")
+
+
+class TestLockedPipNativeTransport:
+
+    def setup_method(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="native-case-")
+        self.home = Path(self.tmp.name)
+        self.env = pytest.MonkeyPatch()
+        for key, value in {
+            "HOME": str(self.home),
+            "NETRC": str(self.home / "absent"),
+            "HTTP_PROXY": "",
+            "HTTPS_PROXY": "",
+            "ALL_PROXY": "",
+            "NO_PROXY": "*",
+        }.items():
+            self.env.setenv(key, value)
+        self.original_send = installer._install_pip_transport_guard()
+        self.calls = []
+        self.sessions = []
+        self.statuses = []
+        self.headers = []
+        self.bodies = []
+        self.transport = None
+
+    def teardown_method(self) -> None:
+        for session in self.sessions:
+            session.close()
+        if self.transport is not None:
+            self.transport.stop()
+        HTTPAdapter.send = self.original_send
+        self.env.undo()
+        self.tmp.cleanup()
+
+    def session(self, *, trusted: Any = (), cache: Any = False, auth: Any = True) -> Any:
+        s = PipSession(trusted_hosts=trusted, cache=str(self.home / "cache") if cache else None)
+        self.sessions.append(s)
+        s.auth.prompting = False
+        s.auth.keyring_provider = "disabled"
+        if not auth:
+            s.trust_env = False
+        return s
+
+    def network(self) -> None:
+        if self.transport is not None:
+            self.transport.stop()
+        outer = self
+
+        def lower(pool: Any, method: Any, url: Any, **kwargs: Any) -> Any:
+            outer.calls.append(
+                {
+                    "scheme": pool.scheme,
+                    "host": pool.host,
+                    "port": pool.port,
+                    "authorization": any((k.lower() == "authorization" for k in kwargs["headers"])),
+                    "cert_reqs": pool.cert_reqs,
+                    "if_none_match": "If-None-Match" in kwargs["headers"],
+                }
+            )
+            status = outer.statuses.pop(0) if outer.statuses else 200
+            headers = outer.headers.pop(0) if outer.headers else {}
+            body = outer.bodies.pop(0) if outer.bodies else b"ok"
+            if status != 304:
+                headers.setdefault("Content-Length", str(len(body)))
+            wire = (
+                "HTTP/1.1 "
+                + str(status)
+                + " synthetic\r\n"
+                + "".join((str(k) + ": " + str(v) + "\r\n" for k, v in headers.items()))
+                + "\r\n"
+            ).encode() + body
+            socket = types.SimpleNamespace(makefile=lambda *args, **kwargs: io.BytesIO(wire))
+            response = http.client.HTTPResponse(socket)
+            response.begin()
+            return HTTPResponse(
+                body=response,
+                original_response=response,
+                status=status,
+                headers=headers,
+                preload_content=False,
+                decode_content=False,
+                request_method=method,
+                request_url=url,
+            )
+
+        self.transport = patch.object(HTTPConnectionPool, "urlopen", lower)
+        self.transport.start()
+
+    def netrc(self, *, filename: Any = ".netrc", default: Any = False) -> Any:
+        p = self.home / filename
+        p.write_text(
+            f"{('default' if default else 'machine redirect-target.example')} login {SYNTHETIC_MARKERS[0]} password {SYNTHETIC_MARKERS[1]}\n"
+        )
+        p.chmod(384)
+        self.env.delenv("NETRC", raising=False)
+        return p
+
+    def test_native_pip_redirect_status_source_matrix(self) -> None:
+        self.network()
+        for status in (301, 302, 303, 307, 308):
+            for filename in (".netrc", "_netrc"):
+                for default in (False, True):
+                    for f in (".netrc", "_netrc"):
+                        (self.home / f).unlink(missing_ok=True)
+                    self.netrc(filename=filename, default=default)
+                    self.calls.clear()
+                    self.statuses[:] = [status]
+                    self.headers[:] = [{"Location": "http://redirect-target.example/path"}]
+                    s = self.session()
+                    with pytest.raises(installer._PipTransportRejected):
+                        s.get("https://index-origin.example/simple")
+                    assert len(self.calls) == 1
+                    assert self.calls[0]["scheme"] == "https"
+
+    def test_native_pip_trusted_port_cache_and_verified_controls(self) -> None:
+        self.network()
+        for cache in (False, True):
+            for match in (True, False):
+                self.calls.clear()
+                self.netrc()
+                s = self.session(cache=cache, trusted=("redirect-target.example:9443",))
+                destination = f"https://redirect-target.example:{(9443 if match else 9444)}/pkg"
+                if match:
+                    with pytest.raises(installer._PipTransportRejected):
+                        s.get(destination)
+                    assert self.calls == []
+                else:
+                    assert s.get(destination).status_code == 200
+                    assert len(self.calls) == 1
+                    assert self.calls[0]["cert_reqs"] == "CERT_REQUIRED"
+
+    def test_native_pip_key_membership_and_verify_native_matrix(self) -> None:
+        self.network()
+        s = self.session(auth=False)
+        for key in ("Authorization", "authorization", "aUtHoRiZaTiOn"):
+            for value in ("", SYNTHETIC_MARKERS[1]):
+                for verify in (False, None, "", 1, object(), str(self.home / "missing")):
+                    request = Request(
+                        "GET", "https://secure.example/", headers={key: value}
+                    ).prepare()
+                    with pytest.raises(installer._PipTransportRejected):
+                        s.get_adapter(request.url).send(request, False, None, verify)
+                request = Request("GET", "http://unsafe.example/", headers={key: value}).prepare()
+                with pytest.raises(installer._PipTransportRejected):
+                    s.get_adapter(request.url).send(request)
+        assert self.calls == []
+        for verify in (True, certifi.where(), str(Path(certifi.where()).parent)):
+            request = Request(
+                "GET", "https://secure.example/", headers={"Authorization": ""}
+            ).prepare()
+            assert s.get_adapter(request.url).send(request, False, None, verify).status_code == 200
+            assert self.calls[-1]["cert_reqs"] == "CERT_REQUIRED"
+
+    def test_native_pip_source_removed_after_attachment(self) -> None:
+        self.network()
+        source = self.netrc(default=True)
+        s = self.session()
+        request = s.prepare_request(Request("GET", "http://redirect-target.example/"))
+        assert "Authorization" in request.headers
+        source.unlink()
+        with pytest.raises(installer._PipTransportRejected):
+            s.send(request)
+        assert self.calls == []
+
+    def test_native_pip_native_401_direct_adapter_retry(self) -> None:
+        self.network()
+        for unsafe in (False, True):
+            self.calls.clear()
+            self.netrc()
+            s = self.session(trusted=("redirect-target.example",) if unsafe else ())
+            s.auth.prompting = True
+            s.auth.index_urls = [
+                f"https://{SYNTHETIC_MARKERS[0]}:{SYNTHETIC_MARKERS[1]}@redirect-target.example/"
+            ]
+            request = Request("GET", "https://redirect-target.example/").prepare()
+            request.register_hook("response", s.auth.handle_401)
+            self.statuses[:] = [401, 200]
+            if unsafe:
+                with pytest.raises(installer._PipTransportRejected):
+                    s.send(request)
+                assert len(self.calls) == 1
+            else:
+                assert s.send(request).status_code == 200
+                assert len(self.calls) == 2
+                assert self.calls[-1]["authorization"]
+            (self.home / ".netrc").unlink()
+            prepared = s.prepare_request(Request("GET", "https://redirect-target.example/after"))
+            assert "Authorization" in prepared.headers
+            if unsafe:
+                with pytest.raises(installer._PipTransportRejected):
+                    s.send(prepared)
+            self.statuses.clear()
+
+    def test_native_pip_cache_miss_hit_revalidation_positional_and_redirect(self) -> None:
+        self.network()
+        s = self.session(cache=True, auth=False)
+        request = Request(
+            "GET", "https://cache.example/item", headers={"Authorization": "synthetic"}
+        ).prepare()
+        self.headers[:] = [
+            {
+                "Date": format_datetime(datetime.now(timezone.utc), usegmt=True),
+                "Cache-Control": "public, max-age=3600",
+                "ETag": '"first"',
+            }
+        ]
+        assert s.send(request).content == b"ok"
+        assert len(self.calls) == 1
+        assert s.send(request).content == b"ok"
+        assert len(self.calls) == 1
+        other = Request(
+            "GET", "https://cache.example/stale", headers={"Authorization": "synthetic"}
+        ).prepare()
+        self.headers[:] = [
+            {
+                "Date": "Thu, 01 Jan 1970 00:00:00 GMT",
+                "Cache-Control": "public, max-age=0",
+                "ETag": '"stale"',
+            }
+        ]
+        assert s.send(other).content == b"ok"
+        before = len(self.calls)
+        with pytest.raises(installer._PipTransportRejected):
+            s.get_adapter(other.url).send(other, False, None, False)
+        assert len(self.calls) == before
+        self.statuses[:] = [304]
+        self.headers[:] = [{"Date": format_datetime(datetime.now(timezone.utc), usegmt=True)}]
+        assert s.send(other).status_code == 200
+        assert self.calls[-1]["if_none_match"]
+        self.netrc(default=True)
+        redirect = self.session(cache=True)
+        self.statuses[:] = [301]
+        self.headers[:] = [
+            {
+                "Location": "http://redirect-target.example/",
+                "Date": format_datetime(datetime.now(timezone.utc), usegmt=True),
+                "Cache-Control": "public, max-age=3600",
+            }
+        ]
+        before = len(self.calls)
+        with pytest.raises(installer._PipTransportRejected):
+            redirect.get("https://cache.example/redirect")
+        assert len(self.calls) == before + 1
+        before = len(self.calls)
+        with pytest.raises(installer._PipTransportRejected):
+            redirect.get("https://cache.example/redirect")
+        assert len(self.calls) == before
+
+    def test_native_pip_secure_and_anonymous_redirect_controls(self) -> None:
+        self.network()
+        for destination, auth, expected in (
+            ("/relative", False, [False, False]),
+            ("https://redirect-target.example/", True, [True, True]),
+            ("https://other-secure.example/", False, [False, False]),
+            ("http://anonymous.example/", False, [False, False]),
+            ("https://anonymous.example:9443/", False, [False, False]),
+        ):
+            for f in (".netrc", "_netrc"):
+                (self.home / f).unlink(missing_ok=True)
+            if auth:
+                self.netrc(default=True)
+            self.calls.clear()
+            self.statuses[:] = [302, 200]
+            self.headers[:] = [{"Location": destination}, {}]
+            s = self.session(trusted=("anonymous.example:9443",), auth=auth)
+            assert s.get("https://index-origin.example/start").status_code == 200
+            assert [c["authorization"] for c in self.calls] == expected
+
+    def test_native_pip_header_value_never_read_by_guard(self) -> None:
+        self.network()
+        from pip._vendor.requests.structures import CaseInsensitiveDict
+
+        s = self.session(auth=False)
+        request = Request("GET", "http://unsafe.example/", headers={"Authorization": ""}).prepare()
+        with patch.object(
+            CaseInsensitiveDict, "__getitem__", side_effect=AssertionError("header value read")
+        ):
+            with pytest.raises(installer._PipTransportRejected):
+                s.send(request)
+        assert self.calls == []
+
+    def test_native_normal_command_wrapper_reports_controlled_transport_rejection(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The real normal pip wrapper returns ERROR without leaking a traceback."""
+        import logging
+        from pip._internal.cli import base_command, main as native_cli
+        from pip._internal.cli.status_codes import ERROR
+
+        self.network()
+        command = base_command.Command("synthetic", "Owned transport rejection")
+        options, args = command.parse_args([])
+        assert options.debug_mode is False
+
+        def rejected_run(_options: Any, _args: list[str]) -> int:
+            session = self.session(auth=False)
+            request = Request(
+                "GET",
+                "http://unsafe.example/",
+                headers={"Authorization": "PHASE0_SYNTH_PASSWORD"},
+            ).prepare()
+            try:
+                session.send(request)
+            except installer._PipTransportRejected:
+                raise
+            raise AssertionError("unsafe authenticated transport was accepted")
+
+        def normal_cli(argv: list[str]) -> int:
+            assert argv == ["--synthetic-cli"]
+            return command._run_wrapper(logging.INFO, options, args)
+
+        monkeypatch.setattr(command, "run", rejected_run)
+        monkeypatch.setattr(native_cli, "main", normal_cli)
+        with caplog.at_level(logging.INFO, logger=base_command.logger.name):
+            result = installer._run_owned_pip_child(["--synthetic-cli"])
+
+        assert result == ERROR == 1
+        assert self.calls == []
+        records = [record for record in caplog.records if record.name == base_command.logger.name]
+        assert [record.getMessage() for record in records] == [installer.PIP_TRANSPORT_ERROR]
+        assert all(record.exc_info is None for record in records)
+        assert "Traceback" not in caplog.text
+        assert not any(marker in caplog.text for marker in SYNTHETIC_MARKERS)
+
+    def test_native_pip_hostname_matcher_accepts_and_rejects(self) -> None:
+        """Exercise the native hostname matcher separately from adapter TLS settings."""
+        from pip._vendor.urllib3.util.ssl_match_hostname import CertificateError, match_hostname
+
+        peer = {"subjectAltName": (("DNS", "secure.example"),)}
+        match_hostname(peer, "secure.example")
+        with pytest.raises(CertificateError):
+            match_hostname(peer, "wrong.example")
+
+
+def test_owned_pip_child_worker_and_atexit_lifetime() -> None:
+    """Native adapters remain guarded after controlled CLI return or exception."""
+    child_source = dedent("""\
+        from __future__ import annotations
+        import atexit
+        import json
+        import sys
+        import threading
+        from unittest.mock import patch
+        from pip._vendor.requests import Request
+        from pip._vendor.urllib3.connectionpool import HTTPConnectionPool
+        from pip._internal.network.session import PipSession
+        from pip._internal.cli import main as native_cli
+
+        import scripts.ci.install_locked_python_requirements as installer
+        kind=sys.argv[1]
+        namespace=installer.main.__globals__
+        ready=threading.Event()
+        threads=[]
+        counts={'worker_blocked':0,'atexit_blocked':0,'lower':0,'cli_exception':0}
+
+        def lower(*args,**kwargs):
+            counts['lower']+=1
+            raise AssertionError('lower transport must never be entered')
+        HTTPConnectionPool.urlopen=lower
+
+        def send(label):
+            s=PipSession()
+            try:
+                req=Request('GET','http://unsafe.example/',headers={'Authorization':'PHASE0_SYNTH_PASSWORD'}).prepare()
+                try:s.get_adapter(req.url).send(req)
+                except namespace['_PipTransportRejected']:
+                    counts[label+'_blocked']+=1
+            finally:s.close()
+
+        def exit_callback():
+            send('atexit')
+            print('LIFETIME_RESULT '+json.dumps(counts,sort_keys=True),flush=True)
+
+        def worker():
+            assert ready.wait(10)
+            send('worker')
+
+        def fake_cli(args):
+            assert args==['--synthetic-cli']
+            t=threading.Thread(target=worker,daemon=False)
+            threads.append(t)
+            t.start()
+            atexit.register(exit_callback)
+            if kind=='exception':raise RuntimeError('PHASE0_SYNTH_EXCEPTION')
+            return 17
+        native_cli.main=fake_cli
+        try:
+            result=namespace['main']([namespace['PIP_CHILD_SELECTOR'],'--synthetic-cli'])
+        except RuntimeError:
+            counts['cli_exception']=1
+            result=18
+        ready.set()
+        for thread in threads:
+            thread.join(10)
+            assert not thread.is_alive()
+        assert counts['worker_blocked']==1 and counts['lower']==0
+        print('CLI_RESULT '+str(result),flush=True)
+        raise SystemExit(result)
+    """)
+    markers = (
+        *SYNTHETIC_MARKERS,
+        base64.b64encode(b"PHASE0_SYNTH_USER:PHASE0_SYNTH_PASSWORD").decode(),
+    )
+    for kind, expected in (("return", 17), ("exception", 18)):
+        result = subprocess.run(
+            [sys.executable, "-c", child_source, kind], capture_output=True, text=True, timeout=300
+        )
+        assert result.returncode == expected, result.stdout + result.stderr
+        line = next(
+            line for line in result.stdout.splitlines() if line.startswith("LIFETIME_RESULT ")
+        )
+        counts = json.loads(line.split(" ", 1)[1])
+        assert counts == {
+            "worker_blocked": 1,
+            "atexit_blocked": 1,
+            "lower": 0,
+            "cli_exception": int(kind == "exception"),
+        }
+        assert not any(marker in result.stdout + result.stderr for marker in markers)
+
+
+def test_owned_pip_launch_rewrites_once_and_preserves_tail(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every owned pip argv shares the child entry; unrelated Python argv stay intact."""
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(installer.subprocess, "run", fake_run)
+    script = str(Path(installer.__file__).resolve())
+    for tail in (
+        ["download", "--index-url", "https://index.example/simple"],
+        ["install", "--no-index"],
+        ["install", "--upgrade", "pip"],
+        ["install", "--upgrade", "--no-index", "pip"],
+        ["install", "local.whl"],
+    ):
+        original = [sys.executable, "-m", "pip", *tail]
+        installer.run_command(original)
+        assert calls[-1] == [sys.executable, script, installer.PIP_CHILD_SELECTOR, *tail]
+        assert original == [sys.executable, "-m", "pip", *tail]
+    for tail in (["-m", "venv", "owned-test-venv"], ["-c", "pass"]):
+        installer.run_command([sys.executable, *tail])
+        assert calls[-1] == [sys.executable, *tail]
+
+
+@pytest.mark.parametrize("error_type", [ImportError, ModuleNotFoundError])
+def test_owned_pip_child_import_failure_has_distinct_private_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    error_type: type[ImportError],
+) -> None:
+    """Missing child prerequisites expose neither synthetic credentials nor traceback."""
+
+    def missing_pip() -> object:
+        raise error_type(" ".join(SYNTHETIC_MARKERS))
+
+    monkeypatch.setattr(installer, "_install_pip_transport_guard", missing_pip)
+    assert installer._run_owned_pip_child(["install", "local.whl"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == installer.PIP_CHILD_IMPORT_ERROR + "\n"
+    assert installer.PIP_TRANSPORT_ERROR not in captured.err
+    assert "Traceback" not in captured.err
+    assert not any(marker in captured.err for marker in SYNTHETIC_MARKERS)
+
+
+@pytest.mark.parametrize("error_type", [ImportError, ModuleNotFoundError])
+def test_owned_pip_execution_import_failure_has_private_phase_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    error_type: type[ImportError],
+) -> None:
+    """Execution import errors stay private and distinct from setup or transport errors."""
+    from pip._internal.cli import main as native_cli
+
+    setup_calls: list[bool] = []
+    execution_calls: list[list[str]] = []
+    argv = ["install", "local.whl"]
+
+    def install_guard() -> None:
+        setup_calls.append(True)
+
+    def failed_execution(args: list[str]) -> int:
+        execution_calls.append(args)
+        raise error_type(" ".join(SYNTHETIC_MARKERS))
+
+    monkeypatch.setattr(installer, "_install_pip_transport_guard", install_guard)
+    monkeypatch.setattr(native_cli, "main", failed_execution)
+    assert installer._run_owned_pip_child(argv) == 1
+    assert setup_calls == [True]
+    assert execution_calls == [argv]
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == installer.PIP_EXECUTION_IMPORT_ERROR + "\n"
+    assert installer.PIP_CHILD_IMPORT_ERROR not in captured.err
+    assert installer.PIP_TRANSPORT_ERROR not in captured.err
+    assert "Traceback" not in captured.err
+    assert not any(marker in captured.err for marker in SYNTHETIC_MARKERS)
+
+
+def _select_sdk_test_loader(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    machine: str = "x86_64",
+    minor: int = 13,
+    system: str = "linux",
+    abi_overrides: dict[str, object] | None = None,
+) -> None:
+    """Synthetic loader identity tests recognition only, never actual source/ABI qualification."""
+    values: dict[str, object] = {
+        "Py_GIL_DISABLED": 0,
+        "SOABI": f"cpython-3{minor}-{machine}-linux-gnu",
+        "EXT_SUFFIX": f".cpython-3{minor}-{machine}-linux-gnu.so",
+    }
+    values.update(abi_overrides or {})
+    monkeypatch.setattr(
+        installer,
+        "sys",
+        types.SimpleNamespace(
+            platform=system,
+            version_info=(3, minor),
+            executable=sys.executable,
+            implementation=types.SimpleNamespace(name="cpython", cache_tag=f"cpython-3{minor}"),
+            abiflags="",
+        ),
+    )
+    monkeypatch.setattr(installer.platform, "machine", lambda: machine)
+    monkeypatch.setattr(installer.sysconfig, "get_config_var", values.get)
+
+
+@pytest.mark.parametrize(
+    "machine,minor,elf_machine,configure_target,source_image",
+    (
+        (
+            "x86_64",
+            11,
+            62,
+            "linux-x86_64",
+            "python@sha256:9fd630803ec3446920ed6b64d20150bd724c1751e71817293a4230522c1a384a",
+        ),
+        (
+            "x86_64",
+            12,
+            62,
+            "linux-x86_64",
+            "python@sha256:a594f7e9df8a4c431265125b5f5d90cd1b81c8a8797fefee69d5b3544be11111",
+        ),
+        (
+            "x86_64",
+            13,
+            62,
+            "linux-x86_64",
+            "python@sha256:7a6b87c02e1f4d6bb572e379235cbbdd7892add0572442c9b0b860a3f5aa9857",
+        ),
+        (
+            "aarch64",
+            13,
+            183,
+            "linux-aarch64",
+            "python@sha256:f0320b9bf735a4c4db05e7578e487cbed66c097e36b59a3864ca6d3e7c7dcea9",
+        ),
+    ),
+)
+def test_sdk_four_actual_loader_tuples_select_matching_source_and_abi(
+    monkeypatch: pytest.MonkeyPatch,
+    machine: str,
+    minor: int,
+    elf_machine: int,
+    configure_target: str,
+    source_image: str,
+) -> None:
+    _select_sdk_test_loader(monkeypatch, machine=machine, minor=minor)
+    target = installer._psycopg_sdk_target(source_image)
+    assert (target.machine, target.minor, target.elf_machine) == (machine, minor, elf_machine)
+    assert target.openssl_target == configure_target
+    assert target.python_tag == f"cp3{minor}"
+    assert target.wheel_platform == f"linux_{machine}"
+    assert target.soabi == f"cpython-3{minor}-{machine}-linux-gnu"
+
+
+@pytest.mark.parametrize(
+    "system,machine,minor",
+    (
+        ("darwin", "arm64", 13),
+        ("darwin", "x86_64", 13),
+        ("linux", "arm64", 13),
+        ("linux", "AMD64", 13),
+        ("linux", "armv8l", 13),
+        ("linux", "i686", 13),
+        ("linux", "aarch64", 11),
+        ("linux", "aarch64", 12),
+        ("linux", "aarch64", 14),
+        ("linux", "x86_64", 14),
+    ),
+)
+def test_sdk_unadmitted_tuple_rejects_before_source_read_mkdir_or_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    system: str,
+    machine: str,
+    minor: int,
+) -> None:
+    _select_sdk_test_loader(monkeypatch, machine=machine, minor=minor, system=system)
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError(
+            "Unsupported target must reject before source, pip, or backend effects"
+        )
+
+    for name in (
+        "_read_regular_input",
+        "inspect_locked_wheel",
+        "derive_psycopg_source",
+        "run_command",
+    ):
+        monkeypatch.setattr(installer, name, forbidden)
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("psycopg[c]==3.3.4\npsycopg-c==3.3.4\n")
+    constraints = tmp_path / "constraints.txt"
+    constraints.write_text("")
+    monkeypatch.setattr(installer, "run_dependency_floor_preflight", lambda **kwargs: None)
+    monkeypatch.setattr(
+        installer, "resolve_private_proxy_settings", lambda **kwargs: (APPROVED_PROXY_URL, None)
+    )
+    for name in ("read_psycopg_c_sdk", "upgrade_pip", "build_wheelhouse", "install_with_guard"):
+        # The read-path call below must still reach the real target recognizer.
+        if name != "read_psycopg_c_sdk":
+            monkeypatch.setattr(installer, name, forbidden)
+    wheelhouse = tmp_path / "uncreated-wheelhouse"
+    with pytest.raises(RuntimeError, match="four admitted Linux tuples"):
+        installer.acquire_locked_wheelhouse(
+            python_executable=sys.executable,
+            requirement_files=[requirements],
+            constraints_file=constraints,
+            wheelhouse=wheelhouse,
+            index_url=APPROVED_PROXY_URL,
+            trusted_host=None,
+            sdk=tmp_path / "unread-sdk",
+        )
+    assert (
+        installer.main(
+            [
+                "--python-executable",
+                sys.executable,
+                "--requirements-file",
+                str(requirements),
+                "--constraints-file",
+                str(constraints),
+                "--psycopg-sdk",
+                str(tmp_path / "unread-sdk"),
+                "--upgrade-pip",
+                "--prefetch-only",
+                "--wheelhouse-dir",
+                str(wheelhouse),
+            ]
+        )
+        == 1
+    )
+    assert "four admitted Linux tuples" in capsys.readouterr().out
+    assert not wheelhouse.exists()
+    output = tmp_path / "uncreated-sdk"
+    with pytest.raises(RuntimeError, match="four admitted Linux tuples"):
+        installer.build_psycopg_c_sdk(
+            source=tmp_path / "unread-source",
+            build_wheels=tmp_path / "unread-build-wheels",
+            native_root=tmp_path / "unread-native",
+            output=output,
+        )
+    with pytest.raises(RuntimeError, match="four admitted Linux tuples"):
+        installer.read_psycopg_c_sdk(tmp_path / "unread-sdk")
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {"Py_GIL_DISABLED": 1},
+        {"Py_GIL_DISABLED": False},
+        {"Py_GIL_DISABLED": "0"},
+        {"SOABI": "cpython-313-x86_64-linux-gnu"},
+        {"EXT_SUFFIX": ".cpython-313-aarch64-linux-gnu.debug.so"},
+    ),
+)
+def test_sdk_rejects_actual_loader_abi_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    overrides: dict[str, object],
+) -> None:
+    _select_sdk_test_loader(monkeypatch, machine="aarch64", abi_overrides=overrides)
+    with pytest.raises(RuntimeError, match="actual CPython ABI/source-image"):
+        installer._psycopg_sdk_target()
+
+
+@pytest.mark.parametrize("drift", ("pointer", "implementation", "cache-tag", "abiflags", "source"))
+def test_sdk_rejects_loader_or_source_identity_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    drift: str,
+) -> None:
+    _select_sdk_test_loader(monkeypatch)
+    source = None
+    if drift == "pointer":
+        monkeypatch.setattr(installer, "struct", types.SimpleNamespace(calcsize=lambda fmt: 4))
+    elif drift == "implementation":
+        installer.sys.implementation.name = "pypy"
+    elif drift == "cache-tag":
+        installer.sys.implementation.cache_tag = "cpython-313t"
+    elif drift == "abiflags":
+        installer.sys.abiflags = "t"
+    else:
+        source = "python@sha256:f0320b9bf735a4c4db05e7578e487cbed66c097e36b59a3864ca6d3e7c7dcea9"
+    with pytest.raises(RuntimeError, match="actual CPython ABI/source-image"):
+        installer._psycopg_sdk_target(source)
+
+
+def _synthetic_sdk_extension_wheel(
+    path: Path,
+    *,
+    machine: str,
+    minor: int,
+    elf_machine: int,
+    fault: str = "",
+) -> dict[str, str]:
+    """Minimal headers exercise static checks; these are never executable native proof."""
+    payload = bytearray(64)
+    payload[:7] = b"\x7fELF\x02\x01\x01"
+    struct.pack_into("<HHI", payload, 16, 3, elf_machine, 1)
+    struct.pack_into("<H", payload, 52, 64)
+    payload.extend(b"libpq.so.5\x00")
+    if fault == "class":
+        payload[4] = 1
+    elif fault == "endianness":
+        payload[5] = 2
+    elif fault == "machine":
+        struct.pack_into("<H", payload, 18, 183 if elf_machine == 62 else 62)
+    elif fault == "type":
+        struct.pack_into("<H", payload, 16, 2)
+    elif fault == "version":
+        struct.pack_into("<I", payload, 20, 0)
+    elif fault == "ehsize":
+        struct.pack_into("<H", payload, 52, 0)
+    elif fault == "libpq":
+        payload[64:] = b"another-library\x00"
+    soabi = f"cpython-3{minor}-{machine}-linux-gnu"
+    members = {f"psycopg_c/{name}.{soabi}.so": bytes(payload) for name in ("_psycopg", "pq")}
+    tag = f"cp3{minor}-cp3{minor}-linux_{machine}"
+    if fault == "tag":
+        tag = f"cp3{minor}-cp3{minor}-linux_other"
+    if fault == "name":
+        members["psycopg_c/unexpected.so"] = members.pop(f"psycopg_c/pq.{soabi}.so")
+    if fault == "missing":
+        members.pop(f"psycopg_c/pq.{soabi}.so")
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "psycopg_c-3.3.4.dist-info/WHEEL",
+            f"Wheel-Version: 1.0\nRoot-Is-Purelib: false\nTag: {tag}\n",
+        )
+        for name, data in members.items():
+            archive.writestr(name, data)
+    return {name: installer.hashlib.sha256(data).hexdigest() for name, data in members.items()}
+
+
+@pytest.mark.parametrize(
+    "machine,minor,elf_machine",
+    (("x86_64", 11, 62), ("x86_64", 12, 62), ("x86_64", 13, 62), ("aarch64", 13, 183)),
+)
+def test_sdk_static_extension_headers_match_each_selected_tuple(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    machine: str,
+    minor: int,
+    elf_machine: int,
+) -> None:
+    _select_sdk_test_loader(monkeypatch, machine=machine, minor=minor)
+    wheel = tmp_path / "synthetic.whl"
+    expected = _synthetic_sdk_extension_wheel(
+        wheel, machine=machine, minor=minor, elf_machine=elf_machine
+    )
+    assert installer._inspect_psycopg_c_extensions(wheel) == expected
+
+
+@pytest.mark.parametrize("machine,elf_machine", (("x86_64", 62), ("aarch64", 183)))
+@pytest.mark.parametrize(
+    "fault",
+    (
+        "class",
+        "endianness",
+        "machine",
+        "type",
+        "version",
+        "ehsize",
+        "libpq",
+        "tag",
+        "name",
+        "missing",
+    ),
+)
+def test_sdk_static_extension_rejects_cross_target_or_malformed_members(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    machine: str,
+    elf_machine: int,
+    fault: str,
+) -> None:
+    _select_sdk_test_loader(monkeypatch, machine=machine)
+    wheel = tmp_path / "synthetic.whl"
+    _synthetic_sdk_extension_wheel(
+        wheel, machine=machine, minor=13, elf_machine=elf_machine, fault=fault
+    )
+    with pytest.raises(RuntimeError):
+        installer._inspect_psycopg_c_extensions(wheel)
+
+
+def test_sdk_supported_tuple_universe_is_exact() -> None:
+    assert {(target.machine, target.minor) for target in installer.PSYCOPG_SDK_TARGETS} == {
+        ("x86_64", 11),
+        ("x86_64", 12),
+        ("x86_64", 13),
+        ("aarch64", 13),
+    }
+    assert len(installer.PSYCOPG_SDK_TARGETS) == 4
+
+
+@pytest.mark.parametrize("sdk_state", ("missing", "malformed"))
+def test_main_sdk_prerequisite_blocks_pip_upgrade_and_target_install(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    sdk_state: str,
+) -> None:
+    _select_sdk_test_loader(monkeypatch)
+    monkeypatch.delenv(installer.PSYCOPG_SDK_ENV, raising=False)
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("psycopg[c]==3.3.4\npsycopg-c==3.3.4\n")
+    constraints = tmp_path / "constraints.txt"
+    constraints.write_text("")
+    monkeypatch.setattr(
+        installer, "resolve_private_proxy_settings", lambda **kwargs: (APPROVED_PROXY_URL, None)
+    )
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError(
+            "SDK failure must precede pip upgrade, acquisition or target installation"
+        )
+
+    for name in (
+        "upgrade_pip",
+        "acquire_locked_wheelhouse",
+        "_validate_exact_wheelhouse",
+        "install_with_guard",
+        "install_with_guard_from_proxy",
+        "run_command",
+    ):
+        monkeypatch.setattr(installer, name, forbidden)
+    args = [
+        "--python-executable",
+        sys.executable,
+        "--requirements-file",
+        str(requirements),
+        "--constraints-file",
+        str(constraints),
+        "--upgrade-pip",
+    ]
+    if sdk_state == "malformed":
+        sdk = tmp_path / "sdk"
+        sdk.mkdir()
+        (sdk / "psycopg-c-sdk.json").write_text('{"unexpected": true}\n')
+        args.extend(("--psycopg-sdk", str(sdk)))
+    assert installer.main(args) == 1
+    message = capsys.readouterr().out
+    assert (
+        "requires its genuine matching" if sdk_state == "missing" else "SDK fields differ"
+    ) in message
+
+
+@pytest.mark.parametrize(
+    "modifier",
+    [
+        ["--prefetch-only"],
+        ["--consume-only"],
+        ["--build-psycopg-c"],
+        ["--upgrade-pip"],
+        ["--python-executable", "python"],
+        ["--install-mode", "wheelhouse"],
+        ["--index-url", "https://synthetic.invalid/simple/"],
+        ["--trusted-host", "synthetic.invalid"],
+        ["--upgrade-pip-spec", "pip"],
+        ["--require-virtualenv"],
+        ["--requirements-profile", "runtime"],
+    ],
+)
+def test_sdk_static_validation_rejects_explicit_modifiers_before_effects(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, modifier: list[str]
+) -> None:
+    def forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("Validation selector rejected too late")
+
+    for name in (
+        "resolve_python_executable",
+        "resolve_private_proxy_settings",
+        "read_psycopg_c_sdk",
+        "acquire_locked_wheelhouse",
+        "install_with_guard",
+        "build_psycopg_c_sdk",
+    ):
+        monkeypatch.setattr(installer, name, forbidden)
+    assert (
+        installer.main(
+            [
+                "--validate-psycopg-sdk",
+                "--psycopg-sdk",
+                str(tmp_path / "sdk"),
+                "--psycopg-native-root",
+                str(tmp_path / "native"),
+                *modifier,
+            ]
+        )
+        == 1
+    )
+    assert not (tmp_path / "sdk").exists() and not (tmp_path / "native").exists()
+
+
+def test_sdk_static_validation_selector_is_not_abbreviated() -> None:
+    with pytest.raises(SystemExit) as error:
+        installer.parse_args(["--validate-psycopg-s"])
+    assert error.value.code == 2
+
+
+def test_sdk_static_validation_uses_canonical_reader_without_install_or_resolver(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fresh_home = tmp_path / "fresh-home"
+    fresh_home.mkdir(mode=0o700)
+    monkeypatch.setenv("HOME", str(fresh_home))
+    for name in (
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "NETRC",
+        "PULSEPLATE_PYTHON_NETRC",
+        "PULSEPLATE_PYTHON_INDEX_URL",
+        "PULSEPLATE_PYTHON_TRUSTED_HOST",
+        "DEVPI_CI_USER",
+        "DEVPI_CI_PASSWORD",
+        "PIP_INDEX_URL",
+        "PIP_EXTRA_INDEX_URL",
+        "UV_INDEX_URL",
+        "UV_EXTRA_INDEX_URL",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "PIP_PROXY",
+        "LD_LIBRARY_PATH",
+        "LD_PRELOAD",
+        "LD_AUDIT",
+        "OPENSSL_CONF",
+        "OPENSSL_MODULES",
+        installer.PSYCOPG_SDK_ENV,
+        "PIP_CONFIG_FILE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    calls: list[object] = []
+    monkeypatch.setattr(installer, "_psycopg_sdk_target", lambda: calls.append("tuple"))
+    monkeypatch.setattr(
+        installer, "_assert_backend_network_isolated", lambda: calls.append("kernel")
+    )
+    monkeypatch.setattr(
+        installer,
+        "read_psycopg_c_sdk",
+        lambda path, *, native_root: calls.append((path, native_root)),
+    )
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("Static validation cannot resolve, install or acquire")
+
+    for name in (
+        "resolve_python_executable",
+        "resolve_private_proxy_settings",
+        "acquire_locked_wheelhouse",
+        "install_with_guard",
+        "build_psycopg_c_sdk",
+        "run_command",
+    ):
+        monkeypatch.setattr(installer, name, forbidden)
+    sdk, native = tmp_path / "sdk", tmp_path / "native"
+    assert (
+        installer.main(
+            [
+                "--validate-psycopg-sdk",
+                "--psycopg-sdk",
+                str(sdk),
+                "--psycopg-native-root",
+                str(native),
+            ]
+        )
+        == 0
+    )
+    assert calls == ["tuple", "kernel", (sdk, native)]
+    assert not sdk.exists() and not native.exists()
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/synthetic/untrusted")
+    calls.clear()
+    assert (
+        installer.main(
+            [
+                "--validate-psycopg-sdk",
+                "--psycopg-sdk",
+                str(sdk),
+                "--psycopg-native-root",
+                str(native),
+            ]
+        )
+        == 1
+    )
+    assert calls == []
+    monkeypatch.delenv("LD_LIBRARY_PATH")
+    (fresh_home / ".docker").mkdir()
+    capsys.readouterr()
+    assert (
+        installer.main(
+            [
+                "--validate-psycopg-sdk",
+                "--psycopg-sdk",
+                str(sdk),
+                "--psycopg-native-root",
+                str(native),
+            ]
+        )
+        == 1
+    )
+    assert calls == []
+    assert "Static SDK validation HOME contains acquisition carriers." in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "fault", ["none", "bytes", "alias", "leaf-link", "multilink", "oversize", "missing"]
+)
+def test_sdk_native_hash_check_is_static_and_preserves_exact_soname_rule(
+    tmp_path: Path, fault: str
+) -> None:
+    root = tmp_path / "native"
+    directory = root / "usr/local/lib"
+    directory.mkdir(parents=True)
+    payloads = {
+        "libpq.so.5": b"inert libpq fixture",
+        "libssl.so.3": b"inert ssl fixture",
+        "libcrypto.so.3": b"inert crypto fixture",
+    }
+    for name, data in payloads.items():
+        (directory / ("libpq.so.5.18" if name == "libpq.so.5" else name)).write_bytes(data)
+    (directory / "libpq.so.5").symlink_to("libpq.so.5.18")
+    expected = {name: installer.hashlib.sha256(data).hexdigest() for name, data in payloads.items()}
+    if fault == "bytes":
+        (directory / "libssl.so.3").write_bytes(b"altered")
+    elif fault == "alias":
+        (directory / "libpq.so.5").unlink()
+        (directory / "libpq.so.5").symlink_to("../libpq.so.5.18")
+    elif fault == "leaf-link":
+        (directory / "libssl.so.3").unlink()
+        (directory / "libssl.so.3").symlink_to(directory / "libcrypto.so.3")
+    elif fault == "multilink":
+        (directory / "extra").hardlink_to(directory / "libcrypto.so.3")
+    elif fault == "oversize":
+        (directory / "libssl.so.3").write_bytes(b"x" * (16 * 1024**2 + 1))
+    elif fault == "missing":
+        (directory / "libcrypto.so.3").unlink()
+    if fault == "none":
+        assert installer._check_psycopg_native_libraries(root, expected) is None
+    else:
+        with pytest.raises((RuntimeError, OSError)):
+            installer._check_psycopg_native_libraries(root, expected)
+
+
+@pytest.fixture
+def future_black_profile_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A later Black patch keeps current non-Black contracts and unchanged source floors."""
+    filenames = (
+        "constraints.txt",
+        "requirements-all.txt",
+        "requirements-dev.in",
+        "requirements-dev.txt",
+        "requirements-lock.txt",
+        "requirements-test.in",
+        "requirements-ci-lite.in",
+        "requirements-test.txt",
+        "requirements-ci-lite.txt",
+        "requirements.txt",
+        "requirements-docker-runtime.txt",
+        "scripts/ci/emergency_python_wheels.json",
+    )
+    for filename in filenames:
+        destination = tmp_path / filename
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes((REPO_ROOT / filename).read_bytes())
+    for filename in ("requirements-dev.txt", "requirements-lock.txt"):
+        path = tmp_path / filename
+        text, count = re.subn(r"(?m)^black==[^\s]+$", "black==26.10.2", path.read_text())
+        assert count == 1
+        path.write_text(text, encoding="utf-8")
+    for filename in ("requirements-dev.in", "constraints.txt", "requirements-all.txt"):
+        path = tmp_path / filename
+        operator = "~=" if filename == "requirements-dev.in" else ">="
+        text, count = re.subn(r"(?mi)^black[^\n]*$", f"black{operator}26.10.1", path.read_text())
+        assert count == 1
+        path.write_text(text, encoding="utf-8")
+    monkeypatch.setattr(f"{__name__}.REPO_ROOT", tmp_path)
+    return tmp_path
+
+
+@pytest.mark.parametrize(
+    "consumer",
+    (
+        test_repo_quality_tooling_profile_matches_dependabot_replacement_contract,
+        test_repo_ds3_test_quality_inputs_locks_and_emergency_manifest_align,
+    ),
+)
+def test_black_installer_consumers_allow_later_safe_patch(
+    future_black_profile_repo: Path, consumer: Callable[[], None]
+) -> None:
+    consumer()
+
+
+@pytest.mark.parametrize(
+    "consumer",
+    (
+        test_repo_quality_tooling_profile_matches_dependabot_replacement_contract,
+        test_repo_ds3_test_quality_inputs_locks_and_emergency_manifest_align,
+    ),
+)
+def test_black_installer_consumers_reject_any_emergency_version(
+    future_black_profile_repo: Path, monkeypatch: pytest.MonkeyPatch, consumer: Callable[[], None]
+) -> None:
+    monkeypatch.setattr(
+        f"{__name__}._repo_active_emergency_artifacts",
+        lambda: [{"package": "black", "version": "9999.0.0"}],
+    )
+    with pytest.raises(AssertionError):
+        consumer()
+
+
+@pytest.mark.parametrize("mutation", ("mismatch", "duplicate", "source-excludes"))
+def test_black_installer_profile_rejects_ambiguous_or_incompatible_inputs(
+    future_black_profile_repo: Path, mutation: str
+) -> None:
+    if mutation == "mismatch":
+        path = future_black_profile_repo / "requirements-lock.txt"
+        path.write_text(path.read_text().replace("black==26.10.2", "black==26.10.3"))
+    elif mutation == "duplicate":
+        path = future_black_profile_repo / "requirements-dev.txt"
+        path.write_text(path.read_text() + "Black==26.10.2\n")
+    else:
+        path = future_black_profile_repo / "requirements-dev.in"
+        path.write_text(path.read_text().replace("black~=26.10.1", "black~=26.11.0"))
+    with pytest.raises(AssertionError):
+        _assert_black_install_profile(future_black_profile_repo)
+
+
+@pytest.mark.parametrize("route", ["upgrade", "wheelhouse", "direct"])
+def test_installer_process_timeout_is_terminal_before_emergency_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str
+) -> None:
+    requirement = tmp_path / "requirements.txt"
+    requirement.write_text("mako==1.4.2\n")
+    calls = []
+
+    def timeout(argv: list[str], **kwargs: object) -> None:
+        assert kwargs.get("timeout") == (300 if route == "upgrade" else None)
+        calls.append(kwargs.get("timeout"))
+        raise subprocess.TimeoutExpired(
+            ["synthetic-private"],
+            1,
+            output="Could not find a version that satisfies the requirement mako==1.4.2",
+            stderr="No matching distribution found for mako==1.4.2",
+        )
+
+    monkeypatch.setattr(installer.subprocess, "run", timeout)
+    for name in (
+        "emergency_artifacts_requested_by_surfaces",
+        "_pip_upgrade_resolver_miss",
+        "_require_private_index_project_health",
+        "_stage_emergency_artifacts",
+    ):
+        monkeypatch.setattr(
+            installer, name, lambda *a, **kw: pytest.fail("fallback reached after timeout")
+        )
+    common = dict(
+        python_executable=sys.executable,
+        index_url=APPROVED_PROXY_URL,
+        trusted_host=None,
+        emergency_wheel_manifest=tmp_path / "emergency.json",
+    )
+    with pytest.raises(RuntimeError, match="^Installer subprocess timed out$"):
+        if route == "upgrade":
+            installer.upgrade_pip(pip_spec="pip>=26,<27", **common)
+        elif route == "wheelhouse":
+            installer.build_wheelhouse_with_emergency_fallback(
+                requirement_files=[requirement],
+                constraints_file=None,
+                wheelhouse_dir=tmp_path / "wheels",
+                **common,
+            )
+        else:
+            installer.install_from_proxy_with_emergency_fallback(
+                requirement_files=[requirement],
+                constraints_file=None,
+                emergency_wheelhouse_dir=tmp_path / "emergency",
+                **common,
+            )
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("certificate", ["wheel-host", "valid"])
+def test_emergency_wheel_real_tls_keeps_fixed_hostname(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    project_page_tls_material: dict[str, Path],
+    certificate: str,
+) -> None:
+    material = project_page_tls_material
+    monkeypatch.setenv("SSL_CERT_FILE", str(material["ca"]))
+    dest = tmp_path / "f.whl"
+    path = "/packages/fixture/f.whl"
+    url = "https://files.pythonhosted.org" + path
+    body = b'<a href="mako-1.4.2-py3-none-any.whl">mako wheel</a>'
+    digest = installer.hashlib.sha256(body).hexdigest()
+    original_connect = installer.socket.create_connection
+    with _project_page_tls_server(material[certificate], material["key"]) as (port, seen):
+
+        def loopback(address: tuple[str, int], *args: Any, **kwargs: Any) -> Any:
+            assert address == ("files.pythonhosted.org", 443)
+            return original_connect(("127.0.0.1", port), *args, **kwargs)
+
+        monkeypatch.setattr(installer.socket, "create_connection", loopback)
+        if certificate == "wheel-host":
+            installer._download_with_sha256(url=url, destination=dest, expected_sha256=digest)
+            assert seen == [path] and dest.read_bytes() == body
+        else:
+            with pytest.raises(ssl.SSLCertVerificationError):
+                installer._download_with_sha256(url=url, destination=dest, expected_sha256=digest)
+            assert not seen and not dest.exists()
+
+
+@pytest.mark.parametrize("operation,expected", [("tags", 30), ("venv", 30), ("guard", 60)])
+def test_interpreter_probe_timeout_is_terminal_and_sanitized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str, expected: int
+) -> None:
+    observed = []
+    for key in tuple(os.environ):
+        if key.startswith("PYTHON") or key == "__PYVENV_LAUNCHER__":
+            monkeypatch.delenv(key)
+
+    def timed_out(argv: list[str], **kwargs: Any) -> None:
+        observed.append(kwargs["timeout"])
+        raise subprocess.TimeoutExpired(
+            ["synthetic-private"], expected, output="No matching distribution found"
+        )
+
+    monkeypatch.setattr(installer.subprocess, "run", timed_out)
+    (tmp_path / "guard").write_text("# fixture")
+    with pytest.raises(RuntimeError, match="^Installer interpreter check timed out$") as failed:
+        if operation == "tags":
+            installer._target_python_wheel_tag_payload(sys.executable)
+        elif operation == "venv":
+            installer.is_virtualenv_python(sys.executable)
+        else:
+            installer.collect_startup_hook_failure_lines(
+                guard_script=tmp_path / "guard", python_executable=sys.executable
+            )
+    assert len(observed) == 1 and 0 < observed[0] <= expected
+    assert "synthetic-private" not in str(failed.value)
+
+
+def test_emergency_transfer_absolute_clock_interrupts_stalled_headers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class StalledConnection:
+        sock = types.SimpleNamespace(settimeout=lambda remaining: None)
+
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def request(self, method: str, path: str) -> None:
+            assert method == "GET"
+
+        def getresponse(self) -> None:
+            installer.time.sleep(2)
+            pytest.fail("stalled header read exceeded the absolute timer")
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(installer, "EMERGENCY_WHEEL_OPERATION_SECONDS", 0.15)
+    monkeypatch.setattr(installer.http.client, "HTTPSConnection", StalledConnection)
+    wheelhouse = tmp_path / "wheels"
+    with pytest.raises(RuntimeError, match="Emergency wheel operation timed out"):
+        installer._download_with_sha256(
+            url="https://files.pythonhosted.org/packages/f.whl",
+            destination=wheelhouse / "f.whl",
+            expected_sha256="a" * 64,
+        )
+    assert list(wheelhouse.iterdir()) == []
+
+
+def test_emergency_artifact_refuses_nested_alias_without_creating_external_file(
+    tmp_path: Path,
+) -> None:
+    external = tmp_path / "external"
+    external.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(external, target_is_directory=True)
+    with pytest.raises(OSError):
+        installer._cached_emergency_sha256(alias / "new" / "f.whl")
+    assert list(external.iterdir()) == []
+
+
+def test_emergency_cache_rejects_leaf_replaced_between_chunks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    leaf = tmp_path / "f.whl"
+    leaf.write_bytes(b"original")
+    replacement = tmp_path / "replacement"
+    replacement.write_bytes(b"original")
+    original_remaining = installer._wheel_remaining
+    observed = 0
+
+    def remaining(deadline: float) -> float:
+        nonlocal observed
+        value = original_remaining(deadline)
+        observed += 1
+        if observed == 2:
+            replacement.replace(leaf)
+        return value
+
+    monkeypatch.setattr(installer, "_wheel_remaining", remaining)
+    with pytest.raises(RuntimeError, match="Cached emergency wheel changed during read"):
+        installer._cached_emergency_sha256(leaf)
+
+
+def test_staging_venv_creation_has_sdk_equivalent_bound_and_cleans_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths: list[Path] = []
+
+    def timed_out(command: list[str], *, timeout: int) -> None:
+        assert command[:3] == [sys.executable, "-m", "venv"] and timeout == 120
+        paths.append(Path(command[3]))
+        raise installer._InstallProcessTimeout("Installer subprocess timed out")
+
+    monkeypatch.setattr(installer, "run_command", timed_out)
+    with pytest.raises(RuntimeError, match="Installer subprocess timed out"):
+        with installer.staged_python_environment(sys.executable):
+            pytest.fail("timed-out staging environment must not become an install target")
+    assert len(paths) == 1 and not paths[0].exists()
+
+
+@pytest.mark.parametrize("parent", ["/tmp", None])
+def test_emergency_cache_accepts_real_platform_tmpdir(parent: str | None) -> None:
+    with tempfile.TemporaryDirectory(prefix="wheel-cache-control-", dir=parent) as work:
+        leaf = Path(work) / "f.whl"
+        leaf.write_bytes(b"fixture")
+        assert (
+            installer._cached_emergency_sha256(leaf)
+            == installer.hashlib.sha256(b"fixture").hexdigest()
+        )
+
+
+@pytest.mark.parametrize(
+    "fault", ["pip", "isolated-pip", "nonpip", "signal", "timeout", "launch", "decode", "resolve"]
+)
+def test_run_command_exposes_only_completed_pip_evidence_to_private_classifiers(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], fault: str
+) -> None:
+    secret = "private-process-diagnostic-canary"
+    miss = "No matching distribution found for pip==26.2.2"
+
+    def resolve(_name: str) -> str:
+        if fault == "resolve":
+            raise RuntimeError(secret)
+        return sys.executable
+
+    def child(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        assert secret in argv
+        if fault == "timeout":
+            raise subprocess.TimeoutExpired([secret], 5, output=miss, stderr=secret)
+        if fault == "launch":
+            raise PermissionError(secret)
+        if fault == "decode":
+            raise UnicodeDecodeError("utf-8", secret.encode(), 0, 1, secret)
+        return subprocess.CompletedProcess(
+            argv, -15 if fault == "signal" else 7, stdout=secret, stderr=miss + "\n" + secret
+        )
+
+    monkeypatch.setattr(installer, "resolve_python_executable", resolve)
+    monkeypatch.setattr(installer.subprocess, "run", child)
+    argv = [sys.executable]
+    if fault == "isolated-pip":
+        argv.append("-I")
+    argv.extend(["-m", "venv" if fault == "nonpip" else "pip", secret])
+    with pytest.raises(RuntimeError) as failed:
+        installer.run_command(argv, timeout=5)
+    exc = failed.value
+    eligible = fault in ("pip", "isolated-pip")
+    assert isinstance(exc, installer._CompletedPipFailure) is eligible
+    assert installer._pip_upgrade_resolver_miss(exc) is eligible
+    assert installer._resolver_miss_error(exc, package="pip", version="26.2.2") is eligible
+    assert secret not in str(exc) + repr(exc) + repr(exc.args)
+    assert miss not in str(exc) and exc.__cause__ is None and exc.__context__ is None
+    assert not getattr(exc, "__notes__", ())
+    assert capsys.readouterr() == ("", "")
+
+
+@pytest.mark.parametrize("route", ["upgrade", "wheelhouse", "direct"])
+def test_generic_resolver_text_never_acquires_emergency_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str
+) -> None:
+    marker = "No matching distribution found for pip==26.2.2"
+
+    def fail(*args: object, **kwargs: object) -> None:
+        raise RuntimeError(marker)
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        pytest.fail("generic exception acquired emergency inputs")
+
+    monkeypatch.setattr(installer, "run_command", fail)
+    monkeypatch.setattr(installer, "build_wheelhouse", fail)
+    monkeypatch.setattr(installer, "install_from_proxy", fail)
+    for name in (
+        "_require_private_index_project_health",
+        "emergency_artifacts_requested_by_surfaces",
+        "_stage_emergency_artifacts",
+        "_stage_pip_upgrade_emergency_wheel",
+    ):
+        monkeypatch.setattr(installer, name, forbidden)
+    common = dict(
+        python_executable=sys.executable,
+        index_url=APPROVED_PROXY_URL,
+        trusted_host=None,
+        emergency_wheel_manifest=tmp_path / "manifest.json",
+    )
+    with pytest.raises(RuntimeError, match="No matching distribution"):
+        if route == "upgrade":
+            installer.upgrade_pip(pip_spec="pip>=26,<27", **common)
+        elif route == "wheelhouse":
+            installer.build_wheelhouse_with_emergency_fallback(
+                requirement_files=[],
+                constraints_file=None,
+                wheelhouse_dir=tmp_path / "wheels",
+                **common,
+            )
+        else:
+            installer.install_from_proxy_with_emergency_fallback(
+                requirement_files=[],
+                constraints_file=None,
+                emergency_wheelhouse_dir=tmp_path / "wheels",
+                **common,
+            )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        [],
+        {},
+        {"prefix": 1, "base_prefix": 2},
+        {"prefix": "/v"},
+        {"prefix": "relative", "base_prefix": "/base"},
+        {"prefix": "/v", "base_prefix": ""},
+        {"prefix": "/v\x00hidden", "base_prefix": "/base"},
+    ],
+)
+def test_virtualenv_probe_rejects_malformed_prefix_envelope(
+    monkeypatch: pytest.MonkeyPatch, payload: object
+) -> None:
+    monkeypatch.setattr(
+        installer.subprocess,
+        "run",
+        lambda argv, **kwargs: subprocess.CompletedProcess(
+            argv, 0, stdout=json.dumps(payload), stderr=""
+        ),
+    )
+    with pytest.raises(
+        RuntimeError, match="^Unable to probe virtualenv state: invalid prefix metadata$"
+    ):
+        installer.is_virtualenv_python(sys.executable)
+
+
+@pytest.mark.parametrize("miss", [False, True])
+def test_completed_pip_failure_cli_and_admitted_recovery_keep_output_private(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], miss: bool
+) -> None:
+    secret = "standalone-secret-from-pip-output"
+    attempts = []
+    actions = []
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert installer.PIP_CHILD_SELECTOR in argv
+        attempts.append(kwargs["timeout"])
+        if "--no-index" in argv:
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        diagnostic = "No matching distribution found for pip==26.2.2" if miss else "package error"
+        return subprocess.CompletedProcess(
+            argv, 9, stdout=secret, stderr=diagnostic + "\n" + secret
+        )
+
+    def stage(**kwargs: object) -> Path:
+        actions.append("stage")
+        return tmp_path / "synthetic.whl"
+
+    monkeypatch.setattr(installer.subprocess, "run", run)
+    monkeypatch.setattr(
+        installer, "resolve_private_proxy_settings", lambda **kwargs: (APPROVED_PROXY_URL, None)
+    )
+    monkeypatch.setattr(
+        installer,
+        "_require_private_index_project_health",
+        lambda **kwargs: actions.append("health"),
+    )
+    monkeypatch.setattr(installer, "_stage_pip_upgrade_emergency_wheel", stage)
+    status = installer.main(["--index-url", APPROVED_PROXY_URL, "--upgrade-pip-only"])
+    assert status == (0 if miss else 1)
+    assert attempts == ([300, 120] if miss else [300])
+    assert actions == (["health", "stage"] if miss else [])
+    output = capsys.readouterr()
+    assert secret not in output.out + output.err
+    if not miss:
+        assert "Command failed: pip exited with status 9" in output.out
+
+
+@pytest.mark.parametrize(
+    "delta,framing",
+    [
+        (-1, "declared"),
+        (0, "declared"),
+        (1, "declared"),
+        (0, "none"),
+        (1, "none"),
+        (0, "chunked"),
+        (1, "chunked"),
+        (1, "lying-small"),
+        (-1, "conflicting"),
+        (1, "chunked-with-length"),
+        (-1, "duplicate-length"),
+    ],
+)
+def test_emergency_wheel_16_mib_wire_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, delta: int, framing: str
+) -> None:
+    cap = installer.MAX_EMERGENCY_WHEEL_BYTES
+    assert cap == 16 * 1024**2
+    payload = b"x" * (cap + delta)
+    # Even a correct digest cannot authorize the extra byte.
+    expected = installer.hashlib.sha256(payload).hexdigest()
+    destination = tmp_path / "test.whl"
+    rejected = delta > 0 or framing in {"conflicting", "duplicate-length"}
+    if rejected:
+        destination.write_bytes(b"prior destination")
+    reads = []
+
+    class Response(io.BytesIO):
+        status = 200
+        chunked = framing in {"chunked", "conflicting", "chunked-with-length"}
+
+        def getheader(self, name: str) -> str | None:
+            assert name == "Content-Length"
+            if framing in {"none", "chunked"}:
+                return None
+            if framing == "duplicate-length":
+                return "12, 12"
+            return str(cap if framing == "lying-small" else len(payload))
+
+        def isclosed(self) -> bool:
+            return False
+
+        def read1(self, size: int = -1) -> bytes:
+            remaining = cap - self.tell()
+            assert size == min(1024**2, remaining + 1)
+            reads.append(size)
+            return super().read1(size)
+
+    class Connection:
+        sock = types.SimpleNamespace(settimeout=lambda _remaining: None)
+
+        def __init__(self, host: str, *, timeout: float) -> None:
+            assert host == "files.pythonhosted.org" and 0 < timeout <= 60
+
+        def request(self, method: str, path: str) -> None:
+            assert (method, path) == ("GET", "/packages/test.whl")
+
+        def getresponse(self) -> Response:
+            return Response(payload)
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(installer.http.client, "HTTPSConnection", Connection)
+
+    def acquire() -> None:
+        installer._download_with_sha256(
+            url="https://files.pythonhosted.org/packages/test.whl",
+            destination=destination,
+            expected_sha256=expected,
+        )
+
+    if rejected:
+        reason = (
+            "Ambiguous"
+            if framing == "conflicting"
+            else "Invalid" if framing == "duplicate-length" else "exceeds byte limit"
+        )
+        with pytest.raises(RuntimeError, match=reason):
+            acquire()
+        assert destination.read_bytes() == b"prior destination"
+        if framing in {"declared", "conflicting", "chunked-with-length", "duplicate-length"}:
+            assert reads == []
+        else:
+            assert reads[-1] == 1
+    else:
+        acquire()
+        assert destination.stat().st_size == len(payload)
+        assert installer._cached_emergency_sha256(destination) == expected
+        if delta == 0:
+            assert reads[-1] == 1
+    assert list(tmp_path.iterdir()) == [destination]
+
+
+@pytest.mark.parametrize("delta", [-1, 0, 1])
+def test_emergency_wheel_cache_limit_uses_real_descriptor_before_hashing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, delta: int
+) -> None:
+    cap = installer.MAX_EMERGENCY_WHEEL_BYTES
+    leaf = tmp_path / "test.whl"
+    payload = b"c" * (cap + delta)
+    leaf.write_bytes(payload)
+    if delta > 0:
+        monkeypatch.setattr(
+            installer.os, "fdopen", lambda *_a, **_kw: pytest.fail("oversized cache read")
+        )
+        with pytest.raises(RuntimeError, match="Cached emergency wheel exceeds byte limit"):
+            installer._cached_emergency_sha256(leaf)
+    else:
+        assert (
+            installer._cached_emergency_sha256(leaf)
+            == installer.hashlib.sha256(payload).hexdigest()
+        )
+    assert leaf.stat().st_size == len(payload)
+
+
+def test_emergency_cache_growing_past_limit_is_rejected_midstream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    leaf = tmp_path / "test.whl"
+    with leaf.open("wb") as stream:
+        stream.truncate(installer.MAX_EMERGENCY_WHEEL_BYTES)
+    fdopen = os.fdopen
+
+    def grow(fd: int, *args: Any, **kwargs: Any) -> Any:
+        with leaf.open("ab") as stream:
+            stream.write(b"!")
+        return fdopen(fd, *args, **kwargs)
+
+    monkeypatch.setattr(installer.os, "fdopen", grow)
+    with pytest.raises(RuntimeError, match="Cached emergency wheel exceeds byte limit"):
+        installer._cached_emergency_sha256(leaf)
+    assert leaf.stat().st_size == installer.MAX_EMERGENCY_WHEEL_BYTES + 1
+
+
+@pytest.mark.parametrize("layout", ["flat", "tooling", "standalone-custom"])
+def test_real_outer_guard_uses_copied_layout_and_preserves_custom_sibling_imports(
+    tmp_path: Path, layout: str
+) -> None:
+    import venv
+
+    copied = (
+        tmp_path
+        / {
+            "flat": "pulseplate-ci",
+            "tooling": "tooling/scripts/ci",
+            "standalone-custom": "standalone/scripts/ci",
+        }[layout]
+    )
+    copied.mkdir(parents=True)
+    installer_path = Path(installer.__file__).resolve()
+    (copied / installer_path.name).write_bytes(installer_path.read_bytes())
+    guard = copied / "check_python_startup_hooks.py"
+    custom = layout == "standalone-custom"
+    marker = tmp_path / "startup-marker"
+    if custom:
+        custom_root = tmp_path / "explicit-custom"
+        custom_root.mkdir()
+        guard = custom_root / "guard.py"
+        (custom_root / "report_support.py").write_text("def outcome(): return 0\n")
+        guard.write_text(
+            "import os, sys\nfrom report_support import outcome\n"
+            "assert len(sys.argv) == 3 and sys.argv[1] == '--python-executable'\n"
+            "assert sys.executable == sys.argv[2] and sys.flags.no_site\n"
+            "assert os.environ['PYTHONUSERBASE'] == 'relative-userbase'\n"
+            "assert os.environ.get('GH_TOKEN') is None\nraise SystemExit(outcome())\n"
+        )
+    else:
+        guard.write_bytes(installer_path.with_name(guard.name).read_bytes())
+
+    env_root = tmp_path / "venv"
+    venv.EnvBuilder(with_pip=False, symlinks=True).create(env_root)
+    python = env_root / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    hostile = tmp_path / "imports"
+    hostile.mkdir()
+    (hostile / "json.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('hostile import')\nraise SystemExit(76)\n"
+    )
+    clean = {
+        "PATH": os.defpath,
+        "LC_ALL": "C",
+        "HOME": str(tmp_path),
+        "PYTHONUSERBASE": "relative-userbase",
+        "PYTHONNOUSERSITE": "1",
+    }
+    positive = subprocess.run(
+        [str(python), "-P", "-S", "-c", "import json"],
+        cwd=copied,
+        env={**clean, "PYTHONPATH": str(hostile)},
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    assert positive.returncode == 76 and marker.read_text() == "hostile import"
+    marker.unlink()
+    driver = (
+        "import json,os,sys\nfrom pathlib import Path\nimport install_locked_python_requirements as target\n"
+        "os.environ.update(PYTHONPATH=sys.argv[3], GH_TOKEN='synthetic-private', HTTPS_PROXY='synthetic-private')\n"
+        "print(json.dumps(target.collect_startup_hook_failure_lines(guard_script=Path(sys.argv[1]),python_executable=sys.argv[2])))"
+    )
+
+    def inspect() -> list[str]:
+        result = subprocess.run(
+            [sys.executable, "-S", "-c", driver, str(guard), str(python), str(hostile)],
+            cwd=copied,
+            env=clean,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=75,
+            check=True,
+        )
+        assert "synthetic-private" not in result.stdout + result.stderr
+        return json.loads(result.stdout)
+
+    assert inspect() == [] and not marker.exists()
+    if custom:
+        guard.write_text("import sys\nprint('synthetic-private',file=sys.stderr)\nsys.exit(1)\n")
+    else:
+        site = (
+            env_root / "Lib/site-packages"
+            if os.name == "nt"
+            else next((env_root / "lib").glob("python*/site-packages"))
+        )
+        (site / "synthetic-private.pth").write_text(
+            f"import pathlib; pathlib.Path({str(marker)!r}).write_text('executed hook')\n"
+        )
+    assert inspect() == [
+        "ERROR: startup-hook guard reported findings or an incomplete finding response."
+    ]
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("kind", ["missing", "directory", "stock-symlink", "retargeted-custom"])
+def test_outer_guard_unavailable_or_changed_input_never_launches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    locator = tmp_path / "installer.py"
+    locator.write_text("# selected installer placement")
+    monkeypatch.setattr(installer, "__file__", str(locator))
+    guard = tmp_path / "check_python_startup_hooks.py"
+    other = tmp_path / "synthetic-secret"
+    other.write_text("raise SystemExit(0)")
+    if kind == "directory":
+        guard.mkdir()
+    elif kind == "stock-symlink":
+        guard.symlink_to(other)
+    elif kind == "retargeted-custom":
+        guard = tmp_path / "chosen.py"
+        first = tmp_path / "first.py"
+        first.write_text("# original")
+        guard.symlink_to(first)
+        original_resolve = Path.resolve
+        observations = []
+
+        def resolve(path: Path, *args: object, **kwargs: Any) -> Path:
+            if path == guard:
+                observations.append(path)
+                if len(observations) == 2:
+                    guard.unlink()
+                    guard.symlink_to(other)
+            return original_resolve(path, **kwargs)
+
+        monkeypatch.setattr(Path, "resolve", resolve)
+    monkeypatch.setattr(
+        installer.subprocess, "run", lambda *a, **kw: pytest.fail("unexpected guard launch")
+    )
+    with pytest.raises(RuntimeError) as failure:
+        installer.collect_startup_hook_failure_lines(
+            guard_script=guard, python_executable=sys.executable
+        )
+    assert str(tmp_path) not in str(failure.value) and "synthetic-secret" not in str(failure.value)
+
+
+def test_empty_selection_validates_requested_python_without_loading_tags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        installer,
+        "_supported_wheel_tags_for_python",
+        lambda *_: pytest.fail("empty selection queried wheel tags"),
+    )
+    assert (
+        installer._filter_runtime_compatible_artifacts([], python_executable=sys.executable) == []
+    )
+    with pytest.raises(RuntimeError, match="Python executable"):
+        installer._filter_runtime_compatible_artifacts(
+            [], python_executable=str(tmp_path / "missing")
+        )
+    with pytest.raises(RuntimeError, match="No active emergency pip artifact"):
+        installer._select_pip_emergency_artifact(manifest_path=None, pip_spec="pip>=24")
+
+
+@pytest.mark.parametrize("system_sites", [False, True])
+def test_prefix_probe_uses_selected_venv_without_activating_startup_hooks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, system_sites: bool
+) -> None:
+    import venv
+
+    env_root = tmp_path / "target"
+    venv.EnvBuilder(with_pip=False, symlinks=True, system_site_packages=system_sites).create(
+        env_root
+    )
+    python = env_root / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    (site_dir,) = [path for path in env_root.rglob("site-packages") if path.is_dir()]
+    marker = tmp_path / "startup"
+    (site_dir / "proof.pth").write_text(f"import pathlib; pathlib.Path({str(marker)!r}).touch()\n")
+    subprocess.run(
+        [str(python), "-I", "-c", "pass"],
+        check=True,
+        timeout=10,
+        env=installer._isolated_probe_environment(),
+    )
+    assert marker.is_file()
+    marker.unlink()
+    monkeypatch.setenv("PYTHONPATH", str(site_dir))
+    assert installer.is_virtualenv_python(str(python))
+    assert not marker.exists()
+    assert not installer.is_virtualenv_python(sys._base_executable)
+
+
+def test_clean_target_uses_metadata_only_for_actual_absence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import venv
+
+    root = tmp_path / "clean"
+    venv.EnvBuilder(with_pip=False, symlinks=True).create(root)
+    python = root / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    monkeypatch.chdir(tmp_path)
+    for key in tuple(os.environ):
+        if key.startswith("PYTHON") or key == "__PYVENV_LAUNCHER__":
+            monkeypatch.delenv(key)
+    payload = installer._target_python_wheel_tag_payload(str(python))
+    assert payload["tags"] is None
+    assert "py3-none-any" in installer._supported_wheel_tags_for_python(str(python))
+    (site_dir,) = [path for path in root.rglob("site-packages") if path.is_dir()]
+    (site_dir / "packaging").mkdir()
+    (site_dir / "packaging" / "__init__.py").write_text("raise ImportError('synthetic-private')\n")
+    with pytest.raises(RuntimeError, match="independent provider qualification"):
+        installer._supported_wheel_tags_for_python(str(python))
+
+
+def test_virtualenv_probe_rejects_another_invocation_on_same_binary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    alias = tmp_path / "other-venv-python"
+    alias.symlink_to(sys.executable)
+    monkeypatch.setattr(
+        installer.subprocess,
+        "run",
+        lambda argv, **kwargs: subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=json.dumps(
+                {"executable": sys.executable, "prefix": "/venv", "base_prefix": "/base"}
+            ),
+        ),
+    )
+    with pytest.raises(RuntimeError, match="invalid prefix metadata"):
+        installer.is_virtualenv_python(str(alias))
+
+
+@pytest.mark.parametrize("tags", [[], [""], ["not a tag"], False, 0])
+def test_invalid_present_provider_tags_never_enter_metadata_fallback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tags: object
+) -> None:
+    monkeypatch.setattr(
+        installer, "_target_python_wheel_tag_payload", lambda selected: {"tags": tags}
+    )
+    target = _write_executable(tmp_path / "target-python")
+    with pytest.raises(RuntimeError, match="Invalid wheel-tag probe payload"):
+        installer._supported_wheel_tags_for_python(str(target))
+
+
+@pytest.mark.parametrize("surface", ["provider", "pth", "sitecustomize", "pythonpath"])
+def test_external_tag_target_rejects_unqualified_provider_or_startup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, surface: str
+) -> None:
+    import venv
+
+    target = tmp_path / "target"
+    venv.EnvBuilder(with_pip=False, symlinks=True).create(target)
+    python = target / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    (site_dir,) = [p for p in target.rglob("site-packages") if p.is_dir()]
+    marker = tmp_path / "executed"
+    code = f"import pathlib; pathlib.Path({str(marker)!r}).touch()\n"
+    monkeypatch.chdir(tmp_path)
+    for key in tuple(os.environ):
+        if key.startswith("PYTHON") or key == "__PYVENV_LAUNCHER__":
+            monkeypatch.delenv(key)
+    assert "py3-none-any" in installer._supported_wheel_tags_for_python(str(python))
+    error = "External wheel-tag target requires independent provider qualification"
+    if surface == "provider":
+        package = site_dir / "packaging"
+        package.mkdir()
+        (package / "__init__.py").write_text(code, encoding="utf-8")
+    elif surface == "pth":
+        (site_dir / "controlled.pth").write_text(code, encoding="utf-8")
+    elif surface == "sitecustomize":
+        (site_dir / "sitecustomize.py").write_text(code, encoding="utf-8")
+    else:
+        monkeypatch.setenv("PYTHONPATH", str(site_dir))
+        error = "External wheel-tag target requires a qualified import environment"
+    with pytest.raises(RuntimeError, match=f"^{error}$"):
+        installer._supported_wheel_tags_for_python(str(python))
+    assert not marker.exists()

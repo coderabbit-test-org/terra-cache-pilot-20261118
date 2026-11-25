@@ -1,0 +1,3680 @@
+"""Tests for deterministic coordinator task bootstrap packets."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import shutil
+import subprocess
+import uuid
+from pathlib import Path
+from typing import cast
+
+import pytest
+
+import scripts.orchestration.task_bootstrap as task_bootstrap_module
+import scripts.orchestration.qoder_dispatch_bridge as qoder_dispatch_bridge
+from core.evidence.fingerprints import fingerprint_payload
+from core.judgment import (
+    CLAIM_EVIDENCE_FIELDS,
+    CLAIM_TYPES,
+    EVIDENCE_MODES,
+    JUDGMENT_FLOW,
+    PROMOTION_LABELS,
+    SUPPORT_STATUSES,
+    UNCERTAINTY_FIELDS,
+)
+from scripts.orchestration.bootstrap_sync_policy import (
+    INVARIANT_CHANGE_CLASSES,
+    matches_any_prefix,
+    resolve_analysis_envelope_mode,
+)
+from scripts.orchestration.context_pack import compute_task_packet_id, repo_relative_paths
+from scripts.orchestration.context_pack_compression import _ROLE_FINGERPRINT_RE
+from scripts.orchestration.design_lane_contract import canonicalize_design_blockers
+from scripts.orchestration.context_pack import REPO_ROOT, normalize_repo_path
+from scripts.orchestration.agent_learning_loop import build_agent_learning_record
+from scripts.orchestration.creative_spec_learning_rollup_contract import (
+    HINTS_ARTIFACT_TYPE,
+    POLICY_VERSION as CREATIVE_LEARNING_POLICY_VERSION,
+    ROLLUP_ARTIFACT_TYPE,
+    SCHEMA_VERSION as CREATIVE_LEARNING_SCHEMA_VERSION,
+    build_coordinator_advisory_hints,
+    default_rollup_authority,
+    validate_creative_spec_learning_rollup,
+    _set_identity as set_creative_learning_identity,
+)
+from scripts.orchestration.routing_graph_loader import (
+    BootstrapLaneActivation,
+    REQUIRED_BOOTSTRAP_LANE,
+)
+from scripts.orchestration.render_codex_start_prompt import (
+    render_packet_prompt,
+    render_recipe_prompt,
+)
+from scripts.orchestration.shadow_reuse_telemetry import SHADOW_REUSE_FIELD
+from scripts.orchestration.skill_router import RESEARCH_POLICY_BUCKET_APPROVED
+from scripts.orchestration.task_bootstrap import (
+    REQUESTED_AGENT_STATUS_ADVISORY_DOMAIN_MISMATCH,
+    REQUESTED_AGENT_STATUS_ADVISORY_NON_ROUTABLE,
+    REQUESTED_AGENT_STATUS_HONORED_PRIMARY,
+    REQUESTED_AGENT_STATUS_PROMOTED,
+    REQUESTED_AGENT_STATUS_REJECTED_UNKNOWN,
+    _apply_pr_lifecycle_review_path,
+    _normalize_secondary_review_path,
+    _resolve_output_path,
+    build_task_packet,
+    main,
+)
+
+FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "orchestration"
+
+
+def _valid_creative_learning_hints() -> dict[str, object]:
+    record = build_agent_learning_record(
+        source="creative_spec_finalize:finalize-test:selected:variant-test",
+        pattern="Selected creative specification variant passed skeptic review.",
+        severity="low",
+        affected_surfaces=["scripts/orchestration/task_bootstrap.py"],
+        root_cause="Skeptic-review coverage created a reusable specification pattern.",
+        required_oracle="deterministic_content_oracle",
+        promotion_target="docs/orchestration/AGENT_LEARNING_LOOP.md",
+        pattern_kind="successful_iteration",
+    )
+    rollup: dict[str, object] = {
+        "schema_version": CREATIVE_LEARNING_SCHEMA_VERSION,
+        "artifact_type": ROLLUP_ARTIFACT_TYPE,
+        "policy_version": CREATIVE_LEARNING_POLICY_VERSION,
+        "rollup_id": "pending",
+        "idempotency_key": "pending",
+        "source": {
+            "bridge_metrics_id": "metrics-test",
+            "bridge_metrics_fingerprint": "sha256:" + ("1" * 64),
+            "bridge_id": "bridge-test",
+            "skeptic_attachment_id": "attachment-test",
+            "skeptic_attachment_fingerprint": "sha256:" + ("2" * 64),
+            "finalize_id": "finalize-test",
+            "finalize_receipt_fingerprint": "sha256:" + ("3" * 64),
+            "bundle_id": "bundle-test",
+            "bundle_fingerprint": "sha256:" + ("4" * 64),
+            "source_packet_id": "packet-test",
+            "source_packet_fingerprint": "sha256:" + ("5" * 64),
+        },
+        "outcomes": {
+            "variant_count": 1,
+            "selected_variant_id": "variant-test",
+            "synthesis_status": "selected",
+            "next_allowed_action": "human_review_for_patch_builder",
+            "pass_review_count": 1,
+            "revise_review_count": 0,
+            "reject_review_count": 0,
+            "unsafe_authority_flag_count": 0,
+            "blocker_count": 0,
+            "unresolved_blocker_count": 0,
+            "rejected_variant_count": 0,
+            "rejection_record_count": 0,
+            "generation_status": "ready",
+            "oracle_status": "ready",
+            "failure_class": None,
+            "human_decision": "pending",
+        },
+        "agent_feedback": [
+            {
+                "reviewer_role": "qa-engineer-agent",
+                "pass_count": 1,
+                "revise_count": 0,
+                "reject_count": 0,
+            }
+        ],
+        "learning_records": [record],
+        "learning_summary": {
+            "learning_record_count": 1,
+            "successful_iteration_count": 1,
+            "failure_count": 0,
+            "reuse_lesson_ids": [record["lesson_id"]],
+            "avoid_lesson_ids": [],
+        },
+        "authority": default_rollup_authority(),
+        "sanitized": True,
+    }
+    set_creative_learning_identity(
+        rollup,
+        id_key="rollup_id",
+        asset_type=ROLLUP_ARTIFACT_TYPE,
+        upstream_ids=("finalize-test", "bundle-test", "metrics-test"),
+    )
+    return build_coordinator_advisory_hints(validate_creative_spec_learning_rollup(rollup))
+
+
+def _write_creative_learning_hints(payload: dict[str, object]) -> Path:
+    hints_dir = task_bootstrap_module.CREATIVE_LEARNING_HINTS_ROOT / (
+        f"pytest-task-bootstrap-{uuid.uuid4().hex}"
+    )
+    hints_dir.mkdir(parents=True, exist_ok=False)
+    hints_path = hints_dir / "coordinator_advisory_hints.json"
+    hints_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return hints_path
+
+
+def _privileged_surface_cases() -> list[dict[str, object]]:
+    fixture = json.loads((FIXTURE_DIR / "privileged_review_surfaces.json").read_text())
+    return list(fixture["cases"])
+
+
+def test_task_bootstrap_resolves_orchestration_domain() -> None:
+    """Scripts/docs orchestration work should resolve to ops/orchestration."""
+
+    packet = build_task_packet(
+        goal="Harden orchestration preflight",
+        task_class="Orchestration",
+        candidate_paths=[
+            "scripts/orchestration/check_preflight.py",
+            "docs/orchestration/workflow.md",
+        ],
+    )
+
+    assert packet["schema_version"] == "3.1"
+    assert packet["domain"] == "orchestration"
+    assert packet["cluster"] == "ops"
+    assert packet["primary_agent"]
+    assert "AGENTS.md" in packet["required_context"]
+    assert "docs/orchestration/AGENT_SKILL_ROUTING_POLICY.md" in packet["required_context"]
+    assert "scripts/AGENTS.md" in packet["required_context"]
+    assert packet["skill_routing"]["selection_mode"] == "deterministic-weighted"
+    assert "pulseplate-workflow" in packet["recommended_skills"]
+    assert "docs-sync" in packet["recommended_skills"]
+    assert "agents-md" in packet["recommended_skills"]
+    assert packet["decision_contract"] == {
+        "mode": "standard",
+        "judgment_enabled": False,
+        "claim_taxonomy": [],
+        "flow": [],
+    }
+    assert packet["judgment_budget"] == {
+        "skeptic_pass_required": False,
+        "verifier_pass_required": False,
+        "max_provider_calls": 0,
+        "uncertainty_split_required": False,
+    }
+    assert packet["result_adjudication"] == {
+        "claim_evidence_fields": [],
+        "support_statuses": [],
+        "evidence_modes": [],
+        "uncertainty_fields": [],
+        "promotion_labels": [],
+    }
+    assert packet["native_subagent_bridge"]["primary"]["repo_agent_slug"] == "agent-coordinator"
+    assert packet["native_subagent_bridge"]["reviewer"]["repo_agent_slug"] == (
+        "architecture-specialist"
+    )
+    compression = packet["context_pack_compression"]
+    assert _ROLE_FINGERPRINT_RE.match(compression["metadata"]["primary_agent_fingerprint"])
+    assert _ROLE_FINGERPRINT_RE.match(compression["metadata"]["reviewer_fingerprint"])
+
+
+def test_task_bootstrap_adds_automation_metadata_defaults() -> None:
+    """Generic task packets should include additive automation metadata with safe defaults."""
+
+    packet = build_task_packet(
+        goal="Refresh engineering lessons docs",
+        task_class="Documentation",
+        candidate_paths=["docs/ENGINEERING_LESSONS.md"],
+    )
+
+    assert packet["automation_flags"] == {
+        "coordinator_first_required": True,
+        "skill_routing_applied": True,
+        "native_subagent_bridge_available": True,
+        "security_review_required": False,
+        "invariant_class_review_required": False,
+        "judgment_lane_enabled": False,
+        "pr_lifecycle_enabled": False,
+        "design_lane_enabled": False,
+    }
+    assert packet["pr_phase"] == "none"
+    assert packet["pr_lifecycle_contract"] == {
+        "contract_version": "pulseplate.pr-lifecycle/v3",
+        "requires_pr": False,
+        "post_open_review_required": False,
+        "review_lane": [],
+        "post_open_codex_security_scan_required": False,
+        "post_open_codex_security_scan": "",
+        "post_open_codex_security_scan_timing": "",
+        "post_open_pulseplate_pr_review_required": False,
+        "post_open_pulseplate_pr_review": "",
+        "post_open_pulseplate_pr_review_timing": "",
+        "final_material_review_gates": [],
+        "final_material_review_timing": "",
+        "post_open_review_chain_policy": "",
+        "post_open_review_rerun_allowed_reasons": [],
+        "post_open_later_comments_handling": "",
+        "provider_no_claim_policy": {
+            "output_required": False,
+            "seal_without_provider_flags": True,
+            "provider_invocation_required": False,
+            "provider_retry_required": False,
+            "provider_wait_required": False,
+            "substitute_provider_required": False,
+            "operator_override_required": False,
+            "ttl_required": False,
+            "absence_is_pass": False,
+            "absence_is_review": False,
+            "absence_is_scan": False,
+            "absence_is_approval": False,
+            "absence_is_no_findings": False,
+        },
+        "artifact_template": "",
+        "current_head_required": False,
+        "current_head_truth": "not-applicable",
+        "merge_readiness_entrypoint": "",
+    }
+    assert packet["role_agent_dispatch_contract"] == {
+        "packet_creation_executes_roles": False,
+        "role_agent_dispatch_required": True,
+        "role_agent_dispatch_hard_gate": True,
+        "dispatch_manifest_entrypoint": "scripts/orchestration/role_dispatch_bridge.py",
+        "dispatch_manifest_compatibility_entrypoints": [
+            "scripts/orchestration/qoder_dispatch_bridge.py"
+        ],
+        "dispatch_manifest_command": (
+            "python3 scripts/orchestration/role_dispatch_bridge.py --packet <packet> --pretty"
+        ),
+        "runtime_implementation_owner_flags_required": False,
+        "runtime_implementation_owners": [],
+        "must_execute_dispatch_sequence_in_order": True,
+        "advisory_role_passes_required": True,
+        "requested_custom_roles_are_not_skippable": True,
+        "missing_role_execution_blocks_readiness": True,
+        "mandatory_pre_open_gates": [
+            {
+                "gate": "custom-role-dispatch",
+                "entrypoint": "scripts/orchestration/role_dispatch_bridge.py",
+                "requirement": (
+                    "Execute every bootstrap-requested/custom role pass from the dispatch "
+                    "manifest, including review-only entries with required_role_pass=true."
+                ),
+            },
+            {
+                "gate": "premortem-risk-review",
+                "entrypoint": "pulseplate-premortem-risk-review",
+                "requirement": (
+                    "Run premortem on the actual PR diff before PR open; every finding "
+                    "must be FIXED, NOT-A-BUG, or DEFERRED with backlog evidence."
+                ),
+            },
+            {
+                "gate": "experiment-runner-oracle",
+                "entrypoint": "scripts/orchestration/experiment_runner.py",
+                "requirement": (
+                    "Run Experiment Runner in oracle-only governance reviewer mode after "
+                    "the first coherent diff and before PR open."
+                ),
+            },
+        ],
+    }
+    assert packet["design_lane_mode"] == "disabled"
+    assert packet["design_lane_contract"] == {
+        "design_source": "",
+        "source_url": "",
+        "file_key_or_workspace": "",
+        "node_id_or_frame_id": "",
+        "target_surface": "",
+        "task_mode": "",
+        "figma_lane_tool": "",
+        "blockers": ["missing_design_trigger"],
+        "code_native_design_brief_required": False,
+        "code_native_design_brief_path": "",
+        "explicit_creation_mode": False,
+    }
+    assert packet["message_envelope"] == {
+        "protocol_version": "1.0",
+        "derived_view": "TASK_PACKET_V1",
+        "mode": "docs-only",
+        "output_requirements": {
+            "must_return": ["AGENT_RESULT_V1 envelope only (no preamble)"],
+        },
+    }
+    compression = packet["context_pack_compression"]
+    assert compression["authority_boundary"] == "metadata_only_non_serving"
+    assert compression["policy_version"] == "semantic-context-compression-o2-v1"
+    assert compression["required_context"] == packet["required_context"]
+    assert compression["estimate"]["tokens_saved_estimate"] >= 0
+    assert "gate_closed" in compression["reason_codes"]
+    assert "metadata_only" in compression["reason_codes"]
+    provider_routing = packet["provider_model_tier_routing"]
+    assert provider_routing["telemetry_phase"] == "PR-O3"
+    assert provider_routing["selected_route"] == "no_runtime_selection"
+    assert "frontier_required" in provider_routing["model_tier_labels"]
+    assert "agent-coordinator" in provider_routing["required_frontier_roles"]
+    assert "no_provider_call" in provider_routing["reason_codes"]
+    assert "no_cache_serving" in provider_routing["reason_codes"]
+    embedding_admission = packet["embedding_retrieval_admission"]
+    assert embedding_admission["telemetry_phase"] == "PR-O4"
+    assert embedding_admission["admission_allowed"] is False
+    assert embedding_admission["embedding_allowed"] is False
+    assert embedding_admission["retrieval_runtime_allowed"] is False
+    assert embedding_admission["semantic_similarity_allowed"] is False
+    assert embedding_admission["vector_search_allowed"] is False
+    assert embedding_admission["provider_calls_allowed"] is False
+    assert embedding_admission["cache_read_allowed"] is False
+    assert embedding_admission["cache_write_allowed"] is False
+    assert embedding_admission["serving_allowed"] is False
+    assert embedding_admission["selected_embedding_backend"] == "none"
+    assert embedding_admission["selected_retrieval_runtime"] == "none"
+    assert embedding_admission["evidence_refs"]
+    assert len(embedding_admission["candidates"]) == 3
+    for reason in (
+        "gate_closed",
+        "metadata_only",
+        "admission_deferred",
+        "no_embeddings",
+        "no_vector_search",
+        "no_runtime_retrieval",
+        "no_provider_call",
+        "no_cache_serving",
+        "future_gate_required",
+    ):
+        assert reason in embedding_admission["reason_codes"]
+    assert packet["review_pattern_oracles"] == {
+        "schema_version": "review_pattern_oracles.v1",
+        "helper": "scripts/orchestration/review_pattern_oracles.py",
+        "contract": "docs/orchestration/contracts/review_pattern_oracles.v1.json",
+        "compact_ids": [
+            "schema_validator_parity",
+            "fail_closed_security_edge",
+            "deterministic_content_oracle",
+            "canonical_route_ownership_guard",
+            "evidence_hygiene_mapping_timing",
+            "review_source_degraded",
+        ],
+        "authority_boundary": "proposal_only_non_canonical",
+        "side_effects_allowed": False,
+        "posting_allowed": False,
+        "thread_resolution_allowed": False,
+        "merge_readiness_authority": False,
+    }
+    assert packet["review_source_degradation_policy"]["source_degraded_is_blocking"] is False
+    assert packet["review_source_degradation_policy"]["posting_allowed"] is False
+    assert packet["agent_learning_loop"]["schema_version"] == "agent_learning_record.v1"
+    assert packet["agent_learning_loop"]["extractor"].endswith("agent_lesson_extractor.py")
+    assert packet["agent_learning_loop"]["promoter"].endswith("agent_lesson_promoter.py")
+    assert packet["agent_learning_loop"]["runtime_authority"] is False
+    assert packet["skill_routing"]["envelope_mode_hint"] == "docs_only"
+    assert packet["creative_learning_hints"] == {
+        "schema_version": "creative_learning_hints_packet.v1",
+        "current_packet_includes_hints": False,
+        "source_hints_id": "",
+        "source_hints_fingerprint": "",
+        "source_rollup_id": "",
+        "source_rollup_fingerprint": "",
+        "recommended_role_focus": [],
+        "reuse_lesson_ids": [],
+        "avoid_lesson_ids": [],
+        "authority_boundary": "advisory_only_non_runtime",
+        "side_effects_allowed": False,
+        "routing_authority": False,
+        "execution_authority": False,
+        "merge_readiness_authority": False,
+        "patch_generation_authority": False,
+        "semantic_cache_used": False,
+        "graph_truth_updated": False,
+        "product_runtime_truth": False,
+        "change_primary_agent": False,
+        "force_agent_routing": False,
+        "skip_required_roles": False,
+        "execute_agents": False,
+        "change_lifecycle_gates": False,
+    }
+    _docs_paths = ["docs/ENGINEERING_LESSONS.md"]
+    _norm_docs = repo_relative_paths([p.strip() for p in _docs_paths if p.strip()])
+    assert packet["skill_routing"]["envelope_mode_hint"] == resolve_analysis_envelope_mode(
+        _norm_docs
+    )
+    implementation_skills = {
+        "pulseplate-backend-endpoints",
+        "pulseplate-openapi-sync",
+        "pulseplate-frontend-ui",
+        "vercel-react-best-practices",
+    }
+    recommended = {item["skill"] for item in packet["skill_routing"]["recommended"]}
+    assert implementation_skills.isdisjoint(recommended)
+    assert packet["needs_backlog_update"] is False
+    assert packet["needs_docs_sync"] is False
+    assert packet["needs_agents_sync"] is False
+
+
+def test_task_bootstrap_creative_learning_hints_are_advisory_only() -> None:
+    hints = _valid_creative_learning_hints()
+    hints_path = _write_creative_learning_hints(hints)
+    try:
+        kwargs = {
+            "goal": "Use creative spec learning hints for reviewer focus",
+            "task_class": "Orchestration",
+            "candidate_paths": [
+                "scripts/orchestration/task_bootstrap.py",
+                "docs/orchestration/AGENT_LEARNING_LOOP.md",
+            ],
+            "requested_agents": [
+                "architecture-specialist",
+                "security-auditor",
+                "qa-engineer-agent",
+            ],
+            "pr_phase": "pre_open",
+        }
+        base_packet = build_task_packet(**kwargs)
+        hinted_packet = build_task_packet(
+            **kwargs,
+            creative_learning_hints_path=hints_path,
+        )
+
+        assert hinted_packet["task_packet_id"] != base_packet["task_packet_id"]
+        for stable_routing_key in (
+            "primary_agent",
+            "secondary_agents",
+            "reviewer",
+            "requested_agent_disposition",
+            "native_subagent_bridge",
+            "role_agent_dispatch_contract",
+            "pr_lifecycle_contract",
+        ):
+            assert hinted_packet[stable_routing_key] == base_packet[stable_routing_key]
+
+        packet_hints = hinted_packet["creative_learning_hints"]
+        assert packet_hints["current_packet_includes_hints"] is True
+        assert packet_hints["source_hints_id"] == hints["hints_id"]
+        assert packet_hints["source_hints_fingerprint"] == fingerprint_payload(hints)
+        assert packet_hints["source_rollup_id"] == hints["source_rollup_id"]
+        assert packet_hints["source_rollup_fingerprint"] == hints["source_rollup_fingerprint"]
+        assert packet_hints["recommended_role_focus"] == hints["recommended_role_focus"]
+        assert packet_hints["reuse_lesson_ids"] == hints["reuse_lesson_ids"]
+        assert packet_hints["avoid_lesson_ids"] == hints["avoid_lesson_ids"]
+        assert packet_hints["routing_authority"] is False
+        assert packet_hints["execution_authority"] is False
+        assert packet_hints["merge_readiness_authority"] is False
+        assert packet_hints["patch_generation_authority"] is False
+        assert packet_hints["semantic_cache_used"] is False
+        assert packet_hints["graph_truth_updated"] is False
+        assert packet_hints["product_runtime_truth"] is False
+    finally:
+        shutil.rmtree(hints_path.parent, ignore_errors=True)
+
+
+def test_task_bootstrap_rejects_invalid_creative_learning_hints() -> None:
+    hints = _valid_creative_learning_hints()
+    hints["authority"]["force_agent_routing"] = True
+    hints_path = _write_creative_learning_hints(hints)
+    try:
+        with pytest.raises(ValueError, match="invalid authority"):
+            build_task_packet(
+                goal="Reject invalid creative spec learning hints",
+                task_class="Orchestration",
+                candidate_paths=["scripts/orchestration/task_bootstrap.py"],
+                creative_learning_hints_path=hints_path,
+            )
+    finally:
+        shutil.rmtree(hints_path.parent, ignore_errors=True)
+
+
+def test_task_bootstrap_rejects_creative_learning_hints_with_undeclared_focus_lessons() -> None:
+    hints = _valid_creative_learning_hints()
+    hints["recommended_role_focus"][0]["source_lesson_ids"] = ["lesson-ffffffffffff"]
+    set_creative_learning_identity(
+        hints,
+        id_key="hints_id",
+        asset_type=HINTS_ARTIFACT_TYPE,
+        upstream_ids=(
+            str(hints["source_rollup_id"]),
+            str(hints["source_rollup_fingerprint"]),
+        ),
+    )
+    hints_path = _write_creative_learning_hints(hints)
+    try:
+        with pytest.raises(ValueError, match="undeclared lesson ids"):
+            build_task_packet(
+                goal="Reject undeclared creative spec learning hint lesson ids",
+                task_class="Orchestration",
+                candidate_paths=["scripts/orchestration/task_bootstrap.py"],
+                creative_learning_hints_path=hints_path,
+            )
+    finally:
+        shutil.rmtree(hints_path.parent, ignore_errors=True)
+
+
+def test_task_bootstrap_rejects_noncanonical_creative_learning_lesson_ids() -> None:
+    hints = _valid_creative_learning_hints()
+    hints["reuse_lesson_ids"] = ["lesson-nothex"]
+    hints["recommended_role_focus"][0]["source_lesson_ids"] = ["lesson-nothex"]
+    set_creative_learning_identity(
+        hints,
+        id_key="hints_id",
+        asset_type=HINTS_ARTIFACT_TYPE,
+        upstream_ids=(
+            str(hints["source_rollup_id"]),
+            str(hints["source_rollup_fingerprint"]),
+        ),
+    )
+    hints_path = _write_creative_learning_hints(hints)
+    try:
+        with pytest.raises(ValueError, match="lesson id"):
+            build_task_packet(
+                goal="Reject noncanonical creative spec learning hint lesson ids",
+                task_class="Orchestration",
+                candidate_paths=["scripts/orchestration/task_bootstrap.py"],
+                creative_learning_hints_path=hints_path,
+            )
+    finally:
+        shutil.rmtree(hints_path.parent, ignore_errors=True)
+
+
+def test_task_bootstrap_cli_accepts_creative_learning_hints(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    hints = _valid_creative_learning_hints()
+    hints_path = _write_creative_learning_hints(hints)
+    output_path = (
+        task_bootstrap_module.TASK_PACKET_DIR
+        / f"pytest-creative-learning-hints-{uuid.uuid4().hex}.json"
+    )
+    try:
+        exit_code = main(
+            [
+                "--goal",
+                "Expose creative spec learning hints in packet",
+                "--task-class",
+                "Orchestration",
+                "--path",
+                "scripts/orchestration/task_bootstrap.py",
+                "--creative-learning-hints",
+                str(hints_path),
+                "--output",
+                str(output_path),
+            ]
+        )
+        captured = capsys.readouterr()
+        assert exit_code == 0, captured.out
+        packet = json.loads(output_path.read_text(encoding="utf-8"))
+        summary = json.loads(captured.out)
+        assert summary["creative_learning_hints_fingerprint"] == fingerprint_payload(hints)
+        assert packet["creative_learning_hints"]["source_hints_fingerprint"] == (
+            fingerprint_payload(hints)
+        )
+    finally:
+        output_path.unlink(missing_ok=True)
+        shutil.rmtree(hints_path.parent, ignore_errors=True)
+
+
+def test_task_bootstrap_requires_learning_loop_for_repeated_premortem_failure() -> None:
+    """Learning-loop should become packet-required when repeated PR-process failure is in scope."""
+
+    packet = build_task_packet(
+        goal=(
+            "Fix repeated role-agent failure where premortem became docs closeout "
+            "instead of diff-specific production-risk closure"
+        ),
+        task_class="Orchestration",
+        candidate_paths=[
+            "AGENTS.md",
+            "docs/orchestration/PR_ORCHESTRATION_CONTRACT_MATRIX.md",
+        ],
+    )
+
+    assert "pulseplate-agent-learning-loop" in packet["recommended_skills"]
+    learning_loop = packet["agent_learning_loop"]
+    assert learning_loop["orchestration_gate"] == "conditional_required_when_triggered"
+    assert learning_loop["current_packet_required"] is True
+    assert learning_loop["current_pr_enforcement_required_when_scope_affected"] is True
+    assert learning_loop["proposal_only_until_promoted"] is True
+    assert learning_loop["redaction_required"] is True
+    assert learning_loop["promotion_requires_reviewed_repo_diff"] is True
+    assert learning_loop["metrics_required"] is True
+    assert learning_loop["metrics_schema_version"] == "agent_learning_metrics.v1"
+    assert "repeat_failure_reduction" in learning_loop["metric_ids"]
+    assert "successful_pattern_reuse" in learning_loop["metric_ids"]
+    assert "user_impact_clarity" in learning_loop["metric_ids"]
+    assert "business_risk_clarity" in learning_loop["metric_ids"]
+    assert "project_development_signal" in learning_loop["metric_ids"]
+    assert learning_loop["runtime_authority"] is False
+    assert learning_loop["canonical_until_promoted_by_repo_diff"] is False
+    assert {item["group_id"] for item in learning_loop["trigger_evidence"]} == {
+        "orchestration.agent_learning_loop"
+    }
+
+
+def test_task_bootstrap_requires_learning_loop_for_successful_iteration_pattern() -> None:
+    """Learning-loop should also become packet-required for repeatable success patterns."""
+
+    packet = build_task_packet(
+        goal=(
+            "Promote a successful iteration where premortem and agent review "
+            "worked well for creative hypothesis routing"
+        ),
+        task_class="Orchestration",
+        candidate_paths=[
+            "docs/orchestration/AGENT_LEARNING_LOOP.md",
+            "docs/orchestration/GOVERNED_CREATIVE_CODE_EXECUTION_CONTRACT.md",
+        ],
+    )
+
+    assert "pulseplate-agent-learning-loop" in packet["recommended_skills"]
+    assert packet["agent_learning_loop"]["current_packet_required"] is True
+    assert packet["agent_learning_loop"]["metrics_required"] is True
+    assert "repeated_successful_iteration_pattern" in packet["agent_learning_loop"]["required_when"]
+
+
+def test_task_bootstrap_requires_learning_loop_for_semantic_trigger_outside_docs_lane() -> None:
+    """Semantic repeated-failure triggers should require learning-loop even on runtime paths."""
+
+    packet = build_task_packet(
+        goal="Fix repeated role-agent failure in frontend planning flow",
+        task_class="Frontend",
+        candidate_paths=["frontend/src/Home.tsx"],
+    )
+
+    learning_loop = packet["agent_learning_loop"]
+    assert {item["group_id"] for item in learning_loop["trigger_evidence"]} == {
+        "orchestration.agent_learning_loop"
+    }
+    assert learning_loop["current_packet_required"] is True
+
+
+def test_task_bootstrap_keeps_wide_pr_packets_when_context_graph_truncates() -> None:
+    """Advisory compression limits must never block task-packet creation."""
+
+    packet = build_task_packet(
+        goal="Wide orchestration lane",
+        task_class="Orchestration",
+        candidate_paths=[
+            f"scripts/orchestration/generated_context_{index}.py" for index in range(225)
+        ],
+    )
+
+    compression = packet["context_pack_compression"]
+    assert len(packet["candidate_paths"]) == 225
+    assert len(compression["graph_nodes"]) <= 200
+    assert compression["required_context"] == packet["required_context"]
+    assert "graph_limit_truncated" in compression["reason_codes"]
+    assert "compression_limit_exceeded" in compression["reason_codes"]
+
+
+def test_task_bootstrap_dispatch_command_includes_runtime_owner_flags() -> None:
+    """Implementation packets should not emit a readonly-only dispatch command."""
+
+    packet = build_task_packet(
+        goal="Implement guided planning frontend roadcut",
+        task_class="Frontend",
+        candidate_paths=["frontend/src/pages/Home.tsx"],
+        requested_agents=["frontend-engineer"],
+    )
+
+    dispatch_contract = packet["role_agent_dispatch_contract"]
+    assert dispatch_contract["runtime_implementation_owner_flags_required"] is True
+    assert dispatch_contract["runtime_implementation_owners"] == ["frontend-engineer"]
+    assert dispatch_contract["dispatch_manifest_command"] == (
+        "python3 scripts/orchestration/role_dispatch_bridge.py --packet <packet> "
+        "--mode runtime --implementation-owner frontend-engineer --pretty"
+    )
+
+
+def test_task_bootstrap_dispatch_command_includes_security_owner_flags() -> None:
+    """Every native read-write primary owner needs runtime owner flags."""
+
+    packet = build_task_packet(
+        goal="Harden security audit workflow",
+        task_class="Security",
+        candidate_paths=["app/security/rate_limit.py"],
+    )
+
+    dispatch_contract = packet["role_agent_dispatch_contract"]
+    assert dispatch_contract["runtime_implementation_owner_flags_required"] is True
+    assert dispatch_contract["runtime_implementation_owners"] == ["security-auditor"]
+    assert dispatch_contract["dispatch_manifest_command"] == (
+        "python3 scripts/orchestration/role_dispatch_bridge.py --packet <packet> "
+        "--mode runtime --implementation-owner security-auditor --pretty"
+    )
+
+
+def test_post_open_review_dispatch_command_suppresses_runtime_owner_flags() -> None:
+    """Post-open review packets must keep mandatory reviewers read-only by default."""
+
+    packet = build_task_packet(
+        goal="Run post-open review",
+        task_class="QA",
+        candidate_paths=["tests/test_qoder_dispatch_bridge.py"],
+        pr_phase="post_open_review",
+    )
+
+    dispatch_contract = packet["role_agent_dispatch_contract"]
+    assert packet["primary_agent"] == "qa-engineer-agent"
+    assert dispatch_contract["runtime_implementation_owner_flags_required"] is False
+    assert dispatch_contract["runtime_implementation_owners"] == []
+    assert dispatch_contract["dispatch_manifest_command"] == (
+        "python3 scripts/orchestration/role_dispatch_bridge.py --packet <packet> --pretty"
+    )
+
+
+def test_task_bootstrap_exposes_skill_routing_explanation_and_connector_policy() -> None:
+    """Bootstrap packets should carry the wave 2 explanation and connector contract."""
+
+    packet = build_task_packet(
+        goal=(
+            "Prepare founder research using YouTube transcripts and Google Trends "
+            "with a stable skill-routing explanation schema"
+        ),
+        task_class="Research",
+        candidate_paths=["docs/audience_pack/ENGINEERING_OVERVIEW.md"],
+    )
+
+    explanation = packet["skill_routing"]["explanation"]
+    connector_policy = packet["skill_routing"]["research_connector_policy"]
+    assert explanation["schema_version"] == "1.0"
+    assert "semantic_group" in explanation["evidence_axes"]
+    assert connector_policy["policy_version"] == "2026-04-18"
+    matched_connectors = {
+        item["connector"] for item in connector_policy["matches"][RESEARCH_POLICY_BUCKET_APPROVED]
+    }
+    assert matched_connectors == {"youtube_transcripts", "google_trends"}
+
+
+def test_task_bootstrap_sets_read_only_design_lane_for_incomplete_figma_packet() -> None:
+    """Explicit Figma packets should fail closed into read-only until metadata is complete."""
+
+    packet = build_task_packet(
+        goal="Prepare Figma activation packet",
+        task_class="Frontend",
+        candidate_paths=["frontend/src/components/Hero.tsx"],
+        design_source="figma_design",
+        target_surface="web.hero",
+        task_mode="implement",
+        figma_lane_tool="figma_native",
+        code_native_design_brief_path="docs/design/HERO_BRIEF.md",
+    )
+
+    assert packet["automation_flags"]["design_lane_enabled"] is True
+    assert packet["design_lane_mode"] == "read_only"
+    assert packet["design_lane_contract"]["design_source"] == "figma_design"
+    assert packet["design_lane_contract"]["blockers"] == ["blocked_by_design_url"]
+    assert packet["design_lane_contract"]["code_native_design_brief_required"] is True
+
+
+def test_task_bootstrap_keeps_coordinator_primary_for_requested_orchestration_lane() -> None:
+    """Coordinator-owned orchestration lanes must not demote agent-coordinator from primary."""
+
+    packet = build_task_packet(
+        goal="Implement wave 2 routing policy and explanation schema",
+        task_class="Orchestration",
+        candidate_paths=[
+            "scripts/orchestration/skill_router.py",
+            "scripts/orchestration/task_bootstrap.py",
+        ],
+        requested_agents=[
+            "agent-coordinator",
+            "architecture-specialist",
+            "security-auditor",
+        ],
+        pr_phase="pre_open",
+    )
+
+    assert packet["primary_agent"] == "agent-coordinator"
+    dispositions = {item["agent"]: item for item in packet["requested_agent_disposition"]}
+    assert dispositions["agent-coordinator"]["status"] == REQUESTED_AGENT_STATUS_HONORED_PRIMARY
+    assert dispositions["architecture-specialist"]["status"] == "honored_reviewer"
+    assert "security-auditor" in packet["secondary_agents"]
+
+
+def test_task_bootstrap_enables_code_native_design_lane_with_valid_packet() -> None:
+    """Code-native design packets should activate without Figma-specific blockers."""
+
+    packet = build_task_packet(
+        goal="Implement code-native design brief",
+        task_class="Frontend",
+        candidate_paths=["frontend/src/components/Hero.tsx"],
+        design_source="code_native_brief",
+        target_surface="web.hero",
+        task_mode="implement",
+        code_native_design_brief_path="docs/design/HERO_BRIEF.md",
+    )
+
+    assert packet["automation_flags"]["design_lane_enabled"] is True
+    assert packet["design_lane_mode"] == "implement"
+    assert packet["design_lane_contract"]["blockers"] == []
+    assert packet["design_lane_contract"]["design_source"] == "code_native_brief"
+    assert packet["design_lane_contract"]["code_native_design_brief_required"] is True
+
+
+def test_task_bootstrap_enables_figma_design_lane_with_complete_packet() -> None:
+    """Complete Figma packets should activate the requested task mode."""
+
+    packet = build_task_packet(
+        goal="Sync Figma-backed design packet",
+        task_class="Frontend",
+        candidate_paths=["frontend/src/components/Hero.tsx"],
+        design_source="figma_design",
+        source_url="https://www.figma.com/design/demo/File?node-id=42-7",
+        file_key_or_workspace="demo",
+        node_id_or_frame_id="42:7",
+        target_surface="web.hero",
+        task_mode="sync",
+        figma_lane_tool="figma_native",
+        code_native_design_brief_path="docs/design/HERO_BRIEF.md",
+    )
+
+    assert packet["automation_flags"]["design_lane_enabled"] is True
+    assert packet["design_lane_mode"] == "sync"
+    assert packet["design_lane_contract"]["blockers"] == []
+    assert packet["design_lane_contract"]["node_id_or_frame_id"] == "42:7"
+
+
+def test_task_bootstrap_allows_explicit_figma_creation_mode_without_existing_node() -> None:
+    """Explicit creation mode should unlock Figma activation without existing URL/node metadata."""
+
+    packet = build_task_packet(
+        goal="Create a new Figma design surface from the canonical brief",
+        task_class="Frontend",
+        candidate_paths=["frontend/src/components/Hero.tsx"],
+        design_source="figma_design",
+        target_surface="web.hero",
+        task_mode="implement",
+        figma_lane_tool="figma_native",
+        code_native_design_brief_path="docs/design/HERO_BRIEF.md",
+        explicit_creation_mode=True,
+    )
+
+    assert packet["automation_flags"]["design_lane_enabled"] is True
+    assert packet["design_lane_mode"] == "implement"
+    assert packet["design_lane_contract"]["blockers"] == []
+    assert packet["design_lane_contract"]["explicit_creation_mode"] is True
+
+
+def test_task_bootstrap_requires_existing_figma_metadata_for_non_implement_creation_mode() -> None:
+    """Creation-mode bypass must not skip URL/node checks for verify or sync flows."""
+
+    packet = build_task_packet(
+        goal="Verify an existing Figma design surface from the canonical brief",
+        task_class="Frontend",
+        candidate_paths=["frontend/src/components/Hero.tsx"],
+        design_source="figma_design",
+        target_surface="web.hero",
+        task_mode="sync",
+        figma_lane_tool="figma_native",
+        code_native_design_brief_path="docs/design/HERO_BRIEF.md",
+        explicit_creation_mode=True,
+    )
+
+    assert packet["automation_flags"]["design_lane_enabled"] is True
+    assert packet["design_lane_mode"] == "read_only"
+    assert packet["design_lane_contract"]["blockers"] == ["blocked_by_design_url"]
+    assert packet["design_lane_contract"]["explicit_creation_mode"] is True
+
+
+def test_task_bootstrap_enables_post_open_review_lane_for_pr_phase() -> None:
+    """Post-open packets must synthesize the canonical QA -> bug -> security lane."""
+
+    packet = build_task_packet(
+        goal="Prepare post-open PR review loop for orchestration automation",
+        task_class="Orchestration",
+        candidate_paths=["scripts/orchestration/task_bootstrap.py"],
+        pr_phase="post_open_review",
+    )
+
+    assert packet["automation_flags"]["pr_lifecycle_enabled"] is True
+    assert packet["pr_phase"] == "post_open_review"
+    assert packet["pr_lifecycle_contract"] == {
+        "contract_version": "pulseplate.pr-lifecycle/v3",
+        "requires_pr": True,
+        "post_open_review_required": True,
+        "review_lane": ["qa-engineer-agent", "bug-hunter", "security-auditor"],
+        "post_open_codex_security_scan_required": False,
+        "post_open_codex_security_scan": "",
+        "post_open_codex_security_scan_timing": "",
+        "post_open_pulseplate_pr_review_required": True,
+        "post_open_pulseplate_pr_review": "pulseplate-pr-review",
+        "post_open_pulseplate_pr_review_timing": "final_material_only",
+        "final_material_review_gates": ["pulseplate-pr-review"],
+        "final_material_review_timing": "final_material_only",
+        "post_open_review_chain_policy": "post_open_roles_then_final_material_gates",
+        "post_open_review_rerun_allowed_reasons": [
+            "coordinator_evidence_backed_reroute",
+            "operator_explicit_request",
+        ],
+        "post_open_later_comments_handling": "fixed_mapping_and_targeted_gates",
+        "provider_no_claim_policy": {
+            "output_required": False,
+            "seal_without_provider_flags": True,
+            "provider_invocation_required": False,
+            "provider_retry_required": False,
+            "provider_wait_required": False,
+            "substitute_provider_required": False,
+            "operator_override_required": False,
+            "ttl_required": False,
+            "absence_is_pass": False,
+            "absence_is_review": False,
+            "absence_is_scan": False,
+            "absence_is_approval": False,
+            "absence_is_no_findings": False,
+        },
+        "artifact_template": "docs/review/PR_<N>_FIXED_MAPPING.md",
+        "current_head_required": True,
+        "current_head_truth": "latest-current-head",
+        "merge_readiness_entrypoint": "",
+    }
+    assert packet["primary_agent"] == "qa-engineer-agent"
+    assert packet["reviewer"] == "architecture-specialist"
+    assert packet["secondary_agents"][:2] == ["bug-hunter", "security-auditor"]
+    assert "bug-hunter" in {
+        binding["repo_agent_slug"] for binding in packet["native_subagent_bridge"]["secondary"]
+    }
+    assert "security-auditor" in {
+        binding["repo_agent_slug"] for binding in packet["native_subagent_bridge"]["secondary"]
+    }
+
+
+def test_task_bootstrap_fails_closed_to_analysis_envelope_for_mixed_scope() -> None:
+    """Mixed runtime plus docs scope must not downshift to docs-only envelope mode."""
+
+    packet = build_task_packet(
+        goal="Reconcile bootstrap seam and protocol docs",
+        task_class="Orchestration",
+        candidate_paths=[
+            "scripts/orchestration/task_bootstrap.py",
+            "docs/orchestration/AGENT_MESSAGE_PROTOCOL.md",
+        ],
+    )
+
+    assert packet["message_envelope"] == {
+        "protocol_version": "1.0",
+        "derived_view": "TASK_PACKET_V1",
+        "mode": "analysis",
+        "output_requirements": {
+            "must_return": ["AGENT_RESULT_V1 envelope only (no preamble)"],
+        },
+    }
+
+
+def test_task_bootstrap_fails_closed_to_analysis_for_privileged_docs() -> None:
+    """Privileged orchestration docs stay in analysis mode while forcing security review."""
+
+    packet = build_task_packet(
+        goal="Tighten agent message protocol wording",
+        task_class="Documentation",
+        candidate_paths=["docs/orchestration/AGENT_MESSAGE_PROTOCOL.md"],
+    )
+
+    assert packet["message_envelope"]["mode"] == "analysis"
+    assert packet["automation_flags"]["security_review_required"] is True
+
+
+def test_task_bootstrap_rejects_whitespace_padded_privileged_docs() -> None:
+    """Producer paths never strip ambiguous surrounding whitespace."""
+
+    with pytest.raises(ValueError, match="canonical task candidate paths"):
+        build_task_packet(
+            goal="Tighten agent message protocol wording",
+            task_class="Documentation",
+            candidate_paths=["  docs/orchestration/AGENT_MESSAGE_PROTOCOL.md  "],
+        )
+
+
+def test_task_bootstrap_keeps_requested_bug_hunter_executable_in_post_open_lane() -> None:
+    """Requested bug-hunter must stay runnable in the canonical post-open lane."""
+
+    packet = build_task_packet(
+        goal="Run post-open review with explicit bug hunter request",
+        task_class="Orchestration",
+        candidate_paths=["scripts/orchestration/task_bootstrap.py"],
+        requested_agents=["bug-hunter"],
+        pr_phase="post_open_review",
+    )
+
+    assert "bug-hunter" in packet["secondary_agents"]
+    assert "bug-hunter" in {
+        binding["repo_agent_slug"] for binding in packet["native_subagent_bridge"]["secondary"]
+    }
+    assert packet["requested_agent_disposition"] == [
+        {
+            "agent": "bug-hunter",
+            "status": "honored_secondary",
+            "reason": (
+                "Requested agent is required for the PR lifecycle review path and stays "
+                "executable in secondary."
+            ),
+        }
+    ]
+
+
+def test_task_bootstrap_preserves_qa_then_bug_hunter_order_in_qa_post_open_lane() -> None:
+    """QA-domain post-open packets must not allow bug-hunter to remain primary."""
+
+    packet = build_task_packet(
+        goal="Run qa post-open review with explicit bug hunter request",
+        task_class="QA",
+        candidate_paths=["tests/test_task_bootstrap.py"],
+        requested_agents=["bug-hunter"],
+        pr_phase="post_open_review",
+    )
+
+    assert packet["primary_agent"] == "qa-engineer-agent"
+    assert packet["reviewer"] == "agent-coordinator"
+    assert packet["secondary_agents"] == ["bug-hunter", "security-auditor"]
+    assert packet["requested_agent_disposition"] == [
+        {
+            "agent": "bug-hunter",
+            "status": "honored_secondary",
+            "reason": "Requested agent stayed honored in secondary after PR lifecycle synthesis.",
+        }
+    ]
+
+
+def test_post_open_review_path_keeps_bug_hunter_executable_when_primary_was_bug_hunter() -> None:
+    """Helper-level regression: reviewer independence must not drop bug-hunter from secondary."""
+
+    primary_agent, secondary_agents, reviewer = _apply_pr_lifecycle_review_path(
+        pr_phase="post_open_review",
+        primary_agent="bug-hunter",
+        secondary_agents=[],
+        reviewer="qa-engineer-agent",
+    )
+
+    normalized_secondary_agents = _normalize_secondary_review_path(
+        primary_agent=primary_agent,
+        secondary_agents=secondary_agents,
+        reviewer=reviewer,
+    )
+
+    assert primary_agent == "qa-engineer-agent"
+    assert reviewer == "agent-coordinator"
+    assert normalized_secondary_agents == ["bug-hunter", "security-auditor"]
+
+
+def test_task_bootstrap_deduplicates_reviewer_from_secondary_in_post_open_lane() -> None:
+    """Canonical packet identities must not list the reviewer twice."""
+
+    packet = build_task_packet(
+        goal="Run post-open review with explicit QA request",
+        task_class="Orchestration",
+        candidate_paths=["scripts/orchestration/task_bootstrap.py"],
+        requested_agents=["qa-engineer-agent"],
+        pr_phase="post_open_review",
+    )
+
+    assert packet["primary_agent"] == "qa-engineer-agent"
+    assert packet["reviewer"] == "architecture-specialist"
+    assert "qa-engineer-agent" not in packet["secondary_agents"]
+    assert packet["requested_agent_disposition"] == [
+        {
+            "agent": "qa-engineer-agent",
+            "status": "honored_primary",
+            "reason": "Requested agent stayed honored as primary after PR lifecycle synthesis.",
+        }
+    ]
+
+
+def test_task_bootstrap_keeps_non_routable_requested_agent_advisory_in_post_open_lane() -> None:
+    """Lifecycle reconciliation must keep requested custom roles as required passes."""
+
+    packet = build_task_packet(
+        goal="Prepare ML post-open review packet with custom-role collaborator",
+        task_class="AI / ML",
+        candidate_paths=["docs/orchestration/AGENT_EXPERIMENTATION_PROTOCOL.md"],
+        requested_agents=["ml-engineer-agent"],
+        pr_phase="post_open_review",
+    )
+
+    assert "ml-engineer-agent" in packet["secondary_agents"]
+    advisory_bindings = packet["native_subagent_bridge"]["advisory"]
+    assert [binding["repo_agent_slug"] for binding in advisory_bindings] == ["ml-engineer-agent"]
+    assert advisory_bindings[0]["execution_mode"] == "advisory_review"
+    assert advisory_bindings[0]["dispatch_contract"]["spawn_with_native_subagent"] is True
+    assert advisory_bindings[0]["dispatch_contract"]["required_role_pass"] is True
+    assert packet["requested_agent_disposition"] == [
+        {
+            "agent": "ml-engineer-agent",
+            "status": "advisory_non_routable",
+            "reason": (
+                "Agent is canonical but non-routable; kept as a required custom-role "
+                "pass, not a skippable note."
+            ),
+        }
+    ]
+
+
+def test_task_bootstrap_keeps_unknown_requested_agent_rejected_in_post_open_lane() -> None:
+    """Post-open synthesis must not upgrade unknown requested agents into runnable roles."""
+
+    packet = build_task_packet(
+        goal="Prepare post-open review packet with unknown collaborator request",
+        task_class="Orchestration",
+        candidate_paths=["scripts/orchestration/task_bootstrap.py"],
+        requested_agents=["unknown-agent"],
+        pr_phase="post_open_review",
+    )
+
+    assert packet["requested_agents"] == ["unknown-agent"]
+    assert "unknown-agent" not in packet["secondary_agents"]
+    assert not [
+        binding["repo_agent_slug"] for binding in packet["native_subagent_bridge"]["advisory"]
+    ]
+    assert packet["requested_agent_disposition"] == [
+        {
+            "agent": "unknown-agent",
+            "status": "rejected_unknown_agent",
+            "reason": "Agent is not registered in the canonical inventory.",
+        }
+    ]
+
+
+def test_task_bootstrap_keeps_domain_mismatch_requested_agent_advisory_in_post_open_lane() -> None:
+    """Post-open synthesis must preserve domain-mismatched requests as required passes."""
+
+    packet = build_task_packet(
+        goal="Prepare post-open review packet with frontend collaborator request",
+        task_class="Orchestration",
+        candidate_paths=["scripts/orchestration/task_bootstrap.py"],
+        requested_agents=["frontend-engineer"],
+        pr_phase="post_open_review",
+    )
+
+    assert "frontend-engineer" in packet["secondary_agents"]
+    advisory_bindings = packet["native_subagent_bridge"]["advisory"]
+    assert [binding["repo_agent_slug"] for binding in advisory_bindings] == ["frontend-engineer"]
+    assert advisory_bindings[0]["execution_mode"] == "advisory_review"
+    assert advisory_bindings[0]["dispatch_contract"]["spawn_with_native_subagent"] is True
+    assert advisory_bindings[0]["dispatch_contract"]["required_role_pass"] is True
+    assert packet["requested_agent_disposition"] == [
+        {
+            "agent": "frontend-engineer",
+            "status": "advisory_domain_mismatch",
+            "reason": (
+                "Requested agent is outside the routed domain slot set; kept as a "
+                "required custom-role pass, not a skippable note."
+            ),
+        }
+    ]
+
+
+def test_task_bootstrap_sets_merge_ready_contract_without_post_open_lane() -> None:
+    """Merge-ready packets should keep lifecycle prep explicit without re-adding QA loop."""
+
+    packet = build_task_packet(
+        goal="Prepare merge readiness packet for orchestration automation",
+        task_class="Orchestration",
+        candidate_paths=["scripts/orchestration/task_bootstrap.py"],
+        pr_phase="merge_ready",
+    )
+
+    assert packet["automation_flags"]["pr_lifecycle_enabled"] is True
+    assert packet["pr_phase"] == "merge_ready"
+    assert packet["pr_lifecycle_contract"] == {
+        "contract_version": "pulseplate.pr-lifecycle/v3",
+        "requires_pr": True,
+        "post_open_review_required": False,
+        "review_lane": [],
+        "post_open_codex_security_scan_required": False,
+        "post_open_codex_security_scan": "",
+        "post_open_codex_security_scan_timing": "",
+        "post_open_pulseplate_pr_review_required": False,
+        "post_open_pulseplate_pr_review": "",
+        "post_open_pulseplate_pr_review_timing": "",
+        "final_material_review_gates": [],
+        "final_material_review_timing": "",
+        "post_open_review_chain_policy": "",
+        "post_open_review_rerun_allowed_reasons": [],
+        "post_open_later_comments_handling": "",
+        "provider_no_claim_policy": {
+            "output_required": False,
+            "seal_without_provider_flags": True,
+            "provider_invocation_required": False,
+            "provider_retry_required": False,
+            "provider_wait_required": False,
+            "substitute_provider_required": False,
+            "operator_override_required": False,
+            "ttl_required": False,
+            "absence_is_pass": False,
+            "absence_is_review": False,
+            "absence_is_scan": False,
+            "absence_is_approval": False,
+            "absence_is_no_findings": False,
+        },
+        "artifact_template": "docs/review/PR_<N>_FIXED_MAPPING.md",
+        "current_head_required": True,
+        "current_head_truth": "latest-current-head",
+        "merge_readiness_entrypoint": "scripts/orchestration/check_merge_ready.py",
+    }
+    assert packet["reviewer"] != "qa-engineer-agent"
+    assert "bug-hunter" not in packet["secondary_agents"]
+
+
+def test_task_bootstrap_enables_judgment_lane_for_relevant_work() -> None:
+    """Judgment metadata should activate only for adjudication-oriented tasks."""
+
+    packet = build_task_packet(
+        goal="Add judgment adjudication protocol and shared evidence contract",
+        task_class="Documentation",
+        candidate_paths=[
+            "docs/orchestration/JUDGMENT_ADJUDICATION_SUBLANE_PROTOCOL.md",
+            "core/judgment.py",
+        ],
+    )
+
+    assert packet["decision_contract"]["mode"] == "verification_first"
+    assert packet["decision_contract"]["judgment_enabled"] is True
+    assert packet["decision_contract"]["claim_taxonomy"] == list(CLAIM_TYPES)
+    assert packet["decision_contract"]["flow"] == list(JUDGMENT_FLOW)
+    assert packet["judgment_budget"] == {
+        "skeptic_pass_required": True,
+        "verifier_pass_required": True,
+        "max_provider_calls": 0,
+        "uncertainty_split_required": True,
+    }
+    assert packet["automation_flags"]["judgment_lane_enabled"] is True
+    assert packet["result_adjudication"]["claim_evidence_fields"] == list(CLAIM_EVIDENCE_FIELDS)
+    assert packet["result_adjudication"]["support_statuses"] == list(SUPPORT_STATUSES)
+    assert packet["result_adjudication"]["evidence_modes"] == list(EVIDENCE_MODES)
+    assert packet["result_adjudication"]["uncertainty_fields"] == list(UNCERTAINTY_FIELDS)
+    assert packet["result_adjudication"]["promotion_labels"] == list(PROMOTION_LABELS)
+
+
+def test_task_bootstrap_candidate_path_aliases_share_canonical_packet_identity() -> None:
+    common = {
+        "goal": "Review canonical task candidate paths",
+        "task_class": "Orchestration",
+    }
+    canonical = build_task_packet(**common, candidate_paths=["docs/example.md"])
+    dot_alias = build_task_packet(**common, candidate_paths=["./docs/example.md"])
+    absolute_alias = build_task_packet(
+        **common,
+        candidate_paths=[f"{REPO_ROOT.as_posix()}/docs/example.md"],
+    )
+
+    assert canonical["candidate_paths"] == ["docs/example.md"]
+    assert dot_alias["candidate_paths"] == canonical["candidate_paths"]
+    assert absolute_alias["candidate_paths"] == canonical["candidate_paths"]
+    assert dot_alias["task_packet_id"] == canonical["task_packet_id"]
+    assert absolute_alias["task_packet_id"] == canonical["task_packet_id"]
+
+
+@pytest.mark.parametrize(
+    "candidate_path",
+    (
+        ".github/Attached HTML and CSS Context",
+        "ios/PulsePlate/Preview Content/.gitkeep",
+    ),
+)
+def test_task_bootstrap_preserves_internal_space_path_identity(candidate_path: str) -> None:
+    common = {
+        "goal": "Review a tracked path containing ordinary spaces",
+        "task_class": "Orchestration",
+    }
+    relative = build_task_packet(**common, candidate_paths=[candidate_path])
+    dot_alias = build_task_packet(**common, candidate_paths=[f"./{candidate_path}"])
+    absolute_alias = build_task_packet(
+        **common,
+        candidate_paths=[f"{REPO_ROOT.as_posix()}/{candidate_path}"],
+    )
+
+    assert relative["candidate_paths"] == [candidate_path]
+    assert dot_alias["candidate_paths"] == [candidate_path]
+    assert absolute_alias["candidate_paths"] == [candidate_path]
+    assert dot_alias["task_packet_id"] == relative["task_packet_id"]
+    assert absolute_alias["task_packet_id"] == relative["task_packet_id"]
+    assert any(
+        row["source_path"] == candidate_path
+        for row in relative["embedding_retrieval_admission"]["evidence_refs"]
+    )
+
+
+@pytest.mark.parametrize(
+    "candidate_paths",
+    (
+        ["./"],
+        [" docs/example.md"],
+        ["docs/example.md "],
+        ["docs/./example.md"],
+        ["docs/example.md/"],
+        ["docs/../example.md"],
+        [f"{REPO_ROOT.as_posix()}-other/docs/example.md"],
+        ["/tmp/outside.py"],
+        cast(list[str], [None]),
+    ),
+)
+def test_task_bootstrap_rejects_noncanonical_candidate_path_input(
+    candidate_paths: list[str],
+) -> None:
+    with pytest.raises(ValueError, match="canonical task candidate paths"):
+        build_task_packet(
+            goal="Reject ambiguous task scope",
+            task_class="Orchestration",
+            candidate_paths=candidate_paths,
+        )
+
+
+def test_task_bootstrap_root_scope_preserves_authority_and_routing() -> None:
+    root_packet = build_task_packet(
+        goal="Inspect repository scope",
+        task_class="Orchestration",
+        candidate_paths=["."],
+    )
+    absorbed_packet = build_task_packet(
+        goal="Inspect repository scope",
+        task_class="Orchestration",
+        candidate_paths=["README.md", "."],
+    )
+    empty_packet = build_task_packet(
+        goal="Inspect repository scope",
+        task_class="Orchestration",
+        candidate_paths=[],
+    )
+
+    assert root_packet["candidate_paths"] == ["."]
+    assert absorbed_packet["candidate_paths"] == ["."]
+    assert absorbed_packet["task_packet_id"] == root_packet["task_packet_id"]
+    assert empty_packet["task_packet_id"] != root_packet["task_packet_id"]
+    assert root_packet["automation_flags"]["security_review_required"] is True
+    assert root_packet["automation_flags"]["invariant_class_review_required"] is True
+    assert root_packet["automation_flags"]["judgment_lane_enabled"] is False
+    assert "security-auditor" in root_packet["secondary_agents"]
+    assert root_packet["invariant_review"]["change_classes"] == list(INVARIANT_CHANGE_CLASSES)
+    assert root_packet["invariant_review"]["state"] == "required_pending"
+    assert root_packet["needs_backlog_update"] is True
+    assert root_packet["needs_docs_sync"] is True
+    assert root_packet["needs_agents_sync"] is True
+    assert root_packet["message_envelope"]["mode"] == "analysis"
+    assert "docs/orchestration/workflow.md" in root_packet["required_context"]
+    assert all(
+        node["path"] != "." for node in root_packet["context_pack_compression"]["graph_nodes"]
+    )
+    assert all(
+        evidence_ref["source_path"] != "."
+        for evidence_ref in root_packet["embedding_retrieval_admission"]["evidence_refs"]
+    )
+
+
+def test_task_bootstrap_enables_judgment_lane_for_underscore_triggers() -> None:
+    """Underscore-separated trigger terms must activate the judgment lane."""
+
+    packet = build_task_packet(
+        goal="Prepare evidence_reconciliation follow-up",
+        task_class="verification_first",
+        candidate_paths=["docs/orchestration/EVIDENCE_RECONCILIATION_PROTOCOL.md"],
+    )
+
+    assert packet["decision_contract"]["mode"] == "verification_first"
+    assert packet["decision_contract"]["judgment_enabled"] is True
+    assert packet["judgment_budget"]["max_provider_calls"] == 0
+
+
+def test_task_bootstrap_uses_loader_backed_judgment_activation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Judgment-lane enablement must follow routing-graph loader metadata."""
+
+    monkeypatch.setattr(
+        "scripts.orchestration.task_bootstrap.load_bootstrap_lane_activations",
+        lambda: {
+            REQUIRED_BOOTSTRAP_LANE: BootstrapLaneActivation(
+                lane=REQUIRED_BOOTSTRAP_LANE,
+                signal_terms=("custom-lane-trigger",),
+                decision_mode="verification_first",
+            )
+        },
+    )
+
+    packet = build_task_packet(
+        goal="Prepare custom-lane-trigger follow-up",
+        task_class="Documentation",
+        candidate_paths=["docs/orchestration/AGENT_ROUTING_GRAPH.md"],
+    )
+
+    assert packet["decision_contract"]["mode"] == "verification_first"
+    assert packet["decision_contract"]["judgment_enabled"] is True
+
+
+def test_task_bootstrap_does_not_fall_back_to_removed_hardcoded_terms(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Custom loader metadata should fully replace legacy hardcoded trigger terms."""
+
+    monkeypatch.setattr(
+        "scripts.orchestration.task_bootstrap.load_bootstrap_lane_activations",
+        lambda: {
+            REQUIRED_BOOTSTRAP_LANE: BootstrapLaneActivation(
+                lane=REQUIRED_BOOTSTRAP_LANE,
+                signal_terms=("custom-lane-trigger",),
+                decision_mode="verification_first",
+            )
+        },
+    )
+
+    packet = build_task_packet(
+        goal="Prepare evidence_reconciliation follow-up",
+        task_class="Documentation",
+        candidate_paths=["docs/orchestration/AGENT_ROUTING_GRAPH.md"],
+    )
+
+    assert packet["decision_contract"]["mode"] == "standard"
+    assert packet["decision_contract"]["judgment_enabled"] is False
+
+
+def test_task_bootstrap_requires_canonical_judgment_lane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bootstrap must fail fast if the required judgment lane disappears from the SoT."""
+
+    monkeypatch.setattr(
+        "scripts.orchestration.task_bootstrap.load_bootstrap_lane_activations",
+        lambda: {
+            "research": BootstrapLaneActivation(
+                lane="research",
+                signal_terms=("custom-lane-trigger",),
+                decision_mode="verification_first",
+            )
+        },
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=f"Required bootstrap lane activation missing: {REQUIRED_BOOTSTRAP_LANE}",
+    ):
+        build_task_packet(
+            goal="Prepare custom-lane-trigger follow-up",
+            task_class="Documentation",
+            candidate_paths=["docs/orchestration/AGENT_ROUTING_GRAPH.md"],
+        )
+
+
+def test_task_bootstrap_rejects_unsupported_judgment_decision_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Judgment packets must reject loader modes that drift from supported semantics."""
+
+    monkeypatch.setattr(
+        "scripts.orchestration.task_bootstrap.load_bootstrap_lane_activations",
+        lambda: {
+            REQUIRED_BOOTSTRAP_LANE: BootstrapLaneActivation(
+                lane=REQUIRED_BOOTSTRAP_LANE,
+                signal_terms=("custom-lane-trigger",),
+                decision_mode="standard",
+            )
+        },
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Unsupported judgment lane decision mode: standard. Supported: verification_first",
+    ):
+        build_task_packet(
+            goal="Prepare custom-lane-trigger follow-up",
+            task_class="Documentation",
+            candidate_paths=["docs/orchestration/AGENT_ROUTING_GRAPH.md"],
+        )
+
+
+def test_task_bootstrap_adds_judgment_context_for_single_file_trigger() -> None:
+    """Single-file judgment triggers must still receive judgment SoT context."""
+
+    packet = build_task_packet(
+        goal="Refactor judgment helper docstrings",
+        task_class="Backend API",
+        candidate_paths=["core/judgment.py"],
+    )
+
+    assert packet["decision_contract"]["judgment_enabled"] is True
+    assert "docs/orchestration/AGENT_ROUTING_GRAPH.md" in packet["required_context"]
+    assert (
+        "docs/orchestration/JUDGMENT_ADJUDICATION_SUBLANE_PROTOCOL.md" in packet["required_context"]
+    )
+    assert "docs/orchestration/EVIDENCE_RECONCILIATION_PROTOCOL.md" in packet["required_context"]
+
+
+def test_task_bootstrap_includes_scoped_agents_only_once() -> None:
+    """Context pack must be deterministic and de-duplicated."""
+
+    packet = build_task_packet(
+        goal="Update frontend release workflow",
+        task_class="Release",
+        candidate_paths=[
+            "frontend/src/components/Button.tsx",
+            "frontend/src/config/routes.ts",
+        ],
+    )
+
+    required_context = packet["required_context"]
+    assert required_context == sorted(required_context)
+    assert required_context.count("frontend/AGENTS.md") == 1
+    assert packet["skill_routing"]["recommended"]
+    assert "pulseplate-workflow" in packet["recommended_skills"]
+    assert "pulseplate-frontend-ui" in packet["recommended_skills"]
+
+
+def test_task_bootstrap_routes_cv_tasks_to_cv_domain() -> None:
+    """CV-first tasks should route to the graph-primary CV domain under ML."""
+
+    packet = build_task_packet(
+        goal="Evaluate food image recognition reliability for offline CV review",
+        task_class="AI / ML",
+        candidate_paths=[
+            ".cursor/agents/cv-agent.md",
+            "docs/orchestration/CV_EXPERIMENTATION_PROTOCOL.md",
+        ],
+    )
+
+    assert packet["domain"] == "cv"
+    assert packet["cluster"] == "ml"
+    assert packet["primary_agent"] == "cv-agent"
+    assert packet["secondary_agents"] == ["data-scientist-agent"]
+    assert packet["reviewer"] == "security-auditor"
+    assert "docs-sync" in packet["recommended_skills"]
+    assert "pulseplate-gates" in packet["recommended_skills"]
+    assert packet["native_subagent_bridge"]["primary"]["native_agent_type"] == "default"
+    assert packet["native_subagent_bridge"]["reviewer"]["native_agent_type"] == "explorer"
+
+
+def test_task_bootstrap_promotes_requested_routable_agent() -> None:
+    """Requested agents already present in the routed slot set may become primary."""
+
+    packet = build_task_packet(
+        goal="Implement backend entitlement routing",
+        task_class="Backend API",
+        candidate_paths=["app/middleware/api_tiers.py"],
+        requested_agents=["backend-engineer"],
+    )
+
+    assert packet["domain"] == "backend"
+    assert packet["primary_agent"] == "backend-engineer"
+    assert "architecture-specialist" in packet["secondary_agents"]
+    assert packet["requested_agents"] == ["backend-engineer"]
+    assert packet["requested_agent_disposition"] == [
+        {
+            "agent": "backend-engineer",
+            "status": "honored_primary",
+            "reason": "Requested agent already matches the routed primary.",
+        }
+    ]
+
+
+def test_task_bootstrap_keeps_non_routable_requested_agent_as_advisory() -> None:
+    """Non-routable specialists should be preserved as required custom-role passes."""
+
+    packet = build_task_packet(
+        goal="Design AI reliability experiment packet",
+        task_class="AI / ML",
+        candidate_paths=["docs/orchestration/AGENT_EXPERIMENTATION_PROTOCOL.md"],
+        requested_agents=["ml-engineer-agent"],
+    )
+
+    assert packet["domain"] == "ml"
+    assert packet["primary_agent"] == "ai-innovation-specialist"
+    assert "ml-engineer-agent" in packet["secondary_agents"]
+    assert {
+        binding["repo_agent_slug"] for binding in packet["native_subagent_bridge"]["secondary"]
+    } == {"rag-systems-agent", "security-auditor"}
+    advisory_bindings = packet["native_subagent_bridge"]["advisory"]
+    assert [binding["repo_agent_slug"] for binding in advisory_bindings] == ["ml-engineer-agent"]
+    assert advisory_bindings[0]["execution_mode"] == "advisory_review"
+    assert advisory_bindings[0]["dispatch_contract"]["advisory_only"] is False
+    assert advisory_bindings[0]["dispatch_contract"]["required_role_pass"] is True
+    assert packet["requested_agent_disposition"] == [
+        {
+            "agent": "ml-engineer-agent",
+            "status": "advisory_non_routable",
+            "reason": (
+                "Agent is canonical but non-routable; kept as a required custom-role "
+                "pass, not a skippable note."
+            ),
+        }
+    ]
+
+
+def test_task_bootstrap_rejects_unknown_requested_agent_with_explicit_rationale() -> None:
+    """Unknown requested agents must stay visible in packet metadata with rejection rationale."""
+
+    packet = build_task_packet(
+        goal="Implement backend entitlement routing",
+        task_class="Backend API",
+        candidate_paths=["app/middleware/api_tiers.py"],
+        requested_agents=[" Unknown-Agent ", "unknown-agent"],
+    )
+
+    assert packet["requested_agents"] == ["unknown-agent"]
+    assert packet["requested_agent_disposition"] == [
+        {
+            "agent": "unknown-agent",
+            "status": "rejected_unknown_agent",
+            "reason": "Agent is not registered in the canonical inventory.",
+        }
+    ]
+    assert "unknown-agent" not in packet["secondary_agents"]
+    assert not [
+        binding["repo_agent_slug"] for binding in packet["native_subagent_bridge"]["advisory"]
+    ]
+
+
+def test_task_bootstrap_keeps_domain_mismatch_requested_agent_as_advisory() -> None:
+    """Routable-but-mismatched requested agents stay required custom-role passes."""
+
+    packet = build_task_packet(
+        goal="Implement backend entitlement routing",
+        task_class="Backend API",
+        candidate_paths=["app/middleware/api_tiers.py"],
+        requested_agents=["frontend-engineer"],
+    )
+
+    assert packet["requested_agents"] == ["frontend-engineer"]
+    assert "frontend-engineer" in packet["secondary_agents"]
+    assert packet["requested_agent_disposition"] == [
+        {
+            "agent": "frontend-engineer",
+            "status": "advisory_domain_mismatch",
+            "reason": (
+                "Requested agent is outside the routed domain slot set; kept as a "
+                "required custom-role pass, not a skippable note."
+            ),
+        }
+    ]
+    assert {
+        binding["repo_agent_slug"] for binding in packet["native_subagent_bridge"]["secondary"]
+    } == {"architecture-specialist"}
+    advisory_bindings = packet["native_subagent_bridge"]["advisory"]
+    assert [binding["repo_agent_slug"] for binding in advisory_bindings] == ["frontend-engineer"]
+    assert advisory_bindings[0]["execution_mode"] == "advisory_review"
+    assert advisory_bindings[0]["dispatch_contract"]["spawn_with_native_subagent"] is True
+    assert advisory_bindings[0]["dispatch_contract"]["required_role_pass"] is True
+
+
+def test_task_bootstrap_requested_agents_change_packet_id() -> None:
+    """Requested agents should contribute to the deterministic packet identity."""
+
+    baseline = build_task_packet(
+        goal="Implement backend entitlement routing",
+        task_class="Backend API",
+        candidate_paths=["app/middleware/api_tiers.py"],
+    )
+    with_requested = build_task_packet(
+        goal="Implement backend entitlement routing",
+        task_class="Backend API",
+        candidate_paths=["app/middleware/api_tiers.py"],
+        requested_agents=["backend-engineer"],
+    )
+
+    assert baseline["task_packet_id"] != with_requested["task_packet_id"]
+
+
+def test_task_bootstrap_keeps_security_auditor_in_privileged_review_path() -> None:
+    """Privileged orchestration paths must retain security review after overrides."""
+
+    packet = build_task_packet(
+        goal="Update privileged orchestration workflow",
+        task_class="Orchestration",
+        candidate_paths=["scripts/orchestration/task_bootstrap.py"],
+        requested_agents=["agent-coordinator"],
+    )
+
+    review_path = {
+        packet["primary_agent"],
+        packet["reviewer"],
+        *packet["secondary_agents"],
+    }
+    assert "security-auditor" in review_path
+    assert packet["automation_flags"]["security_review_required"] is True
+    assert "security-auditor" in {
+        packet["native_subagent_bridge"]["reviewer"]["repo_agent_slug"],
+        *[binding["repo_agent_slug"] for binding in packet["native_subagent_bridge"]["secondary"]],
+    }
+    assert "security-auditor" not in {
+        binding["repo_agent_slug"] for binding in packet["native_subagent_bridge"]["advisory"]
+    }
+
+
+@pytest.mark.parametrize(
+    "candidate_path",
+    (
+        ".cursor/agents/security-auditor.md",
+        ".agents/skills/pulseplate-gates/SKILL.md",
+        ".cursor/commands/init.md",
+        ".cursor/rules/cybersecurity-skills-index.md",
+        ".github/actions/setup/action.yml",
+        ".github/scripts/parse-safety-report.py",
+        ".githooks/pre-push",
+        "appstore/fitchef/appstore_review_checklist.md",
+        "Dockerfile",
+        ".env.example",
+        ".trivyignore",
+        ".flake8",
+        ".markdownlint.json",
+        ".nvmrc",
+        ".pre-commit-config.yaml",
+        ".devcontainer/Dockerfile",
+        ".devcontainer/devcontainer.json",
+        ".devcontainer/docker-compose.devcontainer.yml",
+        ".github/CODEOWNERS",
+        ".github/actionlint.yaml",
+        ".github/dependabot.yaml",
+        "docker-compose.yaml",
+        "deploy/Caddyfile.production",
+        "deploy/docker-compose.production.yaml",
+        "deploy/docker-compose.production.selfhosted.yaml",
+        "deploy/docker-compose.staging.yaml",
+        "frontend/.dockerignore",
+        "frontend/Dockerfile.caddy-spa",
+        "frontend/package-lock.json",
+        "ios/Gemfile.lock",
+        "ios/Package.swift",
+        "ios/Package.resolved",
+        "ios/PulsePlate.xcodeproj/project.pbxproj",
+        "ios/PulsePlate.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved",
+        "ios/PulsePlate.xcworkspace/xcshareddata/swiftpm/Package.swift",
+        "ios/PulsePlate/PrivacyInfo.xcprivacy",
+        "package-lock.json",
+        "pyproject.toml",
+        "requirements-ci-lite.txt",
+        "requirements.in",
+        "constraints.txt",
+        "scripts/deploy.sh",
+        "scripts/diagnose_web.sh",
+        "scripts/ops/postgres_backup.sh",
+        "scripts/ops/postgres_restore.sh",
+        "scripts/redeploy_caddy.sh",
+        "scripts/ci_bandit.sh",
+        "scripts/ci_pip_audit.sh",
+        "scripts/deploy_production.sh",
+        "scripts/ci/check_pr_merge_readiness.py",
+        "scripts/release/publish.py",
+        "docs/orchestration/workflow.md",
+        "docs/review/PR_1254_FIXED_MAPPING.md",
+        "tests/guards/test_nosec_policy_guard.py",
+        "trivy/policy.rego",
+        "AGENTS.md",
+        "scripts/AGENTS.md",
+        "Makefile",
+        "RUNBOOK_AGENT.md",
+        ".bandit",
+        ".bandit.yaml",
+        ".coveragerc",
+        "codecov.yml",
+        "codecov.yaml",
+        ".coderabbit.yaml",
+        ".gitmodules",
+        ".python-version",
+        ".ruby-version",
+        ".secrets.baseline",
+        ".sourcery.yaml",
+        ".tool-versions",
+        ".yamllint",
+        ".cursor/mcp.json.example",
+        ".kimi/mcp.json.example",
+        ".github/PULL_REQUEST_TEMPLATE/design.md",
+        ".github/pull_request_template.md",
+        "alembic.ini",
+        "deploy/metatron-lab/docker-compose.yaml",
+        "deploy/systemd/pulseplate-postgres-backup.service.example",
+        "deploy/systemd/pulseplate-postgres-backup.timer.example",
+        "frontend/wrangler.toml",
+        ".github/agents/my-agent.md",
+        ".github/prompts/vibecoder.prompt.md",
+        ".vscode/extensions.json",
+        "docs/security/vscode_extensions_allowlist.txt",
+        "ios/PulsePlate/Info-Release.plist",
+        "ios/PulsePlate/PulsePlate.entitlements",
+        "ios/PulsePlate.xcodeproj/xcshareddata/xcschemes/PulsePlate.xcscheme",
+        "ios/PulsePlate/en.lproj/InfoPlist.strings",
+        "mcp-config.json",
+        "mcp-setup.sh",
+        "mcp_pulseplate_server.py",
+        "opencode.json",
+        "scripts/devcontainer/smoke.sh",
+        "scripts/hooks/repo_python.sh",
+        "scripts/install_codex_skills.sh",
+        "scripts/metatron_lab/compose_guard.py",
+        "scripts/opencode/run_pulseplate_mcp.sh",
+        "scripts/run-backend-tests-pre-commit.sh",
+        "scripts/validate-ci-environment.sh",
+        "scripts/verify_codex_skills_install.py",
+        "setup_custom_mcp.py",
+        "tests/security/_api_authz_contracts.py",
+        "tests/security/test_api_authz_contract_static.py",
+        "tests/test_install_codex_skills.py",
+        "tests/test_repo_policy_guards.py",
+        "tools/agentguard/scan_text.mjs",
+        "tools/codex_skills/pulseplate-gates/SKILL.md",
+        "tools/cybersecurity_skills/index.json",
+        "update_api_key.py",
+        "worker.js",
+        "wrangler.toml",
+    ),
+)
+def test_task_bootstrap_marks_privileged_review_surfaces_as_privileged(
+    candidate_path: str,
+) -> None:
+    """Privileged review surfaces must force the security review path."""
+
+    packet = build_task_packet(
+        goal="Refresh merge-governance automation contract",
+        task_class="Documentation",
+        candidate_paths=[candidate_path],
+        requested_agents=["agent-coordinator"],
+    )
+
+    review_path = {
+        packet["primary_agent"],
+        packet["reviewer"],
+        *packet["secondary_agents"],
+    }
+
+    assert packet["automation_flags"]["security_review_required"] is True
+    assert "security-auditor" in review_path
+    assert "security-auditor" in {
+        packet["native_subagent_bridge"]["reviewer"]["repo_agent_slug"],
+        *[binding["repo_agent_slug"] for binding in packet["native_subagent_bridge"]["secondary"]],
+    }
+
+
+def test_task_bootstrap_does_not_mark_non_privileged_control_path_as_privileged() -> None:
+    """Ordinary test paths must not widen the privileged security-review path."""
+
+    packet = build_task_packet(
+        goal="Refresh a non-privileged bootstrap test",
+        task_class="Testing",
+        candidate_paths=["tests/test_task_bootstrap.py"],
+        requested_agents=["agent-coordinator"],
+    )
+
+    assert packet["automation_flags"]["security_review_required"] is False
+
+
+def test_task_bootstrap_rejects_parent_traversal_candidate_paths() -> None:
+    """Parent traversal candidate paths must fail closed before routing."""
+
+    with pytest.raises(ValueError, match="canonical task candidate paths"):
+        build_task_packet(
+            goal="Review normalized workflow path",
+            task_class="Orchestration",
+            candidate_paths=["docs/../.github/workflows/ci.yml"],
+            requested_agents=["agent-coordinator"],
+        )
+
+
+@pytest.mark.parametrize("case", _privileged_surface_cases(), ids=lambda case: case["case_id"])
+def test_task_bootstrap_consumes_shared_privileged_surface_matrix(
+    case: dict[str, object],
+) -> None:
+    """Bootstrap packet security-review flags must follow the shared matrix."""
+
+    packet = build_task_packet(
+        goal="Refresh guarded orchestration surface",
+        task_class="Governance",
+        candidate_paths=[str(case["path"])],
+    )
+
+    assert packet["automation_flags"]["security_review_required"] is bool(case["privileged"])
+    if case["privileged"]:
+        assert "security-auditor" in {
+            packet["primary_agent"],
+            packet["reviewer"],
+            *packet["secondary_agents"],
+        }
+
+
+def test_task_bootstrap_forces_requested_security_auditor_into_executable_bridge() -> None:
+    """Privileged review must keep an explicitly requested security auditor runnable."""
+
+    packet = build_task_packet(
+        goal="Audit privileged orchestration workflow",
+        task_class="Orchestration",
+        candidate_paths=["scripts/orchestration/task_bootstrap.py"],
+        requested_agents=["security-auditor"],
+    )
+
+    assert "security-auditor" in packet["secondary_agents"]
+    assert "security-auditor" in {
+        binding["repo_agent_slug"] for binding in packet["native_subagent_bridge"]["secondary"]
+    }
+    assert "security-auditor" not in {
+        binding["repo_agent_slug"] for binding in packet["native_subagent_bridge"]["advisory"]
+    }
+    assert packet["requested_agent_disposition"] == [
+        {
+            "agent": "security-auditor",
+            "status": "honored_secondary",
+            "reason": (
+                "Requested agent is required for the privileged review path and stays "
+                "executable in secondary."
+            ),
+        }
+    ]
+
+
+def test_task_bootstrap_preserves_coordinator_primary_for_requested_orchestration_lane() -> None:
+    """Coordinator-owned orchestration lanes should keep agent-coordinator as primary."""
+
+    packet = build_task_packet(
+        goal="Update privileged orchestration workflow",
+        task_class="Orchestration",
+        candidate_paths=["scripts/orchestration/task_bootstrap.py"],
+        requested_agents=["agent-coordinator", "architecture-specialist"],
+    )
+
+    assert packet["primary_agent"] == "agent-coordinator"
+    assert "agent-coordinator" not in packet["secondary_agents"]
+    assert packet["requested_agent_disposition"] == [
+        {
+            "agent": "agent-coordinator",
+            "status": "honored_primary",
+            "reason": "Requested agent already matches the routed primary.",
+        },
+        {
+            "agent": "architecture-specialist",
+            "status": "honored_reviewer",
+            "reason": (
+                "Coordinator-owned lane keeps `agent-coordinator` as primary; "
+                "requested reviewer stays honored in reviewer."
+            ),
+        },
+    ]
+
+
+def test_task_bootstrap_keeps_displaced_requested_reviewer_required_post_open() -> None:
+    """Post-open QA synthesis must not drop a requested reviewer role pass."""
+
+    packet = build_task_packet(
+        goal="Update privileged orchestration workflow",
+        task_class="Orchestration",
+        candidate_paths=["scripts/orchestration/task_bootstrap.py"],
+        requested_agents=["agent-coordinator", "architecture-specialist"],
+        pr_phase="post_open_review",
+    )
+
+    assert packet["primary_agent"] == "qa-engineer-agent"
+    assert packet["reviewer"] == "architecture-specialist"
+    assert "agent-coordinator" in packet["secondary_agents"]
+    assert "architecture-specialist" in {
+        packet["native_subagent_bridge"]["reviewer"]["repo_agent_slug"]
+    }
+    assert packet["requested_agent_disposition"] == [
+        {
+            "agent": "agent-coordinator",
+            "status": "honored_secondary",
+            "reason": "Requested agent stayed honored in secondary after PR lifecycle synthesis.",
+        },
+        {
+            "agent": "architecture-specialist",
+            "status": "honored_reviewer",
+            "reason": "Requested agent stayed honored as reviewer after PR lifecycle synthesis.",
+        },
+    ]
+
+
+def test_task_bootstrap_does_not_treat_cve_or_cvss_as_cv_domain() -> None:
+    """Security acronyms must not trigger the CV routing domain."""
+
+    packet = build_task_packet(
+        goal="Audit CVE and CVSS handling for auth failures",
+        task_class="Security",
+        candidate_paths=["app/security/auth.py"],
+    )
+
+    assert packet["domain"] == "security"
+
+
+def test_task_bootstrap_preserves_explicit_security_task_class_over_cv_goal_hint() -> None:
+    """Explicit non-CV task classes must win over generic CV goal wording."""
+
+    packet = build_task_packet(
+        goal="Audit CV controls for image upload abuse paths",
+        task_class="Security",
+        candidate_paths=["app/security/auth.py"],
+    )
+
+    assert packet["domain"] == "security"
+
+
+def test_task_bootstrap_routes_cv_path_hints_for_cv_routable_task_class() -> None:
+    """CV-specific paths should route to CV for ML/CV-class tasks."""
+
+    packet = build_task_packet(
+        goal="Refresh CV protocol references",
+        task_class="AI / ML",
+        candidate_paths=[
+            "docs/orchestration/CV_EXPERIMENTATION_PROTOCOL.md",
+            ".cursor/agents/cv-agent.md",
+        ],
+    )
+
+    assert packet["domain"] == "cv"
+    assert packet["cluster"] == "ml"
+    assert packet["primary_agent"] == "cv-agent"
+
+
+def test_task_bootstrap_preserves_docs_task_class_over_cv_path_hint() -> None:
+    """Explicit docs tasks must not be re-routed by CV-specific candidate paths."""
+
+    packet = build_task_packet(
+        goal="Refresh CV protocol references",
+        task_class="Documentation",
+        candidate_paths=[
+            "docs/orchestration/CV_EXPERIMENTATION_PROTOCOL.md",
+            ".cursor/agents/cv-agent.md",
+        ],
+    )
+
+    assert packet["domain"] == "docs"
+    assert packet["cluster"] == "ops"
+
+
+def test_task_bootstrap_marks_backlog_sync_triggers() -> None:
+    """Backlog-oriented inputs should set the deterministic backlog sync flag."""
+
+    packet = build_task_packet(
+        goal="Prepare roadmap follow-up for deferred orchestration hardening",
+        task_class="Documentation",
+        candidate_paths=["docs/roadmap/BACKLOG_LEDGER.md"],
+    )
+
+    assert packet["needs_backlog_update"] is True
+
+
+def test_task_bootstrap_marks_backlog_sync_for_roadmap_marker() -> None:
+    """Roadmap markers are part of the explicit PR2 backlog-sync contract."""
+
+    packet = build_task_packet(
+        goal="Refresh roadmap sequencing for orchestration follow-ups",
+        task_class="Documentation",
+        candidate_paths=["docs/orchestration/workflow.md"],
+    )
+
+    assert packet["needs_backlog_update"] is True
+
+
+def test_task_bootstrap_marks_backlog_sync_for_follow_up_variant() -> None:
+    """Non-hyphenated follow-up wording should still trigger backlog sync."""
+
+    packet = build_task_packet(
+        goal="Track follow up items for orchestration hardening",
+        task_class="Documentation",
+        candidate_paths=["docs/orchestration/workflow.md"],
+    )
+
+    assert packet["needs_backlog_update"] is True
+
+
+def test_task_bootstrap_marks_docs_sync_for_code_only_paths() -> None:
+    """Implementation-only tasks should request docs sync when docs paths are absent."""
+
+    packet = build_task_packet(
+        goal="Tighten auth middleware behavior",
+        task_class="Backend API",
+        candidate_paths=["app/security/auth.py"],
+    )
+
+    assert packet["needs_docs_sync"] is True
+
+
+def test_task_bootstrap_marks_agents_sync_for_agent_contract_paths() -> None:
+    """Agent and skill contract paths should request agent-doc synchronization."""
+
+    packet = build_task_packet(
+        goal="Refresh coordinator contract guidance",
+        task_class="Documentation",
+        candidate_paths=[
+            "AGENTS.md",
+            "frontend/AGENTS.md",
+            ".cursor/agents/agent-coordinator.md",
+            "SKILL.md",
+            "skills/coordination/SKILL.md",
+        ],
+    )
+
+    assert packet["needs_agents_sync"] is True
+
+
+def test_task_bootstrap_does_not_mark_agents_sync_for_non_contract_paths() -> None:
+    """Non-contract docs should not trigger agent synchronization."""
+
+    packet = build_task_packet(
+        goal="Refresh orchestration docs",
+        task_class="Documentation",
+        candidate_paths=["docs/AGENTS-guide.md", "docs/orchestration/workflow.md"],
+    )
+
+    assert packet["needs_agents_sync"] is False
+
+
+def test_task_bootstrap_keeps_packet_id_stable_for_identical_inputs() -> None:
+    """Additive metadata must remain derivable without perturbing packet identity."""
+
+    first_packet = build_task_packet(
+        goal="Refresh docs sync guidance",
+        task_class="Documentation",
+        candidate_paths=["docs/orchestration/AGENT_MESSAGE_PROTOCOL.md"],
+    )
+    second_packet = build_task_packet(
+        goal="Refresh docs sync guidance",
+        task_class="Documentation",
+        candidate_paths=["docs/orchestration/AGENT_MESSAGE_PROTOCOL.md"],
+    )
+
+    assert first_packet["task_packet_id"] == second_packet["task_packet_id"]
+    assert first_packet["automation_flags"] == second_packet["automation_flags"]
+    assert first_packet["pr_phase"] == second_packet["pr_phase"]
+    assert first_packet["design_lane_mode"] == second_packet["design_lane_mode"]
+    assert first_packet["design_lane_contract"] == second_packet["design_lane_contract"]
+    assert first_packet["message_envelope"] == second_packet["message_envelope"]
+    assert first_packet["context_pack_compression"] == second_packet["context_pack_compression"]
+    assert (
+        first_packet["provider_model_tier_routing"] == second_packet["provider_model_tier_routing"]
+    )
+    assert SHADOW_REUSE_FIELD not in first_packet
+    assert SHADOW_REUSE_FIELD not in second_packet
+    assert (
+        first_packet["embedding_retrieval_admission"]
+        == second_packet["embedding_retrieval_admission"]
+    )
+    assert first_packet["needs_backlog_update"] == second_packet["needs_backlog_update"]
+    assert first_packet["needs_docs_sync"] == second_packet["needs_docs_sync"]
+    assert first_packet["needs_agents_sync"] == second_packet["needs_agents_sync"]
+
+
+def test_task_bootstrap_changes_packet_id_when_pr_phase_changes() -> None:
+    """Lifecycle phase must affect packet identity to avoid artifact collisions."""
+
+    baseline_packet = build_task_packet(
+        goal="Refresh docs sync guidance",
+        task_class="Documentation",
+        candidate_paths=["docs/orchestration/AGENT_MESSAGE_PROTOCOL.md"],
+    )
+    review_packet = build_task_packet(
+        goal="Refresh docs sync guidance",
+        task_class="Documentation",
+        candidate_paths=["docs/orchestration/AGENT_MESSAGE_PROTOCOL.md"],
+        pr_phase="post_open_review",
+    )
+
+    assert baseline_packet["task_packet_id"] != review_packet["task_packet_id"]
+
+
+def test_task_bootstrap_changes_packet_id_when_design_contract_changes() -> None:
+    """Design metadata must participate in packet identity."""
+
+    baseline_packet = build_task_packet(
+        goal="Refresh docs sync guidance",
+        task_class="Documentation",
+        candidate_paths=["docs/orchestration/AGENT_MESSAGE_PROTOCOL.md"],
+    )
+    design_packet = build_task_packet(
+        goal="Refresh docs sync guidance",
+        task_class="Documentation",
+        candidate_paths=["docs/orchestration/AGENT_MESSAGE_PROTOCOL.md"],
+        design_source="code_native_brief",
+        target_surface="web.hero",
+        task_mode="implement",
+        code_native_design_brief_path="docs/design/HERO_BRIEF.md",
+    )
+
+    assert baseline_packet["task_packet_id"] != design_packet["task_packet_id"]
+
+
+def test_task_bootstrap_canonicalizes_design_blocker_order_for_packet_identity() -> None:
+    """Design blocker ordering must not perturb deterministic packet identity."""
+
+    first_packet = build_task_packet(
+        goal="Refresh docs sync guidance",
+        task_class="Documentation",
+        candidate_paths=["docs/orchestration/AGENT_MESSAGE_PROTOCOL.md"],
+        design_source="code_native_brief",
+        target_surface="web.hero",
+        task_mode="implement",
+        code_native_design_brief_path="docs/design/HERO_BRIEF.md",
+        design_blockers=("stale", "blocked_by_plan"),
+    )
+    second_packet = build_task_packet(
+        goal="Refresh docs sync guidance",
+        task_class="Documentation",
+        candidate_paths=["docs/orchestration/AGENT_MESSAGE_PROTOCOL.md"],
+        design_source="code_native_brief",
+        target_surface="web.hero",
+        task_mode="implement",
+        code_native_design_brief_path="docs/design/HERO_BRIEF.md",
+        design_blockers=("blocked_by_plan", "stale"),
+    )
+
+    assert first_packet["task_packet_id"] == second_packet["task_packet_id"]
+    assert first_packet["design_lane_contract"]["blockers"] == [
+        "blocked_by_plan",
+        "stale",
+    ]
+    assert second_packet["design_lane_contract"]["blockers"] == [
+        "blocked_by_plan",
+        "stale",
+    ]
+
+
+def test_canonicalize_design_blockers_keeps_unknown_entries_deterministic() -> None:
+    """Unknown blockers must not crash direct canonicalization helpers."""
+
+    assert canonicalize_design_blockers(
+        ("custom_blocker", "blocked_by_plan", "custom_alpha"),
+    ) == [
+        "blocked_by_plan",
+        "custom_alpha",
+        "custom_blocker",
+    ]
+
+
+def test_matches_any_prefix_covers_exact_and_nested_paths() -> None:
+    """Prefix matcher must honor exact directory roots and nested repo paths."""
+
+    prefixes = ("scripts/", "docs/orchestration/")
+
+    assert matches_any_prefix("scripts", prefixes) is True
+    assert matches_any_prefix("scripts/orchestration/task_bootstrap.py", prefixes) is True
+    assert matches_any_prefix("docs/orchestration/workflow.md", prefixes) is True
+    assert matches_any_prefix("tests/test_task_bootstrap.py", prefixes) is False
+
+
+def test_normalize_repo_path_preserves_dot_cursor_prefix() -> None:
+    """Leading './' removal must not strip the '.cursor' directory name."""
+
+    assert normalize_repo_path("./.cursor/agents/agent-coordinator.md") == (
+        ".cursor/agents/agent-coordinator.md"
+    )
+
+
+def test_normalize_repo_path_keeps_absolute_outside_repo() -> None:
+    """Absolute paths outside repo should not raise and stay absolute."""
+
+    outside = Path("/tmp/pulseplate-outside/task.json")
+    assert normalize_repo_path(outside) == outside.as_posix()
+
+
+def test_resolve_output_path_anchors_relative_paths_to_repo_root() -> None:
+    """Relative --output should resolve within the repository root."""
+
+    out_path = _resolve_output_path("tmp/task-packet.json", "ignored")
+    assert out_path == (REPO_ROOT / "tmp/task-packet.json").resolve()
+
+
+def test_main_rejects_output_outside_repo(tmp_path, capsys) -> None:
+    """CLI should fail cleanly when --output targets a path outside the repo."""
+
+    outside = tmp_path / "task-packet.json"
+    exit_code = main(
+        [
+            "--goal",
+            "Harden orchestration bootstrap",
+            "--task-class",
+            "Orchestration",
+            "--path",
+            "scripts/orchestration/task_bootstrap.py",
+            "--output",
+            str(outside),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "FAIL: --output must stay within the repository root" in captured.out
+
+
+def test_main_repeated_packet_records_same_head_shadow_exact_hit(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """CLI artifact loop should see prior same-ID packets as shadow candidates."""
+
+    task_packet_dir = (REPO_ROOT / f"tmp/task-packets-{uuid.uuid4().hex}").resolve()
+    head_sha = "c" * 40
+    args = [
+        "--goal",
+        "Review coordinator packet reuse",
+        "--task-class",
+        "Orchestration",
+        "--path",
+        "scripts/orchestration/task_bootstrap.py",
+        "--path",
+        "scripts/orchestration/shadow_reuse_telemetry.py",
+        "--requested-agent",
+        "agent-coordinator",
+        "--requested-agent",
+        "architecture-specialist",
+        "--pr-phase",
+        "pre_open",
+    ]
+    monkeypatch.setattr(task_bootstrap_module, "TASK_PACKET_DIR", task_packet_dir)
+    monkeypatch.setattr(
+        task_bootstrap_module,
+        "resolve_current_head_sha",
+        lambda _repo_root: head_sha,
+    )
+    task_packet_dir.mkdir(parents=True)
+    for index in range(60):
+        unrelated_packet = {
+            "schema_version": "3.0",
+            "task_packet_id": f"unrelated-{index}",
+            "goal": f"Unrelated packet {index}",
+        }
+        (task_packet_dir / f"00-unrelated-{index:02d}.json").write_text(
+            json.dumps(unrelated_packet),
+            encoding="utf-8",
+        )
+
+    try:
+        first_exit = main(args)
+        first_stdout = json.loads(capsys.readouterr().out)
+        first_packet_path = task_packet_dir / f"{first_stdout['task_packet_id']}.json"
+        first_packet = json.loads(first_packet_path.read_text(encoding="utf-8"))
+
+        second_exit = main(args)
+        second_stdout = json.loads(capsys.readouterr().out)
+        second_packet_path = task_packet_dir / f"{second_stdout['task_packet_id']}.json"
+        second_packet = json.loads(second_packet_path.read_text(encoding="utf-8"))
+
+        assert first_exit == 0
+        assert second_exit == 0
+        assert first_stdout["task_packet_id"] == second_stdout["task_packet_id"]
+        assert first_packet["task_packet_id"] == second_packet["task_packet_id"]
+        first_summary = first_packet[SHADOW_REUSE_FIELD]["reuse_summary"]
+        second_summary = second_packet[SHADOW_REUSE_FIELD]["reuse_summary"]
+        assert first_summary["decision"] == "miss"
+        assert first_summary["checked_previous_packet_count"] == 0
+        assert first_summary["skipped_previous_packet_count"] > 0
+        assert second_summary["decision"] == "hit"
+        assert second_summary["match_mode"] == "exact"
+        assert second_summary["matched_packet_id"] == second_packet["task_packet_id"]
+        assert second_summary["checked_previous_packet_count"] == 1
+        assert second_summary["skipped_previous_packet_count"] > 0
+        assert second_packet[SHADOW_REUSE_FIELD]["same_head_partition"]["head_sha"] == head_sha
+    finally:
+        shutil.rmtree(task_packet_dir, ignore_errors=True)
+
+
+def test_main_writes_relative_output_inside_repo(monkeypatch, capsys) -> None:
+    """CLI should write relative --output under repo root and report repo-relative path."""
+
+    # Unique path avoids xdist races on a shared repo-local tmp file.
+    relative_output = Path(f"tmp/task-packet-{uuid.uuid4().hex}.json")
+    repo_output = (REPO_ROOT / relative_output).resolve()
+    if repo_output.exists():
+        repo_output.unlink()
+
+    packet = {
+        "schema_version": "3.0",
+        "task_packet_id": "abc123def456",
+        "goal": "Test bootstrap write",
+        "task_class": "Orchestration",
+        "domain": "orchestration",
+        "cluster": "ops",
+        "candidate_paths": ["scripts/orchestration/task_bootstrap.py"],
+        "primary_agent": "agent-coordinator",
+        "secondary_agents": [],
+        "reviewer": "architecture-specialist",
+        "requested_agents": [],
+        "requested_agent_disposition": [],
+        "required_context": ["AGENTS.md"],
+        "recommended_skills": ["pulseplate-workflow"],
+        "skill_routing": {
+            "policy_version": "2026-03-27",
+            "selection_mode": "deterministic-weighted",
+            "requested_agents": [],
+            "task_classification": {
+                "label": "implementation",
+                "score": 0,
+                "reasons": ["fallback:default-implementation"],
+            },
+            "required": [
+                {
+                    "skill": "pulseplate-workflow",
+                    "rationale": "Mandatory entry skill for all PulsePlate tasks.",
+                    "reasons": ["always-on"],
+                }
+            ],
+            "recommended": [],
+            "conditional": [],
+            "blocked": [],
+        },
+        "decision_contract": {
+            "mode": "verification_first",
+            "claim_taxonomy": list(CLAIM_TYPES),
+            "flow": list(JUDGMENT_FLOW),
+        },
+        "judgment_budget": {
+            "skeptic_pass_required": True,
+            "verifier_pass_required": True,
+            "max_provider_calls": 1,
+            "uncertainty_split_required": True,
+        },
+        "result_adjudication": {
+            "claim_evidence_fields": list(CLAIM_EVIDENCE_FIELDS),
+            "support_statuses": list(SUPPORT_STATUSES),
+            "evidence_modes": list(EVIDENCE_MODES),
+            "uncertainty_fields": list(UNCERTAINTY_FIELDS),
+            "promotion_labels": list(PROMOTION_LABELS),
+        },
+        "native_subagent_bridge": {
+            "protocol_version": "1.0",
+            "transport": "codex-native-subagents",
+            "primary": {"native_agent_type": "default"},
+            "secondary": [],
+            "reviewer": {"native_agent_type": "explorer"},
+        },
+        "routing_rationale": {"source": "canonical_only"},
+    }
+    monkeypatch.setattr(
+        "scripts.orchestration.task_bootstrap.build_task_packet",
+        lambda **_: packet,
+    )
+
+    try:
+        exit_code = main(
+            [
+                "--goal",
+                "ignored",
+                "--task-class",
+                "ignored",
+                "--output",
+                str(relative_output),
+            ]
+        )
+        captured = capsys.readouterr()
+        assert exit_code == 0
+        written = json.loads(repo_output.read_text(encoding="utf-8"))
+        assert written["task_packet_id"] == "abc123def456"
+        assert written["decision_contract"]["claim_taxonomy"] == list(CLAIM_TYPES)
+        assert written["result_adjudication"]["support_statuses"] == list(SUPPORT_STATUSES)
+        assert written["result_adjudication"]["evidence_modes"] == list(EVIDENCE_MODES)
+        stdout_payload = json.loads(captured.out)
+        assert stdout_payload["output"] == relative_output.as_posix()
+        assert stdout_payload["primary_native_agent_type"] == "default"
+        assert stdout_payload["packet_creation_executes_roles"] is False
+        assert stdout_payload["role_agent_dispatch_required"] is True
+        assert (
+            stdout_payload["dispatch_manifest_entrypoint"]
+            == "scripts/orchestration/role_dispatch_bridge.py"
+        )
+    finally:
+        if repo_output.exists():
+            repo_output.unlink()
+
+
+def test_main_writes_repo_root_output_as_relative_path(monkeypatch, capsys) -> None:
+    """Direct children of the repo root should still be reported repo-relative."""
+
+    relative_output = Path(f"task-packet-root-{uuid.uuid4().hex}.json")
+    repo_output = (REPO_ROOT / relative_output).resolve()
+    if repo_output.exists():
+        repo_output.unlink()
+
+    packet = {
+        "schema_version": "3.0",
+        "task_packet_id": "rootpacket123",
+        "goal": "Test root output write",
+        "task_class": "Orchestration",
+        "domain": "orchestration",
+        "cluster": "ops",
+        "candidate_paths": ["scripts/orchestration/task_bootstrap.py"],
+        "primary_agent": "agent-coordinator",
+        "secondary_agents": [],
+        "reviewer": "architecture-specialist",
+        "requested_agents": [],
+        "requested_agent_disposition": [],
+        "required_context": ["AGENTS.md"],
+        "recommended_skills": ["pulseplate-workflow"],
+        "skill_routing": {
+            "policy_version": "2026-03-27",
+            "selection_mode": "deterministic-weighted",
+            "requested_agents": [],
+            "task_classification": {
+                "label": "implementation",
+                "score": 0,
+                "reasons": ["fallback:default-implementation"],
+            },
+            "required": [
+                {
+                    "skill": "pulseplate-workflow",
+                    "rationale": "Mandatory entry skill for all PulsePlate tasks.",
+                    "reasons": ["always-on"],
+                }
+            ],
+            "recommended": [],
+            "conditional": [],
+            "blocked": [],
+        },
+        "decision_contract": {
+            "mode": "verification_first",
+            "claim_taxonomy": list(CLAIM_TYPES),
+            "flow": list(JUDGMENT_FLOW),
+        },
+        "judgment_budget": {
+            "skeptic_pass_required": True,
+            "verifier_pass_required": True,
+            "max_provider_calls": 1,
+            "uncertainty_split_required": True,
+        },
+        "result_adjudication": {
+            "claim_evidence_fields": list(CLAIM_EVIDENCE_FIELDS),
+            "support_statuses": list(SUPPORT_STATUSES),
+            "evidence_modes": list(EVIDENCE_MODES),
+            "uncertainty_fields": list(UNCERTAINTY_FIELDS),
+            "promotion_labels": list(PROMOTION_LABELS),
+        },
+        "native_subagent_bridge": {
+            "protocol_version": "1.0",
+            "transport": "codex-native-subagents",
+            "primary": {"native_agent_type": "default"},
+            "secondary": [],
+            "reviewer": {"native_agent_type": "explorer"},
+        },
+        "routing_rationale": {"source": "canonical_only"},
+    }
+    monkeypatch.setattr(
+        "scripts.orchestration.task_bootstrap.build_task_packet",
+        lambda **_: packet,
+    )
+
+    try:
+        exit_code = main(
+            [
+                "--goal",
+                "ignored",
+                "--task-class",
+                "ignored",
+                "--output",
+                str(relative_output),
+            ]
+        )
+        captured = capsys.readouterr()
+        assert exit_code == 0
+        assert repo_output.exists()
+        written = json.loads(repo_output.read_text(encoding="utf-8"))
+        assert written["result_adjudication"]["promotion_labels"] == list(PROMOTION_LABELS)
+        assert json.loads(captured.out)["output"] == relative_output.as_posix()
+        assert json.loads(captured.out)["reviewer_native_agent_type"] == "explorer"
+    finally:
+        if repo_output.exists():
+            repo_output.unlink()
+
+
+def test_main_passes_requested_agent_flags(monkeypatch, capsys) -> None:
+    """CLI should propagate repeated --requested-agent values into the packet builder."""
+
+    observed: dict[str, object] = {}
+
+    def _fake_build_task_packet(**kwargs: object) -> dict[str, object]:
+        observed.update(kwargs)
+        return {
+            "schema_version": "3.0",
+            "task_packet_id": "req-agent-packet",
+            "goal": "Use requested agents",
+            "task_class": "Orchestration",
+            "domain": "orchestration",
+            "cluster": "ops",
+            "candidate_paths": ["scripts/orchestration/task_bootstrap.py"],
+            "primary_agent": "agent-coordinator",
+            "secondary_agents": ["security-auditor"],
+            "reviewer": "architecture-specialist",
+            "requested_agents": ["agent-coordinator", "security-auditor"],
+            "requested_agent_disposition": [],
+            "required_context": ["AGENTS.md"],
+            "recommended_skills": ["pulseplate-workflow"],
+            "skill_routing": {
+                "policy_version": "2026-03-27",
+                "selection_mode": "deterministic-weighted",
+                "requested_agents": ["agent-coordinator", "security-auditor"],
+                "task_classification": {
+                    "label": "implementation",
+                    "score": 0,
+                    "reasons": ["fallback:default-implementation"],
+                },
+                "required": [
+                    {
+                        "skill": "pulseplate-workflow",
+                        "rationale": "Mandatory entry skill for all PulsePlate tasks.",
+                        "reasons": ["always-on"],
+                    }
+                ],
+                "recommended": [],
+                "conditional": [],
+                "blocked": [],
+            },
+            "native_subagent_bridge": {
+                "protocol_version": "1.0",
+                "transport": "codex-native-subagents",
+                "primary": {"native_agent_type": "default"},
+                "secondary": [{"native_agent_type": "worker"}],
+                "reviewer": {"native_agent_type": "explorer"},
+            },
+            "routing_rationale": {"source": "canonical_only"},
+        }
+
+    monkeypatch.setattr(
+        "scripts.orchestration.task_bootstrap.build_task_packet",
+        _fake_build_task_packet,
+    )
+
+    exit_code = main(
+        [
+            "--goal",
+            "Use explicit requested agents",
+            "--task-class",
+            "Orchestration",
+            "--requested-agent",
+            "agent-coordinator",
+            "--requested-agent",
+            "security-auditor",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert observed["requested_agents"] == ["agent-coordinator", "security-auditor"]
+    assert json.loads(captured.out)["requested_agents"] == [
+        "agent-coordinator",
+        "security-auditor",
+    ]
+    assert json.loads(captured.out)["primary_native_agent_type"] == "default"
+
+
+def test_main_passes_pr_phase_flag(monkeypatch, capsys) -> None:
+    """CLI should propagate --pr-phase into the packet builder."""
+
+    observed: dict[str, object] = {}
+
+    def _fake_build_task_packet(**kwargs: object) -> dict[str, object]:
+        observed.update(kwargs)
+        return {
+            "schema_version": "3.0",
+            "task_packet_id": "pr-phase-packet",
+            "goal": "Use explicit PR phase",
+            "task_class": "Orchestration",
+            "domain": "orchestration",
+            "cluster": "ops",
+            "candidate_paths": ["scripts/orchestration/task_bootstrap.py"],
+            "primary_agent": "agent-coordinator",
+            "secondary_agents": ["bug-hunter"],
+            "reviewer": "qa-engineer-agent",
+            "requested_agents": [],
+            "requested_agent_disposition": [],
+            "required_context": ["AGENTS.md"],
+            "recommended_skills": ["pulseplate-workflow"],
+            "skill_routing": {
+                "policy_version": "2026-03-27",
+                "selection_mode": "deterministic-weighted",
+                "requested_agents": [],
+                "task_classification": {
+                    "label": "implementation",
+                    "score": 0,
+                    "reasons": ["fallback:default-implementation"],
+                },
+                "required": [
+                    {
+                        "skill": "pulseplate-workflow",
+                        "rationale": "Mandatory entry skill for all PulsePlate tasks.",
+                        "reasons": ["always-on"],
+                    }
+                ],
+                "recommended": [],
+                "conditional": [],
+                "blocked": [],
+            },
+            "native_subagent_bridge": {
+                "protocol_version": "1.0",
+                "transport": "codex-native-subagents",
+                "primary": {"native_agent_type": "default"},
+                "secondary": [{"native_agent_type": "worker"}],
+                "reviewer": {"native_agent_type": "explorer"},
+            },
+            "routing_rationale": {"source": "canonical_only"},
+        }
+
+    monkeypatch.setattr(
+        "scripts.orchestration.task_bootstrap.build_task_packet",
+        _fake_build_task_packet,
+    )
+
+    exit_code = main(
+        [
+            "--goal",
+            "Run post-open review phase",
+            "--task-class",
+            "Orchestration",
+            "--pr-phase",
+            "post_open_review",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert observed["pr_phase"] == "post_open_review"
+    assert json.loads(captured.out)["task_packet_id"] == "pr-phase-packet"
+
+
+def test_main_passes_native_bridge_transport_flag(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """CLI should propagate --native-bridge-transport into the packet builder."""
+
+    observed: dict[str, object] = {}
+
+    def _fake_build_task_packet(**kwargs: object) -> dict[str, object]:
+        observed.update(kwargs)
+        return {
+            "schema_version": "3.0",
+            "task_packet_id": "bridge-transport-packet",
+            "goal": "Use kimi native transport",
+            "task_class": "Orchestration",
+            "domain": "orchestration",
+            "cluster": "ops",
+            "candidate_paths": ["scripts/orchestration/task_bootstrap.py"],
+            "primary_agent": "agent-coordinator",
+            "secondary_agents": ["bug-hunter"],
+            "reviewer": "qa-engineer-agent",
+            "requested_agents": [],
+            "requested_agent_disposition": [],
+            "required_context": ["AGENTS.md"],
+            "recommended_skills": ["pulseplate-workflow"],
+            "skill_routing": {
+                "policy_version": "2026-03-27",
+                "selection_mode": "deterministic-weighted",
+                "requested_agents": [],
+                "task_classification": {
+                    "label": "implementation",
+                    "score": 0,
+                    "reasons": ["fallback:default-implementation"],
+                },
+                "required": [
+                    {
+                        "skill": "pulseplate-workflow",
+                        "rationale": "Mandatory entry skill for all PulsePlate tasks.",
+                        "reasons": ["always-on"],
+                    }
+                ],
+                "recommended": [],
+                "conditional": [],
+                "blocked": [],
+            },
+            "native_subagent_bridge": {
+                "protocol_version": "1.0",
+                "transport": "kimi-native-subagents",
+                "primary": {"native_agent_type": "default"},
+                "secondary": [{"native_agent_type": "worker"}],
+                "reviewer": {"native_agent_type": "explorer"},
+            },
+            "routing_rationale": {"source": "canonical_only"},
+        }
+
+    monkeypatch.setattr(
+        "scripts.orchestration.task_bootstrap.build_task_packet",
+        _fake_build_task_packet,
+    )
+
+    exit_code = main(
+        [
+            "--goal",
+            "Use Kimi bridge transport",
+            "--task-class",
+            "Orchestration",
+            "--native-bridge-transport",
+            "kimi-native-subagents",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert observed["native_bridge_transport"] == "kimi-native-subagents"
+    assert json.loads(captured.out)["task_packet_id"] == "bridge-transport-packet"
+
+
+def test_build_task_packet_defaults_native_bridge_transport_to_codex() -> None:
+    """Direct packet builder calls should preserve Codex as the default transport."""
+
+    packet = build_task_packet(
+        goal="Harden orchestration bootstrap",
+        task_class="Orchestration",
+        candidate_paths=["scripts/orchestration/task_bootstrap.py"],
+    )
+
+    assert packet["native_subagent_bridge"]["transport"] == "codex-native-subagents"
+
+
+def test_oracle_hook_metadata_is_inert_and_outside_closed_contracts() -> None:
+    from scripts.orchestration.evidence_rail_applicability import AUTOMATION_FLAG_FIELDS
+
+    packet = build_task_packet(
+        goal="Prepare a direct orchestration fix",
+        task_class="Orchestration",
+        candidate_paths=["scripts/orchestration/task_bootstrap.py"],
+        pr_phase="pre_open",
+        creative_applicability="direct_fix",
+    )
+    assert packet["pr_oracle_attachment"] == {
+        "state": "pending",
+        "enabled_by_default": True,
+        "entrypoint": "scripts/orchestration/pr_oracle_attachment.py dispatch",
+        "requires_coordinator_admission": True,
+        "requires_distinct_material_root": True,
+        "trusted_tool_root": "externally_admitted_before_startup",
+        "backend": "explicit_host_compatible_container",
+        "authority": "metadata_only",
+    }
+    assert set(packet["automation_flags"]) == AUTOMATION_FLAG_FIELDS
+    assert "pr_oracle_attachment" not in packet["role_agent_dispatch_contract"]
+    assert packet["role_agent_dispatch_contract"]["packet_creation_executes_roles"] is False
+
+
+def test_build_task_packet_passes_explicit_kimi_native_bridge_transport() -> None:
+    """Direct packet builder calls should propagate explicit Kimi transport."""
+
+    packet = build_task_packet(
+        goal="Harden orchestration bootstrap",
+        task_class="Orchestration",
+        candidate_paths=["scripts/orchestration/task_bootstrap.py"],
+        native_bridge_transport="kimi-native-subagents",
+    )
+
+    assert packet["native_subagent_bridge"]["transport"] == "kimi-native-subagents"
+
+
+def test_build_task_packet_rejects_unknown_native_bridge_transport() -> None:
+    """Direct packet builder calls must reject unsupported transport labels."""
+
+    with pytest.raises(ValueError, match="Unsupported native_bridge_transport"):
+        build_task_packet(
+            goal="Harden orchestration bootstrap",
+            task_class="Orchestration",
+            candidate_paths=["scripts/orchestration/task_bootstrap.py"],
+            native_bridge_transport="unknown-native-subagents",
+        )
+
+
+def test_main_passes_design_lane_flags(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """CLI should propagate additive design-lane arguments into the packet builder."""
+
+    observed: dict[str, object] = {}
+
+    def _fake_build_task_packet(**kwargs: object) -> dict[str, object]:
+        observed.update(kwargs)
+        return {
+            "schema_version": "3.0",
+            "task_packet_id": "design-packet",
+            "goal": "Use explicit design packet",
+            "task_class": "Frontend",
+            "domain": "frontend",
+            "cluster": "product",
+            "candidate_paths": ["frontend/src/components/Hero.tsx"],
+            "primary_agent": "agent-coordinator",
+            "secondary_agents": [],
+            "reviewer": "architecture-specialist",
+            "requested_agents": [],
+            "requested_agent_disposition": [],
+            "required_context": ["AGENTS.md"],
+            "recommended_skills": ["pulseplate-workflow"],
+            "skill_routing": {
+                "policy_version": "2026-03-27",
+                "selection_mode": "deterministic-weighted",
+                "requested_agents": [],
+                "task_classification": {
+                    "label": "design",
+                    "score": 1,
+                    "reasons": ["explicit-design-source:figma_design(+packet)"],
+                },
+                "required": [
+                    {
+                        "skill": "pulseplate-workflow",
+                        "rationale": "Mandatory entry skill for all PulsePlate tasks.",
+                        "reasons": ["always-on"],
+                    }
+                ],
+                "recommended": [],
+                "conditional": [],
+                "blocked": [],
+            },
+            "automation_flags": {
+                "coordinator_first_required": True,
+                "skill_routing_applied": True,
+                "native_subagent_bridge_available": True,
+                "security_review_required": False,
+                "judgment_lane_enabled": False,
+                "pr_lifecycle_enabled": False,
+                "design_lane_enabled": True,
+            },
+            "pr_phase": "none",
+            "pr_lifecycle_contract": {
+                "contract_version": "pulseplate.pr-lifecycle/v3",
+                "requires_pr": False,
+                "post_open_review_required": False,
+                "review_lane": [],
+                "post_open_codex_security_scan_required": False,
+                "post_open_codex_security_scan": "",
+                "post_open_codex_security_scan_timing": "",
+                "post_open_pulseplate_pr_review_required": False,
+                "post_open_pulseplate_pr_review": "",
+                "post_open_pulseplate_pr_review_timing": "",
+                "final_material_review_gates": [],
+                "final_material_review_timing": "",
+                "post_open_review_chain_policy": "",
+                "post_open_review_rerun_allowed_reasons": [],
+                "post_open_later_comments_handling": "",
+                "provider_no_claim_policy": {
+                    "output_required": False,
+                    "seal_without_provider_flags": True,
+                    "provider_invocation_required": False,
+                    "provider_retry_required": False,
+                    "provider_wait_required": False,
+                    "substitute_provider_required": False,
+                    "operator_override_required": False,
+                    "ttl_required": False,
+                    "absence_is_pass": False,
+                    "absence_is_review": False,
+                    "absence_is_scan": False,
+                    "absence_is_approval": False,
+                    "absence_is_no_findings": False,
+                },
+                "artifact_template": "",
+                "current_head_required": False,
+                "current_head_truth": "not-applicable",
+                "merge_readiness_entrypoint": "",
+            },
+            "design_lane_mode": "implement",
+            "design_lane_contract": {
+                "design_source": "figma_design",
+                "source_url": "",
+                "file_key_or_workspace": "",
+                "node_id_or_frame_id": "",
+                "target_surface": "web.hero",
+                "task_mode": "implement",
+                "figma_lane_tool": "figma_native",
+                "blockers": [],
+                "code_native_design_brief_required": True,
+                "code_native_design_brief_path": "docs/design/HERO_BRIEF.md",
+                "explicit_creation_mode": True,
+            },
+            "needs_backlog_update": False,
+            "needs_docs_sync": False,
+            "needs_agents_sync": False,
+            "decision_contract": {
+                "mode": "standard",
+                "judgment_enabled": False,
+                "claim_taxonomy": [],
+                "flow": [],
+            },
+            "judgment_budget": {
+                "skeptic_pass_required": False,
+                "verifier_pass_required": False,
+                "max_provider_calls": 0,
+                "uncertainty_split_required": False,
+            },
+            "result_adjudication": {
+                "claim_evidence_fields": [],
+                "support_statuses": [],
+                "evidence_modes": [],
+                "uncertainty_fields": [],
+                "promotion_labels": [],
+            },
+            "native_subagent_bridge": {
+                "protocol_version": "1.0",
+                "transport": "codex-native-subagents",
+                "primary": {"native_agent_type": "default"},
+                "secondary": [],
+                "reviewer": {"native_agent_type": "explorer"},
+            },
+            "routing_rationale": {"source": "canonical_only"},
+        }
+
+    monkeypatch.setattr(
+        "scripts.orchestration.task_bootstrap.build_task_packet",
+        _fake_build_task_packet,
+    )
+
+    exit_code = main(
+        [
+            "--goal",
+            "Run design activation packet",
+            "--task-class",
+            "Frontend",
+            "--design-source",
+            "figma_design",
+            "--target-surface",
+            "web.hero",
+            "--task-mode",
+            "implement",
+            "--figma-lane-tool",
+            "figma_native",
+            "--code-native-design-brief-path",
+            "docs/design/HERO_BRIEF.md",
+            "--explicit-creation-mode",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert observed["design_source"] == "figma_design"
+    assert observed["target_surface"] == "web.hero"
+    assert observed["task_mode"] == "implement"
+    assert observed["figma_lane_tool"] == "figma_native"
+    assert observed["code_native_design_brief_path"] == "docs/design/HERO_BRIEF.md"
+    assert observed["explicit_creation_mode"] is True
+    assert json.loads(captured.out)["task_packet_id"] == "design-packet"
+
+
+def _disposition_map(packet: dict[str, object]) -> dict[str, dict[str, str]]:
+    """Map agent slug -> disposition row for requested-agent assertions."""
+
+    rows = packet["requested_agent_disposition"]
+    assert isinstance(rows, list)
+    out: dict[str, dict[str, str]] = {}
+    for row in rows:
+        assert isinstance(row, dict)
+        agent = str(row["agent"])
+        out[agent] = {str(k): str(v) for k, v in row.items()}
+    return out
+
+
+def test_build_task_packet_rejects_unknown_requested_agent() -> None:
+    """Unknown slugs must record rejected_unknown with explicit rationale."""
+
+    packet = build_task_packet(
+        goal="Orchestration hygiene",
+        task_class="Orchestration",
+        candidate_paths=["scripts/orchestration/task_bootstrap.py"],
+        requested_agents=["totally-unknown-agent-slug-xyz"],
+    )
+    dm = _disposition_map(packet)
+    assert dm["totally-unknown-agent-slug-xyz"]["status"] == REQUESTED_AGENT_STATUS_REJECTED_UNKNOWN
+    assert "not registered" in dm["totally-unknown-agent-slug-xyz"]["reason"].lower()
+    assert "totally-unknown-agent-slug-xyz" not in packet["secondary_agents"]
+
+
+def test_build_task_packet_non_routable_requested_agent_stays_advisory() -> None:
+    """Non-routable specialists outside domain slots stay required custom-role passes."""
+
+    packet = build_task_packet(
+        goal="Harden task bootstrap",
+        task_class="Orchestration",
+        candidate_paths=["scripts/orchestration/task_bootstrap.py"],
+        requested_agents=["ml-engineer-agent"],
+    )
+    dm = _disposition_map(packet)
+    assert dm["ml-engineer-agent"]["status"] == REQUESTED_AGENT_STATUS_ADVISORY_NON_ROUTABLE
+    assert "non-routable" in dm["ml-engineer-agent"]["reason"].lower()
+    assert "ml-engineer-agent" in packet["secondary_agents"]
+    secondary_slugs = {b["repo_agent_slug"] for b in packet["native_subagent_bridge"]["secondary"]}
+    assert "ml-engineer-agent" not in secondary_slugs
+    advisory_slugs = {b["repo_agent_slug"] for b in packet["native_subagent_bridge"]["advisory"]}
+    assert "ml-engineer-agent" in advisory_slugs
+    advisory_binding = packet["native_subagent_bridge"]["advisory"][0]
+    assert advisory_binding["execution_mode"] == "advisory_review"
+    assert advisory_binding["dispatch_contract"]["spawn_with_native_subagent"] is True
+    assert advisory_binding["dispatch_contract"]["required_role_pass"] is True
+
+
+def test_build_task_packet_promotes_requested_agent_in_domain_slot_set() -> None:
+    """Requested agent listed in graph primary/secondary/reviewer may be promoted."""
+
+    packet = build_task_packet(
+        goal="Tune retrieval quality",
+        task_class="AI / ML",
+        candidate_paths=["core/ai/insight_runtime.py"],
+        requested_agents=["rag-systems-agent"],
+    )
+    assert packet["domain"] == "ml"
+    dm = _disposition_map(packet)
+    assert dm["rag-systems-agent"]["status"] == REQUESTED_AGENT_STATUS_PROMOTED
+    assert packet["primary_agent"] == "rag-systems-agent"
+    assert "ai-innovation-specialist" in packet["secondary_agents"]
+
+
+def test_build_task_packet_routable_agent_domain_mismatch_stays_advisory() -> None:
+    """Routable agent outside routed domain slots becomes a required custom-role pass."""
+
+    packet = build_task_packet(
+        goal="Docs routing only",
+        task_class="Orchestration",
+        candidate_paths=["scripts/orchestration/task_bootstrap.py"],
+        requested_agents=["backend-engineer"],
+    )
+    dm = _disposition_map(packet)
+    assert dm["backend-engineer"]["status"] == REQUESTED_AGENT_STATUS_ADVISORY_DOMAIN_MISMATCH
+    assert "slot" in dm["backend-engineer"]["reason"].lower()
+    assert packet["primary_agent"] == "agent-coordinator"
+    advisory_binding = packet["native_subagent_bridge"]["advisory"][0]
+    assert advisory_binding["repo_agent_slug"] == "backend-engineer"
+    assert advisory_binding["execution_mode"] == "advisory_review"
+    assert advisory_binding["dispatch_contract"]["spawn_with_native_subagent"] is True
+    assert advisory_binding["dispatch_contract"]["required_role_pass"] is True
+
+
+def test_build_task_packet_graph_slot_precedes_non_routable_specialist_list() -> None:
+    """Specialists listed as non-routable but present on graph slots are promoted, not advisory."""
+
+    packet = build_task_packet(
+        goal="Refine CV metrics export",
+        task_class="Computer Vision",
+        candidate_paths=["README.md"],
+        requested_agents=["data-scientist-agent"],
+    )
+    assert packet["domain"] == "cv"
+    dm = _disposition_map(packet)
+    assert dm["data-scientist-agent"]["status"] == REQUESTED_AGENT_STATUS_PROMOTED
+    assert packet["primary_agent"] == "data-scientist-agent"
+    assert "cv-agent" in packet["secondary_agents"]
+
+
+def test_build_task_packet_honored_primary_when_requested_matches_routed_primary() -> None:
+    """Explicit request for the default primary must record honored_primary."""
+
+    packet = build_task_packet(
+        goal="Coordinator bootstrap",
+        task_class="Orchestration",
+        candidate_paths=["scripts/orchestration/task_bootstrap.py"],
+        requested_agents=["agent-coordinator"],
+    )
+    dm = _disposition_map(packet)
+    assert dm["agent-coordinator"]["status"] == REQUESTED_AGENT_STATUS_HONORED_PRIMARY
+    assert packet["primary_agent"] == "agent-coordinator"
+
+
+def test_final_material_provider_policy_has_one_global_source_and_scoped_projections() -> None:
+    marker = "**Final-material Codex Security budget invariant (hard):**"
+    root_agents = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    runbook = (REPO_ROOT / "RUNBOOK_AGENT.md").read_text(encoding="utf-8")
+    scoped_agents = (REPO_ROOT / "docs/orchestration/AGENTS.md").read_text(encoding="utf-8")
+    matrix = (REPO_ROOT / "docs/orchestration/PR_ORCHESTRATION_CONTRACT_MATRIX.md").read_text(
+        encoding="utf-8"
+    )
+    assert root_agents.count(marker) == 1
+    assert marker not in runbook
+    assert marker not in scoped_agents
+    assert marker not in matrix
+    for projection in (runbook, scoped_agents, matrix):
+        assert "root `agents.md`" in projection.casefold()
+        assert "pulseplate-pr-review" in projection
+    assert "automatic_budget=1" in matrix
+    assert "repository_invokes_plugin=false" in matrix
+    for projection in (
+        root_agents,
+        runbook,
+        scoped_agents,
+        matrix,
+    ):
+        normalized = projection.casefold()
+        assert "provider" in normalized
+        assert "no-claim" in normalized
+        assert "pulseplate-pr-review" in normalized
+    assert "external Codex Security `opened` / `synchronize` auto-triggers" not in root_agents
+    assert "synchronize-triggered Codex review" not in runbook
+
+
+def test_active_orchestration_surfaces_forbid_per_diff_security_reruns() -> None:
+    paths = (
+        REPO_ROOT / "AGENTS.md",
+        REPO_ROOT / "RUNBOOK_AGENT.md",
+        REPO_ROOT / "docs/orchestration/AGENTS.md",
+        REPO_ROOT / "docs/orchestration/AGENT_EXPERIMENTATION_PROTOCOL.md",
+        REPO_ROOT / "docs/orchestration/PR_ORCHESTRATION_CONTRACT_MATRIX.md",
+    )
+    forbidden = (
+        "single pass per material diff",
+        "single_pass_per_material_diff",
+        "scan_artifact_failed_or_incomplete",
+        "security_relevant_diff_changed",
+    )
+
+    for path in paths:
+        text = path.read_text(encoding="utf-8")
+        for phrase in forbidden:
+            assert phrase not in text, f"{path}: stale security lifecycle phrase {phrase!r}"
+
+
+def test_invariant_review_packet_preserves_requested_agents_and_orders_system_roles() -> None:
+    """The system pre-fix pair must not masquerade as operator-requested roles."""
+
+    packet = build_task_packet(
+        goal="Harden a policy mechanism",
+        task_class="Orchestration",
+        candidate_paths=["README.md"],
+        requested_agents=["architecture-specialist"],
+        invariant_change_classes=["guard"],
+        pr_phase="pre_open",
+    )
+
+    assert packet["requested_agents"] == ["architecture-specialist"]
+    assert packet["invariant_review"] == {
+        "schema_version": "invariant_review.v1",
+        "state": "required_pending",
+        "change_classes": ["guard"],
+        "trigger_evidence": [
+            {"change_class": "guard", "source": "explicit"},
+        ],
+        "coverage_claim": "explicit_plus_bounded_positive_triggers_only",
+        "required_roles": ["logic-agent", "philosophy-agent"],
+        "boundary_classes": [
+            "finite_closed_world",
+            "bounded_surface",
+            "delegated_recognizer",
+            "open_world_stop",
+        ],
+        "required_output_fields": [
+            "invariant_statement",
+            "boundary_class",
+            "canonical_sot",
+            "completeness_claim",
+            "counterexample_families",
+            "fail_closed_behavior",
+            "stop_condition",
+            "residual_risk",
+        ],
+        "stop_condition": (
+            "second_materially_novel_carrier_same_open_world_invariant_requires_rescope"
+        ),
+        "implementation_authority": False,
+        "merge_authority": False,
+    }
+    assert packet["automation_flags"]["invariant_class_review_required"] is True
+    assert packet["role_agent_dispatch_contract"]["dispatch_role_order"][:3] == [
+        "agent-coordinator",
+        "logic-agent",
+        "philosophy-agent",
+    ]
+    spawnable_roles = {
+        packet["native_subagent_bridge"]["primary"]["repo_agent_slug"],
+        *[binding["repo_agent_slug"] for binding in packet["native_subagent_bridge"]["secondary"]],
+        *[binding["repo_agent_slug"] for binding in packet["native_subagent_bridge"]["advisory"]],
+        packet["native_subagent_bridge"]["reviewer"]["repo_agent_slug"],
+    }
+    assert set(packet["role_agent_dispatch_contract"]["dispatch_role_order"]) == (spawnable_roles)
+
+
+def test_invariant_review_no_trigger_preserves_legacy_dispatch_and_rag_scope() -> None:
+    """Ordinary product refactors retain the legacy role path and no G0 dispatch."""
+
+    packet = build_task_packet(
+        goal="Remove pass-only RAG constructors",
+        task_class="Backend API",
+        candidate_paths=["core/rag/simple_rag.py"],
+        requested_agents=["backend-engineer"],
+        pr_phase="pre_open",
+    )
+
+    assert packet["invariant_review"]["state"] == "not_required"
+    assert packet["invariant_review"]["change_classes"] == []
+    assert packet["invariant_review"]["trigger_evidence"] == []
+    assert packet["invariant_review"]["required_roles"] == []
+    assert packet["automation_flags"]["invariant_class_review_required"] is False
+    assert "dispatch_role_order" not in packet["role_agent_dispatch_contract"]
+
+
+def test_repeated_family_review_has_one_explicit_cli_input() -> None:
+    """L2 uses one bounded opt-in flag and no parallel parser surface."""
+
+    raw_path = "artifacts/orchestration/review_invariant_family_relations/input.json"
+    args = task_bootstrap_module._parse_args(
+        [
+            "--goal",
+            "Review repeated families",
+            "--task-class",
+            "Orchestration",
+            "--pr-phase",
+            "post_open_review",
+            "--review-invariant-family-relations-input",
+            raw_path,
+        ]
+    )
+
+    assert args.review_invariant_family_relations_input == raw_path
+    source = Path(task_bootstrap_module.__file__).read_text(encoding="utf-8")
+    assert (
+        source.count('parser.add_argument(\n        "--review-invariant-family-relations-input"')
+        == 1
+    )
+
+
+def test_invariant_review_packet_id_uses_order_insensitive_class_set() -> None:
+    """Equivalent class sets share identity while a different set changes it."""
+
+    common_kwargs = {
+        "goal": "Review mechanism scope",
+        "task_class": "Orchestration",
+        "candidate_paths": ["README.md"],
+        "requested_agents": ["architecture-specialist"],
+        "pr_phase": "pre_open",
+    }
+    first = build_task_packet(
+        **common_kwargs,
+        invariant_change_classes=["guard", "parser", "guard"],
+    )
+    reordered = build_task_packet(
+        **common_kwargs,
+        invariant_change_classes=["parser", "guard"],
+    )
+    different = build_task_packet(
+        **common_kwargs,
+        invariant_change_classes=["validator", "guard"],
+    )
+
+    assert first["task_packet_id"] == reordered["task_packet_id"]
+    assert first["task_packet_id"] != different["task_packet_id"]
+
+
+def test_invariant_review_packet_id_frames_class_identity_against_path_collisions() -> None:
+    """A class token must not collide with a same-named candidate path."""
+
+    common_kwargs = {
+        "goal": "Review mechanism scope",
+        "task_class": "Orchestration",
+        "requested_agents": [],
+        "pr_phase": "pre_open",
+    }
+    explicit_class = build_task_packet(
+        **common_kwargs,
+        candidate_paths=["zzz"],
+        invariant_change_classes=["guard"],
+    )
+    same_token_as_path = build_task_packet(
+        **common_kwargs,
+        candidate_paths=["guard", "zzz"],
+    )
+    different_path = build_task_packet(
+        **common_kwargs,
+        candidate_paths=["yyy"],
+        invariant_change_classes=["guard"],
+    )
+
+    assert explicit_class["task_packet_id"] != same_token_as_path["task_packet_id"]
+    assert explicit_class["task_packet_id"] != different_path["task_packet_id"]
+    assert len(explicit_class["task_packet_id"]) == 12
+    assert all(character in "0123456789abcdef" for character in explicit_class["task_packet_id"])
+
+
+def test_invariant_review_empty_fingerprint_preserves_legacy_packet_id() -> None:
+    """No-class callers must keep the pre-G0 task packet identity."""
+
+    legacy_payload = "\n".join(
+        [
+            "Review product scope",
+            "Backend API",
+            "backend",
+            "pre_open",
+            "",
+            "",
+            "core/rag/simple_rag.py",
+            "backend-engineer",
+        ]
+    )
+
+    packet_id = compute_task_packet_id(
+        goal="Review product scope",
+        task_class="Backend API",
+        domain="backend",
+        candidate_paths=["core/rag/simple_rag.py"],
+        requested_agents=["backend-engineer"],
+        pr_phase="pre_open",
+    )
+
+    assert packet_id == hashlib.sha256(legacy_payload.encode("utf-8")).hexdigest()[:12]
+
+
+def test_invariant_review_does_not_repeat_during_post_open_review() -> None:
+    """Post-open lifecycle keeps QA -> bug -> security without the pre-fix pair."""
+
+    packet = build_task_packet(
+        goal="Review guard PR",
+        task_class="Orchestration",
+        candidate_paths=["scripts/ci/guard_actions_pin.py"],
+        invariant_change_classes=["guard"],
+        pr_phase="post_open_review",
+    )
+
+    assert packet["invariant_review"]["state"] == "not_required"
+    assert packet["invariant_review"]["change_classes"] == ["guard"]
+    assert packet["invariant_review"]["required_roles"] == []
+    assert packet["automation_flags"]["invariant_class_review_required"] is False
+    assert "dispatch_role_order" not in packet["role_agent_dispatch_contract"]
+    assert packet["primary_agent"] == "qa-engineer-agent"
+    assert packet["secondary_agents"][:2] == [
+        "bug-hunter",
+        "security-auditor",
+    ]
+
+
+def test_invariant_review_rejects_creative_workspace_before_loading_it() -> None:
+    """Mechanism work must leave the creative lane before workspace overrides."""
+
+    with pytest.raises(
+        ValueError,
+        match="create a separate ordinary pre-open invariant-review packet",
+    ):
+        build_task_packet(
+            goal="Experiment with a guard mechanism",
+            task_class="Orchestration",
+            candidate_paths=["scripts/ci/guard_actions_pin.py"],
+            creative_pilot_workspace_path="missing-workspace.json",
+            creative_pilot_phase="independent",
+        )
+
+
+def test_invariant_review_python_api_rejects_malformed_class() -> None:
+    """Direct callers cannot bypass the CLI enum."""
+
+    with pytest.raises(ValueError, match="Unsupported invariant change class"):
+        build_task_packet(
+            goal="Review mechanism scope",
+            task_class="Orchestration",
+            candidate_paths=["README.md"],
+            invariant_change_classes=["Guard"],
+        )
+
+
+def _run_invariant_launcher(
+    script_name: str,
+    *args: str,
+    cwd: Path = REPO_ROOT,
+) -> subprocess.CompletedProcess[str]:
+    """Exercise the real shell launcher boundary with captured output."""
+
+    bash_path = shutil.which("bash")
+    if bash_path is None:
+        raise RuntimeError("bash executable not found on PATH")
+    return subprocess.run(
+        [bash_path, str(REPO_ROOT / "scripts/orchestration" / script_name), *args],
+        cwd=cwd,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+def test_invariant_review_launchers_forward_repeatable_classes_to_prompt(
+    tmp_path: Path,
+) -> None:
+    """Both canonical launchers must retain ordered classes through prompt handoff."""
+
+    local_session = _run_invariant_launcher(
+        "local_session_bootstrap.sh",
+        "--goal",
+        "Review guard authority",
+        "--task-class",
+        "Orchestration",
+        "--invariant-change-class",
+        "guard",
+        "--invariant-change-class",
+        "authority",
+        cwd=tmp_path,
+    )
+    start_lane = _run_invariant_launcher(
+        "start_pr_lane.sh",
+        "--goal",
+        "Review guard authority",
+        "--task-class",
+        "pr_governance",
+        "--branch",
+        "codex/invariant-launcher-test",
+        "--worktree",
+        "worktrees/invariant-launcher-test",
+        "--invariant-change-class",
+        "guard",
+        "--invariant-change-class",
+        "authority",
+        "--dry-run",
+    )
+
+    for result in (local_session, start_lane):
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.index("--invariant-change-class guard") < result.stdout.index(
+            "--invariant-change-class authority"
+        )
+        paste_block = result.stdout.partition("Paste into Codex now:")[2]
+        assert "Invariant change classes: guard, authority" in paste_block
+
+
+@pytest.mark.parametrize(
+    ("script_name", "base_args"),
+    [
+        (
+            "local_session_bootstrap.sh",
+            ("--goal", "Review guard", "--task-class", "Orchestration"),
+        ),
+        (
+            "start_pr_lane.sh",
+            (
+                "--goal",
+                "Review guard",
+                "--task-class",
+                "pr_governance",
+                "--branch",
+                "codex/invariant-launcher-test",
+                "--worktree",
+                "worktrees/invariant-launcher-test",
+                "--dry-run",
+            ),
+        ),
+    ],
+)
+def test_invariant_review_launchers_reject_case_shifted_classes(
+    script_name: str,
+    base_args: tuple[str, ...],
+) -> None:
+    """Shell entrypoints must reject case-shifted enum aliases."""
+
+    result = _run_invariant_launcher(
+        script_name,
+        *base_args,
+        "--invariant-change-class",
+        "Guard",
+    )
+
+    assert result.returncode == 2
+    assert "--invariant-change-class must be one of" in result.stderr
+
+
+def test_invariant_review_recipe_prompt_names_current_classes() -> None:
+    """The copy-paste handoff must expose the normalized class scope."""
+
+    prompt = render_recipe_prompt(
+        goal="Review guard authority",
+        task_class="Orchestration",
+        pr_phase="pre_open",
+        paths=["scripts/orchestration/task_bootstrap.py"],
+        requested_agents=["logic-agent"],
+        invariant_change_classes=["guard", "authority"],
+    )
+
+    assert "Invariant change classes: guard, authority" in prompt
+
+
+def test_invariant_review_packet_prompt_preserves_validated_dispatch_order() -> None:
+    """Prompt rendering must not rewrite an authoritative pre-fix sequence."""
+
+    packet = build_task_packet(
+        goal="Review a guard mechanism",
+        task_class="Orchestration",
+        candidate_paths=["README.md"],
+        requested_agents=[
+            "bug-hunter",
+            "qa-engineer-agent",
+            "security-auditor",
+        ],
+        invariant_change_classes=["guard"],
+        pr_phase="none",
+    )
+    role_dispatch_contract = packet["role_agent_dispatch_contract"]
+    assert isinstance(role_dispatch_contract, dict)
+    dispatch_role_order = role_dispatch_contract["dispatch_role_order"]
+    assert isinstance(dispatch_role_order, list)
+
+    prompt = render_packet_prompt(packet, packet_path="packet.json")
+
+    assert f"Role order: {', '.join(dispatch_role_order)}" in prompt
+
+
+def test_invariant_review_shell_launchers_share_the_canonical_python_enum() -> None:
+    """Every documented shell carrier must mirror the closed Python enum exactly."""
+
+    expected_case = "|".join(INVARIANT_CHANGE_CLASSES)
+    launcher_paths = (
+        REPO_ROOT / "scripts/orchestration/local_session_bootstrap.sh",
+        REPO_ROOT / "scripts/orchestration/start_pr_lane.sh",
+        REPO_ROOT / "docs/templates/pulseplate-coordinator-launch.example.sh",
+    )
+
+    for launcher_path in launcher_paths:
+        launcher = launcher_path.read_text(encoding="utf-8")
+        assert f"{expected_case})" in launcher
+        assert 'INVARIANT_CLASS_ARGS+=(--invariant-change-class "$2")' in launcher
+        assert any(
+            forwarding_marker in launcher
+            for forwarding_marker in (
+                'prompt_cmd+=("${INVARIANT_CLASS_ARGS[@]}")',
+                'bootstrap_cmd+=("${INVARIANT_CLASS_ARGS[@]}")',
+                '${INVARIANT_CLASS_ARGS[@]+"${INVARIANT_CLASS_ARGS[@]}"}',
+            )
+        )
+
+
+def test_creative_applicability_is_structured_and_packet_identity_bearing() -> None:
+    inputs = {
+        "goal": "Improve the local formatter",
+        "task_class": "Implementation",
+        "candidate_paths": ["tests/test_example.py"],
+    }
+    baseline = build_task_packet(**inputs)
+    alternatives = build_task_packet(**inputs, creative_applicability="alternatives")
+    direct_fix = build_task_packet(**inputs, creative_applicability="direct_fix")
+    disabled = build_task_packet(**inputs, creative_applicability="disabled")
+
+    assert (
+        len({row["task_packet_id"] for row in (baseline, alternatives, direct_fix, disabled)}) == 4
+    )
+    assert "creative_applicability" not in baseline
+    assert alternatives["creative_applicability_base_packet_id"] == baseline["task_packet_id"]
+    assert alternatives["creative_applicability"] == "alternatives"
+    assert direct_fix["creative_applicability"] == "direct_fix"
+    with pytest.raises(ValueError, match="creative-applicability"):
+        build_task_packet(**inputs, creative_applicability="unsupported")
+
+
+def test_creative_applicability_packet_preserves_native_dispatch(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    packet = build_task_packet(
+        goal="Compare local formatter approaches",
+        task_class="Implementation",
+        candidate_paths=["tests/test_example.py"],
+        creative_applicability="alternatives",
+    )
+    packet_path = (
+        REPO_ROOT / "artifacts/orchestration/task_packets" / f"dispatch-{uuid.uuid4().hex}.json"
+    )
+    packet_path.parent.mkdir(parents=True, exist_ok=True)
+    packet_path.write_text(json.dumps(packet), encoding="utf-8")
+    try:
+        command = ["--packet", str(packet_path), "--mode", "runtime"]
+        for role in packet["role_agent_dispatch_contract"]["runtime_implementation_owners"]:
+            command.extend(["--implementation-owner", role])
+        assert qoder_dispatch_bridge.main(command) == 0
+        manifest = json.loads(capsys.readouterr().out)
+        assert manifest["missing_agents"] == []
+        assert manifest["dispatch_sequence"]
+    finally:
+        packet_path.unlink(missing_ok=True)

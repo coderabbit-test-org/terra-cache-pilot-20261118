@@ -1,0 +1,41 @@
+import { Meta } from '@storybook/addon-docs/blocks';
+
+<Meta title="PulsePlate/Brand/Design System Guidelines" />
+
+# PulsePlate Design System Guidelines
+
+## Canonical review surface
+
+- Storybook is the primary review surface for the web design system.
+- Product routes are not the source of truth for design-system preview or governance docs.
+- Penpot and Figma may annotate or explore the system, but Storybook remains the repo-native review anchor.
+- Hidden routes such as `/design-system` and `/welcome-gate-v1` are convenience preview mirrors only.
+- Review, canon decisions, and visual sign-off still resolve back to Storybook entries and repo paths.
+
+## Asset canon
+
+- Canonical web brand assets live under `frontend/src/assets/brand/`.
+- `pulseplate-brand-mark.png` is the canonical brand mark for web lockups and compact signatures.
+- `fitchef-static.png` and `fitchef-wink.png` are the approved mascot variants for current web docs.
+- `ecg-line.svg` is the supporting accent asset for lockups and branded surfaces.
+- Current FitChef seed pack is documented in `docs/design/FITCHEF_MASCOT_ASSET_CANON.md`.
+- Figma exploration assets are reference-only and must not be used in production until the corresponding asset files are added to this repo in a dedicated PR.
+
+## Token and component rules
+
+- Use token SoT from `frontend/src/styles/tokens.ts` and `frontend/src/styles/tokens.css`.
+- Reuse primitives from `frontend/src/components/ui/` before adding design-only wrappers.
+- Keep visual direction luxury-clean, calm, and wellness-safe.
+- Avoid clinical imagery, cyberpunk/neon treatments, glossy purple blobs, and decorative drift.
+
+## Storybook coverage intent
+
+- `PulsePlate/Brand/*` covers canonical brand assets and lockups.
+- `PulsePlate/Tokens/*` covers palette, typography, spacing, and radius.
+- `PulsePlate/Patterns/Figma Canon/*` covers imported Figma documentation boards and canon mirrors.
+- `PulsePlate/Patterns/*` covers brand identity, governance, platform inventory, and overview composition.
+- `PulsePlate/Components/*` covers token-aware component showcase surfaces built from current primitives.
+- `PulsePlate/Onboarding/*` covers welcome-gate preview surfaces and future onboarding review packets.
+- `PulsePlate/Parity Pack/*` covers implemented product review surfaces through deterministic Storybook harnesses.
+- `HPP/Skeleton` and `HPP/EmptyState` cover empty/loading/error state semantics for governed primitive review.
+- Design handoff can use Penpot page/frame references, but implementation review still resolves back to Storybook and repo paths.

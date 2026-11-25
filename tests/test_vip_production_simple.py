@@ -1,0 +1,232 @@
+"""Tests for VIP router in production mode."""
+
+from unittest.mock import patch
+
+import pytest
+
+from tests._client import open_test_client
+from tests._route_patch import find_route_endpoint, patch_endpoint_global
+
+VALID_WEEKLY_PLAN_REQUEST = {
+    "sex": "male",
+    "age": 30,
+    "height_cm": 175,
+    "weight_kg": 70,
+    "activity": "moderate",
+    "goal": "maintain",
+}
+
+
+@pytest.fixture(autouse=True)
+def vip_production_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep production-mode VIP tests isolated from ENVIRONMENT drift."""
+
+    monkeypatch.setenv("VIP_MODULE_ENABLED", "true")
+    monkeypatch.setenv("APP_ENV", "test")
+    monkeypatch.setenv("DEBUG", "false")
+    monkeypatch.setenv("ALLOW_DEV_API_KEY", "false")
+    monkeypatch.delenv("ENVIRONMENT", raising=False)
+    monkeypatch.delenv("API_KEY", raising=False)
+    monkeypatch.delenv("VIP_API_KEYS", raising=False)
+
+
+class TestVIPProductionMode:
+    """Test VIP router production mode functionality."""
+
+    def test_vip_api_key_validation_missing_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test API key validation when API_KEY is set but key is missing (line 95)."""
+        import app
+
+        with open_test_client(app.app) as client:
+            with monkeypatch.context() as request_env:
+                request_env.setenv("APP_ENV", "production")
+                request_env.setenv("API_KEY", "secret-key")
+                request_env.setenv("VIP_API_KEYS", "secret-key")  # pragma: allowlist secret
+
+                # Test request without API key to VIP endpoint
+                response = client.post("/api/v1/vip/weekly-plan", json={"test": "data"})
+                assert response.status_code == 403
+                assert response.headers["content-type"].startswith("application/json")
+                detail_lower = response.json()["detail"].lower()
+                assert "vip access" in detail_lower or "invalid api key" in detail_lower
+
+    def test_vip_api_key_validation_wrong_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test API key validation with incorrect key (line 95)."""
+        import app
+
+        with open_test_client(app.app) as client:
+            with monkeypatch.context() as request_env:
+                request_env.setenv("APP_ENV", "production")
+                request_env.setenv("API_KEY", "secret-key")
+                request_env.setenv("VIP_API_KEYS", "secret-key")  # pragma: allowlist secret
+
+                # Test request with wrong API key
+                response = client.post(
+                    "/api/v1/vip/weekly-plan",
+                    json={"test": "data"},
+                    headers={"X-API-Key": "wrong-key"},
+                )
+                assert response.status_code == 403
+                assert response.headers["content-type"].startswith("application/json")
+                detail_lower = response.json()["detail"].lower()
+                assert "invalid api" in detail_lower or "vip access" in detail_lower
+
+    def test_vip_api_key_validation_correct_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test API key validation with correct key passes authentication."""
+        import app
+
+        with open_test_client(app.app) as client:
+            with monkeypatch.context() as request_env:
+                request_env.setenv("APP_ENV", "production")
+                request_env.setenv("API_KEY", "secret-key")
+                request_env.setenv("VIP_API_KEYS", "secret-key")  # pragma: allowlist secret
+
+                # Test request with correct API key
+                response = client.post(
+                    "/api/v1/vip/weekly-plan",
+                    json=VALID_WEEKLY_PLAN_REQUEST,
+                    headers={"X-API-Key": "secret-key"},
+                )
+                assert response.status_code == 200
+
+    @pytest.mark.parametrize("app_env", ["production", "development"])
+    def test_weekly_menu_generation_error_handling(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        vip_headers: dict[str, str],
+        app_env: str,
+    ) -> None:
+        """Internal weekly-plan failures stay private in every environment."""
+        import app
+
+        sentinel = "PRIVATE_EXCEPTION_SENTINEL_/srv/internal/module.py"
+
+        def raise_exc(*args: object, **kwargs: object) -> None:
+            raise RuntimeError(sentinel)
+
+        deprecated_endpoint = find_route_endpoint(
+            app=app.app,
+            path="/api/v1/vip/weekly-plan",
+            method="POST",
+        )
+        # Patch the registered route globals for deterministic behavior under reload/shim imports.
+        patch_endpoint_global(
+            monkeypatch=monkeypatch,
+            endpoint=deprecated_endpoint,
+            name="make_weekly_menu",
+            value=raise_exc,
+        )
+
+        with open_test_client(app.app) as client:
+            with monkeypatch.context() as request_env:
+                request_env.setenv("APP_ENV", app_env)
+                request_env.setenv("API_KEY", vip_headers["X-API-Key"])
+                request_env.setenv("VIP_API_KEYS", vip_headers["X-API-Key"])
+
+                response = client.post(
+                    "/api/v1/vip/weekly-plan",
+                    json=VALID_WEEKLY_PLAN_REQUEST,
+                    headers=vip_headers,
+                )
+
+                assert response.status_code == 200
+                assert response.headers["content-type"].startswith("application/json")
+                assert response.json() == {
+                    "status": "error",
+                    "message": "Weekly plan generation failed",
+                    "data": {},
+                }
+                assert sentinel not in response.text
+
+    def test_vip_recipes_endpoint_auth_check(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test VIP recipes endpoint requires authentication."""
+        import app
+
+        with open_test_client(app.app) as client:
+            with monkeypatch.context() as request_env:
+                request_env.setenv("APP_ENV", "production")
+                request_env.setenv("API_KEY", "secret-key")
+                request_env.setenv("VIP_API_KEYS", "secret-key")  # pragma: allowlist secret
+
+                # Test recipes endpoint without API key
+                response = client.post("/api/v1/vip/recipes/synthesize", json={"ingredients": []})
+                assert response.status_code == 403  # VIP = feature-gate, returns 403
+                assert response.headers["content-type"].startswith("application/json")
+                detail = response.json()["detail"].lower()
+                assert any(sub in detail for sub in ("vip", "access"))
+
+    def test_vip_regions_endpoint_auth_check(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test VIP regions endpoint requires authentication."""
+        import app
+
+        with open_test_client(app.app) as client:
+            with monkeypatch.context() as request_env:
+                request_env.setenv("APP_ENV", "production")
+                request_env.setenv("API_KEY", "secret-key")
+                request_env.setenv("VIP_API_KEYS", "secret-key")  # pragma: allowlist secret
+
+                # Test regions endpoint without API key
+                response = client.get("/api/v1/vip/regions")
+                assert response.status_code == 403  # VIP = feature-gate, returns 403
+                assert response.headers["content-type"].startswith("application/json")
+                detail = response.json()["detail"].lower()
+                assert any(sub in detail for sub in ("vip", "access"))
+
+    def test_vip_production_mode_coverage_lines(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test specific production mode lines for coverage.
+
+        This test targets the specific uncovered lines in VIP router:
+        - Line 88-95: API key validation and HTTP exception conversion
+        - Line 155: Menu generation error handling
+        - Line 320: Recipe search error handling
+        - Line 663: Regional search error handling
+        """
+        import app
+
+        with open_test_client(app.app) as client:
+            with monkeypatch.context() as request_env:
+                request_env.setenv("APP_ENV", "production")
+                request_env.setenv("API_KEY", "secret-key")
+                request_env.setenv("VIP_API_KEYS", "secret-key")  # pragma: allowlist secret
+
+                # Test 1: Invalid API key (lines 88-95)
+                response = client.post(
+                    "/api/v1/vip/weekly-plan",
+                    json=VALID_WEEKLY_PLAN_REQUEST,
+                    headers={"X-API-Key": "wrong-key"},
+                )
+                assert response.status_code == 403
+
+                # Test 2: Valid API key allows access
+                response = client.post(
+                    "/api/v1/vip/weekly-plan",
+                    json=VALID_WEEKLY_PLAN_REQUEST,
+                    headers={"X-API-Key": "secret-key"},
+                )
+                assert response.status_code == 200
+
+    def test_vip_app_get_api_key_http_exception_403(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test app.get_api_key raising HTTPException with 403 (line 88-92)."""
+        from fastapi import HTTPException
+
+        import app
+
+        # Mock app.get_api_key to raise 403
+        with patch("app.get_api_key") as mock_get_api_key:
+            mock_get_api_key.side_effect = HTTPException(status_code=403, detail="Forbidden")
+
+            with open_test_client(app.app) as client:
+                with monkeypatch.context() as request_env:
+                    request_env.setenv("APP_ENV", "production")
+                    request_env.setenv("API_KEY", "secret-key")
+
+                    response = client.post(
+                        "/api/v1/vip/weekly-plan",
+                        json={"test": "data"},
+                        headers={"X-API-Key": "some-key"},
+                    )
+
+                    # Should return 403 as raised
+                    assert response.status_code == 403
+                    assert response.headers["content-type"].startswith("application/json")
+                    assert "Forbidden" in response.json()["detail"]

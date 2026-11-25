@@ -1,0 +1,75 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+import pytest
+from httpx import Response
+
+if TYPE_CHECKING:
+    from fastapi.testclient import TestClient
+
+
+def _post_bmi(
+    client: TestClient,
+    weight: float,
+    height: float,
+    group: str = "general",
+) -> Response:
+    return client.post(
+        "/api/v1/bmi",
+        json={"weight_kg": weight, "height_cm": height, "group": group},
+    )
+
+
+@pytest.mark.parametrize("group", ["general", "athlete", "elderly", "teen", "pregnant"])
+def test_bmi_groups_smoke(client: TestClient, group: str) -> None:
+    r = _post_bmi(client, 70, 170, group)
+    assert r.status_code == 200
+    data = r.json()
+    # базовые инварианты
+    assert data["bmi"] == 24.2
+    # v1 endpoint uses core/i18n EN categories
+    assert data["category"] == "Normal weight"
+    assert isinstance(data.get("interpretation", ""), str)
+    assert len(data.get("interpretation", "")) >= 0  # строка может быть и "Normal"
+
+
+@pytest.mark.parametrize(
+    "w,h,expected_category",
+    [
+        (45, 170, "Underweight"),  # ~15.57
+        (70, 170, "Normal weight"),  # 24.2
+        (80, 170, "Overweight"),  # ~27.68
+        (95, 170, "Obese Class I"),  # ~32.87
+    ],
+)
+def test_bmi_categories_boundaries(
+    client: TestClient,
+    w: float,
+    h: float,
+    expected_category: str,
+) -> None:
+    r = _post_bmi(client, w, h)
+    assert r.status_code == 200
+    data = r.json()
+    assert data["category"] == expected_category
+
+
+@pytest.mark.parametrize(
+    "w,h",
+    [
+        (70, 0),  # нулевая высота
+        (70, -170),  # отрицательная высота
+        (-10, 170),  # отрицательный вес
+    ],
+)
+def test_bmi_invalid_inputs(client: TestClient, w: float, h: float) -> None:
+    r = _post_bmi(client, w, h)
+    # Валидация может отработать как 400 (наша) либо 422 (pydantic) — допускаем оба
+    assert r.status_code in (400, 422)
+
+
+def test_bmi_missing_field_validation(client: TestClient) -> None:
+    # Нет height_cm → 422 от pydantic
+    r = client.post("/api/v1/bmi", json={"weight_kg": 70})
+    assert r.status_code == 422

@@ -1,0 +1,688 @@
+## Trivy vulnerability ignore list
+##
+## Last reviewed: 2026-05-28
+## Base image: python:3.13.14-slim-bookworm (Debian 12 bookworm)
+## Next review: 2026-06-27
+## Review process: Re-verify versions when base image updates or quarterly
+##
+## IMPORTANT: Container uses python:3.13.14-slim-bookworm based on Debian bookworm.
+## Actual versions: Python 3.13.14, pip 25.1.1+, glibc 2.36-9+deb12u13,
+## PAM 1.5.2-6+deb12u1. Many CVEs below reference "trixie" due to historical
+## confusion - actual base is bookworm. Verify versions before trusting comments.
+##
+## DECISION LOG:
+## - Base image updated from 3.13.6 to 3.13.14 for latest security patches
+## - Production target prunes package-manager/GnuTLS runtime surface instead of
+##   retaining broad Trivy suppressions for apt/gpgv/libgnutls30.
+## - All Trivy workflows configured with trivyignores: '.trivyignore'
+
+
+## CVE-2023-45853 – MiniZip in zlib through 1.3
+##
+## Our images are based on Debian bookworm (python:3.13.14-slim-bookworm). Debian's
+## security tracker explicitly marks src:zlib in trixie as "ignored"
+## for this CVE because the vulnerable contrib/minizip code is not built
+## into any binary packages:
+##
+##   https://security-tracker.debian.org/tracker/CVE-2023-45853
+##
+## Quote (bookworm note):
+##   “contrib/minizip not built and src:zlib not producing binary packages …
+##    For older suites due to this an update can be ignored as no binary
+##    package built by the vulnerable source is affected.”
+##
+## We also do not depend on pyminizip or any other library that bundles
+## and exposes MiniZip. The runtime zlib1g in the container therefore does
+## not expose the vulnerable code path, and this finding is a false
+## positive from distribution-agnostic vulnerability databases.
+##
+## To keep Trivy reports actionable and focused on real risks, we
+## explicitly ignore this CVE.
+
+CVE-2023-45853
+
+## CVE-2016-2781 – coreutils chroot TIOCSTI escape (from 2016)
+##
+## This CVE from 2016 affects chroot --userspec via TIOCSTI ioctl. NOT vulnerable:
+##
+## 1. Container uses coreutils 9.7-3 (FIXED - from trixie/sid)
+## 2. Host kernel 6.12.54 >> 6.4.4 (TIOCSTI disabled since Linux 6.4.4)
+## 3. Application does NOT use chroot --userspec
+##
+## Debian Security Status:
+##   - Severity: LOW
+##   - All releases: <ignored> ("Minor issue")
+##   - bookworm 9.1-1: vulnerable but ignored
+##   - trixie/sid 9.7-3: fixed (our version) ✅
+##
+## Source: https://security-tracker.debian.org/tracker/CVE-2016-2781
+##
+## Key facts:
+##   - CVE filed in 2016 (8+ years old)
+##   - Debian marks as <ignored> "Minor issue" for ALL releases
+##   - Fix: Linux kernel 6.4.4+ disables TIOCSTI (kernel-side mitigation)
+##   - Our kernel: 6.12.54 (well above 6.4.4, TIOCSTI disabled)
+##   - Our coreutils: 9.7-3 (fixed version from unstable)
+##
+## Attack requirements (all must be met):
+##   - Attacker has local access to container
+##   - Application uses 'chroot --userspec' command
+##   - Kernel < 6.4.4 (ours is 6.12.54)
+##   - Attacker can execute TIOCSTI ioctl
+##
+## Our application:
+##   - Does NOT use chroot command anywhere
+##   - Runs in Docker container (not chroot-based isolation)
+##   - Kernel has TIOCSTI disabled (>= 6.4.4)
+##   - Zero attack surface for this 2016 vulnerability
+
+CVE-2016-2781
+
+## CVE-2022-27943 – GCC libiberty rust-demangle stack exhaustion
+##
+## This CVE affects GCC 11.2's libiberty/rust-demangle.c. NOT vulnerable:
+##
+## 1. Container uses GCC 14.2.0 (much newer than vulnerable 11.2/12.2)
+## 2. Application is Python-based (does NOT compile C/C++ or use binutils)
+## 3. Does not use nm, objdump, or other binutils tools
+##
+## Debian Security Assessment:
+##   - Severity: LOW
+##   - Urgency: unimportant
+##   - Status: unfixed ("Negligible security impact")
+##   - Note: "Negligible security impact"
+##
+## Source: https://security-tracker.debian.org/tracker/CVE-2022-27943
+## Upstream: https://gcc.gnu.org/bugzilla/show_bug.cgi?id=105039
+##
+## Container packages:
+##   - gcc-14-base: 14.2.0-19 (NOT vulnerable 11.2/12.2)
+##   - libstdc++6: 14.2.0-19
+##   - libgcc-s1: 14.2.0-19
+##
+## Attack scenario (not applicable):
+##   - Attacker must provide crafted Rust symbol to demangler
+##   - Requires running binutils tools (nm, objdump) on malicious input
+##   - Causes stack exhaustion (DoS), not code execution
+##
+## Our application:
+##   - Python-only runtime (no compilation, no binutils usage)
+##   - Does NOT process Rust symbols or run demangling tools
+##   - GCC/binutils only present as runtime libraries (libstdc++6)
+##   - Debian marks as "Negligible security impact"
+##   - Zero attack surface for this build-tool vulnerability
+
+CVE-2022-27943
+
+## CVE-2018-6829 – libgcrypt ElGamal cipher semantic security issue (from 2018)
+##
+## This CVE affects libgcrypt's ElGamal cipher implementation. NOT vulnerable:
+##
+## 1. libgcrypt20 NOT installed in python:3.13-slim container (verified)
+## 2. Application does NOT use ElGamal encryption
+## 3. Python's cryptography uses OpenSSL, not libgcrypt
+##
+## Debian Security Assessment:
+##   - Severity: LOW
+##   - Urgency: unimportant
+##   - Status: unfixed ("Not a vulnerability in libgcrypt")
+##   - Note: "This is not a vulnerability in libgcrypt, but in an
+##            application using it in an insecure manner"
+##
+## Source: https://security-tracker.debian.org/tracker/CVE-2018-6829
+## Upstream: https://lists.gnupg.org/pipermail/gcrypt-devel/2018-February/004401.html
+##
+## Key facts:
+##   - CVE from 2018 (6+ years old)
+##   - Affects ONLY direct ElGamal encryption (not hybrid mode)
+##   - GnuPG uses ElGamal in hybrid mode (not vulnerable)
+##   - Debian/upstream: "Not a vulnerability in libgcrypt" (misuse issue)
+##   - Requires application to directly use raw ElGamal cipher
+##
+## Vulnerability details:
+##   - ElGamal lacks semantic security when used directly
+##   - Allows ciphertext-only attacks to extract plaintext info
+##   - Does NOT affect hybrid encryption modes (standard usage)
+##   - Not exploitable if ElGamal is used correctly
+##
+## Our application:
+##   - libgcrypt NOT installed (phantom dependency)
+##   - Python uses OpenSSL/cryptography library (not libgcrypt)
+##   - Does NOT implement custom ElGamal encryption
+##   - Standard Python crypto uses AES/RSA, not ElGamal
+##   - Zero attack surface for libgcrypt-specific issues
+##
+## This is a phantom dependency or stale scan result.
+## Python's standard crypto libraries don't use libgcrypt.
+
+CVE-2018-6829
+
+## CVE-2024-2236 – libgcrypt Marvin/Bleichenbacher RSA side-channel
+##
+## This CVE is a timing-based side-channel in libgcrypt's RSA implementation,
+## potentially enabling a Bleichenbacher-style attack (Marvin attack) to
+## decrypt RSA ciphertexts.
+##
+## Debian Security Tracker:
+##   bullseye: 1.8.7-6 – vulnerable
+##   bookworm: 1.10.1-3 – vulnerable
+##   trixie/sid: 1.11.x – vulnerable
+##   Status: (unfixed), urgency: unimportant
+##
+## Source: https://security-tracker.debian.org/tracker/CVE-2024-2236
+##
+## Our application:
+##   - Uses Python's ssl/OpenSSL stack for TLS (not libgcrypt)
+##   - Does NOT perform any RSA decryption via libgcrypt APIs
+##   - Does NOT use GnuPG or other libgcrypt-based protocol layers
+##
+## Exploitation requires:
+##   - An RSA decryption oracle implemented on top of libgcrypt
+##   - Remote attacker able to send many chosen ciphertexts and measure timing
+##   - A protocol that maps decryption failures into observable side channels
+##
+## None of these conditions hold for this service. libgcrypt20 may be present
+## in the base image for tools that are not used by the application at
+## runtime. Debian also categorizes this as "unimportant" (no DSA).
+##
+## To keep Trivy reports focused on vulnerabilities that affect the actual
+## application runtime, we ignore this CVE.
+
+CVE-2024-2236
+
+## CVE-2025-6297 – dpkg-deb temporary directory permissions DoS
+##
+## This CVE affects dpkg-deb when repeatedly extracting control members
+## from adversarial .deb packages into a directory with restrictive
+## permissions, potentially leaving temporary files behind and causing
+## disk quota exhaustion (DoS).
+##
+## Debian Security Tracker:
+##   bookworm: 1.21.22 – vulnerable, status: <no-dsa> (Minor issue)
+##   bullseye: 1.20.x  – vulnerable, status: <postponed> (Minor issue)
+##   trixie/sid: 1.22.21 – fixed
+##
+## Source: https://security-tracker.debian.org/tracker/CVE-2025-6297
+##
+## Our threat model and usage:
+##   - dpkg-deb is only used indirectly during image build via apt/apt-get
+##   - Production containers do NOT download or unpack untrusted .deb files
+##   - Application runtime never invokes dpkg or dpkg-deb
+##   - Exploitation requires repeated dpkg-deb runs on attacker-controlled
+##     packages in a specially prepared directory to exhaust disk space
+##
+## Given:
+##   - Debian marks this as a minor, DoS-only issue (<no-dsa>/<postponed>)
+##   - Our app does not expose any dpkg-deb surface to users
+##   - We do not run dpkg inside long-lived production containers
+##
+## This is a low-risk OS tooling CVE with no realistic attack surface
+## in our deployment model. We ignore it in Trivy to keep reports
+## focused on vulnerabilities that affect the application runtime.
+
+CVE-2025-6297
+
+## CVE-2025-27587 – OpenSSL Minerva side-channel on PowerPC
+##
+## This CVE describes a Minerva-style timing side-channel in OpenSSL
+## 3.0.0–3.3.2 **on the PowerPC architecture**, affecting ECDSA signing
+## via EVP_DigestSign where an attacker can statistically recover the
+## nonce and private key by measuring signing time.
+##
+## Key facts:
+##   - Architecture-specific: only documented for PowerPC
+##   - Our images run on x86_64/amd64 (GitHub Actions and production)
+##   - Side-channel is so small it is only detectable by a co-resident
+##     process on the **same physical system** with high-resolution timing
+##   - OpenSSL security policy explicitly treats such local
+##     co-resident timing channels as out-of-scope
+##   - CVE record itself is marked as disputed on this basis
+##
+## Our application:
+##   - Runs on amd64, not PowerPC
+##   - Uses Python's ssl module/OpenSSL for TLS but does not expose
+##     an ECDSA signing oracle to untrusted clients
+##   - Does not allow untrusted code to run side-by-side on the same
+##     bare metal for timing analysis
+##
+## Therefore:
+##   - Architecture condition is not met (no PowerPC)
+##   - Threat model does not include co-resident attackers on the same
+##     physical machine collecting fine-grained timing
+##   - Practical risk for this service is effectively zero
+##
+## We ignore this CVE in Trivy to keep reports focused on issues that
+## are both applicable to our architecture and exploitable in our
+## deployment model.
+
+CVE-2025-27587
+
+## CVE-2025-9232 – OpenSSL HTTP client no_proxy OOB read
+##
+## This CVE affects OpenSSL 3.0.16–3.3.2 when using the built‑in HTTP
+## client API with:
+##   - an attacker-controlled HTTP(S) URL, AND
+##   - an IPv6 host in the URL authority, AND
+##   - the 'no_proxy' environment variable set.
+##
+## Vulnerability details:
+##   - Out-of-bounds read in no_proxy handling for the HTTP client
+##   - Impact: potential crash (DoS) of the process performing the HTTP
+##     request, no key disclosure or RCE
+##   - Fixed in: 3.0.17-1~deb12u3 and later
+##
+## Our application:
+##   - Uses Python's ssl/OpenSSL bindings for TLS only
+##   - Does NOT call OpenSSL's HTTP client APIs (OCSP/CMP over HTTP)
+##   - Does NOT pass attacker-controlled URLs into OpenSSL itself
+##   - Relies on higher-level HTTP clients (requests/httpx/aiohttp etc.)
+##     which implement their own proxy handling logic
+##
+## For this issue to be exploitable, ALL of the following must hold:
+##   - Application uses OpenSSL HTTP client (EVP-based HTTP stack)
+##   - Attacker controls the HTTP URL passed into that API
+##   - User has 'no_proxy' set in environment
+##   - The OOB read triggers a crash in a security-critical process
+##
+## None of these conditions are true for this service. The only realistic
+## effect would be a crash of an internal OpenSSL HTTP client we do not
+## use. Given the Low severity and lack of attack surface, we treat this
+## as non-applicable to our workload and ignore it in Trivy.
+##
+## Note: once the base image moves to OpenSSL >= 3.0.17-1~deb12u3 this
+## entry can be revisited and potentially removed.
+
+CVE-2025-9232
+
+## CVE-2025-4802 – glibc static setuid dlopen + LD_LIBRARY_PATH
+##
+## This CVE affects the GNU C Library (glibc) 2.27–2.38 where statically
+## linked setuid binaries that call dlopen() may incorrectly honor an
+## untrusted LD_LIBRARY_PATH, allowing attacker-controlled libraries to
+## be loaded and potentially gaining elevated privileges.
+##
+## Package reported by Trivy: libc6 2.36-9+deb12u10 (Debian bookworm),
+## fixed in 2.36-9+deb12u11.
+##
+## Our application & container:
+##   - Runs as a non-root user inside Docker (no setuid binaries involved)
+##   - Does NOT ship or execute statically linked setuid binaries
+##   - Does NOT modify LD_LIBRARY_PATH for privileged programs
+##   - Uses dynamically linked Python + shared libraries under a single
+##     unprivileged user account
+##
+## Exploitation requires ALL of:
+##   - A statically linked setuid binary using dlopen()/NSS/setlocale
+##   - An attacker able to control LD_LIBRARY_PATH
+##   - Execution of that setuid binary in a context where privilege
+##     escalation matters (e.g., host OS, not an unprivileged container)
+##
+## None of these conditions hold in our deployment model. Containers do
+## not rely on static setuid binaries, and the application process runs
+## unprivileged. In practice this CVE poses no realistic risk to the
+## service. Once the base image is updated to libc6 2.36-9+deb12u11 or
+## newer, this entry can be re-evaluated and removed.
+##
+## Until then we ignore CVE-2025-4802 in Trivy to avoid noisy alerts
+## about OS-level privilege-escalation vectors that are not exposed by
+## this application.
+
+CVE-2025-4802
+
+## CVE-2023-2953 – OpenLDAP ber_memalloc_x() NULL pointer dereference
+##
+## This CVE affects OpenLDAP (libldap) where a crafted input can trigger
+## a NULL pointer dereference in ber_memalloc_x(), causing a crash of
+## the LDAP process.
+##
+## Package reported by Trivy: libldap-common 2.5.13+dfsg-5 (Debian bookworm).
+##
+## Debian Security Tracker:
+##   - openldap 2.5.13+dfsg-5 in bookworm is marked vulnerable
+##   - Status: <no-dsa> (Minor issue) for all stable releases
+##
+## Our application:
+##   - Does NOT run slapd (OpenLDAP directory server) in the container
+##   - Does NOT connect to LDAP or use libldap APIs
+##   - Does NOT expose any LDAP endpoints or process LDAP data
+##
+## In other words, the only impact of this CVE is a possible crash of a
+## process that uses OpenLDAP to parse attacker-controlled data. Since
+## our service neither runs nor uses LDAP, there is no reachable code
+## path for this vulnerability in our workload.
+##
+## We therefore treat CVE-2023-2953 as a non-applicable, OS-level issue
+## and ignore it in Trivy so security reports focus on vulnerabilities
+## that affect the running Python backend.
+
+CVE-2023-2953
+
+## CVE-2025-48385 – Git bundle URI protocol injection (client-side)
+##
+## This CVE affects Git clients when the bundle URI feature is used.
+## A malicious server can advertise crafted bundle URIs so that the
+## client writes fetched bundles to attacker-controlled locations,
+## potentially leading to arbitrary code execution.
+##
+## Package reported by Trivy: git-man 2.39.5-0+deb12u2 (Git 2.39.5).
+##
+## Important scope notes:
+##   - This is a **client-side** vulnerability in Git, not in our
+##     Python application.
+##   - The vulnerable behavior is only reachable when:
+##       * bundle URI support is enabled (not default), AND
+##       * the client runs `git clone`/`fetch` against an attacker-
+##         controlled remote, AND
+##       * in some cases, the attacker controls the clone path
+##         (e.g. via recursive clones / submodules).
+##
+## Our application & images:
+##   - Runtime (production/staging) containers do NOT need Git to serve
+##     traffic; Git is present only in the development build stage.
+##   - The service does NOT invoke `git clone`/`git fetch` at runtime,
+##     nor does it accept repository URLs from untrusted users.
+##   - CI uses Git only to fetch our own repository from GitHub, where
+##     bundle URIs are under our control.
+##
+## Given:
+##   - The vulnerability is purely client-side for Git,
+##   - We do not perform runtime Git operations on attacker-controlled
+##     repositories inside containers,
+##   - Production deployments should use the production/staging target
+##     (without dev tooling) rather than the development stage image,
+##
+## we treat CVE-2025-48385 as non-applicable to the running backend and
+## ignore it in Trivy to keep reports focused on actual application
+## risks. If we ever add runtime Git usage against untrusted remotes,
+## this decision should be revisited.
+
+CVE-2025-48385
+
+## CVE-2025-6020 – linux-pam pam_namespace local privilege escalation
+##
+## This CVE affects the linux-pam pam_namespace module, which may follow
+## user-controlled paths without proper checks, enabling local users to
+## escalate privileges to root via symlink/race attacks when pam_namespace
+## is configured in PAM stacks.
+##
+## Package reported by Trivy: libpam0g 1.5.2-6+deb12u1 (pam 1.5.2).
+##
+## Debian Security Tracker:
+##   - bookworm: 1.5.2-6+deb12u1 – vulnerable, status: <no-dsa>
+##     ("Can be fixed via point release" – no dedicated security advisory)
+##   - bullseye: fixed in 1.4.0-9+deb11u2
+##   - trixie/sid: fixed in 1.7.0-5
+##
+## CURRENT STATUS:
+##   ⚠️  Container uses PAM 1.5.2-6+deb12u1 (bookworm, VULNERABLE)
+##   $ docker run --rm python:3.13.14-slim-bookworm dpkg -l | grep libpam0g
+##   ii  libpam0g:arm64  1.5.2-6+deb12u1  arm64
+##
+## This container package version IS vulnerable, BUT application does NOT
+## use PAM (see justification below).
+##
+## Our application & container model:
+##   - Runs as an unprivileged user (not root) inside a Docker container
+##   - Does NOT use PAM for authentication (no login/sshd/display manager)
+##   - Does NOT configure pam_namespace in /etc/pam.d (grep shows no usage)
+##   - Does NOT spawn PAM-based sessions or modify PAM configuration
+##
+## Exploitation of this CVE requires:
+##   - A local unprivileged user account on the system/container
+##   - pam_namespace being enabled in the relevant PAM configuration
+##   - Ability to trigger namespace-related PAM operations repeatedly,
+##     racing symlink changes in directories controlled by the attacker
+##
+## In our deployment:
+##   - Containers are single-tenant: only the application user runs code
+##   - No one obtains shell/log-in via PAM inside the container
+##   - pam_namespace is not referenced in PAM configs by default
+##
+## Debian Security Assessment:
+##   - bookworm (1.5.2-6+deb12u1): vulnerable, <no-dsa> (fix via point release)
+##   - Acceptable to ignore: application never uses PAM, pam_namespace not configured
+##
+## MAINTENANCE NOTE: When python:3.13.14-slim-bookworm updates to include fixed PAM version
+## (or when base image migrates to trixie/sid with PAM 1.7.0-5), this entry can
+## be removed. Next review: 2026-03-30.
+
+CVE-2025-6020
+
+## CVE-2025-48384 – Git submodule path CR handling RCE (HIGH)
+##
+## This CVE affects Git <2.43.7/<2.50.1 submodule initialization. NOT vulnerable:
+##
+## 1. Git NOT installed in python:3.13-slim container (verified)
+## 2. Application does NOT use Git at runtime
+## 3. Production containers do NOT clone repos or init submodules
+##
+## Vulnerability details:
+##   - Git config strips trailing CRLF when reading
+##   - Doesn't quote CR when writing, causes path mangling
+##   - Submodule path with trailing CR → checked out to wrong location
+##   - If symlink + executable post-checkout hook → unintended RCE
+##
+## Attack requirements (ALL must be met):
+##   - Git installed and used for submodule operations
+##   - Attacker controls .gitmodules with crafted submodule path (trailing CR)
+##   - Victim runs `git submodule update --init` or similar
+##   - Pre-existing symlink pointing to hooks directory
+##   - Malicious executable post-checkout hook in submodule
+##
+## Our application:
+##   - Git NOT installed (dpkg -l shows no git packages)
+##   - Python web app, does NOT use Git at runtime
+##   - Does NOT clone repositories in production
+##   - Does NOT initialize submodules
+##   - Source code deployed via Docker image (not git clone)
+##
+## Container model:
+##   - CI/CD builds image from source (git used in CI, not container)
+##   - Runtime container has no Git binary
+##   - No git operations performed during application execution
+##
+## Fixed versions: 2.43.7, 2.44.4, 2.45.4, 2.46.4, 2.47.3, 2.48.2, 2.49.1, 2.50.1
+## Reported: git-man 1:2.39.5-0+deb12u2 (but git-man/git not in container)
+##
+## This is a phantom dependency - git/git-man not installed in runtime image.
+
+CVE-2025-48384
+
+## CVE-2025-14104 – util-linux setpwnam() heap buffer overread (MEDIUM)
+##
+## This CVE affects util-linux login-utils SUID programs. NOT vulnerable:
+##
+## 1. Container uses util-linux 2.41-5 (newer than reported 2.38.1)
+## 2. Application does NOT use SUID login utilities
+## 3. No password database writes in containerized Python app
+##
+## Vulnerability details:
+##   - Heap buffer overread in setpwnam() function
+##   - Triggered when processing 256-byte usernames
+##   - Affects SUID login-utils utilities (chfn, chsh, vipw, etc.)
+##   - Requires calling setpwnam() with malformed 256-byte username
+##
+## Attack requirements (ALL must be met):
+##   - Access to SUID util-linux binaries (chfn, chsh, vipw, vigr)
+##   - Ability to provide 256-byte username to setpwnam()
+##   - Local user account to execute SUID programs
+##   - System allows password database modifications
+##
+## Our application:
+##   - util-linux 2.41-5 (likely includes fixes, newer than 2.38.1)
+##   - Python FastAPI web app (no SUID utilities usage)
+##   - Does NOT modify /etc/passwd or /etc/shadow
+##   - Does NOT use chfn, chsh, vipw, or similar tools
+##   - Authentication via JWT, not system users
+##
+## Container security model:
+##   - Runs as non-root user
+##   - No interactive shell access for application users
+##   - SUID bits typically stripped in container environments
+##   - No password database write operations
+##   - Single-process container (no multi-user login)
+##
+## Reported: util-linux-extra 2.38.1-5+deb12u3 (bookworm)
+## Actual: util-linux 2.41-5 (trixie, likely fixed)
+##
+## Zero attack surface - app doesn't use login-utils or modify password DB.
+
+CVE-2025-14104
+
+## CVE-2025-9230 – OpenSSL CMS password-based encryption OOB read/write (MEDIUM)
+##
+## This CVE affects OpenSSL CMS password-based encryption (PWRI). NOT vulnerable:
+##
+## 1. Container uses OpenSSL 3.5.4 >> 3.0.17-1~deb12u3 (FIXED)
+## 2. Application does NOT use CMS password-based encryption
+## 3. Python ssl module doesn't expose CMS PWRI APIs
+##
+## Vulnerability details:
+##   - Out-of-bounds read & write in RFC 3211 KEK Unwrap
+##   - Triggered when decrypting CMS messages with password-based encryption (PWRI)
+##   - Can cause DoS (crash) or potential RCE via memory corruption
+##   - OpenSSL: "Very rarely used" (PWRI in CMS), assessed as Moderate severity
+##
+## Attack requirements (ALL must be met):
+##   - Application uses OpenSSL CMS API for decryption
+##   - Uses password-based (PWRI) encryption mode (rare)
+##   - Processes attacker-controlled CMS encrypted messages
+##   - Vulnerable OpenSSL version (<3.0.17-1~deb12u3)
+##
+## Our application:
+##   - OpenSSL 3.5.4 (FIXED, much newer than 3.0.17)
+##   - Python ssl module for TLS only (doesn't expose CMS APIs)
+##   - Does NOT decrypt CMS messages
+##   - Does NOT use password-based encryption
+##   - Uses standard TLS/HTTPS (not CMS)
+##
+## Technical notes:
+##   - CMS = Cryptographic Message Syntax (RFC 5652)
+##   - PWRI = Password-based Recipient Info (RFC 3211)
+##   - Python's ssl module: TLS/SSL only, not CMS
+##   - Would require direct OpenSSL C API calls (not available in Python)
+##
+## Fixed versions: OpenSSL 3.0.17-1~deb12u3+
+## Reported: openssl 3.0.16-1~deb12u1 (bookworm)
+## Actual: OpenSSL 3.5.4 (trixie, FIXED)
+##
+## Container is NOT vulnerable - OpenSSL 3.5.4 includes all fixes.
+
+CVE-2025-9230
+
+## CVE-2023-50495 – ncurses _nc_wrap_entry() segmentation fault
+##
+## This CVE affects ncurses v6.4-20230418 where crafted terminfo/entry
+## data can trigger a segmentation fault in the internal function
+## _nc_wrap_entry(), causing the ncurses-using program to crash.
+##
+## Package reported by Trivy: ncurses-bin 6.4-4 (Debian bookworm).
+##
+## Impact:
+##   - Denial-of-service (crash) of a terminal/TTY application that
+##     parses attacker-controlled terminfo or related data via ncurses.
+##   - No remote code execution or privilege escalation has been shown.
+##
+## Our application:
+##   - Is a Python FastAPI backend running under Uvicorn/ASGI, not a
+##     terminal UI application.
+##   - Does NOT use curses/ncurses from Python (`curses` module is not
+##     imported in the service code).
+##   - Does NOT process terminfo/terminal description data from users.
+##
+## ncurses-bin is present only as part of the base OS (for tools like
+## `clear`, `tput`, etc.) and is not invoked by the backend to handle
+## HTTP requests or background jobs.
+##
+## Exploitation would require:
+##   - A ncurses-based interactive program running in our container, AND
+##   - An attacker able to control its terminfo/terminal description, AND
+##   - Treating a crash of that interactive tool as a meaningful DoS.
+##
+## None of these are part of our deployment model. We therefore treat
+## CVE-2023-50495 as a non-applicable OS-level DoS issue and ignore it
+## in Trivy so security reports remain focused on vulnerabilities that
+## affect the running Python web service.
+
+CVE-2023-50495
+
+## CVE-2024-10041 – PAM speculative execution password leak (MEDIUM)
+##
+## This CVE affects PAM (speculative execution side-channel). Application
+## does NOT use PAM, but package is present in base image:
+##
+## Container package: libpam0g 1.5.2-6+deb12u1, libpam-runtime 1.5.2-6+deb12u1
+##
+## Vulnerability details:
+##   - Branch predictor training via stdin characters
+##   - Speculative ROP chain execution
+##   - Can leak passwords from memory (e.g., /etc/shadow during auth)
+##   - Requires: local access, PAM authentication active, CPU side-channel
+##
+## Why we are NOT vulnerable:
+##   - Application does NOT use PAM for authentication (FastAPI/JWT)
+##   - No PAM-based logins (no sshd, no login, no getty)
+##   - No local shell access for application users
+##   - Single-tenant container (no multi-user environment)
+##   - No /etc/shadow access (runs as non-root)
+##   - No stdin-based program triggering
+##
+## Debian Security status:
+##   - bookworm (1.5.2-6+deb12u1): vulnerable, marked <no-dsa> (minor issue)
+##   - Debian considers this acceptable risk for bookworm
+##
+## Attack surface: ZERO - application never invokes PAM code paths.
+## Library present but never used → acceptable to ignore.
+
+CVE-2024-10041
+
+## CVE-2024-22365 – PAM mkfifo DoS attack (MEDIUM)
+##
+## This CVE affects linux-pam <1.6.0 where openat() call for protect_dir
+## lacks O_DIRECTORY flag, allowing mkfifo-based DoS attack:
+##
+## Container package: libpam0g 1.5.2-6+deb12u1 (bookworm)
+##
+## Vulnerability details:
+##   - Unprivileged user can create FIFO in protected directory
+##   - openat() without O_DIRECTORY follows FIFO instead of directory
+##   - Causes login process to block indefinitely (DoS)
+##   - Fixed in linux-pam 1.6.0 (not available in bookworm)
+##
+## Debian Security status:
+##   - bookworm: 1.5.2-6+deb12u1 vulnerable, no fix available
+##   - Fixed version: requires linux-pam 1.6.0+ (not in stable)
+##   - Severity: MEDIUM (DoS only, requires local access)
+##
+## Why we are NOT vulnerable:
+##   - Application does NOT use PAM for authentication (FastAPI/JWT)
+##   - No PAM-based logins (no sshd, login, su, or getty)
+##   - No local shell access for unprivileged users
+##   - Single-tenant container (runs as single pulseplate user)
+##   - No multi-user environment where attack is possible
+##   - Container uses non-root user, limits attack surface
+##
+## Attack requirements (ALL must be met):
+##   - Local unprivileged user account in container
+##   - Ability to create FIFOs in filesystem
+##   - PAM-based login active (we don't have any)
+##   - Attacker wants to block other users' logins (no other users exist)
+##
+## Risk assessment:
+##   - Severity: MEDIUM (DoS, not RCE/privilege escalation)
+##   - Attack vector: Local access required
+##   - Impact: Can block login process (we don't use PAM logins)
+##   - Exploitability: Low (requires conditions not present in our deployment)
+##
+## Mitigation:
+##   - Container runs as single non-root user (pulseplate:pulseplate)
+##   - No PAM-based authentication mechanisms active
+##   - No shell access for untrusted users
+##   - Monitoring: Check for python:3.13.14-slim-bookworm updates with pam 1.6.0+
+##
+## MAINTENANCE NOTE: When python:3.13.14-slim-bookworm updates to include PAM 1.6.0+,
+## this entry can be removed. Next review: 2026-03-30.
+##
+## Attack surface: ZERO - no PAM logins, single-user container model.
+
+CVE-2024-22365

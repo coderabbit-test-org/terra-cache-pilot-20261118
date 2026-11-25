@@ -1,0 +1,4 @@
+/* Russian Info.plist Localization */
+"NSHealthShareUsageDescription" = "PulsePlate читает данные о питании и весе из Health, чтобы с вашего согласия показывать wellness-прогресс и планирование.";
+"CFBundleDisplayName" = "PulsePlate";
+"CFBundleName" = "PulsePlate";

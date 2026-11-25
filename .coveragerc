@@ -1,0 +1,108 @@
+# Coverage.py configuration for PulsePlate project
+# Excludes untestable code from coverage metrics
+#
+# Note: For current coverage threshold requirements, see CI configuration (.github/workflows/pr-tests.yml)
+# and PR #294 for context on any temporary adjustments during feature development.
+# Project standard: 97% coverage on production code after excluding boilerplate.
+
+[run]
+branch = True
+source = .
+omit =
+    # Test files themselves
+    */tests/*
+    */test_*.py
+    */*_test.py
+
+    # Local helper/coverage scripts and demos (not part of runtime app surface)
+    */check_coverage.py
+    */fix_coverage_tests.py
+    */fix_failing_tests.py
+    */quick_coverage_check.py
+    */quick_coverage_update.py
+    */run_coverage_tests.py
+    */setup_dev_env.py
+    */setup_env_check.py
+    */example_nutrition_api.py
+    */update_api_key.py
+    */setup_custom_mcp.py
+
+    # Optional/feature-flagged modules not executed in standard runtime
+    */app/routers/vip.py
+
+    # Test analyzer utilities (infrastructure tooling, not business logic)
+    */core/bayesian_test_analyzer.py
+    */core/comprehensive_bayesian_analyzer.py
+    */core/integrated_bayesian_analyzer.py
+    */core/nutrition_bayesian_analyzer.py
+    */core/business_bayesian_analyzer.py
+
+    # Scripts and CLI entrypoints
+    scripts/*
+    app/__main__.py
+
+    # Third-party integrations and providers
+    providers/*
+
+    # Package initialization (often just imports)
+    */__init__.py
+
+    # Entrypoint modules with extensive integration wiring
+    app.py
+    pytest_sharding.py
+
+    # Database migrations (generated code)
+    */migrations/*
+    */alembic/*
+
+    # Data files and static resources
+    */data_files/*
+    */static/*
+    */templates/*
+
+    # CI/CD and tooling
+    .github/**
+    setup.py
+    conftest.py
+
+    # Virtual environments
+    venv/*
+    .venv/*
+    env/*
+
+    # Build artifacts
+    build/*
+    dist/*
+    *.egg-info/*
+
+[report]
+# Regexes for lines to exclude from consideration
+exclude_lines =
+    # Have to re-enable the standard pragma
+    pragma: no cover
+
+    # Don't complain about missing debug-only code
+    def __repr__
+
+    # Don't complain if tests don't hit defensive assertion code
+    raise AssertionError
+    raise NotImplementedError
+
+    # Don't complain if non-runnable code isn't run
+    if __name__ == "__main__":
+    if TYPE_CHECKING:
+
+    # Don't complain about abstract methods
+    @abstractmethod
+
+    # Skip type checking blocks
+    if typing.TYPE_CHECKING:
+
+# Show missing line numbers in the report
+show_missing = True
+
+# Precision for coverage percentage
+precision = 2
+
+# Skip empty files
+skip_empty = True

@@ -1,0 +1,1394 @@
+#!/usr/bin/env python3
+"""Bounded experiment runner for governed candidate evaluation.
+
+RU: Применяет candidate patch только в изолированном checkout, запускает
+неизменяемые oracle-команды в sandbox и пишет локальный result artifact.
+EN: Applies a candidate patch only in an isolated checkout, runs immutable
+oracle commands in the sandbox, and writes a local result artifact.
+"""
+
+from __future__ import annotations
+
+import argparse
+from contextlib import contextmanager
+import json
+import math
+import os
+from pathlib import Path, PurePosixPath
+import shlex
+import shutil
+import subprocess  # nosec B404: git subprocesses are required for isolated temp checkouts (remove-by: 2027-02-01, ref: PR-1082)
+import sys
+import tempfile
+import time
+from typing import Any, Iterator
+
+RUNNER_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(RUNNER_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(RUNNER_REPO_ROOT))
+
+from app.security import agent_control_plane as cp
+from app.security import execution_sandbox as sandbox
+from app.security.execution_sandbox import SandboxRequest
+from core.evidence.fingerprints import fingerprint_payload
+from scripts.orchestration.context_pack import REPO_ROOT, normalize_repo_path
+from scripts.orchestration.creative_code_patch_workspace import (
+    git_env_without_parent_state as _sanitized_git_env_without_parent_state,
+    safe_git_config_args as _safe_git_config_args,
+)
+from scripts.orchestration.experiment_contract import (
+    CONTRIBUTION_KINDS,
+    DEFAULT_STOP_CONDITION,
+    DEFAULT_RUNNER_MODE,
+    MAX_CANDIDATE_PATCH_BYTES,
+    has_oom_evidence,
+    ORACLE_BINARY_ALLOWLIST,
+    ORACLE_ONLY_GOVERNANCE_REVIEWER_MODE,
+    SCHEMA_VERSION,
+    validate_contribution_attribution,
+    validate_experiment_id,
+    validate_runner_mode,
+    validate_experiment_packet,
+)
+
+RESULT_SCHEMA_VERSION = SCHEMA_VERSION
+RESULT_ARTIFACT_DIR = REPO_ROOT / "artifacts" / "orchestration" / "experiments" / "results"
+PYTHON_ORACLE_BINARIES = {"python", "python3"}
+CAPABILITY_LOSS_AFTER_INFRA_RETRY_ERROR = (
+    "Execution capability became unavailable after an infrastructure retry."
+)
+RUNNER_CAPABILITY_EXIT_CODE = 3
+RUNNER_REJECTED_EXIT_CODE = 4
+RUNNER_CAPABILITY_DIAGNOSTIC = (
+    "FAIL: execution capability unavailable; trusted backend provenance is required."
+)
+RUNNER_CAPABILITY_ERROR = "runner_capability_mismatch"
+
+
+def _safe_git_config_args_for(cwd: Path, *, bind_work_tree: bool = True) -> list[str]:
+    """Return checkout clamps plus one exact per-invocation trust boundary."""
+
+    try:
+        resolved_cwd = cwd.expanduser().resolve(strict=True)
+    except OSError as exc:
+        raise InfraFlakeError("git cwd must resolve to an existing directory.") from exc
+    if not resolved_cwd.is_dir():
+        raise InfraFlakeError("git cwd must resolve to an existing directory.")
+    args = [
+        *_safe_git_config_args(),
+        "-c",
+        f"core.worktree={resolved_cwd}",
+        "-c",
+        f"safe.directory={resolved_cwd}",
+    ]
+    if bind_work_tree:
+        args.insert(0, f"--work-tree={resolved_cwd}")
+    return args
+
+
+class ExperimentRunnerError(RuntimeError):
+    """Base error for internal runner failures."""
+
+
+class PolicyViolationError(ExperimentRunnerError):
+    """Candidate patch or oracle command violates the governed contract."""
+
+
+class InfraFlakeError(ExperimentRunnerError):
+    """Patch/apply/oracle execution failed for runner reasons, not code signal."""
+
+    _checkout_uncertain = False
+    _retained_checkout: str | None = None
+
+
+class CapabilityMismatchError(ExperimentRunnerError):
+    """Required execution isolation disappeared or is unsupported."""
+
+
+class RunnerCapabilitySignal(ExperimentRunnerError):
+    """Data-free internal signal for first-attempt post-preflight capability loss."""
+
+
+def _result_payload(
+    *,
+    experiment_id: str,
+    runner_mode: str = DEFAULT_RUNNER_MODE,
+    candidate_patch: str,
+    status: str,
+    failure_class: str | None,
+    mutated_paths: list[str],
+    oracle_results: list[dict[str, Any]],
+    budget_observations: dict[str, Any],
+    shared_tree_untouched: bool,
+    contribution_kind: str = "none",
+    coauthor_required: bool = False,
+    coauthor_reason: str = "",
+) -> dict[str, Any]:
+    """Build the stable result payload returned by the runner."""
+
+    if status != "accepted":
+        contribution_kind = "none"
+        coauthor_required = False
+        coauthor_reason = ""
+
+    normalized_budget_observations = dict(budget_observations)
+    if "oracle_commands_executed" in normalized_budget_observations:
+        normalized_budget_observations["oracle_commands_executed"] = len(oracle_results)
+
+    return {
+        "schema_version": RESULT_SCHEMA_VERSION,
+        "experiment_id": experiment_id,
+        "runner_mode": runner_mode,
+        "candidate_patch": candidate_patch,
+        "status": status,
+        "failure_class": failure_class,
+        "mutated_paths": mutated_paths,
+        "oracle_results": oracle_results,
+        "budget_observations": normalized_budget_observations,
+        "shared_tree_untouched": shared_tree_untouched,
+        "promotion_ready": False,
+        "contribution_kind": contribution_kind,
+        "coauthor_required": coauthor_required,
+        "coauthor_reason": coauthor_reason,
+    }
+
+
+def _read_json_object(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Unable to load experiment packet JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("Experiment packet must be a JSON object.")
+    return payload
+
+
+def _read_patch_text(path: Path, *, max_bytes: int | None = None) -> str:
+    """Read a candidate patch, bounding fingerprinted inputs before hashing."""
+
+    try:
+        if max_bytes is None:
+            return path.read_text(encoding="utf-8")
+        with path.open("rb") as handle:
+            raw_patch = handle.read(max_bytes + 1)
+    except (OSError, UnicodeDecodeError) as exc:
+        raise InfraFlakeError(f"Unable to read candidate patch: {exc}") from exc
+    if len(raw_patch) > max_bytes:
+        raise PolicyViolationError("Candidate patch exceeds the host fingerprint limit.")
+    try:
+        return raw_patch.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise InfraFlakeError(f"Unable to read candidate patch: {exc}") from exc
+
+
+def _normalize_patch_target(raw_path: str) -> str:
+    """Normalize a patch target and reject path-escape tricks."""
+
+    stripped = raw_path.strip()
+    if stripped in {"", "/dev/null"}:
+        return ""
+    if stripped.startswith(("a/", "b/")):
+        stripped = stripped[2:]
+    pure_path = PurePosixPath(stripped)
+    if pure_path.is_absolute():
+        raise PolicyViolationError(f"Patch path must be repo-relative, got: {raw_path}")
+    if any(part == ".." for part in pure_path.parts):
+        raise PolicyViolationError(f"Patch path escapes mutable surface: {raw_path}")
+    normalized_parts = [part for part in pure_path.parts if part not in {"", "."}]
+    if not normalized_parts:
+        raise PolicyViolationError(f"Patch path must not be empty: {raw_path}")
+    return PurePosixPath(*normalized_parts).as_posix()
+
+
+def _extract_mutated_paths(patch_text: str) -> list[str]:
+    """Extract deterministic touched paths from a unified diff patch."""
+
+    if patch_text.strip() == "":
+        return []
+
+    mutated_paths: set[str] = set()
+    saw_diff_marker = False
+    for raw_line in patch_text.splitlines():
+        if raw_line.startswith("diff --git "):
+            saw_diff_marker = True
+            parts = raw_line.split()
+            if len(parts) >= 4:
+                target = _normalize_patch_target(parts[3])
+                if target:
+                    mutated_paths.add(target)
+            continue
+        if raw_line.startswith(("rename to ", "copy to ")):
+            saw_diff_marker = True
+            target = _normalize_patch_target(raw_line.split(" ", 2)[2])
+            if target:
+                mutated_paths.add(target)
+            continue
+        if raw_line.startswith("rename from "):
+            saw_diff_marker = True
+            source = _normalize_patch_target(raw_line.split(" ", 2)[2])
+            if source:
+                mutated_paths.add(source)
+            continue
+        if raw_line.startswith("+++ "):
+            saw_diff_marker = True
+            target = _normalize_patch_target(raw_line[4:])
+            if target:
+                mutated_paths.add(target)
+
+    if not mutated_paths and saw_diff_marker:
+        return []
+    if not mutated_paths:
+        raise InfraFlakeError("Candidate patch is not a valid unified diff.")
+    return sorted(mutated_paths)
+
+
+def _path_matches_surface(path: str, surface: str) -> bool:
+    return path == surface or path.startswith(f"{surface}/")
+
+
+def _validate_patch_targets(packet: dict[str, Any], mutated_paths: list[str]) -> None:
+    """Reject patches that exceed mutable surfaces or changed-file budget."""
+
+    if not mutated_paths:
+        return
+
+    changed_file_budget = int(packet["budgets"]["max_changed_files"])
+    if len(mutated_paths) > changed_file_budget:
+        raise PolicyViolationError(
+            "Candidate patch exceeds max_changed_files budget: "
+            f"{len(mutated_paths)} > {changed_file_budget}"
+        )
+
+    mutable_surface = packet["mutable_candidate_surface"]
+    invalid_paths = [
+        path
+        for path in mutated_paths
+        if not any(_path_matches_surface(path, surface) for surface in mutable_surface)
+    ]
+    if invalid_paths:
+        joined = ", ".join(invalid_paths)
+        raise PolicyViolationError(
+            "Candidate patch touches paths outside mutable_candidate_surface: " f"{joined}"
+        )
+
+
+def _resolve_git_binary() -> str:
+    git_binary = shutil.which("git")
+    if not git_binary:
+        raise InfraFlakeError("git binary is required for experiment_runner.")
+    resolved = Path(git_binary).expanduser().resolve(strict=True)
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        raise InfraFlakeError("git binary must resolve to an executable file.")
+    return str(resolved)
+
+
+def _run_git(
+    args: list[str],
+    *,
+    cwd: Path,
+    check: bool = True,
+    input_text: str | None = None,
+    bind_work_tree: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    """Run git with an absolute binary and stable text capture."""
+
+    argv = [
+        _resolve_git_binary(),
+        *_safe_git_config_args_for(cwd, bind_work_tree=bind_work_tree),
+        *args,
+    ]
+    environment = _sanitized_git_env_without_parent_state()
+    mutates_checkout = args[:1] in (["clone"], ["checkout"], ["apply"]) and "--check" not in args
+    try:
+        process = subprocess.run(  # nosec B603: absolute git binary with bounded argv is required for isolated checkouts (remove-by: 2027-01-01, ref: PR-1082)
+            argv,
+            cwd=str(cwd),
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+            input=input_text,
+        )
+    except (KeyboardInterrupt, SystemExit) as interruption:
+        if mutates_checkout:
+            setattr(interruption, "_checkout_uncertain", True)
+        raise
+    if mutates_checkout and process.returncode < 0:
+        failure = InfraFlakeError("Isolated checkout writer terminated by signal.")
+        failure._checkout_uncertain = True
+        raise failure
+    if check and process.returncode != 0:
+        raise InfraFlakeError(f"Git operation failed (exit {process.returncode}).")
+    return process
+
+
+def _absolute_path_env(raw_path: str | None) -> str:
+    """Return PATH entries as absolute paths for subprocess cwd isolation."""
+
+    if not raw_path:
+        return ""
+    absolute_entries: list[str] = []
+    for entry in raw_path.split(os.pathsep):
+        if not entry:
+            continue
+        candidate = Path(entry).expanduser()
+        if not candidate.is_absolute():
+            candidate = candidate.resolve()
+        absolute_entries.append(str(candidate))
+    return os.pathsep.join(absolute_entries)
+
+
+def _repo_python_from_env(env_name: str) -> Path | None:
+    """Return a validated repo-approved Python executable from an env override."""
+
+    raw_value = os.environ.get(env_name)
+    if raw_value is None or raw_value.strip() == "":
+        return None
+    candidate = Path(raw_value).expanduser()
+    if not candidate.is_absolute():
+        raise InfraFlakeError(f"{env_name} must be an absolute executable path.")
+    if not candidate.is_file() or not os.access(candidate, os.X_OK):
+        raise InfraFlakeError(f"{env_name} is set but is not executable: {candidate}")
+    return candidate
+
+
+def _select_repo_python() -> Path | None:
+    """Select the repo-approved Python interpreter for Python oracle commands."""
+
+    for env_name in ("VENV_PYTHON", "DEV_PYTHON"):
+        selected = _repo_python_from_env(env_name)
+        if selected is not None:
+            return selected
+
+    candidates = [
+        Path(REPO_ROOT) / ".venv" / "bin" / "python",
+        Path(REPO_ROOT) / ".venv" / "Scripts" / "python.exe",
+    ]
+    parent_dir = Path(REPO_ROOT).resolve().parent
+    if parent_dir.name == "worktrees":
+        shared_root = parent_dir.parent
+        try:
+            git_common_dir = Path(
+                _run_git(
+                    ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                    cwd=Path(REPO_ROOT),
+                ).stdout.strip()
+            ).resolve()
+            git_common_dir.relative_to(shared_root / ".git")
+        except (InfraFlakeError, OSError, ValueError):
+            pass
+        else:
+            candidates.extend(
+                [
+                    shared_root / ".venv" / "bin" / "python",
+                    shared_root / ".venv" / "Scripts" / "python.exe",
+                ]
+            )
+
+    for repo_python in candidates:
+        if repo_python.is_file() and os.access(repo_python, os.X_OK):
+            return repo_python
+    return None
+
+
+def _python_oracle_path_prefix(requests: list[SandboxRequest]) -> str | None:
+    """Return PATH prefix required for Python oracles, or fail closed."""
+
+    python_binaries = sorted(
+        {request.binary for request in requests if request.binary in PYTHON_ORACLE_BINARIES}
+    )
+    if not python_binaries:
+        return None
+
+    selected_python = _select_repo_python()
+    if selected_python is None:
+        binaries = ", ".join(python_binaries)
+        raise InfraFlakeError(
+            "Python oracle command requires repo-approved Python, but no executable "
+            f"VENV_PYTHON, DEV_PYTHON, or repo .venv/bin/python was found for: {binaries}"
+        )
+
+    python_bin_dir = selected_python.parent
+    for binary in python_binaries:
+        resolved_binary = shutil.which(binary, path=str(python_bin_dir))
+        if resolved_binary is None:
+            raise InfraFlakeError(
+                f"Python oracle binary {binary!r} was not found in repo-approved "
+                f"Python bin dir: {python_bin_dir}"
+            )
+        if Path(resolved_binary).parent != python_bin_dir:
+            raise InfraFlakeError(
+                f"Python oracle binary {binary!r} did not resolve through "
+                f"repo-approved Python bin dir: {python_bin_dir}"
+            )
+    return str(python_bin_dir)
+
+
+def _shared_tree_status(root: Path) -> str:
+    """Capture tracked/untracked status to prove the shared tree stayed untouched."""
+
+    return _run_git(["status", "--short"], cwd=root).stdout
+
+
+def _working_tree_diff_against_head(root: Path) -> str:
+    """Capture tracked working-tree changes for oracle-only reviewer evidence."""
+
+    return _run_git(
+        ["diff", "--no-ext-diff", "--no-textconv", "--binary", "HEAD"],
+        cwd=root,
+    ).stdout
+
+
+def _safe_result_experiment_id(packet: Any) -> str:
+    if not isinstance(packet, dict):
+        return "invalid-experiment"
+    raw_experiment_id = str(packet.get("experiment_id", "")).strip()
+    if not raw_experiment_id:
+        return "invalid-experiment"
+    try:
+        return str(validate_experiment_id(raw_experiment_id, label="Experiment result"))
+    except ValueError:
+        return "invalid-experiment"
+
+
+def _safe_result_runner_mode(packet: Any) -> str:
+    if not isinstance(packet, dict):
+        return str(DEFAULT_RUNNER_MODE)
+    try:
+        return str(validate_runner_mode(packet.get("runner_mode", DEFAULT_RUNNER_MODE)))
+    except ValueError:
+        return str(DEFAULT_RUNNER_MODE)
+
+
+def _candidate_patch_ref_for_runner_mode(runner_mode: str, candidate_patch_ref: str) -> str:
+    if runner_mode == ORACLE_ONLY_GOVERNANCE_REVIEWER_MODE:
+        return str(ORACLE_ONLY_GOVERNANCE_REVIEWER_MODE)
+    return candidate_patch_ref
+
+
+def _invalid_packet_result(
+    *,
+    packet: Any,
+    candidate_patch_ref: str,
+    error: str,
+) -> dict[str, Any]:
+    runner_mode = _safe_result_runner_mode(packet)
+    return _result_payload(
+        experiment_id=_safe_result_experiment_id(packet),
+        runner_mode=runner_mode,
+        candidate_patch=_candidate_patch_ref_for_runner_mode(runner_mode, candidate_patch_ref),
+        status="rejected",
+        failure_class="policy_violation",
+        mutated_paths=[],
+        oracle_results=[],
+        budget_observations={
+            "attempts": 0,
+            "retries_consumed": 0,
+            "runner_error": error,
+        },
+        shared_tree_untouched=False,
+    )
+
+
+@contextmanager
+def _temporary_sandbox_env(
+    *,
+    sandbox_root: Path,
+    allowed_binaries: tuple[str, ...],
+    timeout_seconds: int,
+    path_prefix: str | None = None,
+) -> Iterator[None]:
+    """Temporarily configure sandbox env without leaking state across runs."""
+
+    normalized_path = _absolute_path_env(os.environ.get("PATH") or os.defpath)
+    if path_prefix:
+        normalized_path = os.pathsep.join([path_prefix, normalized_path])
+    overrides = {
+        sandbox.SANDBOX_ENABLED_ENV: "true",
+        sandbox.SANDBOX_ROOT_ENV: str(sandbox_root),
+        sandbox.SANDBOX_TIMEOUT_ENV: str(timeout_seconds),
+        sandbox.SANDBOX_ALLOWED_BINARIES_ENV: ",".join(allowed_binaries),
+        cp.EXECUTION_MODE_ENV: cp.EXECUTION_MODE_AUTO_SAFE,
+        "PATH": normalized_path,
+    }
+    previous = {key: os.environ.get(key) for key in overrides}
+    try:
+        os.environ.update(overrides)
+        yield
+    finally:
+        for key, original in previous.items():
+            if original is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = original
+
+
+class _CheckoutReservation:
+    """Explicit ownership of one temporary checkout, without GC-triggered removal."""
+
+    def __init__(self, root: Path) -> None:
+        parent = Path(tempfile.gettempdir()).resolve(strict=True)
+        if parent.is_relative_to(root.resolve(strict=True)):
+            raise InfraFlakeError("Temporary checkout parent overlaps the source.")
+        self.name = tempfile.mkdtemp(prefix="experiment-runner-", dir=parent)
+        try:
+            self._fd = os.open(self.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError:
+            failure = InfraFlakeError("Temporary checkout reservation could not be identified.")
+            failure._checkout_uncertain = True
+            failure._retained_checkout = self.name
+            raise failure from None
+        self.removal_completed = False
+        try:
+            self.identity = os.fstat(self._fd)
+        except BaseException as primary:
+            failure = InfraFlakeError("Temporary checkout reservation could not be identified.")
+            failure._checkout_uncertain = True
+            failure._retained_checkout = self.name
+            try:
+                os.close(self._fd)
+            except OSError as secondary:
+                failure.add_note("Checkout descriptor cleanup failed: " + type(secondary).__name__)
+            if not isinstance(primary, Exception):
+                setattr(primary, "_checkout_uncertain", True)
+                setattr(primary, "_retained_checkout", self.name)
+                for note in getattr(failure, "__notes__", ()):
+                    primary.add_note(note)
+                raise
+            raise failure from None
+
+    def retain(self) -> None:
+        os.close(self._fd)
+
+    def cleanup(self) -> None:
+        reservation = Path(self.name)
+        try:
+            if not os.path.samestat(reservation.lstat(), self.identity):
+                raise InfraFlakeError("Temporary checkout reservation identity changed.")
+            children = os.listdir(self._fd)
+            if children:
+                if children != ["checkout"]:
+                    raise InfraFlakeError("Unexpected member in temporary checkout reservation.")
+                shutil.rmtree("checkout", dir_fd=self._fd)
+            if not os.path.samestat(reservation.lstat(), self.identity):
+                raise InfraFlakeError("Temporary checkout reservation identity changed.")
+            reservation.rmdir()
+            self.removal_completed = True
+        finally:
+            os.close(self._fd)
+
+
+def _finish_checkout(owner: _CheckoutReservation, primary: BaseException | None) -> None:
+    if primary is not None and getattr(primary, "_checkout_uncertain", False):
+        setattr(primary, "_retained_checkout", owner.name)
+        try:
+            owner.retain()
+        except OSError as secondary:
+            primary.add_note("Checkout descriptor cleanup failed: " + type(secondary).__name__)
+        primary.add_note("Isolated checkout retained after writer interruption.")
+        return
+    try:
+        owner.cleanup()
+        try:
+            Path(owner.name).lstat()
+        except FileNotFoundError:
+            if owner.removal_completed:
+                return
+        raise InfraFlakeError("Temporary checkout removal was not observed.")
+    except BaseException as cleanup:
+        # Only an observed absent entry permits the incumbent infrastructure retry.
+        try:
+            Path(owner.name).lstat()
+        except FileNotFoundError:
+            uncertain = not owner.removal_completed
+        except OSError:
+            uncertain = True
+        else:
+            uncertain = True
+        if primary is not None:
+            setattr(primary, "_checkout_cleanup_failed", True)
+            primary.add_note("Isolated checkout cleanup failed: " + type(cleanup).__name__)
+            if uncertain:
+                setattr(primary, "_checkout_uncertain", True)
+                setattr(primary, "_retained_checkout", owner.name)
+            return
+        if not isinstance(cleanup, Exception):
+            raise
+        failure = InfraFlakeError("Unable to clean temp checkout.")
+        if uncertain:
+            failure._checkout_uncertain = True
+            failure._retained_checkout = owner.name
+        raise failure from None
+
+
+def _checkout_failure_message(error: ExperimentRunnerError) -> str:
+    """Project cleanup state without exposing private paths or subprocess details."""
+    if getattr(error, "_checkout_uncertain", False):
+        if getattr(error, "_checkout_cleanup_failed", False):
+            return (
+                "Experiment failed; secondary checkout cleanup failed and removal is unconfirmed."
+            )
+        return "Isolated checkout state is uncertain; retry is blocked."
+    if getattr(error, "_checkout_cleanup_failed", False):
+        return "Experiment failed; secondary checkout cleanup also failed."
+    return str(error)
+
+
+def _create_temp_checkout(root: Path) -> tuple[_CheckoutReservation, Path]:
+    """Transfer the explicit reservation only after checkout succeeds."""
+    temp_dir = _CheckoutReservation(root)
+    checkout_root = Path(temp_dir.name) / "checkout"
+    try:
+        _run_git(
+            [
+                "clone",
+                "--quiet",
+                "--no-checkout",
+                "--no-hardlinks",
+                str(root),
+                str(checkout_root),
+            ],
+            cwd=root,
+            bind_work_tree=False,
+        )
+        head_sha = _run_git(["rev-parse", "HEAD"], cwd=root).stdout.strip()
+        _run_git(["checkout", "--quiet", "--detach", head_sha], cwd=checkout_root)
+    except BaseException as primary:
+        _finish_checkout(temp_dir, primary)
+        raise
+    return temp_dir, checkout_root
+
+
+def _require_candidate_base_commit(
+    packet: dict[str, Any], *, execution_root: Path | None = None
+) -> None:
+    """Bind a fingerprinted direct runner invocation to its packet base."""
+
+    material_root = REPO_ROOT if execution_root is None else execution_root
+    expected_base = packet.get("base_commit_sha")
+    if expected_base is None:
+        return
+    current_head = _run_git(["rev-parse", "HEAD"], cwd=material_root).stdout.strip()
+    if current_head != expected_base:
+        raise PolicyViolationError(
+            "Experiment packet base_commit_sha does not match current repository HEAD."
+        )
+    tracked_status = _run_git(
+        ["status", "--short", "--untracked-files=no"], cwd=material_root
+    ).stdout
+    if tracked_status:
+        raise PolicyViolationError(
+            "Fingerprinted candidate packets require a clean tracked repository checkout."
+        )
+
+
+def _apply_candidate_patch(checkout_root: Path, patch_text: str) -> None:
+    """Verify patch applicability before applying it inside the isolated checkout."""
+
+    _run_git(["apply", "--check"], cwd=checkout_root, input_text=patch_text)
+    _run_git(["apply"], cwd=checkout_root, input_text=patch_text)
+
+
+def _has_effective_diff(checkout_root: Path) -> bool:
+    """Return whether the temp checkout changed after patch apply."""
+
+    process = _run_git(["status", "--short"], cwd=checkout_root, check=False)
+    if process.returncode != 0:
+        raise InfraFlakeError(f"Git status after patch failed (exit {process.returncode}).")
+    return bool(process.stdout.strip())
+
+
+def _command_to_request(command: str, *, disable_network: bool = False) -> SandboxRequest:
+    """Convert a packet oracle command string into a sandbox request."""
+
+    try:
+        argv = shlex.split(command)
+    except ValueError as exc:
+        raise InfraFlakeError(f"Unable to parse oracle command: {command}") from exc
+    if not argv:
+        raise InfraFlakeError("Oracle command must not be empty.")
+    binary = argv[0]
+    if binary not in ORACLE_BINARY_ALLOWLIST:
+        allowed = ", ".join(ORACLE_BINARY_ALLOWLIST)
+        raise PolicyViolationError(
+            f"Oracle binary {binary!r} is not allowlisted for experiment runner. "
+            f"Allowed: {allowed}"
+        )
+    request_env = {sandbox.SANDBOX_DISABLE_NETWORK_ENV: "1"} if disable_network else None
+    return SandboxRequest(binary=binary, args=tuple(argv[1:]), cwd=".", env=request_env)
+
+
+def _classify_oracle_failure(result: sandbox.SandboxResult) -> str:
+    """Map a non-zero oracle result to the canonical PR3 failure classes."""
+
+    if result.timed_out:
+        return "timeout"
+    combined_output = f"{result.stdout}\n{result.stderr}"
+    if "unshare:" in combined_output and any(
+        marker in combined_output.lower()
+        for marker in (
+            "operation not permitted",
+            "permission denied",
+            "failed to execute",
+            "invalid option",
+            "not found",
+        )
+    ):
+        return "capability_mismatch"
+    if has_oom_evidence(combined_output):
+        return "oom"
+    return "guard_failure"
+
+
+def _run_oracles(
+    packet: dict[str, Any], checkout_root: Path
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Execute immutable oracle commands in the isolated sandbox root."""
+
+    oracle_results: list[dict[str, Any]] = []
+    failure_class: str | None = None
+    disable_network = int(packet["budgets"]["network_budget"]) == 0
+    requests = [
+        _command_to_request(oracle["command"], disable_network=disable_network)
+        for oracle in packet["immutable_oracles"]
+    ]
+    allowed_binaries = tuple(sorted({request.binary for request in requests}))
+    path_prefix = _python_oracle_path_prefix(requests)
+    total_wall_clock_seconds = int(packet["budgets"]["wall_clock_seconds"])
+    started_at = time.monotonic()
+
+    for oracle, request in zip(packet["immutable_oracles"], requests, strict=True):
+        remaining_seconds = total_wall_clock_seconds - (time.monotonic() - started_at)
+        if remaining_seconds <= 0:
+            oracle_results.append(
+                {
+                    "command": oracle["command"],
+                    "returncode": 124,
+                    "timed_out": True,
+                    "truncated": False,
+                    "stdout": "",
+                    "stderr": "Experiment wall_clock_seconds budget exhausted before oracle start.",
+                    "cwd": str(checkout_root),
+                }
+            )
+            failure_class = "timeout"
+            break
+
+        timeout_seconds = max(1, math.floor(remaining_seconds))
+        with _temporary_sandbox_env(
+            sandbox_root=checkout_root,
+            allowed_binaries=allowed_binaries,
+            timeout_seconds=timeout_seconds,
+            path_prefix=path_prefix,
+        ):
+            try:
+                result = sandbox.run_local_sandbox(
+                    request,
+                    allowlist={("sandbox.exec", "local://sandbox")},
+                )
+            except (KeyboardInterrupt, SystemExit) as interruption:
+                # The call was entered and did not return its terminal result.
+                setattr(interruption, "_checkout_uncertain", True)
+                raise
+            except subprocess.TimeoutExpired:
+                failure = InfraFlakeError(
+                    "Sandbox command interrupted before terminal observation."
+                )
+                failure._checkout_uncertain = True
+                raise failure from None
+            except Exception as exc:
+                message = str(exc).lower()
+                if disable_network and (
+                    "unshare" in message or "network-disabled sandbox" in message
+                ):
+                    raise CapabilityMismatchError(
+                        f"Unable to enforce zero-network oracle isolation for "
+                        f"{oracle['command']!r}: {exc}"
+                    ) from exc
+                raise InfraFlakeError(
+                    f"Unable to execute oracle {oracle['command']!r}: {exc}"
+                ) from exc
+
+        oracle_results.append(
+            {
+                "command": oracle["command"],
+                "returncode": result.returncode,
+                "timed_out": result.timed_out,
+                "truncated": result.truncated,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "cwd": result.cwd,
+            }
+        )
+        if result.returncode != 0 and failure_class is None:
+            failure_class = _classify_oracle_failure(result)
+            break
+
+    return oracle_results, failure_class
+
+
+def _resolve_output_path(raw_output: str | None, experiment_id: str) -> Path:
+    """Resolve result output path under the experiment result artifact directory."""
+
+    if raw_output:
+        candidate = Path(raw_output)
+        if not candidate.is_absolute():
+            candidate = RESULT_ARTIFACT_DIR / candidate
+    else:
+        candidate = RESULT_ARTIFACT_DIR / f"{experiment_id}.json"
+    candidate = candidate.resolve()
+
+    try:
+        candidate.relative_to(RESULT_ARTIFACT_DIR.resolve())
+    except ValueError as exc:
+        raise ValueError(
+            "--output must stay within artifacts/orchestration/experiments/results"
+        ) from exc
+    return candidate
+
+
+def _evaluate_attempt(
+    *,
+    packet: dict[str, Any],
+    patch_text: str,
+    mutated_paths: list[str],
+    budget_observations: dict[str, Any],
+    candidate_patch_ref: str,
+    execution_root: Path | None = None,
+) -> dict[str, Any]:
+    """Run one isolated evaluation attempt and fail closed on cleanup errors."""
+
+    temp_dir, checkout_root = _create_temp_checkout(
+        REPO_ROOT if execution_root is None else execution_root
+    )
+    primary: BaseException | None = None
+    try:
+        _apply_candidate_patch(checkout_root, patch_text)
+        if not _has_effective_diff(checkout_root):
+            return _result_payload(
+                experiment_id=packet["experiment_id"],
+                runner_mode=packet.get("runner_mode", DEFAULT_RUNNER_MODE),
+                candidate_patch=candidate_patch_ref,
+                status="rejected",
+                failure_class="unchanged_result",
+                mutated_paths=mutated_paths,
+                oracle_results=[],
+                budget_observations=budget_observations,
+                shared_tree_untouched=True,
+            )
+
+        oracle_results, failure_class = _run_oracles(packet, checkout_root)
+        budget_observations["oracle_commands_executed"] = len(oracle_results)
+        status = "accepted" if failure_class is None else "rejected"
+        return _result_payload(
+            experiment_id=packet["experiment_id"],
+            runner_mode=packet.get("runner_mode", DEFAULT_RUNNER_MODE),
+            candidate_patch=candidate_patch_ref,
+            status=status,
+            failure_class=failure_class,
+            mutated_paths=mutated_paths,
+            oracle_results=oracle_results,
+            budget_observations=budget_observations,
+            shared_tree_untouched=True,
+        )
+    except BaseException as error:
+        primary = error
+        raise
+    finally:
+        _finish_checkout(temp_dir, primary)
+
+
+def evaluate_candidate(
+    packet: dict[str, Any], candidate_patch_path: Path, *, execution_root: Path | None = None
+) -> dict[str, Any]:
+    """Evaluate a candidate patch against a validated experiment packet."""
+
+    material_root = REPO_ROOT if execution_root is None else execution_root
+    candidate_patch_ref = str(candidate_patch_path)
+    try:
+        packet = validate_experiment_packet(packet)
+    except ValueError as exc:
+        return _invalid_packet_result(
+            packet=packet,
+            candidate_patch_ref=candidate_patch_ref,
+            error=str(exc),
+        )
+    budget_observations = {
+        "configured_budgets": dict(packet["budgets"]),
+        "stop_condition": packet["budgets"].get("stop_condition", DEFAULT_STOP_CONDITION),
+        "oracle_commands_configured": len(packet["immutable_oracles"]),
+        "oracle_commands_executed": 0,
+        "candidate_changed_files": 0,
+        "attempts": 0,
+        "retries_consumed": 0,
+    }
+    shared_status_before: str | None = None
+    capability_signal = False
+    candidate_patch_fingerprint: str | None = None
+
+    try:
+        candidate_patch_ref = normalize_repo_path(candidate_patch_path)
+        shared_status_before = _shared_tree_status(material_root)
+        if packet.get("runner_mode") == ORACLE_ONLY_GOVERNANCE_REVIEWER_MODE:
+            raise PolicyViolationError(
+                "oracle_only_governance_reviewer mode must not evaluate candidate patches"
+            )
+        expected_patch_fingerprint = packet.get("candidate_patch_fingerprint")
+        if expected_patch_fingerprint is None:
+            patch_text = _read_patch_text(candidate_patch_path)
+        else:
+            patch_text = _read_patch_text(
+                candidate_patch_path,
+                max_bytes=MAX_CANDIDATE_PATCH_BYTES,
+            )
+        actual_patch_fingerprint = fingerprint_payload({"candidate_patch": patch_text})
+        if expected_patch_fingerprint is not None:
+            if expected_patch_fingerprint != actual_patch_fingerprint:
+                raise PolicyViolationError(
+                    "Candidate patch fingerprint does not match the experiment packet."
+                )
+            candidate_patch_fingerprint = actual_patch_fingerprint
+            _require_candidate_base_commit(
+                packet, **({"execution_root": material_root} if execution_root is not None else {})
+            )
+        mutated_paths = _extract_mutated_paths(patch_text)
+        budget_observations["candidate_changed_files"] = len(mutated_paths)
+        if not mutated_paths:
+            result = _result_payload(
+                experiment_id=packet["experiment_id"],
+                runner_mode=packet.get("runner_mode", DEFAULT_RUNNER_MODE),
+                candidate_patch=candidate_patch_ref,
+                status="rejected",
+                failure_class="unchanged_result",
+                mutated_paths=[],
+                oracle_results=[],
+                budget_observations=budget_observations,
+                shared_tree_untouched=True,
+            )
+            if candidate_patch_fingerprint is not None:
+                result["candidate_patch_fingerprint"] = candidate_patch_fingerprint
+            return result
+
+        _validate_patch_targets(packet, mutated_paths)
+
+        max_attempts = int(packet["budgets"]["retry_budget"]) + 1
+        last_infra_error: str | None = None
+        for attempt_number in range(1, max_attempts + 1):
+            budget_observations["attempts"] = attempt_number
+            budget_observations["retries_consumed"] = attempt_number - 1
+            budget_observations["oracle_commands_executed"] = 0
+
+            try:
+                result = _evaluate_attempt(
+                    **({"execution_root": material_root} if execution_root is not None else {}),
+                    packet=packet,
+                    patch_text=patch_text,
+                    mutated_paths=mutated_paths,
+                    budget_observations=budget_observations,
+                    candidate_patch_ref=candidate_patch_ref,
+                )
+            except CapabilityMismatchError:
+                if attempt_number > 1:
+                    raise InfraFlakeError(CAPABILITY_LOSS_AFTER_INFRA_RETRY_ERROR) from None
+                raise
+            except InfraFlakeError as exc:
+                last_infra_error = str(exc)
+                if exc._checkout_uncertain or attempt_number == max_attempts:
+                    raise
+                continue
+            if (
+                result.get("status") == "rejected"
+                and result.get("failure_class") == "capability_mismatch"
+            ):
+                if attempt_number > 1:
+                    raise InfraFlakeError(CAPABILITY_LOSS_AFTER_INFRA_RETRY_ERROR) from None
+                capability_signal = True
+                budget_observations["runner_error"] = RUNNER_CAPABILITY_ERROR
+                result = _result_payload(
+                    experiment_id=packet["experiment_id"],
+                    runner_mode=packet.get("runner_mode", DEFAULT_RUNNER_MODE),
+                    candidate_patch=candidate_patch_ref,
+                    status="rejected",
+                    failure_class="infra_flake",
+                    mutated_paths=[],
+                    oracle_results=[],
+                    budget_observations=budget_observations,
+                    shared_tree_untouched=True,
+                )
+            break
+        else:
+            raise InfraFlakeError(last_infra_error or "Unknown infra_flake during experiment run.")
+    except PolicyViolationError as exc:
+        budget_observations["runner_error"] = _checkout_failure_message(exc)
+        result = _result_payload(
+            experiment_id=packet["experiment_id"],
+            runner_mode=packet.get("runner_mode", DEFAULT_RUNNER_MODE),
+            candidate_patch=_candidate_patch_ref_for_runner_mode(
+                packet.get("runner_mode", DEFAULT_RUNNER_MODE),
+                candidate_patch_ref,
+            ),
+            status="rejected",
+            failure_class="policy_violation",
+            mutated_paths=[],
+            oracle_results=[],
+            budget_observations=budget_observations,
+            shared_tree_untouched=shared_status_before is not None,
+        )
+    except CapabilityMismatchError:
+        capability_signal = True
+        budget_observations["runner_error"] = RUNNER_CAPABILITY_ERROR
+        result = _result_payload(
+            experiment_id=packet["experiment_id"],
+            runner_mode=packet.get("runner_mode", DEFAULT_RUNNER_MODE),
+            candidate_patch=candidate_patch_ref,
+            status="rejected",
+            failure_class="infra_flake",
+            mutated_paths=[],
+            oracle_results=[],
+            budget_observations=budget_observations,
+            shared_tree_untouched=shared_status_before is not None,
+        )
+    except InfraFlakeError as exc:
+        capability_signal = False
+        budget_observations["runner_error"] = _checkout_failure_message(exc)
+        result = _result_payload(
+            experiment_id=packet["experiment_id"],
+            runner_mode=packet.get("runner_mode", DEFAULT_RUNNER_MODE),
+            candidate_patch=candidate_patch_ref,
+            status="rejected",
+            failure_class="infra_flake",
+            mutated_paths=[],
+            oracle_results=[],
+            budget_observations=budget_observations,
+            shared_tree_untouched=shared_status_before is not None,
+        )
+
+    if candidate_patch_fingerprint is not None:
+        result["candidate_patch_fingerprint"] = candidate_patch_fingerprint
+    if shared_status_before is None:
+        result["shared_tree_untouched"] = False
+        result["status"] = "rejected"
+        result["failure_class"] = "infra_flake"
+        result["budget_observations"].setdefault(
+            "runner_error",
+            "Unable to capture shared working tree status before run.",
+        )
+        return result
+
+    try:
+        shared_status_after = _shared_tree_status(material_root)
+    except InfraFlakeError as exc:
+        result["shared_tree_untouched"] = False
+        result["status"] = "rejected"
+        result["failure_class"] = "infra_flake"
+        result["budget_observations"]["runner_error"] = str(exc)
+        return result
+    if shared_status_before != shared_status_after:
+        capability_signal = False
+        result["shared_tree_untouched"] = False
+        result["status"] = "rejected"
+        result["failure_class"] = "infra_flake"
+        result["budget_observations"]["runner_error"] = "Shared working tree changed during run."
+    if capability_signal:
+        raise RunnerCapabilitySignal
+    return result
+
+
+def evaluate_oracle_only_governance_reviewer(
+    packet: dict[str, Any],
+    *,
+    contribution_kind: str = "none",
+    coauthor_required: bool = False,
+    coauthor_reason: str = "",
+    execution_root: Path | None = None,
+) -> dict[str, Any]:
+    """Run immutable governance oracles without applying any candidate patch."""
+
+    material_root = REPO_ROOT if execution_root is None else execution_root
+    try:
+        contribution_kind, coauthor_required, coauthor_reason = validate_contribution_attribution(
+            contribution_kind=contribution_kind,
+            coauthor_required=coauthor_required,
+            coauthor_reason=coauthor_reason,
+        )
+    except ValueError as exc:
+        raise PolicyViolationError(str(exc)) from exc
+
+    try:
+        packet = validate_experiment_packet(packet)
+    except ValueError as exc:
+        return _invalid_packet_result(
+            packet=packet,
+            candidate_patch_ref=ORACLE_ONLY_GOVERNANCE_REVIEWER_MODE,
+            error=str(exc),
+        )
+    if packet.get("runner_mode") != ORACLE_ONLY_GOVERNANCE_REVIEWER_MODE:
+        raise PolicyViolationError(
+            "evaluate_oracle_only_governance_reviewer requires oracle-only runner_mode"
+        )
+
+    budget_observations = {
+        "configured_budgets": dict(packet["budgets"]),
+        "stop_condition": packet["budgets"].get("stop_condition", DEFAULT_STOP_CONDITION),
+        "oracle_commands_configured": len(packet["immutable_oracles"]),
+        "oracle_commands_executed": 0,
+        "candidate_changed_files": 0,
+        "attempts": 1,
+        "retries_consumed": 0,
+        "runner_mode": ORACLE_ONLY_GOVERNANCE_REVIEWER_MODE,
+        "source_diff_applied": False,
+        "source_diff_paths": [],
+    }
+    shared_status_before: str | None = None
+    capability_signal = False
+
+    try:
+        shared_status_before = _shared_tree_status(material_root)
+        source_diff = _working_tree_diff_against_head(material_root)
+        source_diff_paths = _extract_mutated_paths(source_diff) if source_diff else []
+        budget_observations["source_diff_paths"] = source_diff_paths
+        context_surface = packet["mutable_candidate_surface"]
+        outside_context = [
+            path
+            for path in source_diff_paths
+            if not any(_path_matches_surface(path, surface) for surface in context_surface)
+        ]
+        if outside_context:
+            joined = ", ".join(outside_context)
+            raise PolicyViolationError(
+                "Oracle-only source diff must stay within packet context surface: " f"{joined}"
+            )
+        temp_dir, checkout_root = _create_temp_checkout(material_root)
+        primary: BaseException | None = None
+        try:
+            if source_diff:
+                _apply_candidate_patch(checkout_root, source_diff)
+                budget_observations["source_diff_applied"] = True
+            oracle_results, failure_class = _run_oracles(packet, checkout_root)
+            budget_observations["oracle_commands_executed"] = len(oracle_results)
+            status = "accepted" if failure_class is None else "rejected"
+            result = _result_payload(
+                experiment_id=packet["experiment_id"],
+                runner_mode=ORACLE_ONLY_GOVERNANCE_REVIEWER_MODE,
+                candidate_patch=ORACLE_ONLY_GOVERNANCE_REVIEWER_MODE,
+                status=status,
+                failure_class=failure_class,
+                mutated_paths=[],
+                oracle_results=oracle_results,
+                budget_observations=budget_observations,
+                shared_tree_untouched=True,
+                contribution_kind=contribution_kind,
+                coauthor_required=coauthor_required,
+                coauthor_reason=coauthor_reason.strip(),
+            )
+            if failure_class == "capability_mismatch":
+                capability_signal = True
+                budget_observations["runner_error"] = RUNNER_CAPABILITY_ERROR
+                result = _result_payload(
+                    experiment_id=packet["experiment_id"],
+                    runner_mode=ORACLE_ONLY_GOVERNANCE_REVIEWER_MODE,
+                    candidate_patch=ORACLE_ONLY_GOVERNANCE_REVIEWER_MODE,
+                    status="rejected",
+                    failure_class="infra_flake",
+                    mutated_paths=[],
+                    oracle_results=[],
+                    budget_observations=budget_observations,
+                    shared_tree_untouched=True,
+                )
+        except BaseException as error:
+            primary = error
+            raise
+        finally:
+            _finish_checkout(temp_dir, primary)
+    except PolicyViolationError as exc:
+        budget_observations["runner_error"] = _checkout_failure_message(exc)
+        result = _result_payload(
+            experiment_id=packet["experiment_id"],
+            runner_mode=ORACLE_ONLY_GOVERNANCE_REVIEWER_MODE,
+            candidate_patch=ORACLE_ONLY_GOVERNANCE_REVIEWER_MODE,
+            status="rejected",
+            failure_class="policy_violation",
+            mutated_paths=[],
+            oracle_results=[],
+            budget_observations=budget_observations,
+            shared_tree_untouched=shared_status_before is not None,
+        )
+    except CapabilityMismatchError:
+        capability_signal = True
+        budget_observations["runner_error"] = RUNNER_CAPABILITY_ERROR
+        result = _result_payload(
+            experiment_id=packet["experiment_id"],
+            runner_mode=ORACLE_ONLY_GOVERNANCE_REVIEWER_MODE,
+            candidate_patch=ORACLE_ONLY_GOVERNANCE_REVIEWER_MODE,
+            status="rejected",
+            failure_class="infra_flake",
+            mutated_paths=[],
+            oracle_results=[],
+            budget_observations=budget_observations,
+            shared_tree_untouched=shared_status_before is not None,
+        )
+    except InfraFlakeError as exc:
+        capability_signal = False
+        budget_observations["runner_error"] = _checkout_failure_message(exc)
+        result = _result_payload(
+            experiment_id=packet["experiment_id"],
+            runner_mode=ORACLE_ONLY_GOVERNANCE_REVIEWER_MODE,
+            candidate_patch=ORACLE_ONLY_GOVERNANCE_REVIEWER_MODE,
+            status="rejected",
+            failure_class="infra_flake",
+            mutated_paths=[],
+            oracle_results=[],
+            budget_observations=budget_observations,
+            shared_tree_untouched=shared_status_before is not None,
+        )
+
+    if shared_status_before is None:
+        result["shared_tree_untouched"] = False
+        result["status"] = "rejected"
+        result["failure_class"] = "infra_flake"
+        result["budget_observations"].setdefault(
+            "runner_error",
+            "Unable to capture shared working tree status before run.",
+        )
+        return result
+
+    try:
+        shared_status_after = _shared_tree_status(material_root)
+    except InfraFlakeError as exc:
+        result["shared_tree_untouched"] = False
+        result["status"] = "rejected"
+        result["failure_class"] = "infra_flake"
+        result["budget_observations"]["runner_error"] = str(exc)
+        return result
+    if shared_status_before != shared_status_after:
+        capability_signal = False
+        result["shared_tree_untouched"] = False
+        result["status"] = "rejected"
+        result["failure_class"] = "infra_flake"
+        result["budget_observations"]["runner_error"] = "Shared working tree changed during run."
+    if capability_signal:
+        raise RunnerCapabilitySignal
+    return result
+
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="experiment_runner",
+        description="Evaluate a governed candidate patch or oracle-only reviewer packet.",
+    )
+    parser.add_argument("--packet", required=True, help="Experiment packet JSON path.")
+    parser.add_argument(
+        "--execution-root",
+        default=None,
+        help="Explicit absolute material checkout; controls and output stay with this Runner.",
+    )
+    parser.add_argument("--candidate-patch", default=None, help="Unified diff patch path.")
+    parser.add_argument(
+        "--output",
+        default=None,
+        help=(
+            "Optional result JSON path under artifacts/orchestration/experiments/results/. "
+            "Defaults to artifacts/orchestration/experiments/results/<id>.json"
+        ),
+    )
+    parser.add_argument(
+        "--contribution-kind",
+        default="none",
+        choices=CONTRIBUTION_KINDS,
+        help=(
+            "Material Experiment Runner contribution kind for advisory attribution. "
+            "Use with --coauthor-required only when the oracle result will shape the PR."
+        ),
+    )
+    parser.add_argument(
+        "--coauthor-required",
+        action="store_true",
+        help="Mark the result artifact as requiring the canonical Experiment Runner trailer.",
+    )
+    parser.add_argument(
+        "--coauthor-reason",
+        default="",
+        help="Human-readable reason when --coauthor-required is set.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
+    packet_path = Path(args.packet).expanduser().resolve()
+    execution_root = None if args.execution_root is None else Path(args.execution_root)
+    if execution_root is not None and (
+        not execution_root.is_absolute()
+        or execution_root.resolve() != execution_root
+        or not execution_root.is_dir()
+    ):
+        print("FAIL: execution root must be an explicit canonical absolute checkout")
+        return 1
+
+    try:
+        packet = validate_experiment_packet(_read_json_object(packet_path))
+        output_path = _resolve_output_path(args.output, packet["experiment_id"])
+    except ValueError as exc:
+        print(f"FAIL: {exc}")
+        return 1
+
+    runner_mode = packet.get("runner_mode", DEFAULT_RUNNER_MODE)
+    try:
+        if runner_mode == ORACLE_ONLY_GOVERNANCE_REVIEWER_MODE:
+            if args.candidate_patch:
+                print(
+                    "FAIL: oracle-only governance reviewer mode does not accept --candidate-patch"
+                )
+                return 1
+            try:
+                result = evaluate_oracle_only_governance_reviewer(
+                    packet,
+                    contribution_kind=args.contribution_kind,
+                    coauthor_required=bool(args.coauthor_required),
+                    coauthor_reason=args.coauthor_reason,
+                    **({"execution_root": execution_root} if execution_root is not None else {}),
+                )
+            except PolicyViolationError as exc:
+                print(f"FAIL: {exc}")
+                return 1
+        else:
+            if args.coauthor_required or args.contribution_kind != "none" or args.coauthor_reason:
+                print("FAIL: contribution attribution flags are supported only in oracle-only mode")
+                return 1
+            if not args.candidate_patch:
+                print("FAIL: --candidate-patch is required for candidate_patch runner mode")
+                return 1
+            candidate_patch_path = Path(args.candidate_patch).expanduser().resolve()
+            result = evaluate_candidate(
+                packet,
+                candidate_patch_path,
+                **({"execution_root": execution_root} if execution_root is not None else {}),
+            )
+    except RunnerCapabilitySignal:
+        print(RUNNER_CAPABILITY_DIAGNOSTIC)
+        return RUNNER_CAPABILITY_EXIT_CODE
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(
+            json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        print(f"FAIL: unable to write experiment result: {exc}")
+        return 1
+
+    print(
+        json.dumps(
+            {
+                "result_artifact_written": True,
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0 if result["status"] == "accepted" else RUNNER_REJECTED_EXIT_CODE
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

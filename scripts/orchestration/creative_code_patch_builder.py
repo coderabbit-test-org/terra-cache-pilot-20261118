@@ -1,0 +1,860 @@
+"""CLI for PR-2 sandboxed creative-code candidate patch building."""
+
+from __future__ import annotations
+
+import argparse
+from collections.abc import Mapping
+from contextlib import contextmanager
+import os
+from pathlib import Path
+import sys
+import tempfile
+from typing import Any, Iterator, TypeGuard
+
+from core.evidence.fingerprints import fingerprint_payload
+from scripts.orchestration.creative_code_patch_contract import (
+    CHANGED_LINE_METRIC,
+    CreativeCodePatchContractError,
+    creative_code_budget_line_family,
+    creative_code_patch_changed_path_statuses,
+    measure_persisted_creative_code_patch,
+    parse_creative_code_numstat,
+    read_creative_code_patch_build_request,
+    validate_creative_code_patch_build_request,
+    validate_creative_code_patch_metadata,
+)
+from scripts.orchestration.creative_code_patch_executor import (
+    CreativeCodePatchExecutorError,
+    run_codex_exec,
+)
+from scripts.orchestration.creative_code_patch_workspace import (
+    REPO_ROOT,
+    CreativeCodePatchWorkspaceError,
+    _reserved_patch_checkout,
+    cleanup_run_dir,
+    destroy_generation_checkout,
+    exclusive_patch_run_lock,
+    generation_checkout,
+    prepare_generation_checkout,
+    read_json,
+    resolve_run_dir,
+    resolve_run_file,
+    run_git,
+    write_json_atomic,
+)
+from scripts.orchestration.creative_code_specification import (
+    read_creative_code_specification_bundle,
+    validate_creative_code_specification_bundle,
+)
+from scripts.orchestration.experiment_bootstrap import build_experiment_packet
+from scripts.orchestration.experiment_contract import (
+    CV_UNCERTAINTY_BANDS,
+    is_cv_experiment,
+)
+
+PREPARE_SUCCESS_OUTPUT = "PASS: creative-code patch prepare complete"
+GENERATE_SUCCESS_OUTPUT = "PASS: creative-code patch generate complete"
+EVALUATE_SUCCESS_OUTPUT = "PASS: creative-code patch evaluate complete"
+CLEANUP_SUCCESS_OUTPUT = "PASS: creative-code patch cleanup complete"
+
+STATE_FILE = "state.json"
+REQUEST_FILE = "request.json"
+SOURCE_BUNDLE_FILE = "source_bundle.json"
+SELECTED_VARIANT_FILE = "selected_variant.json"
+PATCH_METADATA_FILE = "patch_metadata.json"
+CANDIDATE_PATCH_FILE = "candidate.patch"
+EXPERIMENT_PACKET_FILE = "experiment_packet.json"
+RESULT_FILE = "result.json"
+
+ALLOWED_DIFF_STATUSES = frozenset({"A", "M"})
+REJECTED_DIFF_STATUS_PREFIXES = ("D", "R", "C", "T", "U", "X", "B")
+REJECTED_MODES = frozenset({"120000", "160000"})
+SAFE_DIFF_FLAGS = ("--no-ext-diff", "--no-textconv")
+
+
+class CreativeCodePatchBuilderError(ValueError):
+    """Raised when the PR-2 patch builder fails closed."""
+
+
+class CreativeCodePatchBudgetError(CreativeCodePatchBuilderError):
+    """Raised with sanitized stable classification for one budget rejection."""
+
+    failure_class = "policy_violation"
+
+    def __init__(self, message: str, *, reason_code: str) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
+
+
+RUNNER_CAPABILITY_ERROR = "Direct candidate evaluation is forbidden; trusted dispatch is required."
+
+
+def evaluate_candidate(packet: dict[str, Any], patch_file: Path) -> dict[str, Any]:
+    """Keep the legacy call seam fail-closed without importing the host runner."""
+
+    del packet, patch_file
+    raise CreativeCodePatchBuilderError(RUNNER_CAPABILITY_ERROR)
+
+
+@contextmanager
+def _exclusive_evaluate_lock(run_dir: Path) -> Iterator[None]:
+    """Serialize builder evaluation with trusted-dispatch finalization."""
+
+    try:
+        with exclusive_patch_run_lock(run_dir, label="creative-code patch evaluation"):
+            yield
+    except CreativeCodePatchWorkspaceError as exc:
+        raise CreativeCodePatchBuilderError(str(exc)) from exc
+
+
+def _load_run_state(run_id: str) -> tuple[Path, dict[str, Any], dict[str, Any], dict[str, Any]]:
+    run_dir = resolve_run_dir(run_id, create=False)
+    state = read_json(resolve_run_file(run_dir, STATE_FILE))
+    request = read_json(resolve_run_file(run_dir, REQUEST_FILE))
+    bundle = read_json(resolve_run_file(run_dir, SOURCE_BUNDLE_FILE))
+    if not isinstance(state, dict) or not isinstance(request, dict) or not isinstance(bundle, dict):
+        raise CreativeCodePatchBuilderError("run artifacts must be JSON objects.")
+    return run_dir, state, request, bundle
+
+
+def _selected_variant(bundle: dict[str, Any]) -> dict[str, Any]:
+    normalized = validate_creative_code_specification_bundle(bundle)
+    selected_id = normalized["synthesis"]["selected_variant_id"]
+    selected_fingerprint = normalized["synthesis"]["selected_variant_fingerprint"]
+    for variant in normalized["variants"]:
+        if (
+            variant["variant_id"] == selected_id
+            and variant["variant_fingerprint"] == selected_fingerprint
+        ):
+            return dict(variant)
+    raise CreativeCodePatchBuilderError("selected variant is not present in source bundle.")
+
+
+def _write_text_atomic(path: Path, content: str) -> None:
+    temp_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=str(path.parent),
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            temp_name = temp_file.name
+            temp_file.write(content)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+        os.replace(temp_name, path)
+        temp_name = None
+    finally:
+        if temp_name is not None:
+            try:
+                Path(temp_name).unlink()
+            except FileNotFoundError:
+                pass
+
+
+def prepare(*, spec_bundle_path: Path, request_path: Path, run_id: str) -> dict[str, Any]:
+    """Validate source artifacts and create the isolated generation checkout."""
+
+    run_dir = resolve_run_dir(run_id, create=True)
+    if any(run_dir.iterdir()):
+        raise CreativeCodePatchBuilderError("run directory must be empty before prepare.")
+    source_bundle = read_creative_code_specification_bundle(spec_bundle_path)
+    request = read_creative_code_patch_build_request(str(request_path))
+    normalized_request = validate_creative_code_patch_build_request(
+        request,
+        source_bundle=source_bundle,
+    )
+    if creative_code_budget_line_family(normalized_request["budgets"]) != "current":
+        raise CreativeCodePatchBuilderError(
+            "legacy patch requests are read-only; prepare requires changed-line budgets."
+        )
+    normalized_bundle = validate_creative_code_specification_bundle(source_bundle)
+    selected_variant = _selected_variant(normalized_bundle)
+    workspace_summary = prepare_generation_checkout(
+        run_dir=run_dir,
+        base_commit_sha=normalized_request["base_commit_sha"],
+    )
+    state = {
+        "run_id": run_id,
+        "request_id": normalized_request["request_id"],
+        "source_bundle_id": normalized_request["source_bundle_id"],
+        "selected_variant_id": normalized_request["selected_variant_id"],
+        "base_commit_sha": normalized_request["base_commit_sha"],
+        "workspace": workspace_summary,
+        "candidate_patch_generated": False,
+        "candidate_patch_evaluated": False,
+    }
+    write_json_atomic(resolve_run_file(run_dir, REQUEST_FILE, for_write=True), normalized_request)
+    write_json_atomic(
+        resolve_run_file(run_dir, SOURCE_BUNDLE_FILE, for_write=True), normalized_bundle
+    )
+    write_json_atomic(
+        resolve_run_file(run_dir, SELECTED_VARIANT_FILE, for_write=True),
+        selected_variant,
+    )
+    write_json_atomic(resolve_run_file(run_dir, STATE_FILE, for_write=True), state)
+    return state
+
+
+def _build_generation_prompt(*, request: dict[str, Any], variant: dict[str, Any]) -> str:
+    steps = "\n".join(f"- {step}" for step in variant["implementation_steps"])
+    target_paths = "\n".join(f"- {path}" for path in variant["target_paths"])
+    allowed_existing = "\n".join(f"- {path}" for path in request["allowed_existing_paths"])
+    allowed_new = "\n".join(f"- {path}" for path in request["allowed_new_paths"]) or "- none"
+    tests_to_add = "\n".join(f"- {path}" for path in variant["tests_to_add"])
+    budgets = request["budgets"]
+    line_family = creative_code_budget_line_family(budgets)
+    max_changed_files = int(budgets["max_changed_files"])
+    line_budget_prompt = (
+        f"- max_diff_lines: {budgets['max_diff_lines']}\n"
+        if line_family == "legacy"
+        else (
+            f"- max_changed_lines: {budgets['max_changed_lines']}\n"
+            f"- line_metric: {budgets['line_metric']}\n"
+        )
+    )
+    edit_instruction = (
+        "Finish immediately after the single allowed file edit; the wrapper validates the patch."
+        if max_changed_files == 1
+        else (
+            "Finish immediately after the allowed file edits within the max_changed_files "
+            "budget; the wrapper validates the patch."
+        )
+    )
+    return (
+        "You are generating a local candidate patch inside an isolated checkout.\n"
+        "Do not run network commands, read secrets, create branches, commit, push, open PRs, "
+        "or edit paths outside the allowlist.\n"
+        "Implement the selected PR-1 creative-code specification only.\n"
+        "Do not run tests, package managers, broad repository searches, provider calls, or "
+        "validation commands. If inspection is needed, inspect only the allowed existing paths. "
+        f"{edit_instruction}\n\n"
+        "Hard mutation budget:\n"
+        f"- max_changed_files: {max_changed_files}\n"
+        f"{line_budget_prompt}"
+        f"- max_patch_bytes: {budgets['max_patch_bytes']}\n"
+        f"- allowed_new_paths_count: {len(request['allowed_new_paths'])}\n\n"
+        f"Selected variant: {variant['variant_id']}\n"
+        f"Problem statement:\n{variant['problem_statement']}\n\n"
+        f"Implementation steps:\n{steps}\n\n"
+        f"Selected target paths:\n{target_paths}\n\n"
+        f"Allowed existing paths:\n{allowed_existing}\n\n"
+        f"Allowed new paths:\n{allowed_new}\n\n"
+        f"Tests expected by the specification (do not add them in this PR-2 patch unless "
+        f"they are also explicitly allowlisted as mutable targets):\n{tests_to_add}\n\n"
+        "Leave the checkout dirty with only the candidate source changes. The wrapper will "
+        "validate and export the patch."
+    )
+
+
+def _status_entries(checkout: Path) -> list[tuple[str, str]]:
+    status = run_git(
+        ["status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=checkout,
+    ).stdout
+    entries: list[tuple[str, str]] = []
+    for line in status.splitlines():
+        if not line:
+            continue
+        status_code = line[:2]
+        path = line[3:].strip()
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1]
+        entries.append((status_code, path))
+    return entries
+
+
+def _add_intent_for_untracked(checkout: Path, allowed_new_paths: set[str]) -> None:
+    for status_code, path in _status_entries(checkout):
+        if status_code == "??":
+            if path not in allowed_new_paths:
+                raise CreativeCodePatchBuilderError(f"untracked path is not allowed: {path}")
+            run_git(["add", "-N", "--", path], cwd=checkout)
+        elif "U" in status_code:
+            raise CreativeCodePatchBuilderError("candidate checkout has unmerged paths.")
+
+
+def _parse_name_status(output: str) -> list[tuple[str, str]]:
+    entries: list[tuple[str, str]] = []
+    seen_paths: set[str] = set()
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) < 2 or not parts[0]:
+            raise CreativeCodePatchBuilderError("unable to parse git name-status output.")
+        status = parts[0]
+        if status.startswith(("R", "C")):
+            if len(parts) != 3:
+                raise CreativeCodePatchBuilderError("unable to parse git name-status output.")
+            path = parts[2]
+        else:
+            if len(parts) != 2:
+                raise CreativeCodePatchBuilderError("unable to parse git name-status output.")
+            path = parts[1]
+        path_obj = Path(path)
+        if (
+            not path
+            or path in {".", ".."}
+            or path_obj.is_absolute()
+            or ".." in path_obj.parts
+            or "\\" in path
+        ):
+            raise CreativeCodePatchBuilderError("git name-status output contains unsafe path.")
+        if path in seen_paths:
+            raise CreativeCodePatchBuilderError("git name-status output contains duplicate path.")
+        seen_paths.add(path)
+        entries.append((status, path))
+    return entries
+
+
+def _reject_forbidden_name_status(checkout: Path) -> None:
+    detected = run_git(["diff", *SAFE_DIFF_FLAGS, "--name-status", "HEAD"], cwd=checkout).stdout
+    for status, path in _parse_name_status(detected):
+        if status.startswith(REJECTED_DIFF_STATUS_PREFIXES):
+            raise CreativeCodePatchBuilderError(
+                f"candidate patch has forbidden status {status}: {path}"
+            )
+
+
+def _changed_paths_by_status(checkout: Path) -> dict[str, str]:
+    no_renames = run_git(
+        ["diff", *SAFE_DIFF_FLAGS, "--name-status", "--no-renames", "HEAD"],
+        cwd=checkout,
+    ).stdout
+    changed: dict[str, str] = {}
+    for status, path in _parse_name_status(no_renames):
+        if status not in ALLOWED_DIFF_STATUSES:
+            raise CreativeCodePatchBuilderError(f"candidate patch status is not allowed: {status}")
+        changed[path] = status
+    return changed
+
+
+def _numstat_summary(checkout: Path, *, expected_paths: list[str]) -> dict[str, Any]:
+    numstat = run_git(
+        ["diff", *SAFE_DIFF_FLAGS, "--numstat", "--no-renames", "HEAD"],
+        cwd=checkout,
+    ).stdout
+    try:
+        summary: object = parse_creative_code_numstat(
+            numstat,
+            expected_paths=expected_paths,
+        )
+    except CreativeCodePatchContractError as exc:
+        raise CreativeCodePatchBuilderError(str(exc)) from exc
+    if not _is_string_keyed_dict(summary):
+        raise CreativeCodePatchBuilderError("git numstat summary must be a string-keyed object.")
+    return summary
+
+
+def _reject_modes(checkout: Path) -> None:
+    raw = run_git(["diff", *SAFE_DIFF_FLAGS, "--raw", "HEAD"], cwd=checkout).stdout
+    for line in raw.splitlines():
+        if not line.startswith(":"):
+            continue
+        header, _, path = line.partition("\t")
+        parts = header.split()
+        if len(parts) < 5:
+            raise CreativeCodePatchBuilderError("unable to parse git diff raw output.")
+        old_mode = parts[0][1:]
+        new_mode = parts[1]
+        status = parts[4]
+        if old_mode in REJECTED_MODES or new_mode in REJECTED_MODES:
+            raise CreativeCodePatchBuilderError(f"candidate patch has forbidden mode for {path}.")
+        if (old_mode == "000000" or status.startswith("A")) and new_mode != "100644":
+            raise CreativeCodePatchBuilderError(
+                f"candidate patch creates forbidden mode for {path}."
+            )
+        if old_mode != new_mode and old_mode != "000000":
+            raise CreativeCodePatchBuilderError(f"candidate patch changes file mode for {path}.")
+        if status.startswith("D"):
+            raise CreativeCodePatchBuilderError(f"candidate patch deletes a file: {path}")
+    summary = run_git(["diff", *SAFE_DIFF_FLAGS, "--summary", "HEAD"], cwd=checkout).stdout
+    if (
+        "mode change" in summary
+        or "create mode 120000" in summary
+        or "create mode 160000" in summary
+    ):
+        raise CreativeCodePatchBuilderError("candidate patch contains forbidden mode summary.")
+
+
+def _validate_paths(
+    *,
+    changed_by_status: dict[str, str],
+    request: dict[str, Any],
+    bundle: dict[str, Any],
+) -> list[str]:
+    existing_allowed = set(request["allowed_existing_paths"])
+    new_allowed = set(request["allowed_new_paths"])
+    allowed_all = existing_allowed | new_allowed
+    selected_variant = _selected_variant(bundle)
+    target_paths = selected_variant["target_paths"]
+    changed_paths = sorted(changed_by_status)
+    if not changed_paths:
+        raise CreativeCodePatchBuilderError("candidate patch is empty.")
+    if len(changed_paths) > request["budgets"]["max_changed_files"]:
+        raise CreativeCodePatchBudgetError(
+            "candidate patch exceeds max_changed_files budget.",
+            reason_code="changed_files_budget_exceeded",
+        )
+    for path in changed_paths:
+        if path not in allowed_all:
+            raise CreativeCodePatchBuilderError(f"candidate patch touches unapproved path: {path}")
+        if changed_by_status[path] == "A" and path not in new_allowed:
+            raise CreativeCodePatchBuilderError(f"new file path is not approved: {path}")
+        if changed_by_status[path] == "M" and path not in existing_allowed:
+            raise CreativeCodePatchBuilderError(f"modified path is not approved: {path}")
+        if not any(
+            path == target or path.startswith(f"{target.rstrip('/')}/") for target in target_paths
+        ):
+            raise CreativeCodePatchBuilderError(
+                f"path is outside selected variant target paths: {path}"
+            )
+        for oracle_path in bundle["immutable_oracles"]:
+            if isinstance(oracle_path, str) and (
+                path == oracle_path
+                or path.startswith(f"{oracle_path.rstrip('/')}/")
+                or oracle_path.startswith(f"{path.rstrip('/')}/")
+            ):
+                raise CreativeCodePatchBuilderError(
+                    "candidate patch overlaps immutable oracle paths."
+                )
+    return changed_paths
+
+
+def _check_patch_applies_cleanly(*, patch_text: str, base_commit_sha: str, run_dir: Path) -> None:
+    validation_checkout = run_dir / "validation_checkout"
+    if validation_checkout.exists() or validation_checkout.is_symlink():
+        raise CreativeCodePatchBuilderError("validation checkout already exists.")
+    with _reserved_patch_checkout(run_dir, "validation_checkout") as (checkout, mutate, verify):
+        mutate(["clone", "--no-hardlinks", str(REPO_ROOT), str(checkout)], REPO_ROOT, None)
+        mutate(["checkout", "--detach", base_commit_sha], checkout, None)
+        verify()
+        if run_git(["remote"], cwd=checkout).stdout.strip():
+            mutate(["remote", "remove", "origin"], checkout, None)
+        mutate(["apply", "--check"], checkout, patch_text)
+
+
+def _patch_metadata(
+    *,
+    checkout: Path,
+    run_dir: Path,
+    request: dict[str, Any],
+    bundle: dict[str, Any],
+) -> dict[str, Any]:
+    _add_intent_for_untracked(checkout, set(request["allowed_new_paths"]))
+    _reject_forbidden_name_status(checkout)
+    changed_by_status = _changed_paths_by_status(checkout)
+    numstat_summary = _numstat_summary(
+        checkout,
+        expected_paths=sorted(changed_by_status),
+    )
+    _reject_modes(checkout)
+    run_git(["diff", *SAFE_DIFF_FLAGS, "--check", "HEAD"], cwd=checkout)
+    changed_paths = _validate_paths(
+        changed_by_status=changed_by_status, request=request, bundle=bundle
+    )
+    patch_text = run_git(
+        ["diff", *SAFE_DIFF_FLAGS, "--unified=3", "--binary", "HEAD"],
+        cwd=checkout,
+    ).stdout
+    if not patch_text.strip():
+        raise CreativeCodePatchBuilderError("candidate patch is empty.")
+    patch_bytes = len(patch_text.encode("utf-8"))
+    serialized_patch_lines = len(patch_text.splitlines())
+    if patch_bytes > request["budgets"]["max_patch_bytes"]:
+        raise CreativeCodePatchBudgetError(
+            "candidate patch exceeds max_patch_bytes budget.",
+            reason_code="patch_bytes_budget_exceeded",
+        )
+    line_family = creative_code_budget_line_family(request["budgets"])
+    if line_family == "legacy":
+        if serialized_patch_lines > request["budgets"]["max_diff_lines"]:
+            raise CreativeCodePatchBudgetError(
+                "candidate patch exceeds max_diff_lines budget.",
+                reason_code="legacy_diff_line_budget_exceeded",
+            )
+    elif numstat_summary["changed_lines"] > request["budgets"]["max_changed_lines"]:
+        raise CreativeCodePatchBudgetError(
+            "candidate patch exceeds max_changed_lines budget.",
+            reason_code="changed_line_budget_exceeded",
+        )
+    _check_patch_applies_cleanly(
+        patch_text=patch_text,
+        base_commit_sha=request["base_commit_sha"],
+        run_dir=run_dir,
+    )
+    patch_file = resolve_run_file(run_dir, CANDIDATE_PATCH_FILE, for_write=True)
+    _write_text_atomic(patch_file, patch_text)
+    metadata = {
+        "changed_paths": changed_paths,
+        "changed_path_statuses": changed_by_status,
+        "patch_fingerprint": fingerprint_payload({"candidate_patch": patch_text}),
+        "patch_bytes": patch_bytes,
+    }
+    if line_family == "legacy":
+        metadata["diff_lines"] = serialized_patch_lines
+    else:
+        metadata.update(
+            {
+                "changed_lines": numstat_summary["changed_lines"],
+                "serialized_patch_lines": serialized_patch_lines,
+                "line_metric": CHANGED_LINE_METRIC,
+            }
+        )
+    return metadata
+
+
+def generate(*, run_id: str) -> dict[str, Any]:
+    """Run Codex in the generation checkout and write a validated candidate patch."""
+
+    run_dir, state, request, bundle = _load_run_state(run_id)
+    normalized_request = validate_creative_code_patch_build_request(request, source_bundle=bundle)
+    selected_variant = read_json(resolve_run_file(run_dir, SELECTED_VARIANT_FILE))
+    if not isinstance(selected_variant, dict):
+        raise CreativeCodePatchBuilderError("selected variant artifact must be a JSON object.")
+    checkout = generation_checkout(run_dir)
+    checkout_destroyed = False
+    try:
+        prompt = _build_generation_prompt(request=normalized_request, variant=selected_variant)
+        run_codex_exec(
+            checkout=checkout,
+            prompt=prompt,
+            timeout_seconds=normalized_request["budgets"]["generation_timeout_seconds"],
+        )
+        try:
+            metadata = _patch_metadata(
+                checkout=checkout,
+                run_dir=run_dir,
+                request=normalized_request,
+                bundle=bundle,
+            )
+        except CreativeCodePatchBudgetError as exc:
+            state["generation_failure"] = {
+                "failure_class": exc.failure_class,
+                "reason_code": exc.reason_code,
+            }
+            raise
+        state["candidate_patch_generated"] = True
+        state["patch_metadata"] = metadata
+        write_json_atomic(resolve_run_file(run_dir, PATCH_METADATA_FILE, for_write=True), metadata)
+        return metadata
+    finally:
+        checkout_destroyed = destroy_generation_checkout(run_dir)
+        state["checkout_destroyed"] = checkout_destroyed
+        write_json_atomic(resolve_run_file(run_dir, STATE_FILE, for_write=True), state)
+
+
+def build_pr2_experiment_budget_overrides(request: Mapping[str, Any]) -> dict[str, int]:
+    """Map a normalized PR-2 request to Experiment Runner budget overrides."""
+
+    return {
+        "wall_clock_seconds": request["budgets"]["evaluation_timeout_seconds"],
+        # Experiment Runner requires a positive infra retry budget; PR-2's one-attempt
+        # generation invariant is enforced separately by the request contract.
+        "retry_budget": 1,
+        "max_changed_files": request["budgets"]["max_changed_files"],
+        "network_budget": 0,
+        "benchmark_budget": 1,
+        "test_budget": min(3, max(1, len(request["oracle_commands"]))),
+    }
+
+
+def _cv_context_for_candidate(
+    *,
+    selected_variant: dict[str, Any],
+    changed_paths: list[str],
+) -> dict[str, Any] | None:
+    """Build deterministic CV metadata when PR-2 evaluates a CV candidate."""
+
+    if not is_cv_experiment(
+        selected_variant["problem_statement"],
+        "Experimentation",
+        *changed_paths,
+    ):
+        return None
+    return {
+        "dataset": {
+            "id": str(selected_variant["source_candidate_id"]),
+            "version": "pr6-offline-eval",
+            "source": "creative_code_candidate_packet",
+            "license": "repo_governed_internal_evaluation",
+            "split_strategy": "offline_prompt_program_review",
+            "label_provenance": "human_reviewed_prompt_program_specification",
+        },
+        "sensor_conditions": [
+            "offline_static_prompt_program",
+            "no_runtime_photo_upload",
+        ],
+        "uncertainty_band_policy": {
+            "mode": "qualitative_only",
+            "bands": list(CV_UNCERTAINTY_BANDS),
+        },
+        "degrade_state_matrix": {
+            "high": "show_ranked_candidates",
+            "medium": "confirm_top_candidate",
+            "low": "manual_entry_required",
+            "unknown": "reject_unusable_image",
+        },
+        "privacy_packet": {
+            "raw_image_retention": "forbidden",
+            "logging_policy": "metadata_only_no_raw_images",
+            "consent_policy": "human_review_required_before_runtime_photo_ingestion",
+            "deletion_policy": "no_runtime_image_storage_created",
+        },
+    }
+
+
+def _creative_research_origin(bundle: dict[str, Any]) -> dict[str, str]:
+    source = bundle["source_creative_research"]
+    return {
+        "bundle_id": source["bundle_id"],
+        "candidate_id": source["candidate_id"],
+        "promotion_decision": source["promotion_decision"],
+    }
+
+
+def _is_string_keyed_dict(value: object) -> TypeGuard[dict[str, Any]]:
+    """Narrow skipped-import results without a configuration-sensitive cast."""
+
+    return isinstance(value, dict) and all(isinstance(key, str) for key in value)
+
+
+def build_pr2_experiment_packet(
+    *,
+    request: Mapping[str, Any],
+    source_bundle: dict[str, Any],
+    changed_paths: list[str],
+    patch_fingerprint: str,
+) -> dict[str, Any]:
+    """Build the canonical Experiment Runner packet for a normalized PR-2 request."""
+
+    selected_variant = _selected_variant(source_bundle)
+    packet: object = build_experiment_packet(
+        decision_question=selected_variant["problem_statement"],
+        task_class="Experimentation",
+        mutable_paths=changed_paths,
+        oracle_commands=request["oracle_commands"],
+        metrics=request["metrics"],
+        negative_controls=selected_variant["negative_controls"],
+        promotion_target="audit_artifact",
+        budgets=build_pr2_experiment_budget_overrides(request),
+        cv_context=_cv_context_for_candidate(
+            selected_variant=selected_variant,
+            changed_paths=changed_paths,
+        ),
+        creative_research_origin=_creative_research_origin(source_bundle),
+        candidate_patch_fingerprint=patch_fingerprint,
+        base_commit_sha=request["base_commit_sha"],
+    )
+    if not _is_string_keyed_dict(packet):
+        raise CreativeCodePatchBuilderError("experiment packet must be a string-keyed object.")
+    return packet
+
+
+def _verified_patch_metadata(
+    *,
+    run_dir: Path,
+    state: dict[str, Any],
+    metadata: dict[str, Any],
+    request: dict[str, Any],
+    bundle: dict[str, Any],
+) -> tuple[Path, list[str], str, int, dict[str, Any]]:
+    """Return patch metadata only when it matches the current candidate patch."""
+
+    if state.get("candidate_patch_generated") is not True:
+        raise CreativeCodePatchBuilderError("candidate patch must be generated before evaluate.")
+    try:
+        normalized_metadata = validate_creative_code_patch_metadata(metadata)
+    except CreativeCodePatchContractError as exc:
+        raise CreativeCodePatchBuilderError(str(exc)) from exc
+    if state.get("patch_metadata") != normalized_metadata:
+        raise CreativeCodePatchBuilderError(
+            "patch metadata must match generation-recorded state before evaluate."
+        )
+    changed_paths = normalized_metadata["changed_paths"]
+    patch_file = resolve_run_file(run_dir, CANDIDATE_PATCH_FILE)
+    try:
+        patch_text = patch_file.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise CreativeCodePatchBuilderError("candidate patch could not be read.") from exc
+    current_fingerprint = fingerprint_payload({"candidate_patch": patch_text})
+    current_bytes = len(patch_text.encode("utf-8"))
+    current_lines = len(patch_text.splitlines())
+    if current_bytes > request["budgets"]["max_patch_bytes"]:
+        raise CreativeCodePatchBuilderError(
+            "candidate patch exceeds request max_patch_bytes budget before evaluate."
+        )
+    try:
+        statuses: object = creative_code_patch_changed_path_statuses(patch_text)
+    except CreativeCodePatchContractError as exc:
+        raise CreativeCodePatchBuilderError(str(exc)) from exc
+    if not _is_string_keyed_dict(statuses):
+        raise CreativeCodePatchBuilderError(
+            "candidate patch statuses must be a string-keyed object."
+        )
+    if normalized_metadata["changed_path_statuses"] != statuses:
+        raise CreativeCodePatchBuilderError("candidate patch statuses do not match patch metadata.")
+    validated_paths = _validate_paths(
+        changed_by_status=statuses,
+        request=request,
+        bundle=bundle,
+    )
+    if validated_paths != sorted(changed_paths):
+        raise CreativeCodePatchBuilderError("candidate patch paths do not match patch metadata.")
+    expected = {
+        "patch_fingerprint": current_fingerprint,
+        "patch_bytes": current_bytes,
+    }
+    line_family = creative_code_budget_line_family(request["budgets"])
+    metadata_family = "legacy" if "diff_lines" in normalized_metadata else "current"
+    if line_family != metadata_family:
+        raise CreativeCodePatchBuilderError(
+            "request and patch metadata line-measurement families must match."
+        )
+    if line_family == "legacy":
+        raise CreativeCodePatchBuilderError(
+            "legacy patch artifacts are read-only and cannot be evaluated."
+        )
+    try:
+        measured = measure_persisted_creative_code_patch(
+            patch_text,
+            expected_paths=changed_paths,
+        )
+    except CreativeCodePatchContractError as exc:
+        raise CreativeCodePatchBuilderError(str(exc)) from exc
+    if measured["changed_lines"] > request["budgets"]["max_changed_lines"]:
+        raise CreativeCodePatchBuilderError(
+            "candidate patch exceeds request max_changed_lines budget before evaluate."
+        )
+    expected.update(
+        {
+            "changed_lines": measured["changed_lines"],
+            "serialized_patch_lines": current_lines,
+            "line_metric": CHANGED_LINE_METRIC,
+        }
+    )
+    for key, value in expected.items():
+        if normalized_metadata.get(key) != value:
+            raise CreativeCodePatchBuilderError("candidate patch metadata does not match patch.")
+    measurements = {
+        key: value
+        for key, value in expected.items()
+        if key not in {"patch_fingerprint", "patch_bytes"}
+    }
+    return patch_file, sorted(changed_paths), current_fingerprint, current_bytes, measurements
+
+
+def _prepare_dispatch_locked(*, run_id: str) -> dict[str, Any]:
+    """Validate generated material and write the packet for trusted dispatch."""
+
+    run_dir, state, request, bundle = _load_run_state(run_id)
+    if state.get("candidate_patch_evaluated") is True:
+        raise CreativeCodePatchBuilderError("candidate patch is already evaluated.")
+    result_file = resolve_run_file(run_dir, RESULT_FILE, for_write=True)
+    if result_file.exists() or result_file.is_symlink():
+        raise CreativeCodePatchBuilderError("candidate patch result already exists.")
+    packet_file = resolve_run_file(run_dir, EXPERIMENT_PACKET_FILE, for_write=True)
+    if packet_file.exists() or packet_file.is_symlink():
+        raise CreativeCodePatchBuilderError("candidate dispatch packet already exists.")
+    normalized_request = validate_creative_code_patch_build_request(request, source_bundle=bundle)
+    shared_head = run_git(["rev-parse", "HEAD"], cwd=REPO_ROOT).stdout.strip()
+    if shared_head != normalized_request["base_commit_sha"]:
+        raise CreativeCodePatchBuilderError(
+            "shared checkout HEAD must match candidate base before evaluate."
+        )
+    metadata = read_json(resolve_run_file(run_dir, PATCH_METADATA_FILE))
+    if not isinstance(metadata, dict):
+        raise CreativeCodePatchBuilderError("patch metadata must be a JSON object.")
+    _patch_file, changed_paths, patch_fingerprint, _patch_bytes, _line_measurements = (
+        _verified_patch_metadata(
+            run_dir=run_dir,
+            state=state,
+            metadata=metadata,
+            request=normalized_request,
+            bundle=bundle,
+        )
+    )
+    packet = build_pr2_experiment_packet(
+        request=normalized_request,
+        source_bundle=bundle,
+        changed_paths=changed_paths,
+        patch_fingerprint=patch_fingerprint,
+    )
+    write_json_atomic(packet_file, packet)
+    return packet
+
+
+def prepare_dispatch(*, run_id: str) -> dict[str, Any]:
+    """Prepare the existing packet without running candidate code on the host."""
+
+    run_dir = resolve_run_dir(run_id, create=False)
+    with _exclusive_evaluate_lock(run_dir):
+        return _prepare_dispatch_locked(run_id=run_id)
+
+
+def evaluate(*, run_id: str) -> dict[str, Any]:
+    """Preserve the legacy entrypoint as a fail-closed dispatch handoff."""
+
+    run_dir = resolve_run_dir(run_id, create=False)
+    with _exclusive_evaluate_lock(run_dir):
+        _prepare_dispatch_locked(run_id=run_id)
+        raise CreativeCodePatchBuilderError(RUNNER_CAPABILITY_ERROR)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Prepare, generate, evaluate, and clean PR-2 creative-code patches."
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    prepare_parser = subparsers.add_parser("prepare")
+    prepare_parser.add_argument("--spec-bundle", required=True)
+    prepare_parser.add_argument("--request", required=True)
+    prepare_parser.add_argument("--run-dir", required=True)
+
+    generate_parser = subparsers.add_parser("generate")
+    generate_parser.add_argument("--run-dir", required=True)
+
+    evaluate_parser = subparsers.add_parser("evaluate")
+    evaluate_parser.add_argument("--run-dir", required=True)
+
+    cleanup_parser = subparsers.add_parser("cleanup")
+    cleanup_parser.add_argument("--run-dir", required=True)
+
+    args = parser.parse_args(argv)
+    try:
+        if args.command == "prepare":
+            prepare(
+                spec_bundle_path=Path(args.spec_bundle),
+                request_path=Path(args.request),
+                run_id=args.run_dir,
+            )
+            print(PREPARE_SUCCESS_OUTPUT)
+        elif args.command == "generate":
+            generate(run_id=args.run_dir)
+            print(GENERATE_SUCCESS_OUTPUT)
+        elif args.command == "evaluate":
+            evaluate(run_id=args.run_dir)
+            print(EVALUATE_SUCCESS_OUTPUT)
+        elif args.command == "cleanup":
+            cleanup_run_dir(args.run_dir)
+            print(CLEANUP_SUCCESS_OUTPUT)
+        else:
+            parser.error("unsupported command")
+    except (
+        CreativeCodePatchBuilderError,
+        CreativeCodePatchContractError,
+        CreativeCodePatchExecutorError,
+        CreativeCodePatchWorkspaceError,
+    ) as exc:
+        print(f"FAIL: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

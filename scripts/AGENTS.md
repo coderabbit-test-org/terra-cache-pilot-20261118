@@ -1,0 +1,1563 @@
+# Agent instructions (scope: scripts/ and subdirectories)
+
+## Scope and layout
+
+- This AGENTS.md applies to: `scripts/` and below.
+- Scripts are repo automation utilities; run from repo root.
+
+## Conventions
+
+- Treat scripts as production automation: avoid breaking flags or outputs.
+- Prefer small, focused edits; update any dependent docs or Make targets if needed.
+- Avoid adding network calls to scripts used in CI unless explicitly required.
+
+- Before freezing changed CI/security Python helper controllers or starting their
+  long validation, run the configured mypy hook with `--hook-stage pre-push` on the
+  changed Python paths. Default-stage `--all-files` does not execute pre-push-only
+  hooks. This early check supplements, and never replaces, the required all-files
+  and ordinary pre-push gates.
+
+- Before an expensive validation or producer operation on a path with a known
+  dated exception, run its existing owning cheap guard on the actual current
+  date. Preserve a failure and fix or explicitly disposition its cause before
+  dependent work; selected branch tests do not establish that this guard ran.
+  This ordering supplements the required gates and grants no expiry renewal
+  or additional native attempt.
+
+- Keep protected-helper commit, regular path/mode, byte length, SHA-256 and Git
+  blob pins synchronized. Before synthetic rebinding, regression tests must
+  derive byte/object identities from the actual helper bytes and reject a stale
+  object with the other pins valid; copied literals are not an independent oracle.
+  Current compiler acquisition and extraction guards must use the same owning
+  artifact size/digest fields; historical compiler identities stay explicit.
+
+- The installer project-page reader always verifies HTTPS certificates and hostnames;
+  a matching trusted-host does not disable verification or relax default-netrc
+  admission. Terminal typed TLS failures must reach both health/version consumers
+  and bypass the generic dependency-floor emergency fallback. Keep HTTP and pip's
+  separately owned transport policies unchanged. Qualify standard SSL trust in
+  the actual owned environment; synthetic CA tests are not private-proxy proof.
+  PR-size Git queries use their 30-second bound; preflight Git uses 30 seconds
+  and its consistency child explicitly uses 120; lab Compose config uses 30 per
+  profile. Timeout remains nonzero, never empty inventory or permissive admission.
+  These bounds do not establish descendant cleanup or renew any nosec exception.
+
+- Locked-install settings and the installer-owned direct project-page reader share default
+  `.netrc`/`_netrc` admission in `install_locked_python_requirements.py` only,
+  before its CLI dispatch or its own connection/context creation.
+  Preserve native first-existing default candidate order (`.netrc`, then `_netrc`),
+  including primary-file permission checks; never infer source absence from a
+  selected-file read failure. Delegate parsing/named-default selection to stdlib,
+  preserve effective login/account
+  and root rejection, and fail closed for indeterminate credentials or malformed
+  trusted authority. Applicable credentials require verified HTTPS; this does
+  not cover every pip authentication source. Each installer-owned pip child
+  loads its native send guard before CLI and retains that common boundary
+  through process termination. Final case-insensitive
+  Authorization membership requires verified HTTPS on the supported native
+  graph; header values and credential sources are not transport predicates.
+  This current native-client correction does not recognize arbitrary plugins,
+  monkeypatched clients or future implementations. The separate proxy
+  health checker is outside this installer contract. Probe failures, including connection
+  creation and cleanup, must expose constant/class-only diagnostics with bounded
+  retries. Docker source downloads must reuse the existing URL validator at the
+  network boundary and reject all redirects through the installed opener; tests
+  replace transport, preserving real handler dispatch. See
+  `docs/security/INLINE_NOSEC_TTL_20260930_REASSESSMENT.md` for the bounded proof.
+
+- For inline annotation reviews, verify Bandit's JSON errors and expected
+  scanned-file inventory alongside its exit status. Prove AST equality for
+  comment-only edits against the admitted base; repair any parse omission or
+  executable delta before claiming that the bounded review is complete.
+  For Git-backed scanner evidence, verify the actual scanned file inventory includes
+  every new candidate path after index admission; explicit path arguments alone do not prove inclusion.
+
+- Before mocking a pinned external CLI or workflow adapter, verify its real
+  flags, serialization fields and permitted Actions contexts through native
+  help, pinned primary source and actionlint. A fixture accepting an invented
+  flag, output field or expression context is not execution evidence.
+  For systemd dependencies, use the existing typed D-Bus property reader and
+  bind the exact unit object/interface/property; human display text is not a
+  unit-identity format. Render all declared Compose profiles only for security
+  configuration validation, keeping runtime profile activation separate.
+  Fixtures must distinguish default/all-profile models and reject incorrect
+  native argv, with a real read-only native observation before claiming parity.
+
+- CI Contract/Risk suites retain their complete sorted target inventory and batches of 24.
+  Run at most two isolated batch processes with separate coverage, JUnit, basetemp and
+  SQLite identities. Wait for every declared exit status and combine only complete data
+  after all batches pass; preserve existing producers, thresholds and job budgets.
+  After direct leaders are reaped, use the bounded canonical registered-group census
+  to distinguish an observed empty group from zombie-only inactivity. Failed or uncertain
+  snapshots and live/mixed members block cleanup. Preserve direct waits/signals and the
+  separate post-wait observation budget. Inactivity does not prove physical absence;
+  retain separate reaping/absence evidence wherever required.
+
+- Correlate interleaved CI timeout stacks with the actual shard plan and JUnit
+  before attributing a hung test. Tune existing parallelism or bounded shard
+  budgets from same-head evidence while preserving outer job caps, test inventory
+  and coverage gates. Record the remaining budget and require current-head CI
+  confirmation.
+
+The canonical test-main matrix uses 180 minutes for each Python 3.11, 3.12
+and 3.13 job. Propagate those exact display names to the existing finite
+current-head consumer. Keep all 32 shards, max-parallel 4, the 5400-second
+shard watchdog, lint/check budgets and every unrelated job timeout unchanged.
+
+For main-test shard cleanup, distinguish a census that never started because its
+whole signal-phase deadline elapsed from an attempted observation that failed.
+Only the group-census caller may take its existing phase transition for that
+exact pre-start expiry; never clear an earlier observation failure or treat expiry
+as a positive census. Missing tools, started query timeouts, short point probes
+and watchdog observations retain their failure semantics. Preserve the existing
+TERM/KILL limits, custody checks and final positive observation/direct wait.
+After a TERM census observes a live member, start a repeat group query only
+when a full polling interval remains after resolving the tool. Wait out any
+fractional slot before escalation. A query that starts receives the remaining
+phase budget, and its failure still blocks a successful cleanup result.
+
+## Premium alias checkpoint adapter
+
+- Deliver the OBS2A checkpoint units disabled; supported manual invocation uses
+  the same service and preserved protected flock inode as the timer.
+- Keep the existing verifier as receipt/decision owner. Failed exit 1/2, missing
+  baseline and timeout must remain native failed invocations with OnFailure.
+  Queries use the existing bound-app raw HTTP relay with an internal 8-second
+  bound through flush inside the existing verifier host bound; no unbounded
+  query fallback is allowed. Actual native owned-task observations prove exit.
+- The failure helper uses only explicit Compose/contour arguments and native
+  amtool with --no-version-check and --timeout=8s inside the unchanged 10-second
+  host command ceiling as an internal margin. A native CLI's command timeout may
+  not cover its pre-action requests; verify actual pinned behavior.
+- Both Python checkpoint callers read the selected Compose directory's
+  `prometheus/image-manifest.json` through the fixed installed canonical reader
+  before their first Compose call, and pass its reference in the child environment.
+  A missing/invalid selection stops the invocation; ambient references are not
+  a fallback. Reader setup keeps its existing command bound and does not renew
+  the notifier event window. Repository wiring is separate from installed-host,
+  schedule and mail-delivery evidence.
+- Keep the fixed 15 min event, 60-second absolute cadence, max 15 attempts and 16 min unit
+  bound. Never forward native error text or treat event expiry as recovery.
+- Native Linux checks in the owning notifier test module include actual owned
+  Docker task observations; host process termination alone is insufficient.
+  Preserve a survivor as HOLD and obtain bounded prerequisite scope.
+  Native fixtures render all profiles only for configuration checks and use the
+  single owned PID/COMMAND census with the unchanged stop deadline. Reset only a
+  positively observed failed invocation; preserve independent owned cleanup and
+  primary errors. The main CD native admission job has its own vars-defined
+  budget, explicit read-only permissions and successful image-scan prerequisite;
+  main build also requires that native job to succeed.
+- Check the outer CI job admission and inner native Git selector together:
+  checkpoint-only changes must reach the required PR native lane without a
+  workflow-file change. Keep its explicit PR guard and raw failure-log retention
+  on the same runner. Validate the owning module in its declared ci-lite profile
+  before relocating native checks, and bound lint/pre-commit/native phases through
+  their named timeout sources; selected execution or expiry is not native PASS.
+
+## Native RubyZip/Fastlane guard
+
+- `ruby scripts/ci/check_rubyzip_fastlane.rb` is the read-only source, lock and
+  advisory guard in the existing Ruby-enabled JWT/Fastlane CI job; that job
+  uses Ruby 3.4.10 and Bundler 2.4.22 and retains the independent JWT guard.
+  Its stdlib behavioral fixtures run as `ruby tests/test_rubyzip_fastlane.rb`
+  in that same job; Python CI/pre-commit tests retain static contracts only and
+  must not install or require a Ruby toolchain.
+- The tracked Ruby dependency inventory is exactly `ios/Gemfile` and its lock.
+  New/aliased surfaces, nonliteral Gemfile code, duplicate declarations or lock
+  rows, and unreconciled sources fail closed. Native Ripper recognizes only
+  literal `source`/`gem` calls; never evaluate the Gemfile or introduce a Python
+  Ruby/version parser. Bundler's lock parser and Gem version/requirement types
+  own dependency semantics.
+- The guard binds the approved immutable maintained Fastlane fork and genuine
+  version, checks compatible dependencies and retained floors, and requires
+  every selected RubyZip occurrence to satisfy all frozen advisory records.
+  It must permit future authorized compatible RubyZip versions, not freeze an
+  entire historical dependency graph. It performs no resolution, installation,
+  network request, lock write or release action; native solver replay and IPA
+  compatibility evidence remain separate requirements.
+
+## Alertmanager source preparation
+
+- The existing Docker source catalog/fetch owner admits only the exact acquired
+  Alertmanager source and matching UI through `--artifact alertmanager`. Default
+  callers retain their incumbent fifteen inputs; this pair has one aggregate
+  300-second acquisition/member bound and zero retries. Private HTTP captures
+  stay outside build contexts and uploaded source/evidence bundles.
+- Existing CD `alertmanager_mode` defaults to `disabled`. Only authenticated
+  same-repository, exact-full-SHA, first-attempt manual `module-qualify` can run
+  the fixed 825-second metadata replay. `build` is explicitly held until actual
+  qualification, full finding/support review and separate build admission.
+- The qualification checkout selects the workflow event's `github.sha`; supplied
+  `source_sha` must equal that revision and the Commit API result. Require the API
+  and native Git commands to succeed before comparing their output; matching
+  stdout cannot excuse a nonzero exit. Verify actual checkout `HEAD` against
+  `GITHUB_SHA` before executing repository qualification code. The supplied value
+  is an identity check, not an executable ref selector.
+- Qualification uses two independent original trees/caches, the one fixed
+  x/net 0.60.0 + gRPC 1.83.2 replacement command, both command graphs online,
+  then actual network-none/read-only offline queries. It starts no compiler.
+  The same 825-second clock starts before the exact admitted source/UI, current Go
+  and public immutable base acquisition, with a fixed SIGALRM owner covering
+  blocking calls; the source child restores the same remaining parent timer.
+  Go uses unchanged acquire/extract for
+  its own qualified identity; every Docker operation uses one owned empty config
+  and offline queries bind the observed base ID with pull disabled. Bad cached
+  bytes are rejected before reading or replacement, with no retry/fallback.
+  Compare complete explicit GOMODCACHE payloads between replays; retain each
+  whole GOPATH/GOCACHE inventory and its individual offline stability. Original
+  and derived locks/projections plus bounded frozen inputs remain in the existing
+  module-evidence upload. The complete artifact, including final inventory bytes,
+  keeps the existing 2 GiB/250000-member bounds. Metadata finalization shares the
+  separate owned cleanup allowance. Docker-save base bytes are a derived export
+  of the observed ID, not a claim of original OCI compressed-blob preservation.
+  Private HTTP captures and HOME stay excluded.
+  The freshly validated Go extraction is frozen with searchable 0555 directories,
+  executable 0555 files and data 0444 files before UID65534 offline queries, with
+  unchanged-byte bindings and after-query snapshots.
+  Offline metadata containers have exact owned names/labels and retained IDs,
+  with a separate 45-second cleanup/absence phase preserving primary failures.
+  The zero-compiler count describes the fixed command list, not unobserved
+  descendants or external compiler absence. Future context generation must bind
+  an empty `storage-dir` copied with UID/GID 65534 into the final recipe.
+- The new Alertmanager Containerfile is COPY-only prepared data. No image
+  coordinates, consumer references or ignore retirement follow from source
+  preparation. Frozen Prometheus inputs stay unchanged; their projection does
+  not establish SDK nonimpact for catalog/fetcher changes.
+
+### Native preparation and fixture boundaries
+
+- Before native effects, observe AM host capability with bounded read-only
+  commands; a permission observation is not installation/start evidence. Keep
+  the guarded private venv bootstrap, aggregate phase ownership and cleanup.
+- Compare complete raw GOMODCACHE rows between independent replays. Only exact
+  canonical descendants of `cache/download/sumdb/` owned by the qualified Go
+  checksum client may differ online; retain all raw rows and require each full
+  cache, including sumdb, to remain stable offline. Another unexplained carrier
+  requires coordinator rescope.
+- Keep historical Q/S recipe identities separate from the current numeric
+  chown/chmod assembly COPY. Set umask only in the isolated assembly child;
+  retain the parent evidence permissions and complete fixed argv.
+- Current `support-inspect` is compiler-free and runs after credential cleanup.
+  Bind exact probe origin, copied scanner/Buildx bytes, frozen DB, complete raw
+  reports and bounded command/exit evidence. An empty supported BusyBox package
+  inventory is a scanner-domain limit, not absence or acceptance. Historical
+  `input-inspect` does not provide another current entrypoint.
+- Preserve full-size binary evidence, held helper descriptors, incoming versus
+  installed project contexts and actual wait/process ownership through cleanup.
+  Synthetic fixtures must accept the real explicit keyword arguments and keep
+  current producer/CA epochs separate from historical data.
+
+## Publisher repair designation
+
+Freeze the current main base B and commit the reviewed controller as K with
+the incumbent pins from B. Create its direct child W by replacing only the
+controller pin in each of the CI and CD callers. Before dispatch, inspect
+the published Git objects, both complete callers, the Frontend CI workflow
+and the executable code they run with credentials. Check the accepted
+Alertmanager image in all three base Compose files and the original
+qualification (Q), support (S) and candidate (C) sources and artifact IDs.
+
+The shared verifier admits only the maintenance files listed by
+`_PUBLISHER_REPAIR_FILES`. At least one controller file must change.
+Account for both endpoints of a rename and preserve regular file modes.
+For `.secrets.baseline`, preserve configuration, verification state,
+fingerprints and multiplicity. The hook can update line positions and its
+timestamp. It can retire the two old public deploy checksum fingerprints
+when the checked wrappers replace exactly those base-helper pins.
+
+Use the existing Frontend CI manual action on the exact published W. The
+authorized operator supplies `candidate-D` and the technical
+`caddy_source_sha` operand `repair-v1:<W>:<binding SHA-256>`. Derive the
+operand with `publisher_repair_input` on the independently inspected PR,
+B/K/W, Q/S/C, candidate ZIP, manifest and selected action. The owner-account
+event, job and original inputs identify the technical invocation. Read the
+original attempt-one job when a later rerun exists. Before starting the
+build, verify that the remaining work through upload and cleanup fits the
+job deadline and finishes before both the 24-hour dispatch expiry and the
+earliest actual expiry of the original Q/S/C artifacts. Check the runner’s
+effective artifact retention against that source horizon before the build;
+the uploaded artifact’s actual expiry supplies the final confirmation.
+
+A build start spends W’s build allowance. If the build starts and the run
+ends without a qualifying retained artifact, preserve the failed job and
+stop build attempts on W. If the upload succeeded and the bounded metadata
+readback exhausted its attempts, that native attempt has failed. A later
+matching artifact ID and digest provide diagnostic evidence only. A new
+build requires a reviewed material correction and a distinct dispatch input
+bound to the new W. When admission stops before
+the build starts, preserve the skipped build step and diagnose the failed
+condition before another invocation.
+
+After successful artifact verification, both CI and CD accept the original
+`pull_request.reopened` event. To start the reads on unchanged W, close and
+reopen the same unmerged PR with its topic branch intact. Verify the PR
+number, open state, W and main base after reopening. Check the new event’s
+creation time, attempt, job and completed steps. The 24-hour window starts
+at the original dispatch creation. To renew on unchanged W, wait until the
+prior window expires. Derive a new `caddy_source_sha` with
+`publisher_repair_input` for action `contract`, and issue a new Frontend CI
+dispatch with `caddy_action=contract`. Verify that GitHub created the new run
+at or after the previous expiry. The import requires the original qualified
+D, its digest and the full matching Caddy input inventory. A repair
+uploads one prepacked `caddy-contract-evidence.zip` and checks GitHub’s
+artifact ID, size, SHA-256 and expiry. The existing by-ID downloader extracts
+its original member paths. The original Q/S/C expiry times bound the period
+for which the retained subject is available. Historical
+qualification requires the original CI and CD reads before expiry and merge.
+The direct mapping-only successor is eligible under the same source checks.
+
+## Retained Alertmanager consumer admission
+
+- The common AM inventory recognizer requires explicit dynamic or accepted-live
+  proof mode and upstream profile. Dynamic proof carries both authenticated base
+  and both native buildinfos. Accepted-live proof carries neither and must join
+  the exact configured source/profile and complete static oracle before effects.
+  Current native selected-consumer checks require the full observation, root
+  inputs and UI inventory; historical fallback requires the exact historical subject.
+
+
+- The same source owner retains the original Q/S/C10 lineage and separately
+  admits only actual qualified current outputs. Keep original
+  producer PR/ref/run/attempt/job/source/artifact and all content hashes intact;
+  the explicitly admitted receiver has its own event/ref/head/base checks.
+  Original C10-to-donor ancestry must never be invented in the receiver graph.
+- Current source rebuilds require explicit coordinator/owner admission through
+  the existing manual Q/S/build stages. Keep current compiler inputs separate
+  from immutable historical receipts. Resolve actual unique same-source Q/S
+  before starting the finite image build; unset output selection remains HOLD.
+  Preserve the complete spent invocation history and never infer native totals
+  from job names or renew a compiler budget through a consumer.
+- AM COPY assembly uses its fixed epoch zero, consistent with the binary BuildDate.
+  Normalize only the fresh seven-file context, empty storage directory and root,
+  and check exact membership, type, mode, identity and mtime before and after assembly.
+  Before accepting a subject required to match a later full H rebuild, prove two
+  independent fresh native COPY assemblies preserve the original base and produce
+  identical complete config/history, graph, blobs and canonical archives. Synthetic
+  graph fixtures and equal binaries alone leave that reproducibility unproved.
+- The existing native AM entrypoint defaults to `selected_consumer`. Its explicit
+  `--alertmanager-producer-image` option belongs only to the source producer and
+  requires an observation. It runs all image controls and emits a distinct
+  producer marker/scope/status; it never configures accepted selection or claims
+  Compose, consumer, merge or publication readiness. After real outputs are
+  independently selected, the ordinary consumer must run the full canonical
+  Compose/native path. Missing/unknown/mixed scope evidence fails closed;
+  historical C10 full evidence remains historical only.
+- Current support transport binds every uploaded API file using the existing
+  file-inventory producer plus the complete native footer. Reject extra/missing
+  members; do not reuse a historical total ZIP count for a changed producer.
+  Keep scanner/database epochs and their exact negative inventories separate.
+- Require current six-file regular Git material and five separately reviewed
+  controller templates before native rendering. ROOT creates real commit C,
+  independently reviews/designates its exact bytes, then pins its known full
+  SHA in H. One ordinary push may contain C,H; authenticate remote C/live H
+  before protected execution. A hash or publication does not supply review.
+- Preserve initial receiver, genuine first-main and ordinary published cases.
+  Ordinary readers require an actual positive publication predecessor, never
+  tag existence or retained-image fallback. Manual publication is a separately
+  authorized operation; code adoption/merge does not prove publication.
+- For the Alertmanager ORAS copy correction, bind the sole PR for
+  `codex/alertmanager-oras-copy-fix` to the actual #2501 merge and the
+  independently reviewed controller and callers. Run the full native checks
+  against the retained subject before merge. Qualify the merged source, build
+  the candidate, then publish it with ORAS `cp --to-registry-config` and read
+  it back by digest with `cp --from-registry-config`. Record an existing-tag
+  pullback separately from a successful new copy. The #2495 reader requires
+  the successful trusted-main publisher and its complete native evidence.
+- Validate complete original source/payload/OCI/config/ordered-layer/diffID,
+  binary/probe/CA, tool/DB and positive/negative scan inventories. Historical
+  scanner evidence is separate from the required fresh supported scan. Failed
+  scans or incomplete negative reports cannot prove rejection success.
+  Live image verification derives the admitted producer epoch once and forwards
+  it consistently to candidate and control validators; test actual caller
+  propagation and retain target-ID rejection independently of scanner severity.
+- Finish authenticated preparation and bounded credential cleanup before the
+  secret-free native child. Preserve aggregate deadlines, shorter parent timers,
+  held-FD capture and WNOWAIT process ownership, complete statuses and owned
+  cleanup. Incoming bundle data never chooses the installed project context.
+- The corrected candidate has an exact empty CVE policy. Old selected or running
+  bytes retain their original expiry, including selected-new/running-old cases.
+  Absent/stopped/off-profile controls never activate or stop a service. Candidate
+  edits are not native acceptance, effective retirement or deployment.
+
+## Official Prometheus image selection
+
+- `deploy/prometheus/image-manifest.json` is the sole v3 image record.
+  `source_prepared` admits producer preparation only; ordinary image consumers
+  must reject its null selection/candidate. `candidate_selected` requires real
+  retained output coordinates. Do not manufacture output digests or future SHAs.
+- The existing `prometheus_source_image.py` owns the finite declared recipe,
+  typed input projection, retained OCI/Docker archive checks and event admission.
+  `deploy/prometheus/Containerfile` is declared data, not executable Dockerfile
+  syntax. Keep vendor base layers intact and append one deterministic payload;
+  Docker's native import/copy observations own physical alias conformance.
+- Manual `prometheus-source-qualify` remains metadata-only. Separately admitted
+  `prometheus-oras-qualify` compiles one same-source ORAS tool with unchanged
+  upstream locks. It must prove the exact command graph, compiler/buildinfo,
+  full scanner inventory and synthetic native format before tool selection.
+  Never substitute the affected upstream prebuilt binary or rebuild the tool
+  during a Prometheus pair or promotion.
+- The finite PR #2494 x/net 0.62 successor is `P0 -> T -> P1 -> Q -> B -> P2`.
+  Complete all helper/workflow/recipe inputs at prepared P0, with retained tool,
+  selection and candidate null. T is one separately released tool operation.
+  P1 is a distinct same-PR descendant changing only the tool's actual retained
+  coordinates in these governed inputs; raw helper/workflow/recipe and the
+  tool's own-output-free projection must remain equal. Q and B share exact P1.
+  Q uses the current compact-18 native evidence reader; historical 0.60 evidence
+  retains its separate identity. B requires the whole Q run, including the
+  independent GHCR package companion, to have succeeded. P2 selects actual B
+  outputs as a later same-PR descendant; prepared inputs never authorize consumers.
+  The early T API check and ordinary precompile check call the same existing
+  admission owner. Early admission uses setup reserve within the existing job
+  cap, never a success token or renewed compiler allowance. Q closes its private
+  API context before source acquisition/native subprocesses. Unknown hosted
+  root correspondence stops B; archive paths cannot select trusted expectations.
+  For the 2026-11-09 replacement, preserve the first 19 spent rows plus T
+  `42510229545` and both jobs of Q `42619126214`. Authenticate one new T
+  (at most one ORAS compiler start) before selecting its output on P1, then
+  one new Q and its read-only companion before the single transferred B pair
+  on that exact P1. Keep the existing two serial image and four binary-compile
+  limits and every original deadline. The security owner records the exact
+  [spent rows and stage limits](../docs/security/MAIN_RECOVERY_1_CONTAINER_PUBLICATION.md#pr-2494-p062-protected-producer-preparation).
+  A predicate match, fixture pass or source commit grants no external dispatch,
+  registry write, retry, merge or release authority.
+- An explicitly selected `tool_prefetch_predecessor` is historical evidence,
+  never retry approval. The singleton selector covers only its original history;
+  the exact two-history selector also binds the second failed offline-metadata
+  phase independently to its own source, raw native records and owned cleanup.
+  The exact three-history selector separately binds the third postcompile layout
+  failure, its immutable Tool=1 start and original admission cap1. Retain all
+  three failed/spent jobs. The historical one-compile addition permitted
+  aggregate Tool1 used/max2/one remaining; no selector grants dispatch authority
+  or another automatic attempt. Ordinary retained
+  tool/candidate readers remain success-only. Preserve pre/post prefetch locks,
+  modes and source inventories, plus diagnostic errors alongside primary failures;
+  missing historical post-state remains unknown. Publish and review the correction
+  before any separately coordinated recovery dispatch. A newly admitted current
+  compiler operation must account for every prior successful and failed native
+  start through the existing history owner; historical selector allowances do
+  not grant another attempt.
+- Manual `prometheus-source-pair` permits exactly two serial logical image
+  builds, each containing the two named commands and bounded to 3600 seconds.
+  Use independent empty source/cache/output areas, no automatic retries,
+  no local Go compiler and no BuildKit Prometheus producer. Invocation history
+  is nonrenewable when inputs change. Complete the raw helper and `build.yml`,
+  including SDK and backend export seams, before spending the pair.
+- A manifest-changing original producer PR consumes only its authenticated
+  same-repository retained artifact after full raw producer/input equivalence
+  and source ancestry within that PR. An unchanged-manifest helper change with
+  unchanged build/recipe reauthenticates the original merged source separately
+  from receiving-main ancestry; historical code remains data only.
+  A new main selection additionally binds the actual squash and final PR head;
+  the PR producer is not required to be an ancestor of the squash commit.
+  Unchanged published components use the immutable subject and a positive
+  publication predecessor. Missing publication is a hold, never a pull fallback.
+  The trusted CD caller has a separate finite publication wait using these same
+  recognizers, with GitHub read credentials only and owned cleanup before the
+  unchanged consumer starts once. The consumer reauthenticates independently;
+  the wait result is not an admission receipt. Effective job timeout must cover
+  wait, consume, both cleanup allowances and the scan/runtime reserve. PR callers
+  do not execute this wait. Its deadline does not guarantee scheduler completion.
+- CI lint restores the exact workflow `github.sha` for every PR after the
+  credentialed consumer and control-checkout cleanup, before Python setup or
+  pre-commit. Preserve its untracked selection evidence with `clean: false`,
+  retain full history and nonpersistent checkout credentials, and verify HEAD
+  against `GITHUB_SHA`; do not relax the dependency evidence resolver.
+- Main-only promotion reuses the retained qualified copier and copies precise
+  OCI bytes into the existing public package; it never rebuilds or executes a
+  candidate with registry credentials. Preserve original producer provenance,
+  SPDX, immutable tag collision checks and byte-identical pullback. Existing
+  promtool/runtime/security checks remain mandatory and suppression-free.
+- Public package inventory admits at most 20,000 versions, with 1 MiB native
+  capture per page and 64 MiB aggregate versions stdout. Read the count-derived
+  short/empty terminal page, reject duplicate IDs and recheck complete identity
+  and count. Failed reads, partial pages or tag existence never replace proof.
+- Main promotion observes the same-run/attempt/head backend publish success
+  before inventory. Pending transitions share the existing deadline (at most
+  16 observations, 32 jobs GETs and 15 clipped sleeps); failed/regressing/ambiguous
+  states reject. A terminal required publisher job stops waiting even if its
+  aggregate run remains active; a later pending poll never resets the original
+  deadline or falls back to an earlier attempt. Preserve the original safe
+  diagnostic through both callers and owned cleanup. This does not prove global
+  registry quiescence.
+- A current source-image vendor refresh must bind the complete retained Docker
+  export to qualification bytes before interpreting its graph or importing it.
+  Reuse the existing tar member reader; compare every file and directory,
+  including compatibility metadata, before the independent pinned layer graph.
+  Historical receipts keep their original recipe/base identities. A current
+  declared-only build plan gains its export descriptor only from validated support;
+  an unset accepted output is HOLD, never a legacy fallback.
+- Deploy readers execute only the separately SHA-bound standalone helper;
+  incoming archives are material/data. Root merge, deployment, credentials,
+  volume changes and observation clocks retain their existing authority gates.
+- CI/CD PR image consumption must finish before PR-local actions, imports or
+  native programs start. Acquire exact event-H material as data, then verify the
+  pinned regular controller in the two workflows before each isolated execution.
+  The first step reads the four regular Git blobs without credentials. The next
+  uses the designated controller and GitHub read credentials to select a PR
+  evidence route within 60 seconds. Publish only the route and event coordinates
+  after owned private-state cleanup. Only the selected published PR route receives
+  the ephemeral registry reader. Consume independently authenticates the same
+  event, route and immutable subject before any registry login or native load.
+  Remove the owned checkout before PR startup. Trusted non-PR CD keeps its
+  positive publication wait and staging Environment registry reader.
+
+### PR evidence selection and controller staging
+
+The source owner keeps its existing 16-case classifier separate from evidence
+selection. Only a same-repository open PR with all four raw source blobs equal
+may use the shared authenticated publisher observation to choose historical
+candidate evidence for a classified nonpositive state. A real positive publisher
+takes the published path without candidate acquisition, even after retained
+artifact expiry. API, identity, malformed-state, ambiguity and drift failures
+remain errors; never catch them to select a candidate. Main and explicit published
+claims retain the strict positive-publisher wrapper.
+
+Before changing CI/CD callers, create and independently designate the real source
+controller commit, then author its exact commit/mode/blob/length/hash pins. Source
+tests read current material; fixed-controller workflow tests derive their oracle
+from the actual pinned regular Git blob. Keep old caller expectations until the
+pin successor exists. One ordinary push may publish both real commits; authenticate
+remote controller/live head before protected execution. The new library selector
+alone does not establish that a still-old fixed caller executes the correction.
+
+The PR-only evidence-selection caller uses GitHub read credentials, no registry
+credential, one bounded observation and owned cleanup. Consume independently
+rederives the route and rejects disagreement; candidate acquisition rechecks live
+PR coordinates after the payload before credential cleanup and native loading.
+Image admission remains distinct from current native/security and actual main
+publication/pullback obligations.
+
+## Deploy-tool Python selection
+
+The three deploy callers (`deploy_production.sh`, `deploy.sh` and
+`QUICK_FIX_PRODUCTION.sh`) admit CPython 3.11, 3.12, 3.13 or 3.14 for their
+standalone stdlib helper. This scoped compatibility set does not change project,
+CI/container 3.13.14 or SDK interpreter/ABI tuples. An explicit absolute
+`PYTHON_BIN` takes precedence; unsupported, non-executable or relative overrides
+fail before helper loading or mutation, without fallback. Defaults inspect only
+the four trusted absolute literals in the callers, including Homebrew's public
+Python and managed 3.14 alias, and skip unsupported defaults. The isolated
+`-I -S` implementation/version probe establishes compatibility input only, not
+binary provenance or security admission. Do not discover Python through PATH,
+cwd, virtualenvs, pyenv or another manager.
+
+For a local caller check, pass the owning repository interpreter explicitly as
+`PYTHON_BIN`; server operators may pass their independently managed supported
+absolute interpreter. Preserve the SHA-bound helper/FD and trusted-tool versus
+incoming-material boundary. Do not substitute an incoming archive's interpreter
+or claim that passing this probe validates the application on Python 3.14.
+
+## Native Docker image evidence
+
+Before changing a source-image recipe, compiler or standard-library input, or
+producer/consumer checker, record in the existing task notes each affected consumer,
+which exact evidence remains reusable or becomes invalid, and the real producer
+needed to replace it. Distinguish a PR candidate, the first trusted-main publisher,
+and an ordinary published-image reader; verify that each prerequisite is achievable
+without requiring its own dependent consumer to pass first. If the producer requires
+published source, separate that prerequisite publication from dependent subject
+adoption or publication admission. Consume the required fresh native proof before
+admitting the dependent result, and reuse historical proof only after positively
+verifying its unchanged governed inputs. Preserve failed and pending consumers
+honestly; neither relabeling old success nor adding workflow needs or retries supplies
+missing producer evidence.
+
+Before pushing Caddy source changes, compare the complete canonical Caddy input
+inventory (paths, modes, byte counts and SHA-256) with the authenticated original
+producer. On a mismatch, record the stale producer head, exact input delta, and
+the next authorized same-source producer step and its owner in the existing
+coordinator handoff. If no producer step is admissible yet, record the blocking
+prerequisite and its owner. Keep source preparation on HOLD for Caddy until
+authenticated same-source native producer evidence is available, and recheck the
+handoff after any governed input change. For #2484 on
+`codex/cab07c-eslint-pages-features`, #2495 on `codex/npm-braces-build-prerequisite`,
+and the historical controller and ORAS corrections, dispatch `candidate-D`
+with `caddy_source_sha` equal to the frozen published head. Subsequent publisher
+repairs use the source-bound operand in the publisher repair procedure above. A build start spends that
+head's authorization. Ordinary PR and exact merged-main runs require one
+successful original artifact from the same designated PR and identical governed
+inputs. At prebuild, confirm the admitted PR number and exact source head. Stage the
+verified tracked frontend files in a fresh private Docker build context so ignored
+checkout files cannot enter the image. The historical #2494 designated branch
+retains its manual route.
+
+- Keep source content identity separate from Docker's native identity: requested
+  reference or index, selected platform manifest, raw config, compressed layer
+  digests and uncompressed diffIDs have different roles. Bind image inspection,
+  the actual create/load operand and container fields through the exact qualified
+  source graph and constructor. Never assume native `Id` is a config digest or
+  admit it by digest-set membership or Docker version alone. Reports retain the
+  true content-config identity; native operands remain separately identified.
+  Read each retained legacy or current archive through its exact supported
+  transport grammar and shared content checks; do not rewrite incoming bytes to
+  manufacture canonical admission. Track the returned full container ID through
+  prestart, terminal inspection and owned cleanup. A base-image observation does
+  not qualify a product-load or BuildKit constructor.
+
+- The maintained Caddy standard-library correction uses the pinned compiler executable
+  with a separate, exact private patched GOROOT. Preserve the original sixteen v3
+  evidence members and the checker's closed twelve-member stdlib extension. Require
+  the actual component baseline RED discriminator, positive controls and complete
+  custom identities; counts alone and cached test results do not qualify a new source.
+  Keep original and copied source inventories, separate fresh caches and post-build
+  source checks. Final import evidence must name only the exact patched stdlib root.
+  Source-local correction is not an official Go release or scanner-clearance claim.
+
+- Bind each Caddy scanner subject to its immutable image, binary, module identity
+  and full and HIGH/CRITICAL reports. Read the affected official binary as data
+  from a stopped container using the pinned Go reader. Only the source-qualified
+  patched candidate may serve requests. Verify static-D separately from ordinary
+  HTTP forwarding and a successful normal WebSocket upgrade with both duplex
+  frames. Retain the two role exits, bounded cleanup and shared RUNTIME budget.
+  The selected upstream source and subject-specific scanner evidence establish
+  the correction. Ordinary traffic establishes compatibility.
+  See `docs/security/CVE-2026-116587-caddy-go-jose.md` for the source owner.
+
+- Keep required vulnerable-control identity detection separate from mutable
+  severity metadata. A reconciled rescore may admit only the explicit observed
+  whole-report states in the existing inventory consumer; it must retain exact
+  target/package associations, occurrence counts, epoch separation and rejection
+  of unexpected HIGH/CRITICAL findings. Preserve raw reports and truthful counts.
+  Parser acceptance alone never proves scanner execution or completion of the
+  remaining native controls; a rescore grants no candidate waiver.
+
+- Retired native families remain real Trivy conversion controls with retained
+  findings. The full canonical `package trivy` / `import rego.v1` /
+  `default ignore := false` file alone is expiry-free. Missing, unreadable,
+  malformed or extra executable policies never inherit that exemption; active
+  suppressions retain review and hard-expiry validation. Scanner/decode errors
+  are errors, never successful negative controls or native-remediation proof.
+
+- Keep the client-only PostgreSQL SDK limited to configured password/SCRAM and
+  verified TLS consumers. Unused GSS/LDAP features and their native package
+  closure stay disabled; enabling them requires explicit scope and fresh
+  source/SDK/library/physical/scanner/behavior evidence. Preserve public API
+  names while rejecting unsupported required feature requests.
+
+- The exact Psycopg C source operation belongs to
+  `install_locked_python_requirements.py`; compiler and proxy-health consumers
+  delegate to that owner. Separate verified archive/binary acquisition from
+  actual backend execution in a supported Linux guest with kernel network
+  isolation and no registry credentials, host HOME, configuration, socket or
+  secret mounts. The canonical installer owns the exact four SDK tuples:
+  x86_64 CPython 3.11/3.12/3.13 and aarch64 CPython 3.13. Reject unsupported
+  interpreter/ABI targets before SDK reads, pip upgrade or wheelhouse creation.
+  During SDK admission, validate the exact source-image pin, wheel tag and both
+  extension ELF targets; aliases are not extra targets.
+  Backend Make/devcontainer callers retain their Linux amd64 boundary.
+  Dormant kernel interfaces require native DOWN flags and absence of external
+  addresses/routes; interface names alone grant no exception. A successfully read,
+  bounded ASCII IPv4 table may normalize to an empty inventory, including blank-only
+  input. Interface/address and IPv6 checks still run; missing, unreadable, malformed
+  nonempty, non-ASCII or oversized tables remain failures. Other packages
+  retain binary-only admission. Consume genuine matching SDK wheels, never
+  metadata-only resolver substitutes.
+  Dedicated source/build-wheel prefetch operations reject explicit install modifiers
+  before interpreter/proxy resolution; only build-wheel prefetch consumes a target
+  Python option. Ordinary SDK install/prefetch/consume operations use the installer
+  interpreter or its venv symlink and reject another interpreter before pip upgrade,
+  SDK staging or wheelhouse creation. Preflight-only and upgrade-only modes retain
+  their existing behavior; binary-only installs retain target-Python selection.
+  Dedicated SDK builds reject an explicit target-Python option because the
+  unchanged four-input build uses its loader interpreter.
+- Review and trust the checkout before explicitly running `make docker-source-artifacts`
+  on the host, then choose **Dev Containers: Reopen in Container**. For the CLI,
+  `make dc-up` already includes this prerequisite. Source acquisition must retain
+  the fetcher's hash, path and expiry checks and propagate failures before the build.
+  Keep host-side preparation out of automatic devcontainer lifecycle commands.
+  Run `make devcontainer-bootstrap` manually inside the trusted container.
+  Keep the project `.env`, host credentials and general host HOME out of automatic
+  bootstrap. See the Dev Container section in `CONTRIBUTING.md`.
+- `make dc-up` credential forwarding is explicit opt-in through
+  `PULSEPLATE_NATIVE_SDK_NETRC_FILE`, defaulting to `/dev/null`. Use only a temporary
+  read-only file scoped to the approved package host after reviewing/trusting the
+  checkout; do not automatically forward or copy host `HOME/.netrc`, `_netrc` or HOME.
+- Before closing a native SDK dependency migration, enumerate every governed compiled profile
+  and real CI/local caller. Verify actual extras, matching SDK/platform handoff and the owning
+  workflow tests; a selected-profile pass cannot establish complete caller coverage. Inspect
+  the full Docker stage inheritance before reporting a missing library, and verify actual
+  final-user calls after the build. CI native callers must select the matching SDK CLI in
+  `/usr/local/bin` before distro tools when setup installs its shared libraries there.
+  Keep corrected runtime behavior, required gates and bot
+  dispositions ahead of closure metadata.
+- AM producer qualification distinguishes the actual open PR source C from a
+  rebuilt merged-main H. Bind H to the genuine merge commit and C separately to
+  the PR commit inventory; squash merges do not imply C ancestry in H. Require
+  the complete typed Git/index/worktree binding and separately measured host and
+  generated inputs. Keep outputs outside the clean checkout, preserve historical
+  starts, and require H's rebuilt subject to match qualified C before full native
+  acceptance. Use the workflow-owned phase reservations and one retained cleanup
+  allowance; neither a source subset, a marker nor a timeout number is acceptance.
+  The AM publisher must close preparation credentials, run fresh strict security
+  and full selected-H controls, then rebind real H/source/input/producer evidence
+  before registry credentials and at most one copy. Preserve immutable pullback,
+  final credential cleanup and complete post-copy native controls. Use one
+  original publisher clock with downstream/cleanup reservations; never renew an
+  expired API deadline or treat an existing tag as a proof bypass. Retain an
+  observed write even if a later check fails. No H marker supplies independent
+  C acceptance or authorizes a new subject.
+- Container helper copies must preserve their `scripts/ci` repository depth and
+  adjacent imports. Exercise the real CLI and its operation parsing from the
+  actual copied layout before a build; command-text assertions alone cannot
+  detect import-time repository-root failures.
+- A native patch must change the expected source bytes before compilation.
+  Check its exact resulting file digest and the unchanged remainder of the
+  source inventory. A patch tool's successful exit alone is insufficient;
+  Git object IDs and whole-file SHA-256 digests are distinct representations.
+- `check_docker_runtime_dependency_surface.py --trivy-report` binds the finite
+  native Trivy v2 image-report projection to the selected local Docker image.
+  Trivy owns vulnerability decisions and JSON-to-SARIF conversion; report
+  retention or structural validation never cancels the scanner exit status.
+- A reviewed whole-source replacement may remove superseded patch inputs from an
+  uncommitted qualification recipe before native proof. Keep every original patch
+  obligation mapped in its existing security owner; achieved retirement requires
+  actual native regressions. Reacquire candidate bytes through the canonical fetcher,
+  never from review downloads. Source-review dates do not certify native/image output.
+  Upstream source epoch and compiler/CA epoch are independent. Bind the source/UI
+  archive pair through the existing canonical tuple owner and carry those root-input
+  hashes into candidate/native observations; never infer upstream identity from a
+  compiler flag or version-display prose. A maintained upstream whose module targets
+  are already fixed must retain unchanged locks and an empty replay delta, not claim
+  authored module upgrades. Absent new AM producer acceptance must HOLD without
+  reusing an older accepted image.
+- The Docker source-artifact fetcher rejects symlink/nonregular cache objects
+  and non-real output-directory chains before reads or mutation. Keep source
+  identity, archive filename, reviewed hash and literal Docker COPY aligned.
+- PCRE2 production replacement uses only the exact reviewed PCRE2 tag and its
+  pinned upstream SLJIT gitlink in the existing source manifest/fetcher. Keep
+  old source records/dates and TLS, redirect, checksum and cache controls intact.
+  Preserve shared 8-bit SONAME, Unicode and JIT; after pruning, exercise native
+  PCRE2 and libselinux regex calls plus retained consumers under the final user.
+- When replacing a packaged native library, verify the actual extension call
+  and loaded replacement under the final runtime user after package pruning.
+  Matching SONAME alone does not preserve required symbol versions; retain the
+  consumer's version namespaces and reject real loader diagnostics.
+  Package-record absence and a clean scanner report do not prove native linkage.
+- For workflow shell adapters, exercise current-step and next-step environments
+  in separate processes: exporting in the current shell and writing GITHUB_ENV
+  are distinct operations. Cleanup must retain the same owned context and use
+  successful native inventory rather than classifying arbitrary errors as absence.
+
+## Merge-check execution budgets
+
+- In `check_merge_ready.py`, merge-governance and review-disposition proof
+  subprocesses share the existing 480-second bounded execution budget. Other
+  gates and authentication/body-fetch operations retain 120 seconds. A timeout
+  remains a blocking failure; the budget does not replace proof or authorize merge.
+
+## CI trust-boundary helper usage
+
+- `check_pr_merge_readiness.py --material-repo-root` is the staged interface for
+  executing policy from the exact authenticated PR base while reading material
+  from a distinct exact PR-head checkout. Keep ordinary local and
+  `--pre-closeout` invocations on their existing single-checkout path. The
+  hosted workflow switches to this interface only after the base contains it.
+- For `check_philosophy_source_corpus_index.py`, put `--files` last. Tokens after
+  it are file paths, including `--help`; parser configuration belongs before it.
+
+Corpus-checker maintenance does not itself select the historical PR5 episode.
+With an exact base, compare the four canonical corpus artifacts and bind their
+regular current head bytes before narrowing that episode scope. Their full
+schema, closed-runtime and privacy validation always runs. A real canonical
+delta keeps the full historical scope; alternate artifact inputs retain the
+strict path. Maintenance retains structural checks for every passed path and
+all existing credential patterns. The direct full validators and no-base CLI
+keep the complete local-path grammar. Supply the complete changed inventory,
+including both move endpoints; no caller filter or path/string allowlist may
+hide a finding. This corpus result is not repository-wide privacy clearance,
+and independently observed public-document hygiene still requires a correction.
+
+- A failed private Python proxy health probe blocks emergency wheel fallback.
+  Only the installer's existing package-scoped pip retry evidence may avoid a
+  new probe. Git-index discovery must neutralize executable repository Git
+  configuration while retaining a positive carrier-discovery path.
+- Each emergency wheel file may be at most 16 MiB (16,777,216 bytes).
+  The installer counts the entire wheel as stored, both during download
+  and when reading an existing wheel from the cache.
+- A nonempty emergency selection for an external Python must reject before
+  package import or download when its provider or startup environment is
+  unqualified. A positive installed provider must never be treated as absent.
+  An alias of the current interpreter uses its current-runtime tag calculation.
+  Empty selections still validate the explicit manifest and target. A verified
+  absent external provider retains the metadata-based compatibility fallback.
+
+- For each newly created child venv, establish the required pip/trust-store
+  baseline through the canonical installer
+  `install_locked_python_requirements.py --upgrade-pip-only` before profile
+  acquisition. Enforce the actual child pip version and vendored CA identity;
+  a parent upgrade or a late version print does not establish this ordering.
+  Distinguish the initial trusted pip bootstrap, and test upgrade failure, stale
+  child pip and CA mismatch before any later package acquisition.
+
+- For `make requirements-locks` graph changes, select only a complete fixed
+  alternative from the existing v1 admission owner; preserve default/legacy
+  rejection and whole source/seed/artifact/profile bindings. Technical closure
+  requires native canonical output plus independent original-base replay before
+  it is called C_R. Retain no-deps acquisition, destroyed credentialed HOME,
+  offline profile views and rollback; do not add another upgrade intent, hand-edit
+  a seed/lock or rotate a baseline. Profile-specific before pins must match each
+  profile's hash-verified original seed, including distinct versions of the same
+  package; never flatten them into an invented common baseline. Record actual hook creation/seed/config bytes
+  separately from version P and final gate success. Command procedure and the
+  finite recorded transition live in `docs/DEPENDENCY_MANAGEMENT.md`.
+- For the current PR #2494 Mako-only correction, follow
+  [the separately scoped runtime-checkpoint procedure](../RUNBOOK_AGENT.md#current-mako-only-checkpoint--pr-2494-2026-10-31).
+  It does not reuse the October23 graph admission or change compiler guards.
+- When the shared admission changes, run all of `tests/test_python_dependency_surfaces.py`
+  before long all-files validation, including legacy fixture consumers. Keep synthetic JSON
+  compact within the unchanged production bound; retain oversized and duplicate-key negatives.
+- Before freezing an affected lock tuple, enumerate the existing installer's
+  installation compositions. Propagate changed shared constraints through every
+  dependent lock, including locks without the original security identities.
+  Preserve exact-pin conflict rejection; individual lock audits do not establish
+  that composed profiles are installable.
+
+## FastEmbed compatibility wheel
+
+- `build_fastembed_compat_wheel.py` is an offline transformer of the single
+  hash-pinned wheel in its adjacent recipe. Supply `--source-wheel` and an
+  existing owned `--output-dir`; acquisition, installation and publication are
+  separate operations. Keep the original wheel and failed outputs intact.
+- Preserve every payload byte and mode except the recipe's distribution-version
+  and Pillow-upper-bound metadata edits, matching dist-info coordinates and
+  regenerated complete RECORD. Do not execute wheel code or widen the recipe
+  into a generic patcher. Two identical builds establish reproducibility only.
+- Native RAG/Pillow compatibility and matching private-index wheel readback are
+  required before lock adoption. Keep the same BGE model/tokenizer and persisted
+  BGE comparison; matching dimensions do not establish historical MPNet parity.
+- `ci_pip_audit.sh` retains the scanner subprocess and six-profile selection.
+  Its `audit_fastembed_compat.py` prepare/validate adapter admits only the exact
+  private FastEmbed coordinate as an explicit upstream advisory comparand after
+  checking both current private-index wheel bytes with the canonical builder.
+  Preserve all other actual pins, strict collection, raw JSON/stderr, complete
+  report inventory and nonzero exits. Rebind original/comparand/provenance bytes
+  after the scanner; intermediate files and final sidecars grant no authority.
+  Require fresh output paths and retain failed raw reports before a new attempt.
+  Another private identity, unsupported carrier or executable patch requires
+  rescope. PyPI does not directly audit the private version; the separate final
+  ten-lock audit and runtime/profile compatibility evidence remain required.
+
+- Owned offline validation children isolate package-index and credential
+  environment controls from the base image. Do not inherit ambient pip/uv index
+  overrides; negative tests inject their own synthetic controls.
+
+## Governed Experimentation Runner
+
+- For mode-aware CV intent versus Oracle context-path handling, follow the canonical
+  [CV packet contract](../docs/orchestration/CV_EXPERIMENTATION_PROTOCOL.md#2-cv-packet-contract).
+
+- `experiment_runner_dispatch.py build-image` requires `--psycopg-sdk-root`
+  pointing to the private, externally qualified genuine ARM SDK export. The
+  host stages only the finite declared helpers, schema, locks and SDK members,
+  then checks actual destination bytes, modes and internal alias before reading
+  proxy secrets. Host transport checks do not authenticate SDK origin or ABI;
+  the canonical installer inside UBI owns those semantic checks. Preserve the
+  original build timeout, history/config hygiene and immutable Apple alias
+  readback. Qualify the successor's native consumers and full scanner inventory
+  before selecting it for an oracle; a build or copied receipt alone is insufficient.
+- Invoke the automatic helper only from externally admitted T with an approved
+  absolute Python `-I`, T cwd and explicit distinct `--material-root M`; root
+  metadata supplies continuity, never trust. Follow the canonical accompaniment
+  contract for read-only T/M guest snapshots, companion-dependent restore,
+  typed failures and bounded claims. For a lane that may span a reboot, keep its
+  admitted trusted tool checkout, governing and experiment packets, and required
+  original companions in durable task-owned local storage outside temporary
+  directories; keep these assets untracked and ownership-scoped. Surviving reports,
+  fingerprints or a ZIP cannot establish recoverability or current validation when
+  required originals are unavailable. Preserve that missing-evidence state and use
+  the existing admission/archive/restore consumers; storage relocation alone is not
+  a reason to repeat Runner or reconstruct historical receipts.
+- `pr_oracle_attachment.py dispatch` is the admitted local host composition
+  for ensure/reuse followed by existing exact role-context delivery. Follow the
+  [single accompaniment contract](../docs/orchestration/contracts/EXPERIMENT_RUNNER_PR_CREATIVE_CONTEXT_CONTRACT.md#admitted-host-oracle-accompaniment-creative-ops-2)
+  for snapshot proof, typed input/result conjunction, explicit attribution,
+  opt-out/manual evidence, bounded retention, interruption recovery and archive
+  dependencies. Bootstrap/rendering stay inert; the bridge validates evidence
+  and appends only outer-envelope data. The helper performs no publication or
+  provider calls. Its `body` command prepares validated local text only.
+- Canonical entrypoints for the experimentation lane are `scripts/orchestration/experiment_bootstrap.py` and `scripts/orchestration/experiment_runner.py`.
+- Run both scripts from repo root so path validation and artifact resolution stay deterministic.
+- `experiment_runner.py` accepts a validated packet plus a prebuilt unified diff
+  via `--packet <packet.json> --candidate-patch <candidate.patch> [--output ...]`
+  for default `candidate_patch` mode.
+- In `oracle_only_governance_reviewer` mode, `experiment_runner.py` accepts
+  `--packet <packet.json> [--output ...]` without `--candidate-patch`, runs only
+  immutable oracle commands in an isolated checkout, applies the current tracked
+  worktree diff to that checkout for evidence freshness, and writes a local
+  evidence artifact. This mode is mandatory evidence for non-trivial PRs, but
+  remains review-only authority: it must not promote, resolve review threads,
+  claim merge readiness, or mutate governance surfaces.
+- Experiment Runner PR creative-context artifacts stay local under
+  `artifacts/orchestration/experiments/creative_context/`. The
+  `experiment_runner_pr_creative_context.py` CLI may only emit sanitized
+  context maps, 3-5 bounded hypotheses for eligible orchestration/creative
+  surfaces, validated operator-supplied local model intake packets,
+  coordinator-owned routing proposals, coordinator dispatch handoffs, oracle
+  attachment summaries, and human-approval reservations. Operator intake is
+  local structured JSON only: the repo validates, normalizes, fingerprints, and
+  routes it without calling a provider/model, storing raw model payloads, or
+  trusting external hypothesis IDs. It must not read raw PR/review bodies,
+  patches, prompts, provider payloads, Codex JSONL, oracle stdout/stderr,
+  secrets, token values, or local absolute paths, and it must not generate
+  patches, modify the worktree, change workflows, dispatch workflows, create or
+  write branches, push, open PRs, edit PR bodies, post comments, resolve review
+  threads, edit fixed mappings, claim readiness, merge, release, call providers,
+  call product runtime, use semantic cache, or mutate GitHub App / Slack
+  settings. The post-open role pass and repo-native `pulseplate-pr-review`
+  remain required; provider-neutral sealing must not invoke, retry, wait for,
+  substitute, or override Connector or Codex Security.
+- Approved creative-hypothesis specification bridge artifacts stay local under
+  `artifacts/orchestration/creative_code/spec_bridge/`. The
+  `creative_hypothesis_spec_bridge.py` CLI may only consume validated
+  creative-context context maps, hypothesis packets, coordinator dispatch
+  handoffs, and human approval packets; emit a validated
+  `creative_hypothesis_specification_bridge.json`,
+  `CreativeCodeCandidatePacket`, deterministic `bridge_metrics.json`, and
+  existing PR-1 `creative_code_spec_pipeline.prepare` artifacts; and validate
+  those artifacts. It must not widen `CreativeCodeCandidatePacket.target_surface`
+  beyond the existing `validate_mutable_candidate_surface(...)` allowlist,
+  execute agents, finalize bundles, generate patches, create/write branches,
+  push, open or edit PRs, resolve review threads, edit fixed mappings, claim
+  readiness, merge, release, call providers, call product runtime, change
+  workflows, use semantic cache, write graph truth, or mutate GitHub App /
+  Slack settings.
+- Reviewed creative-code specification finalization artifacts stay local under
+  `artifacts/orchestration/creative_code/spec_bridge/<bridge-id>/spec_finalize_reviewed/`.
+  The `creative_specification_skeptic_review.py` CLI may only read a prepared
+  bridge run, read operator-supplied sanitized local skeptic-review evidence,
+  copy immutable `spec_prepare/` inputs into the sibling reviewed run,
+  normalize `skeptic_reviews.json`, call the existing PR-1
+  `creative_code_spec_pipeline.finalize`, and emit
+  `skeptic_review_attachment.json` plus `finalize_receipt.json`. It must not
+  rewrite `spec_prepare/`, execute agents, call providers, generate patches,
+  create/write branches, push/open PRs, edit fixed mappings, resolve review
+  threads, modify workflows, call product runtime, use semantic cache, write
+  graph truth, or claim readiness.
+- Creative spec learning rollup artifacts stay local under
+  `artifacts/orchestration/creative_code/learning_rollup/<rollup-id>/`. The
+  `creative_spec_learning_rollup.py` CLI may only read validated bridge
+  metrics, skeptic-review attachment, finalize receipt, and
+  `CreativeCodeSpecificationBundle` artifacts; emit proposal-only
+  `agent_learning_record.v1` records and coordinator advisory hints; and
+  validate those local artifacts. Hints may be surfaced in `task_bootstrap.py`
+  packets with `--creative-learning-hints`, but only as reviewer-focus context.
+  They must not change primary/reviewer/role order, execute agents, auto-route
+  roles, skip required roles, generate patches, create/write branches,
+  push/open PRs, post GitHub comments, edit fixed mappings, resolve review
+  threads, claim readiness, merge, release, call providers, call product
+  runtime, use semantic cache, write graph truth, or mutate GitHub App / Slack
+  settings.
+- Creative spec patch admission artifacts stay local under
+  `artifacts/orchestration/creative_code/patch_admission/<admission-id>/`. The
+  `creative_spec_patch_admission.py` CLI may only read validated finalized
+  creative-spec bundle and receipt artifacts plus an explicit operator human
+  admission, build an existing PR-2 `CreativeCodePatchBuildRequest` through
+  `build_creative_code_patch_build_request(...)`, validate the request, and
+  optionally call patch-builder `prepare` only. It must not call patch-builder
+  `generate` or `evaluate`, call Codex, produce `candidate.patch`, execute
+  Experiment Runner candidate mode, promote candidates, create or write
+  branches, push/open PRs, resolve review threads, edit fixed mappings, claim
+  readiness, merge, release, call providers, call product runtime, modify
+  workflows, use semantic cache, write graph truth, or mutate GitHub App / Slack
+  settings.
+- The runner must apply patches only inside an isolated temporary checkout and must leave the shared working tree untouched.
+- Mutable surfaces, immutable oracles, budgets, and promotion boundaries are defined by `docs/orchestration/AGENT_EXPERIMENTATION_PROTOCOL.md`; do not duplicate or relax them here.
+- Runner mutation of `scripts/ci/**`, `docs/review/**`, `AGENTS.md`, merge
+  gates, review-thread scripts, tests, fixtures, or policy docs is forbidden
+  unless a separate threat-model PR explicitly opens a narrow allowlist with
+  tests and rollback notes.
+- The current validator-script mutation threat model is fail-closed: no active
+  runner mutation of `scripts/ci/**` is allowed until a later PR promotes a
+  reviewed allowlist, forbidden-surface tests, identity checks, and rollback
+  notes.
+- Result artifacts stay local under `artifacts/orchestration/experiments/results/` and are evidence only, not merge-ready or promotion-ready output.
+- `experiment_runner_dispatch.py` is the strict local backend boundary for
+  macOS Experiment Runner execution. It may probe, build the dedicated local
+  image, create a self-contained temporary repository snapshot, and execute the
+  existing runner only after one backend passes capability checks. `auto`
+  precedence is Apple Container then Docker; backend selection is final before
+  oracle execution. The dispatcher must never change `network_budget`, retry
+  with network access, add broad Linux capabilities, mount host home/keychain/
+  agent/runtime sockets, persist raw runtime output, or treat capability/result
+  artifacts as readiness or promotion authority. Missing strict isolation is
+  `capability_mismatch`, not `infra_flake`.
+- On macOS, `oracle_only_governance_reviewer` is stricter than the general
+  backend order: `run` requires explicit `--backend apple-container`. `auto`,
+  `docker`, and `native-linux` are rejected before any runtime probe or result
+  write, and an Apple capability failure is terminal `capability_mismatch`
+  without Docker fallback. General probe, candidate-patch, and negative-control
+  Docker surfaces remain supported.
+- Strict dispatch requires `network_budget=0` and container-equivalent
+  filesystem containment. The existing native Linux Runner remains compatible,
+  but `native-linux` capability probing must report
+  `filesystem_isolation_unavailable` until that containment is implemented.
+- Container-backed dispatch must not expose a host-writable result bind to the
+  untrusted runner. Use a private named volume, force-delete the uniquely named
+  runner after PID 1 exits, and extract the bounded regular result through a
+  separate read-only trusted collector inside guest `unshare`; delete the
+  volume on every path. Apple gateway canaries must use runtime network inspect,
+  never a hard-coded host address.
+- The direct sandbox CLI anchors repository imports to its own file location.
+  It must run without a caller-provided PYTHONPATH.
+- Sandbox timeout completion requires the direct child to be reaped and both
+  output readers to reach EOF and close successfully within one cleanup allowance.
+  Uncertain completion retains the candidate checkout and blocks retry.
+  Preserve the original cancellation and never publish partially drained output.
+- Automatic creative preparation cleanup removes only a verified empty directory
+  created by that invocation before preparation returns. Retain partial checkouts,
+  unknown files and prepared runs on later summary or publication errors for
+  explicit recovery. Validation and generation share the existing private checkout
+  reservation and preserve uncertain writers and the original failure.
+- PR-2 creative-code patch-builder artifacts stay local under
+  `artifacts/orchestration/creative_code/patch_runs/`. The builder CLI
+  `creative_code_patch_builder.py` is not role dispatch, PR lifecycle
+  automation, merge governance, or promotion authority. Its `evaluate` command
+  must not call the host Experiment Runner for candidate evaluation. Its
+  `evaluate` command prepares only the bound packet and fails closed; the
+  existing strict native dispatcher and finalizer own execution/result truth,
+  which is not the mandatory PR oracle-only governance evidence and
+  must not be used as fixed-mapping, review-disposition, or merge-readiness
+  proof. New PR-2 writers must budget mutation as Git numstat additions plus
+  deletions with `line_metric=numstat_added_plus_deleted_v1`; serialized U3
+  patch lines are observability only. Legacy `max_diff_lines` artifacts remain
+  exact-shape read-only evidence and must never be relabeled as changed lines.
+- PR-2 creative-code generation gate artifacts stay local under
+  `artifacts/orchestration/creative_code/patch_generation/`. The
+  `creative_code_patch_generation.py` CLI may only validate an already prepared
+  patch admission, emit `generation_gate.json`, call the existing PR-2 builder
+  `generate` and `prepare_dispatch` seams through `generate-candidate`, and
+  leave an explicit native-dispatch handoff without an early result or receipt.
+  Only `finalize-dispatched-result` may emit a sanitized `generation_receipt.json`
+  from matched dispatch evidence. Receipt validation must re-read linked
+  `candidate.patch`, `patch_metadata.json`, `experiment_packet.json`, and
+  `result.json` sidecars, require them to be the canonical files under the
+  receipt's `patch_runs/<run_id>/` directory, and fail closed when any sidecar
+  drifts or carries unsafe/unsupported metadata. It must not change role order,
+  mark role passes complete, create/write branches, push/open PRs, resolve
+  review threads, edit fixed mappings, claim readiness, promote candidates, call
+  providers, call product runtime, modify workflows, use semantic cache, write
+  graph truth, or mutate GitHub App / Slack settings.
+- PR-3 creative-code PR promotion artifacts stay local under
+  `artifacts/orchestration/creative_code/promotions/`. The promoter CLI
+  `creative_code_pr_promotion.py` may only plan, validate, TTY-approve, and
+  promote one accepted PR-2 patch into a new non-draft `experiment/*` PR. It
+  requires one exact accepted Apple Container dispatch result plus its
+  explicitly supplied canonical PR-2 generation receipt for new `validate`
+  and first `promote` operations; both paths are required together and remain under their
+  canonical local artifact roots. This intake uses the existing PR-2 trusted
+  binding validator without direct host re-evaluation, must reconstruct the gate
+  from canonical admission and finalized run state, and must re-read the
+  packet, result, gate, and receipt after local gates. The validation artifact
+  records trusted Apple dispatch and binds the applicable evidence fingerprints;
+  historical direct-evaluation artifacts remain parseable but cannot authorize
+  a first promotion. `promote` reruns real validation and current-actor TTY
+  approval, then rechecks live remote main, actor, branch, patch and evidence
+  before remote effects. The intake must never regenerate or
+  finalize PR-2 artifacts through this intake. It must not open drafts, update
+  existing branches, force-push, request reviews, submit reviews, resolve review
+  threads, edit fixed mappings, claim merge readiness, merge, release, call
+  Slack/GitHub App authority paths, or call
+  `experiment_pipeline.py`, `experiment_promote.py`, or notification wrappers.
+- PR-4 creative-code telemetry artifacts stay local under
+  `artifacts/orchestration/creative_code/telemetry/`. The telemetry CLI
+  `creative_code_telemetry.py` may only read already-sanitized local PR-1/PR-2
+  / PR-3 creative-code artifacts and emit advisory event/rollup/taxonomy
+  sidecars. It must not read raw patches, prompts, provider payloads, oracle
+  stdout/stderr, Slack/GitHub payloads, review-thread bodies, PR bodies,
+  secrets, token values, or local absolute paths, and it must not create
+  branches, open PRs, resolve review threads, edit fixed mappings, claim merge
+  readiness, merge, release, call providers, call product runtime, or call
+  Slack/GitHub authority paths.
+- Terminal creative-code outcome artifacts stay local under
+  `artifacts/orchestration/creative_code/terminal_outcomes/`. The
+  `creative_code_terminal_outcome.py` CLI may only cross-bind one validated
+  PR-3 plan/open receipt to one closed sanitized terminal observation and emit
+  one immutable `CreativeCodeTerminalOutcomeV1`. Terminal states are exactly
+  `merged` or `closed_unmerged`; unavailable terminal evidence emits no
+  outcome. The outcome is the sole semantic carrier and may project into
+  exactly one durable v2 `pr_terminal` telemetry event. It must not persist
+  separate review/terminal/post-merge events, read raw PR/review bodies,
+  comments, patches, prompts, provider/oracle output, arbitrary notes, paths,
+  or URLs, call GitHub/network/providers/product runtime/Evidence Graph, create
+  or write branches, edit mappings, resolve threads, claim readiness, merge,
+  change workflows, or add probability/cognitive state. Identical replay is
+  no-write; divergent replay preserves the original artifact. Existing v1
+  telemetry schemas, identities, readers, and no-terminal collector output
+  remain unchanged. Terminal input and publication hardening assumes cooperative
+  local artifact users: it rejects traversal, symlinks, non-regular files, and
+  replacement of the canonical file, but does not promise pathname stability
+  against an uncooperative same-UID process between checks. Descriptor-relative
+  hostile-process hardening requires a separate reviewed portability and threat-
+  model lane.
+- The same terminal-outcome CLI may project one validated canonical
+  `terminal_outcome.json` into its single sibling `evidence_events.json` only
+  through `project-evidence --outcome ... --produced-at <RFC3339-UTC>`, and may
+  validate it read-only through `validate-evidence-projection --outcome ...`.
+  The destination is fixed; public output-root/output/events overrides are
+  forbidden. The timestamp must be explicit, use a known UTC offset, and use
+  the RFC3339 profile supported by the existing evidence-event contract;
+  leap-second representations (`time-second=60`) fail closed. Accepted offsets
+  are normalized to `Z`; fractional seconds drop insignificant trailing zeros
+  and are omitted when all digits are zero. The timestamp is projection time
+  only; clocks and filesystem times are not evidence. The
+  output is one atomic no-replace, mode-`0600`, three-row control-plane
+  normalization bundle using the existing `item_metadata`, `gate_metric`, and
+  `gate_decision` event types. It is not three lifecycle events, telemetry,
+  Evidence Graph admission, or a replacement for the single `pr_terminal`
+  telemetry event. Identical replay is zero-write; different canonical bytes,
+  malformed/oversized/hardlinked/symlinked files, non-regular files, and input
+  identity changes fail closed without overwrite, deletion, or repair. The
+  commands must not serialize local paths or the external experimental lane id,
+  perform historical backfill, consume Pilot 4 adaptive evidence, or add
+  provider/network/GitHub/DB/product-runtime/promotion/merge authority.
+- Creative-code lifecycle transition analytics stay local under
+  `artifacts/orchestration/creative_code/lifecycle_transition_analytics/<analytics-id>/`.
+  `creative_code_lifecycle_transition_analytics.py` may read only the fixed
+  telemetry JSONL and mixed v2 rollup names under the fixed telemetry root,
+  rebuild and exactly compare the rollup, join only the closed seven-stage graph
+  through typed adjacent lineage, and emit one aggregate-only `analytics.json`.
+  Missing adjacent events must be counted as unobserved neighbors and never as
+  inferred skip edges; rejected patches and blocked PR opens are stop branches
+  for successor accounting. JSONL order, timestamps, paths, filesystem metadata,
+  and the sibling three-row Evidence Eval bundle are not lifecycle joins. Output
+  must not serialize event/source/candidate/promotion IDs, PR numbers, SHAs,
+  paths, timestamps, review text, patches, prompts, command, provider, or oracle
+  payloads. Publication is fixed-root, mode-`0600`, atomic no-replace; identical
+  replay is zero-write and validation is read-only. Malformed, oversized,
+  symlinked, or hardlinked inputs, source identity drift, ambiguous joins, stale
+  rollups, non-canonical profiles, or divergent winners fail closed without
+  overwrite, deletion, or repair. This descriptive artifact grants no routing,
+  retry, promotion, review, mapping, merge, learning, Evidence Graph,
+  provider/network/DB, or product-runtime authority.
+- Forecasted creative-code PR-2 targets stay local under
+  `artifacts/orchestration/creative_code/bayesian_shadow/<forecast-id>/`.
+  `creative_code_lifecycle_bayesian_shadow.py` may build only from exact
+  validated lifecycle analytics plus its fixed telemetry snapshot and one clean
+  canonical generation gate. For a forecasted target, `generate-candidate`
+  must receive paired `--shadow-forecast` / `--started-at`, publish or read back
+  immutable canonical `start.json` under the existing cooperative run lock,
+  recheck forecast/gate sources, hold that same lock through generation to
+  serialize duplicate invocation, release it before preparing the bound
+  dispatch packet under the existing per-run lock, and otherwise preserve the
+  builder path. Trusted native dispatch and finalization follow separately.
+  It must never pass forecast probabilities downstream.
+  An occupied exact shadow slot blocks unbound generation; identical replay is
+  zero-write and divergent replay preserves the first winner. Forecast/start/
+  score artifacts are mode-`0600` under mode-`0700` directories and remain
+  shadow-only with `calibration_state=not_assessed` and chronology claim
+  `local_dependency_order_only`. They grant no routing, retry, role, candidate,
+  promotion, review, PR, merge, provider, network, product-runtime, or
+  predictive-quality authority.
+- PR-5 creative-code review-disposition artifacts stay local under
+  `artifacts/orchestration/creative_code/review_disposition/`. The
+  `creative_code_review_disposition.py` CLI may only read sanitized
+  `pr_review_context.py` output or explicit read-only fixtures and emit
+  advisory feedback-record, disposition-packet, and repair-launch sidecars. It
+  must not preserve raw review bodies, PR bodies, patches, prompts, provider
+  payloads, oracle output, secrets, token values, or local absolute paths, and
+  it must not call GitHub write endpoints, resolve review threads, edit fixed
+  mappings, create branches, write branches, push, open PRs, claim merge
+  readiness, call providers, call product runtime, or call Slack/GitHub App
+  authority paths.
+- PR-6 creative-code applied-candidate run-plan artifacts stay local under
+  `artifacts/orchestration/creative_code/applied_candidates/`. The
+  `creative_code_applied_candidate_pr6.py` CLI may only validate PR-5
+  `CreativeCodeRepairLaunchPacket` inputs, bind the first applied candidate
+  target to `docs/prompts/cv/program.md`, and emit a deterministic local
+  PR-1 / PR-2 / PR-3 / PR-4 command checklist. The PR-2 sequence must retain
+  human admission, the generation gate, native dispatch and the existing
+  finalizer; PR-3 validation and promotion carry the matched result/receipt
+  pair. Historical direct-evaluate command graphs must be regenerated. It must not execute patch
+  generation, call Codex or providers, create or write branches, push, open PRs,
+  resolve review threads, edit fixed mappings, claim merge readiness, merge,
+  release, call product runtime, change GitHub App or Slack settings, or widen
+  the generated candidate mutation surface beyond the selected prompt/program
+  document.
+- Creative-code private-pilot loop artifacts stay local under
+  `artifacts/orchestration/creative_code/private_pilot/`. The
+  `creative_code_private_pilot_loop_operator.py` CLI may only read sanitized
+  GitHub PR/head/check/run metadata, read already-sanitized PR-4 telemetry /
+  PR-5 review-disposition / PR-6 run-plan refs, compare current-head check/run
+  SHAs to the PR head SHA, and emit `pilot_state.json` plus checklist-only
+  `candidate_plan.json` artifacts. It must not read raw PR/review bodies,
+  execute PR-1 / PR-2 / PR-3 commands, generate candidates, create or write
+  branches, push, open PRs, resolve review threads, edit fixed mappings, claim
+  readiness, merge, release, call providers, call product runtime, change
+  workflows, read secrets, use semantic cache, or change GitHub App / Slack
+  settings. Candidate plans remain bound to `docs/prompts/cv/program.md` as the
+  only checklist-only candidate-plan target surface.
+- `experiment_notify.py` follows the notification contract in
+  `docs/orchestration/AGENT_EXPERIMENTATION_PROTOCOL.md`: local artifact output
+  is the default, SMTP email and Slack delivery are explicit opt-in only, and no
+  notification sink may expose raw patches, oracle stdout/stderr, secrets,
+  absolute local paths, or user data. Slack delivery must remain channel
+  allowlisted, runtime-secret backed, timeout/rate/idempotency bounded, and
+  audit-backed.
+- `experiment_slack_socket_bridge.py` is an operator-only Socket Mode command
+  boundary, not a lane-start authority. It must keep Slack SDK/Bolt imports
+  optional and lazy, run `--help` and dry-run validation without optional Slack
+  packages, require runtime Socket Mode/bot credentials only for live use, and
+  require channel plus user allowlists before handling operator input. Default
+  dispatch mode must stay dry-run; execute mode may dispatch only fixed
+  allowlisted workflows with explicit GitHub runtime auth. Audit artifacts must
+  stay local and hash-only, with no raw Slack payloads, tokens, channel/user
+  IDs, local absolute paths, oracle output, patch text, or raw hypotheses.
+- `experiment_pipeline.py` is the governed completion wrapper for
+  runner -> promotion -> notification sequencing. Email reports are automatic
+  only inside that wrapper when `--email-reports` is explicitly present; the
+  wrapper must use the fixed governed v1 recipient and must delegate SMTP,
+  redaction, idempotency, and audit behavior to `experiment_notify.py`.
+- Experiment Runner Git attribution must follow
+  `docs/orchestration/GOVERNED_NON_HUMAN_IDENTITY_POLICY.md`; placeholder
+  identities such as `runner@example.com` are not allowed for new attribution.
+  When Experiment Runner materially contributes to a commit, use exactly:
+  `Co-authored-by: PulsePlate Experiment Runner <pulseplate@pm.me>`.
+  Oracle-only results can be material contributions even when
+  `mutated_paths: []`; use the trailer only when the referenced result artifact
+  actually shaped the plan, validation, mapping, review disposition, or commit
+  decision.
+- `scripts/orchestration/check_experiment_runner_identity.py` validates the
+  machine-readable identity policy. It must remain offline, deterministic, and
+  must not generate, read, or persist signing key material.
+- `role_dispatch_bridge.py` is the runtime-agnostic custom role dispatch
+  manifest CLI. The older `qoder_dispatch_bridge.py` filename is a compatibility
+  facade only; new packets should point at `role_dispatch_bridge.py`.
+- `context_bundle.py` is the single owner of opt-in exact JSON packet-backed
+  role-context materialization. `--role-context-order N` selects one existing final
+  one-based dispatch occurrence and returns a separate
+  `pulseplate.role-context-output.v1` envelope around the unchanged v2
+  manifest. It reads only explicit canonical repo paths, preserves full strict
+  UTF-8 bytes, rejects symlink/hardlink/nonregular and changed sources, and is
+  bounded to 128 sources, 2 MiB per source and 8 MiB total. Packet content and
+  current dispatch metadata remain dynamic and grant no new authority. A
+  declared static source with the packet's captured device/inode identity
+  blocks instead of duplicating or silently dropping the packet.
+- `context_bundle.py` alone owns final static-source class admission before
+  acquisition; callers may validate instruction-root eligibility, but they
+  must not become the sole carrier of sensitive or dynamic source denial.
+- Exact role context is not persisted. Do not add a cache flag, watcher,
+  service, alternate store, or commit-only freshness shortcut through this
+  materializer. Any future persistence proposal requires its own bounded lane
+  and evidence.
+- Exact context never expands wildcards or directories. Those inputs produce
+  `complete=false` for the existing manual loading route. Missing, unsafe,
+  malformed, changed, or over-limit required sources fail closed. Explicit
+  instruction files must be repo-relative Markdown under an admitted repo
+  skill root or already selected context; recommended skill names are not
+  content authority.
+- `creative_pilot_workspace.py` is the local adaptive production-adjacent
+  planning entrypoint. It may bind one or two exact tracked files only under
+  `core/rag/` or `core/insight/`, reuses the existing mutable-surface validator
+  unchanged, and writes only gitignored adaptive-pilot artifacts. All pilot
+  dispatch items are read-only. Handoff approval requires an interactive TTY
+  and exact phrase; provider, patch, repository, runtime, cache, graph-truth,
+  GitHub, Slack, review-thread, and merge authority stay closed.
+- `creative_pilot_workspace resume-pr1` may consume one retained, approved v2
+  pilot and exact `CreativeAdaptivePr1VariantIntakeV1` declarations only after
+  current `origin/main`, target blobs/content, and immutable-oracle
+  blobs/content match the retained target manifest. It publishes a new-only
+  `spec_bridge/<resume-id>/` bundle through complete staging and leaves the
+  original adaptive pilot byte-identical. Identical replay is no-write;
+  all prepared sidecars are recomputed and compared, and nested symlinks,
+  partial, divergent, or stale bindings fail closed. The adaptive
+  context/packet/workspace/synthesis/approval/bridge/candidate lineage and
+  terminal `handoff_ref` must be reconstructed before source fingerprinting;
+  valid-but-substituted artifacts fail closed before publication. Resume and
+  intake pilot IDs plus all original candidate/source/prepare refs must bind to
+  one exact `adaptive_pilots/<pilot-id>/` root. Adaptive downstream
+  attach/validate/finalize re-entry must reuse complete exact-prepare validation
+  so altered context packs or re-fingerprinted pending reviews fail closed. The
+  adaptive
+  source bindings must come from the validated in-memory lineage and canonical
+  retained-prepare snapshots, with pinned disk revalidation before replay and
+  immediately before atomic publication; a second unconstrained source read
+  must never become binding truth. Publication must use an atomic kernel
+  no-replace directory rename and fail as `adaptive_publish_collision` rather
+  than replacing any concurrent canonical resume directory. The adaptive
+  intake identity is the documented compatibility alias for existing
+  attachment `metrics_*` fields; no fake v1 metrics artifact or widened
+  attachment/finalize schema is allowed. Patch/provider/network/runtime/cache,
+  graph-truth, repository, GitHub, Slack, PR-2, and PR-3 authority remain false.
+- Adaptive resume/attach hardening stops at cooperative locking, safe at-rest
+  no-symlink reads, owned same-parent staging, kernel no-replace publication,
+  parent fsync, and deterministic replay validation. Finalize commits bundle
+  then receipt-last. Do not add directory exchange, canonical cleanup,
+  hostile same-UID syscall-seam tests, or repeated terminal/path/ctime seals;
+  those exceed the local artifact threat model and require a separate reviewed
+  threat-model lane if ever needed.
+- The role dispatch bridge treats `readonly: true` in `.cursor/agents/*.md` as
+  the safe default. In `--mode runtime`, write-capable dispatch for a native
+  bridge `execution_mode: read_write` primary/secondary role must be explicit
+  via repeated `--implementation-owner <role>` flags on a coordinator packet
+  invocation (`--packet ...`); ad-hoc `--roles` invocations must fail closed.
+  The accepted owner slugs must stay aligned with native read-write profiles in
+  `scripts/orchestration/native_subagent_bridge.py`, and the CLI must validate
+  requested owners against the packet bridge bindings before clearing readonly.
+  The manifest records `implementation_owner_override: true` for those entries.
+
+## PR evidence sidecar v1
+
+- `pr_evidence_sidecar.py` owns one fixed gitignored store under
+  `artifacts/orchestration/pr_evidence_sidecars/`; do not add a root override.
+- Treat start/terminal receipts and whole-store reports as structural local
+  receipts only. Reference fingerprints are non-verifying. They grant no
+  review, CI, merge, release, enrollment,
+  causality, outcome, promotion, repository, or GitHub authority.
+- `observed_pr_terminal_state` is an operator-supplied local observation only.
+  GitHub owns authenticated PR state, review governance owns review semantics,
+  and `CreativeCodeTerminalOutcome` owns its separate terminal ontology.
+- `operator_observations` is limited to operator minutes plus review and repair
+  cycle counts; do not add finding, false-positive, regression, rollback,
+  quality, or external-outcome fields.
+- Preserve strict bounded JSON, private modes, symlink/hardlink/nonregular-file
+  rejection, sibling-stage kernel no-replace rename publication, exact replay
+  at capacity, pre-creation rejection of new ids at capacity, identical
+  no-write replay, and divergent replay failure. Never sweep arbitrary sibling
+  stage-looking residue.
+- Preserve the public-operation lock boundary: thread `RLock` plus fixed-store
+  directory `flock`, exclusive for prepare/finalize and shared for
+  validate/report. Internal loaders remain lock-free and canonical receipts
+  must validate only at link count one.
+- The first receipt is for the next freshly bootstrapped lane after the feature
+  lands. Never backfill the implementation PR with a retrospective self receipt.
+- Contract and terminal rail truth table:
+  `docs/orchestration/PR_EVIDENCE_SIDECAR_V1.md`.
+
+The renderer delivers the [required Euler preflight and conditional supervision
+handoff](../docs/orchestration/PR_EVIDENCE_SIDECAR_V1.md#required-euler-preflight-and-supervision-handoff)
+as inert instructions in both startup modes. Its helper and owning-test references
+must remain protected by the focused standalone-consumer guard; no rendering-time
+Euler import, execution or store access is permitted.
+
+## Packet-bound evidence-rail applicability
+
+- `evidence_rail_applicability.py` is the sole owner of the selection-only
+  treatment projection for Teleology, Euler, Experiment Runner, and Creative.
+  It consumes only validated structured fields from one schema-3.1 task-packet
+  snapshot; raw goal or task-class prose must not select a treatment.
+- The closed precedence is higher assurance (invariant or security) before a
+  ready design lane, then docs-only, then the conservative default. Experiment
+  Runner remains `required`; Teleology remains `full` or docs-only `compact`;
+  Creative is recommendation-only and never becomes a sidecar rail.
+- `design_lane_contract.py::normalize_design_lane_packet_projection` owns the
+  exact frozen design-packet recognizer used by this decision. Its
+  `execution_ready` result means packet-local contract readiness only; it does
+  not infer role execution, human approval, authorization, or asset mutation.
+- `--evidence-sidecar-rail` remains a repeatable additive upgrade. It must not
+  downshift an automatic treatment, create an N/A path for required evidence,
+  or grant Euler enrollment, Creative execution, asset mutation, review, CI,
+  routing, merge, release, promotion, or outcome authority.
+- `start_pr_lane.sh` builds the projection only after bootstrap, keeps the
+  canonical JSON ephemeral, revalidates it through stdin, and sends only the
+  exact effective legacy rails to `pr_evidence_sidecar.py`. Applicability
+  failure blocks sidecar preparation and prompt rendering; sidecar storage
+  failure retains the existing advisory `unavailable` / `invalid` behavior.
+- The packet fingerprint and task-packet id must be cross-bound again before
+  the renderer prints treatments. Do not pass the projection in argv, an
+  environment variable, a temporary file, or a new persistent artifact.
+- Raw packet-fingerprint continuity starts only at the descriptor-safe read. It
+  must not be described as authenticating bytes already changed by the same
+  local UID or as proving that a pre-existing packet id matches producer v1/v2
+  semantics. ORCH-RAIL-1 does not recompute that identity; the shared
+  producer-owned verifier is tracked in
+  `docs/roadmap/BACKLOG_LEDGER.md#ledger-p1-canonical-task-packet-identity-verifier`.
+  Every applicability authority field remains literal `false`.
+- A coordinator may set `--creative-applicability alternatives|direct_fix|not_applicable|disabled`
+  through `start_pr_lane.sh` or manual bootstrap. The starter forwards the same
+  closed value in both its dry-run recipe and actual bootstrap. The structured
+  value is packet-identity-bearing; the sole
+  applicability selector recommends operational Creative for admitted
+  alternatives in `none` or `pre_open` phases only when the packet's structured
+  dispatch contract declares at least one runtime owner and its packet scope
+  contains a non-directory exact-file candidate, after higher-assurance
+  preemption. An execution-ready design packet without that explicit choice and a
+  `post_open_review`/`merge_ready` packet, any packet without a runtime writer,
+  and directory-only scope receive no Creative recommendation. The
+  recommendation is not native execution or writer authority. The host follows
+  the operational sequence in `.agents/skills/pulseplate-orchestration-dispatch/SKILL.md`, and
+  the additive `creative_workflow.v1` CLI validates returned intake, separate
+  review, exact-file writer handoff and sanitized capsule. The host reviews a
+  generated patch before any test execution and uses only
+  the existing strict zero-network Experiment Runner in an owned scratch
+  checkout for supported commands; unavailable containment or unsupported
+  platform commands remain pending, never a host-side fallback. Canonical
+  repository paths may contain credential-related names; secret-value checks apply to
+  their contents, while prose may name an API key without containing one.
+  Request, native-result and review prose use the same
+  route-aware local-path check before any stage is persisted. Each stage keeps
+  its predecessor's inherited request, native
+  result and review bytes; a matching predecessor hash alone is insufficient.
+  Archive export permits route literals in explicit decorator or HTTP-method
+  context while rejecting local filesystem paths, including UNC shares. Both
+  export and restore require the Git-parsed patch files to equal the exact writer
+  handoff and structured test evidence to bind its digest and admitted commands;
+  only regular patch modes and stored ZIP members are accepted, and Work Review
+  must name each accepted criterion. This continuity does not authenticate
+  test execution. Export and restore share the same UTF-8 and private-content
+  sanitizer. Restore also rechecks
+  the packet's canonical writer manifest and the criteria,
+  requirements, and Euler source digests; missing or changed evidence fails
+  closed. Legacy v1/adaptive-v2
+  hypothesis and PR-2 patch-sandbox authority remains unchanged.
+- Contract and readiness boundaries:
+  `docs/orchestration/PR_EVIDENCE_SIDECAR_V1.md` and
+  `docs/orchestration/AUTOMATION_READINESS_MATRIX.md`.
+
+## Pre-push backend tests (smart diff runner)
+
+The `run-backend-tests-pre-commit.sh` script is used by pre-commit framework to run backend pytest for changed Python files plus explicitly mapped cross-surface governance triggers.
+
+Changes under `docs/` select the exact docs path-leakage guard node, including
+isolated documentation branches. Root and one-level `.txt`/`.in` carrier
+candidates select the dependency security guard alongside ownership validation;
+these guards must remain reachable without a companion Python-file change.
+Changes to root `AGENTS.md`, `RUNBOOK_AGENT.md` or `docs/ENGINEERING_LESSONS.md` also select the complete `tests/test_agent_docs_registry_guard.py` module.
+The owning selection tests are `tests/test_pre_commit_hook_python_resolver.py`.
+CD-only changes also select the exact pure pgvector compatibility node and the
+existing parameterized scan-loop node in `test_pgvector_attestations.py`; the
+latter executes the actual workflow argv and four-subject scanner dataflow.
+Keep database integration in its separately required hosted native lane.
+
+Verify this hook on the supported shells from
+[the Bash portability lesson](../docs/ENGINEERING_LESSONS.md#3-bash-scripts-must-be-portable-bash-32),
+including the actual macOS Bash 3.2 executable when validating on macOS.
+A successfully established empty selection is a no-test result; failed or
+aborted discovery is an error. Nonempty selection regressions must observe the
+actual pytest arguments, and discovery/test failures must stop the real
+`make validate-changed` target before its completion message. Do not treat exit
+zero alone as proof that tests ran or let cleanup overwrite an earlier error.
+
+First-class repo wrappers:
+
+- `make validate-changed` is the supported repo-root command for this diff-based path and runs the script with the repo `.venv` on `PATH`.
+- `scripts/quick_check.sh` is a separate convenience helper: it runs `make validate-min` first, then staged-file format/import/syntax checks.
+- `scripts/orchestration/local_session_bootstrap.sh` is an **opt-in** raw-session helper: runs `check_preflight.py --mode analyze` from repo root and prints how to invoke `task_bootstrap.py`. It does not replace a machine-local launcher and does not auto-start Codex/Cursor sessions.
+- For an explicitly approved Euler L1 artifact, pass the single `--review-invariant-family-relations-input <repo-relative-json-path>` separately from `--path`, only with `--pr-phase post_open_review`, concrete `--goal`/`--task-class`, and no `--invariant-change-class`. The helper and standalone recipe renderer preserve the argument in shell-safe printed commands; only `task_bootstrap.py` reads and validates it. Follow the [L2 handoff contract](../docs/orchestration/contracts/REPEATED_INVARIANT_FAMILY_ABSTRACTION_REVIEW_CONTRACT.md#input-boundary) before any explicit role dispatch; rendering creates no packet, role execution or episode enrollment.
+
+**Coordinator cold-start precedence (host):**
+
+1. Opt-in **machine-local launcher** (operator-installed; see `docs/dev/LOCAL_COORDINATOR_LAUNCHER_ROLLOUT.md` + `docs/templates/pulseplate-coordinator-launch.example.sh`)
+2. Repo helper `scripts/orchestration/local_session_bootstrap.sh` (preflight + printed recipe)
+3. Direct `python3 scripts/orchestration/task_bootstrap.py ...` after `check_preflight.py`
+- `scripts/orchestration/local_support_plane.py` is an **experimental non-canonical** operator KV store under gitignored `artifacts/orchestration/local_support_plane/` (override via `LOCAL_SUPPORT_PLANE_ROOT`). Mutations require `AGENT_CONTROL_ALLOWLIST` to include `local_support_plane:artifacts_kv` and a compatible `AGENT_CONTROL_EXECUTION_MODE` (see `app/security/agent_control_plane.py`). It is not orchestration SoT.
+- **Advisory wiki compiler** (local-only, gitignored): `wiki_ingest.py`, `wiki_query.py`, `wiki_lint.py`, `wiki_promote.py` under `scripts/orchestration/` with shared `_wiki_compiler_support.py`. Writes markdown under `artifacts/orchestration/wiki/` and may mirror metadata to the support plane using `wiki.*` keys. See `docs/orchestration/LOCAL_WIKI_SUPPORT_PLANE.md`.
+
+**Change detection order:**
+
+1. Ordinary commits select the cached path delta only. Clean local default-stage
+   all-files runs the configured static/security hooks with zero backend tests.
+   Hosted lint explicitly selects its checked-out PR integration or push delta
+   using its ci-lite environment, including fast-fail and its canary exclusion.
+2. For an ordinary single feature-branch push, the installed pre-push stage
+   runs one full-profile `make validate-changed` against the fetched
+   `origin/${PR_SCOPE_BASE_REF:-main}` merge-base, including surviving changes
+   already published on the feature branch. Set `PR_SCOPE_BASE_REF` to the
+   established target name on a stacked PR. The checkout tested by the hook
+   must be clean and match the outgoing commit. Record its terminal result as
+   the required Make gate for that push. To capture a report, use
+   `PYTEST_ADDOPTS="--junitxml=/absolute/path/backend.xml" git push`. Supply one absolute output path without
+   whitespace. Other `PYTEST_ADDOPTS` values block this required stage.
+   Without the native hook, the
+   standalone Make target retains the main/master merge-base discovery.
+3. Otherwise, direct invocation checks the configured upstream diff, then
+   `origin/<current-branch>` and the main/master merge-base when no paths were
+   found. If no Python or governance targets are selected, the existing
+   `RECENT_COMMITS_FALLBACK` (default 10, bounded by available history) checks
+   recent commits.
+
+**Debug mode:**
+
+- Set `PREPUSH_DEBUG=1` to print resolved upstream/base and file list
+- Example: `PREPUSH_DEBUG=1 git push` will show detailed change detection info
+
+**Output and timing:**
+
+The native hook runner captures child output and prints the terminal hook row
+when that child completes. A last completed frontend `Passed` row does not
+identify the active phase or establish a frontend hang. Verify the active phase
+and its terminal result; budget the complete required hook bundle plus setup.
+The lint job in `.github/workflows/ci.yml` owns its CI execution budget.
+
+**Skip tests:**
+
+- For `SKIP_TESTS=1`, follow [root `AGENTS.md`](../AGENTS.md) Hard Gates and approval policy.
+
+## Evaluation validity
+
+For evaluation-validity work, follow `docs/evals/PULSEPLATE_EVAL_VALIDITY_CONTRACT.md`.
+Eval artifact sidecars with predictable filenames must use symlink-safe,
+fail-closed writers. Eval JSONL validators must reject malformed fields with
+`ValueError`, must not coerce raw values into accepted schema fields, and must
+defensively copy validated mutable containers.
+
+## NOOS-1B FitChef answer evaluation
+
+- `scripts/evals/collect_fitchef_answers.py` is opt-in and local only. At the actual `collect()` entry, revalidate/deep-copy the complete 24-case manifest, require all admitted languages in holdout and actual remaining synthetic monthly quota, suppress/restore SDK preflight logging, then require a committed clean checkout, a frozen private synthetic 24-case manifest, verified Sonar pricing/parameters, isolated synthetic PRO quota/SQLite/audit state, and the private Perplexity key. The owner-approved cap is 32 actual HTTP attempts with US$0.15 reserved before each send; retain reservations after timeout and preserve incomplete-run receipts. Do not rerun for a preferred answer.
+- `scripts/evals/fitchef_claim_assurance_eval.py` is offline. Require the same owner-private 32-byte replay key for packet-v2 preparation, validation and reporting; keep it out of candidate material, logs and Git. Preserve historical case-v1/rubric bytes and report missing captured fingerprints; new case-v2 must retain the actual observed canonical freeze fingerprint. Reuse only the pure `app.services.fitchef_claim_evidence_assurance` snapshot helpers for consistency, without copying their canonicalizer. Keep candidate packets blind, exact answer/source/rubric bindings strict, `abstain` separate from a support label, and report NOOS-1A structural output only as advisory. Private outputs must reuse the bounded no-follow JSONL reader and no-replace writer in `evidence_relation_audit.py`. See `docs/evals/FITCHEF_CLAIM_EVIDENCE_EVAL_V1.md` for the owning rubric.
+
+## Security/dev-tooling regression guards
+
+When touching Makefile devcontainer project-name generation, dependency audit
+helpers, dependency-submission filters, CI risk routing, or eval artifact
+writers, update the focused guards in
+`tests/guards/test_security_devtooling_regression_guards.py`. Optional
+RAG/vector dependency profiles must be covered consistently by pip-audit,
+Python dependency submission, and CI risk-profile routing.
+
+The standalone invariant-family episode evidence writer must keep one private,
+fail-closed kernel no-replace publisher for its two fixed-root/private-mode
+bundle shapes. Its focused security/dev-tooling guard is mandatory; arbitrary
+path selection, overwrite, repair, delete, or a second publication bypass is
+forbidden.
+
+Use the owning worktree's Euler module: the Python interpreter does not select
+its fixed store. `validate` returns a non-persisted baseline acknowledgement;
+`checkpoint` explicitly retains normalized J and that acknowledgement in an
+immutable receipt bound to an accepted enrollment. The optional checkpoint lane
+preserves v1 receipt/source compatibility. `status` never writes and establishes
+current reporting only through whole-store manifest equality. Explicit
+`complete` uses caller-supplied terminal/report inputs and resumes published
+evidence without inferring missing J, time or outcomes. These operations grant
+no downstream authority. Follow the
+[episode contract](../docs/orchestration/contracts/INVARIANT_FAMILY_REVIEW_EPISODE_CONTRACT.md#optional-lifecycle-supervision-euler-ops-1)
+and its [focused tests](../tests/test_invariant_family_review_episode.py).
+
+
+## Source-bound maintained compiler updates
+
+For the existing AM/Prometheus/ORAS producer, carry the canonically authenticated
+source/Q/frozen-root compiler Artifact through internal materialize/native/
+build-info/inventory callers. Reify all nine existing Artifact fields with exact
+types in the P owner; current booleans, x/net epochs, report names/counts/dates,
+Python identity and candidate-declared fields do not select a compiler. Preserve
+old tuples as historical evidence, without new execution permission. Keep the
+existing returned plan/root-input and manifest shapes.
+
+The current Caddy caller binds its authenticated Dockerfile/compiler ref to the
+same native owner's expected_source before create/start/probe and forwards it
+through terminal/cleanup. Admit only measured native representations; supplier
+DATA/projections do not replace new native controls or post-test/build trees.
+Freeze changed F/P source and current deployment-caller fingerprints in C
+while keeping each workflow controller commit and its regular path, mode,
+length, SHA-256 and Git blob coherent.
+Do not install new helper raw pins under an old controller ref.
+Derive new pins from the independently designated real C object. H updates
+the affected controller in both workflows together. A joint F/P transition
+moves four logical refs. A P-only change
+keeps the two AM controller refs when the existing immutable F/P checkout and
+its six-file material and five-template bindings still match. For Prometheus,
+update both checkout refs and all six revision, length/SHA-256 and blob checks
+from C's actual P object. Contract-test oracles use the immutable pins and
+strict Git reader without worktree fallback. Keep historical pins explicit
+and omit byte-equal paths from C's changed set while retaining them in the
+reviewed source closure.
+Require exact spent history and positive separate presence of the original
+zero-job run before the existing T/P1/Q+PG/B/P2 sequence. ROOT designates and
+verifies actual P0 and P1 under exclusive ref and dispatch custody before each
+release. The prepared-null Prometheus manifest cannot consume an old tool/image
+under new inputs. Keep the natural accepted-AM live-read sequence and existing
+attempt, budget and evidence contracts. No private adapter, new epoch/schema,
+generic OCI verifier or provider/native replay.
+The dated NoSec fixture remains the renewal carrier; preserve original inline
+comments and refresh the same five P coordinates/current owner bindings after
+final P bytes. ROOT owns fresh cheap gates before expensive validation.

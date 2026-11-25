@@ -1,0 +1,621 @@
+"""FitChef structured coaching router.
+
+RU: Тонкий router для bounded structured FitChef coaching surfaces.
+EN: Thin router for bounded structured FitChef coaching surfaces.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Coroutine
+import json
+import logging
+import os
+from typing import Any, Literal, cast
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, Response
+from fastapi.routing import APIRoute
+from pydantic import ValidationError
+from starlette.concurrency import run_in_threadpool
+from starlette.requests import ClientDisconnect
+
+from app.contracts.vip_contract import vip_error
+from app.metrics import record_fitchef_support_outcome_write
+from app.middleware.api_tiers import (
+    derive_subject_id_from_api_key,
+    require_pro_tier,
+    require_vip_tier,
+)
+from app.schemas.fitchef import (
+    FitChefDistortionSimulatorInput,
+    FitChefDistortionSimulatorTaskEnvelope,
+    FitChefIdentityLoopMapperInput,
+    FitChefIdentityLoopMapperTaskEnvelope,
+)
+from app.schemas.fitchef_coaching import (
+    FitChefCoachingErrorResponse,
+    FitChefCoachingSourceItem,
+    FitChefDistortionSimulatorRequest,
+    FitChefDistortionSimulatorResponse,
+    FitChefIdentityLoopMapperRequest,
+    FitChefIdentityLoopMapperResponse,
+    FitChefIdentityLoopView,
+    FitChefSupportHandoffRequest,
+    FitChefSupportHandoffResponse,
+    FitChefSupportOutcomeRequest,
+    FitChefSupportOutcomeResponse,
+    FitChefVipCoachingErrorResponse,
+)
+from app.security.agent_control_plane import normalize_execution_mode, require_execution_mode
+from app.security.agent_input_guard import require_safe_ai_agent_input
+from app.security.rate_limit import (
+    RATE_LIMIT_429_RESPONSES,
+    RATE_LIMIT_INSIGHT,
+    limit_if_available,
+    rate_limit_fitchef_support_outcome_value,
+)
+from app.services import fitchef_runtime
+from app.services.fitchef_support_handoff import build_fitchef_support_handoff
+from core.insight.fitchef_companion import has_high_distress_boundary
+
+logger = logging.getLogger(__name__)
+
+FITCHEF_STRUCTURED_FLAG_ENV = "FEATURE_FITCHEF_STRUCTURED_COACH"
+FITCHEF_STRUCTURED_EXECUTION_MODE_ENV = "FITCHEF_STRUCTURED_COACH_EXECUTION_MODE"
+FitChefStructuredMode = Literal["auto-safe", "review-required", "blocked"]
+FITCHEF_HIGH_DISTRESS_BOUNDARY_DETAIL = "fitchef_high_distress_boundary"
+FITCHEF_STRUCTURED_DISABLED_DETAIL = "FEATURE_FITCHEF_STRUCTURED_COACH is disabled"
+FITCHEF_IDENTITY_LOOP_VALIDATION_DETAIL = "fitchef_identity_loop_mapper_validation_error"
+FITCHEF_SUPPORT_HANDOFF_VALIDATION_DETAIL = "fitchef_support_handoff_validation_error"
+FITCHEF_SUPPORT_OUTCOME_FLAG_ENV = "FEATURE_FITCHEF_SUPPORT_OUTCOME_LEDGER"
+FITCHEF_SUPPORT_OUTCOME_DISABLED_DETAIL = "FEATURE_FITCHEF_SUPPORT_OUTCOME_LEDGER is disabled"
+FITCHEF_SUPPORT_OUTCOME_VALIDATION_DETAIL = "fitchef_support_outcome_validation_error"
+FITCHEF_SUPPORT_OUTCOME_CONFLICT_DETAIL = "fitchef_support_outcome_idempotency_conflict"
+FITCHEF_SUPPORT_OUTCOME_STORE_DETAIL = "fitchef_support_outcome_store_unavailable"
+FITCHEF_SUPPORT_OUTCOME_BODY_MAX_BYTES = 4096
+FITCHEF_SUPPORT_OUTCOME_JSON_MAX_DEPTH = 4
+
+_VIP_ERROR_CODE_BY_DETAIL: dict[str, str] = {
+    FITCHEF_STRUCTURED_DISABLED_DETAIL: "fitchef_structured_disabled",
+    "LLM provider not available": "llm_provider_unavailable",
+    "LLM provider returned empty response": "llm_provider_empty_response",
+    "LLM provider call timed out": "llm_provider_timeout",
+    "VIP access required": "vip_access_required",
+    "API key does not have VIP tier access. Upgrade to VIP to access this feature.": "vip_access_required",
+}
+FITCHEF_VIP_429_RESPONSES: dict[int | str, dict[str, object]] = {
+    429: {
+        "description": "Rate limit exceeded or monthly quota exhausted",
+        "model": FitChefVipCoachingErrorResponse,
+    }
+}
+
+
+class FitChefVipEnvelopeRoute(APIRoute):
+    """Wrap pre-handler VIP dependency and validation failures in the frozen envelope."""
+
+    def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
+        original_route_handler = super().get_route_handler()
+
+        async def custom_route_handler(request: Request) -> Response:
+            try:
+                return await original_route_handler(request)
+            except RequestValidationError:
+                return _vip_error_response(
+                    status_code=422,
+                    detail=FITCHEF_IDENTITY_LOOP_VALIDATION_DETAIL,
+                )
+            except HTTPException as exc:
+                return _vip_error_response(status_code=exc.status_code, detail=exc.detail)
+
+        return custom_route_handler
+
+
+router = APIRouter(tags=["pro", "fitchef", "coaching", "structured"])
+support_handoff_router = APIRouter(tags=["pro", "fitchef", "coaching", "structured"])
+support_outcome_router = APIRouter(tags=["pro", "fitchef", "coaching", "structured"])
+vip_router = APIRouter(
+    tags=["vip", "fitchef", "coaching", "structured"],
+    route_class=FitChefVipEnvelopeRoute,
+)
+
+_FITCHEF_SUPPORT_HANDOFF_REQUEST_BODY_OPENAPI: dict[str, object] = {
+    "required": True,
+    "content": {
+        "application/json": {
+            "schema": FitChefSupportHandoffRequest.model_json_schema(),
+        }
+    },
+}
+_FITCHEF_SUPPORT_HANDOFF_SUMMARY = "Select deterministic FitChef support handoff"
+_FITCHEF_SUPPORT_HANDOFF_DESCRIPTION = (
+    "POST /api/v1/pro/fitchef/recommend returns one deterministic, non-executing "
+    "product-surface handoff selected solely from the request's explicit support_need. "
+    "It does not inspect a plan, history, adherence, goal, or prior FitChef response; "
+    "infer friction or intent; call RAG, an AI provider, or an LLM; invoke the target "
+    "surface; or create or change a plan."
+)
+_FITCHEF_SUPPORT_HANDOFF_RESPONSES: dict[int | str, dict[str, object]] = {
+    200: {"description": "Deterministic FitChef support handoff selected"},
+    401: {"description": "API key required", "model": FitChefCoachingErrorResponse},
+    403: {"description": "PRO tier required", "model": FitChefCoachingErrorResponse},
+    422: {
+        "description": "Request validation failed",
+        "model": FitChefCoachingErrorResponse,
+    },
+    503: {"description": "Feature disabled", "model": FitChefCoachingErrorResponse},
+}
+
+_FITCHEF_SUPPORT_OUTCOME_REQUEST_BODY_OPENAPI: dict[str, object] = {
+    "required": True,
+    "content": {
+        "application/json": {
+            "schema": FitChefSupportOutcomeRequest.model_json_schema(),
+        }
+    },
+}
+_FITCHEF_SUPPORT_OUTCOME_SUMMARY = "Record a client-reported FitChef support outcome"
+_FITCHEF_SUPPORT_OUTCOME_DESCRIPTION = (
+    "Records one authenticated client-reported outcome assertion for a bounded FitChef "
+    "support choice. The row does not prove a human click, a prior handoff response, "
+    "consent, understanding, navigation, plan execution, or product effectiveness."
+)
+_FITCHEF_SUPPORT_OUTCOME_RESPONSES: dict[int | str, dict[str, object]] = {
+    200: {"description": "Outcome recorded or identically replayed"},
+    401: {"description": "API key required", "model": FitChefCoachingErrorResponse},
+    403: {"description": "PRO tier required", "model": FitChefCoachingErrorResponse},
+    409: {
+        "description": "Idempotency key is bound to different material",
+        "model": FitChefCoachingErrorResponse,
+    },
+    422: {"description": "Request validation failed", "model": FitChefCoachingErrorResponse},
+    503: {
+        "description": "Feature disabled or outcome store unavailable",
+        "model": FitChefCoachingErrorResponse,
+    },
+    **RATE_LIMIT_429_RESPONSES,
+}
+
+
+def _is_fitchef_structured_enabled() -> bool:
+    """Return whether structured FitChef coaching is enabled."""
+
+    return os.getenv(FITCHEF_STRUCTURED_FLAG_ENV, "false").lower() in {"1", "true", "yes", "on"}
+
+
+def _is_fitchef_support_outcome_enabled() -> bool:
+    """Return whether the support-outcome ledger is request-time enabled."""
+
+    return os.getenv(FITCHEF_SUPPORT_OUTCOME_FLAG_ENV, "false").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _require_fitchef_structured_mode() -> FitChefStructuredMode:
+    """Resolve and validate the structured-coach execution mode."""
+
+    raw_execution_mode = os.getenv(FITCHEF_STRUCTURED_EXECUTION_MODE_ENV)
+    try:
+        execution_mode = cast(
+            FitChefStructuredMode,
+            normalize_execution_mode(raw_execution_mode),
+        )
+    except RuntimeError as exc:
+        logger.error("FitChef structured execution mode misconfigured", exc_info=True)
+        raise HTTPException(
+            status_code=503,
+            detail="agent_execution_mode_misconfigured",
+        ) from exc
+
+    try:
+        require_execution_mode(execution_mode)
+    except PermissionError:
+        detail = f"agent_execution_{execution_mode.replace('-', '_')}"
+        raise HTTPException(status_code=503, detail=detail)
+    return execution_mode
+
+
+def _require_identity_loop_mapper_boundary(payload: FitChefIdentityLoopMapperRequest) -> None:
+    """Fail closed before runtime when identity mapping is unsafe to personalize."""
+
+    if has_high_distress_boundary(
+        payload.goal,
+        payload.recent_pattern,
+        payload.self_talk,
+        payload.trigger_context,
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=FITCHEF_HIGH_DISTRESS_BOUNDARY_DETAIL,
+        )
+
+
+def _vip_error_response(status_code: int, detail: object) -> JSONResponse:
+    """Return the frozen VIP error envelope for this VIP structured route."""
+
+    message = detail if isinstance(detail, str) and detail else "fitchef_identity_loop_mapper_error"
+    code = _VIP_ERROR_CODE_BY_DETAIL.get(message, message)
+    return JSONResponse(
+        status_code=status_code,
+        content=vip_error(code=code, message=message),
+    )
+
+
+async def _parse_fitchef_support_handoff_request(
+    request: Request,
+) -> FitChefSupportHandoffRequest:
+    """Parse the frozen request only after auth and feature admission."""
+
+    content_type = request.headers.get("content-type")
+    if not content_type or content_type.partition(";")[0].lower() != "application/json":
+        raise HTTPException(
+            status_code=422,
+            detail=FITCHEF_SUPPORT_HANDOFF_VALIDATION_DETAIL,
+        )
+
+    try:
+        raw_payload = await request.json()
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        raise HTTPException(
+            status_code=422,
+            detail=FITCHEF_SUPPORT_HANDOFF_VALIDATION_DETAIL,
+        ) from None
+
+    try:
+        payload: FitChefSupportHandoffRequest
+        payload = FitChefSupportHandoffRequest.model_validate(raw_payload)
+    except ValidationError:
+        raise HTTPException(
+            status_code=422,
+            detail=FITCHEF_SUPPORT_HANDOFF_VALIDATION_DETAIL,
+        ) from None
+    return payload
+
+
+class _DuplicateJsonKeyError(ValueError):
+    """Raised when a JSON object repeats a decoded key."""
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicateJsonKeyError
+        result[key] = value
+    return result
+
+
+def _reject_nonstandard_json_constant(_value: str) -> object:
+    raise ValueError
+
+
+def _json_structural_depth(value: object) -> int:
+    if isinstance(value, dict):
+        if not value:
+            return 1
+        return 1 + max(_json_structural_depth(item) for item in value.values())
+    if isinstance(value, list):
+        if not value:
+            return 1
+        return 1 + max(_json_structural_depth(item) for item in value)
+    return 0
+
+
+async def _read_fitchef_support_outcome_body(request: Request) -> bytes:
+    body = bytearray()
+    try:
+        async for chunk in request.stream():
+            if not isinstance(chunk, bytes):
+                raise ValueError
+            if len(body) + len(chunk) > FITCHEF_SUPPORT_OUTCOME_BODY_MAX_BYTES:
+                raise ValueError
+            body.extend(chunk)
+    except (ClientDisconnect, RuntimeError, ValueError):
+        raise HTTPException(
+            status_code=422,
+            detail=FITCHEF_SUPPORT_OUTCOME_VALIDATION_DETAIL,
+        ) from None
+    return bytes(body)
+
+
+async def _parse_fitchef_support_outcome_request(
+    request: Request,
+) -> FitChefSupportOutcomeRequest:
+    """Parse one bounded, duplicate-free JSON object after auth/flag/rate admission."""
+
+    content_type = request.headers.get("content-type")
+    if not content_type or content_type.partition(";")[0].lower() != "application/json":
+        raise HTTPException(
+            status_code=422,
+            detail=FITCHEF_SUPPORT_OUTCOME_VALIDATION_DETAIL,
+        )
+
+    raw_body = await _read_fitchef_support_outcome_body(request)
+    try:
+        decoded = raw_body.decode("utf-8", errors="strict")
+        raw_payload = json.loads(
+            decoded,
+            object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=_reject_nonstandard_json_constant,
+        )
+        if type(raw_payload) is not dict:
+            raise ValueError
+        if _json_structural_depth(raw_payload) > FITCHEF_SUPPORT_OUTCOME_JSON_MAX_DEPTH:
+            raise ValueError
+        payload: FitChefSupportOutcomeRequest
+        payload = FitChefSupportOutcomeRequest.model_validate(raw_payload)
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        RecursionError,
+        ValidationError,
+        ValueError,
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=FITCHEF_SUPPORT_OUTCOME_VALIDATION_DETAIL,
+        ) from None
+    return payload
+
+
+@router.post(
+    "/api/v1/pro/fitchef/explain",
+    response_model=FitChefDistortionSimulatorResponse,
+    responses={
+        200: {"description": "FitChef distortion simulator generated"},
+        400: {"description": "Unsafe AI input blocked", "model": FitChefCoachingErrorResponse},
+        401: {"description": "API key required", "model": FitChefCoachingErrorResponse},
+        403: {"description": "PRO tier required", "model": FitChefCoachingErrorResponse},
+        503: {
+            "description": "Feature disabled or provider unavailable",
+            "model": FitChefCoachingErrorResponse,
+        },
+        504: {"description": "LLM provider call timed out", "model": FitChefCoachingErrorResponse},
+        **RATE_LIMIT_429_RESPONSES,
+    },
+)
+@limit_if_available(RATE_LIMIT_INSIGHT)
+async def fitchef_distortion_simulator(
+    payload: FitChefDistortionSimulatorRequest,
+    request: Request,
+    pro_key: str = Depends(require_pro_tier),
+) -> FitChefDistortionSimulatorResponse:
+    """Generate the bounded PRO distortion-simulator surface."""
+
+    if not _is_fitchef_structured_enabled():
+        raise HTTPException(status_code=503, detail="FEATURE_FITCHEF_STRUCTURED_COACH is disabled")
+
+    execution_mode = _require_fitchef_structured_mode()
+    if has_high_distress_boundary(
+        payload.situation, payload.automatic_thought, payload.emotion, payload.goal
+    ):
+        raise HTTPException(status_code=400, detail=FITCHEF_HIGH_DISTRESS_BOUNDARY_DETAIL)
+    task = FitChefDistortionSimulatorTaskEnvelope(
+        mode=execution_mode,
+        input=FitChefDistortionSimulatorInput(
+            safe_situation=require_safe_ai_agent_input(payload.situation),
+            safe_automatic_thought=require_safe_ai_agent_input(payload.automatic_thought),
+            safe_emotion=require_safe_ai_agent_input(payload.emotion),
+            safe_goal=(
+                require_safe_ai_agent_input(payload.goal)
+                if payload.goal is not None and payload.goal.strip()
+                else None
+            ),
+            lang=payload.lang,
+            api_key=pro_key,
+            endpoint=str(request.url.path),
+            method=request.method,
+        ),
+    )
+    result = await fitchef_runtime.run_distortion_simulator_task(task)
+    return FitChefDistortionSimulatorResponse(
+        scenario="distortion_simulator",
+        distortion_labels=result.distortion_labels,
+        why_it_matches=result.why_it_matches,
+        evidence_for=result.evidence_for,
+        evidence_against=result.evidence_against,
+        balanced_reframe=result.balanced_reframe,
+        next_small_action=result.next_small_action,
+        sources=[
+            FitChefCoachingSourceItem(
+                file=item.file,
+                preview=item.preview,
+                score=item.score,
+            )
+            for item in result.sources
+        ],
+        confidence=result.confidence,
+        warnings=result.warnings,
+        quota_state=result.quota_state,
+        transparency_notice_id=result.transparency_notice_id,
+        wellness_boundary=result.wellness_boundary,
+    )
+
+
+@support_handoff_router.post(
+    "/api/v1/pro/fitchef/recommend",
+    dependencies=[Depends(require_pro_tier)],
+    response_model=FitChefSupportHandoffResponse,
+    response_model_include=None,
+    response_model_exclude=None,
+    response_model_by_alias=True,
+    response_model_exclude_unset=False,
+    response_model_exclude_defaults=False,
+    response_model_exclude_none=False,
+    summary=_FITCHEF_SUPPORT_HANDOFF_SUMMARY,
+    description=_FITCHEF_SUPPORT_HANDOFF_DESCRIPTION,
+    responses=_FITCHEF_SUPPORT_HANDOFF_RESPONSES,
+    openapi_extra={"requestBody": _FITCHEF_SUPPORT_HANDOFF_REQUEST_BODY_OPENAPI},
+)
+async def fitchef_support_handoff(request: Request) -> FitChefSupportHandoffResponse:
+    """Return one non-executing product-surface descriptor for a PRO caller."""
+
+    if not _is_fitchef_structured_enabled():
+        raise HTTPException(status_code=503, detail=FITCHEF_STRUCTURED_DISABLED_DETAIL)
+
+    payload = await _parse_fitchef_support_handoff_request(request)
+    response: FitChefSupportHandoffResponse = build_fitchef_support_handoff(
+        support_need=payload.support_need
+    )
+    return response
+
+
+@support_outcome_router.post(
+    "/api/v1/pro/fitchef/recommend/outcome",
+    response_model=FitChefSupportOutcomeResponse,
+    response_model_include=None,
+    response_model_exclude=None,
+    response_model_by_alias=True,
+    response_model_exclude_unset=False,
+    response_model_exclude_defaults=False,
+    response_model_exclude_none=False,
+    summary=_FITCHEF_SUPPORT_OUTCOME_SUMMARY,
+    description=_FITCHEF_SUPPORT_OUTCOME_DESCRIPTION,
+    responses=_FITCHEF_SUPPORT_OUTCOME_RESPONSES,
+    openapi_extra={"requestBody": _FITCHEF_SUPPORT_OUTCOME_REQUEST_BODY_OPENAPI},
+)
+@limit_if_available(rate_limit_fitchef_support_outcome_value)
+async def fitchef_support_outcome(
+    request: Request,
+    pro_key: str = Depends(require_pro_tier),
+) -> FitChefSupportOutcomeResponse:
+    """Persist one credential-admitted client-reported support outcome."""
+
+    if not _is_fitchef_support_outcome_enabled():
+        raise HTTPException(status_code=503, detail=FITCHEF_SUPPORT_OUTCOME_DISABLED_DETAIL)
+
+    payload = await _parse_fitchef_support_outcome_request(request)
+    handoff: FitChefSupportHandoffResponse = build_fitchef_support_handoff(
+        support_need=payload.support_need
+    )
+    subject_id = derive_subject_id_from_api_key(pro_key)
+
+    from app.services.fitchef_support_outcomes import (
+        FitChefSupportOutcomeConflictError,
+        FitChefSupportOutcomeRecord,
+        FitChefSupportOutcomeStoreUnavailableError,
+        record_fitchef_support_outcome,
+    )
+
+    record = FitChefSupportOutcomeRecord(
+        schema_version=payload.schema_version,
+        support_need=payload.support_need,
+        target_surface=handoff.action.target_surface,
+        outcome=payload.outcome,
+        client_event_id=payload.client_event_id,
+    )
+    try:
+        state = await run_in_threadpool(
+            record_fitchef_support_outcome,
+            subject_id=subject_id,
+            record=record,
+        )
+    except FitChefSupportOutcomeConflictError:
+        record_fitchef_support_outcome_write(
+            support_need=payload.support_need,
+            outcome=payload.outcome,
+            result="rejected",
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=FITCHEF_SUPPORT_OUTCOME_CONFLICT_DETAIL,
+        ) from None
+    except FitChefSupportOutcomeStoreUnavailableError:
+        raise HTTPException(
+            status_code=503,
+            detail=FITCHEF_SUPPORT_OUTCOME_STORE_DETAIL,
+        ) from None
+
+    record_fitchef_support_outcome_write(
+        support_need=payload.support_need,
+        outcome=payload.outcome,
+        result=state,
+    )
+    return FitChefSupportOutcomeResponse(
+        schema_version="fitchef_support_outcome_v1",
+        state=state,
+    )
+
+
+@vip_router.post(
+    "/api/v1/vip/fitchef/insight",
+    response_model=FitChefIdentityLoopMapperResponse,
+    responses={
+        200: {"description": "FitChef identity-loop mapper generated"},
+        400: {"description": "Unsafe AI input blocked", "model": FitChefVipCoachingErrorResponse},
+        403: {"description": "VIP tier required", "model": FitChefVipCoachingErrorResponse},
+        503: {
+            "description": "Feature disabled or provider unavailable",
+            "model": FitChefVipCoachingErrorResponse,
+        },
+        504: {
+            "description": "LLM provider call timed out",
+            "model": FitChefVipCoachingErrorResponse,
+        },
+        422: {"description": "Request validation failed", "model": FitChefVipCoachingErrorResponse},
+        **FITCHEF_VIP_429_RESPONSES,
+    },
+)
+@limit_if_available(RATE_LIMIT_INSIGHT)
+async def fitchef_identity_loop_mapper(
+    payload: FitChefIdentityLoopMapperRequest,
+    request: Request,
+    vip_key: str = Depends(require_vip_tier),
+) -> FitChefIdentityLoopMapperResponse | JSONResponse:
+    """Generate the bounded VIP identity-loop mapper surface."""
+
+    try:
+        if not _is_fitchef_structured_enabled():
+            raise HTTPException(status_code=503, detail=FITCHEF_STRUCTURED_DISABLED_DETAIL)
+
+        execution_mode = _require_fitchef_structured_mode()
+        _require_identity_loop_mapper_boundary(payload)
+        task = FitChefIdentityLoopMapperTaskEnvelope(
+            mode=execution_mode,
+            input=FitChefIdentityLoopMapperInput(
+                safe_goal=require_safe_ai_agent_input(payload.goal),
+                safe_recent_pattern=require_safe_ai_agent_input(payload.recent_pattern),
+                safe_self_talk=require_safe_ai_agent_input(payload.self_talk),
+                safe_trigger_context=(
+                    require_safe_ai_agent_input(payload.trigger_context)
+                    if payload.trigger_context is not None and payload.trigger_context.strip()
+                    else None
+                ),
+                api_key=vip_key,
+                endpoint=str(request.url.path),
+                method=request.method,
+            ),
+        )
+        result = await fitchef_runtime.run_identity_loop_mapper_task(task)
+    except HTTPException as exc:
+        return _vip_error_response(status_code=exc.status_code, detail=exc.detail)
+
+    return FitChefIdentityLoopMapperResponse(
+        scenario="identity_loop_mapper",
+        identity_loop=FitChefIdentityLoopView(
+            belief=result.identity_loop.belief,
+            behavior=result.identity_loop.behavior,
+            short_term_reward=result.identity_loop.short_term_reward,
+            long_term_cost=result.identity_loop.long_term_cost,
+        ),
+        identity_shift_statement=result.identity_shift_statement,
+        replacement_action=result.replacement_action,
+        repair_if_slip=result.repair_if_slip,
+        sources=[
+            FitChefCoachingSourceItem(
+                file=item.file,
+                preview=item.preview,
+                score=item.score,
+            )
+            for item in result.sources
+        ],
+        confidence=result.confidence,
+        warnings=result.warnings,
+        quota_state=result.quota_state,
+        transparency_notice_id=result.transparency_notice_id,
+        wellness_boundary=result.wellness_boundary,
+    )

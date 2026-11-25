@@ -1,0 +1,6 @@
+/* Spanish Info.plist Localization */
+"NSHealthShareUsageDescription" = "PulsePlate lee nutrición y peso corporal de Health para mostrar progreso y planificación wellness con tu consentimiento.";
+"CFBundleDisplayName" = "PulsePlate";
+"CFBundleName" = "PulsePlate";
+"CFBundleShortVersionString" = "1.0";
+"CFBundleVersion" = "1";

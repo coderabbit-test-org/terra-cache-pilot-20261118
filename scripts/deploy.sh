@@ -1,0 +1,1840 @@
+#!/usr/bin/env bash
+# Fail-closed staging deploy. Requires Docker Compose and two attested GHCR digests.
+set -euo pipefail
+
+STAGING_DEPLOY_CONTRACT_VERSION="6"
+STAGING_DEPLOY_MARKER_CONTENT="pulseplate-staging-attested-digest-v1"
+CANONICAL_IMAGE_PATTERN='^ghcr\.io/katsiarynakavaleuskaya/pulseplate@sha256:[0-9a-f]{64}$'
+
+usage() {
+  cat >&2 <<'EOF'
+Usage:
+  deploy.sh [--preflight-only] BACKEND_DIGEST_REF CADDY_DIGEST_REF
+
+Both image references must use the canonical PulsePlate GHCR repository and a
+lowercase sha256 digest. Floating tags are not accepted.
+EOF
+}
+
+PREFLIGHT_ONLY=0
+if [ "${1:-}" = "--preflight-only" ]; then
+  PREFLIGHT_ONLY=1
+  shift
+fi
+
+if [ "$#" -ne 2 ]; then
+  usage
+  exit 2
+fi
+
+BACKEND_IMAGE_REF="$1"
+CADDY_IMAGE_REF="$2"
+
+for image_ref in "$BACKEND_IMAGE_REF" "$CADDY_IMAGE_REF"; do
+  if [[ ! "$image_ref" =~ $CANONICAL_IMAGE_PATTERN ]]; then
+    echo "❌ Immutable canonical GHCR digest reference required: $image_ref" >&2
+    exit 2
+  fi
+done
+
+if [ "$BACKEND_IMAGE_REF" = "$CADDY_IMAGE_REF" ]; then
+  echo "❌ Backend and Caddy image digests must be distinct" >&2
+  exit 2
+fi
+
+PROJECT_DIR="${PROJECT_DIR:-/srv/pulseplate-staging}"
+PROJECT_DIR="$(cd "$PROJECT_DIR" && pwd -P)"
+ENV_FILE="${ENV_FILE:-${PROJECT_DIR}/.env}"
+COMPOSE_FILE="${COMPOSE_FILE:-${PROJECT_DIR}/docker-compose.staging.yaml}"
+CADDYFILE="${CADDYFILE:-${PROJECT_DIR}/Caddyfile}"
+BACKUP_DIR="${BACKUP_DIR:-/mnt/pulseplate-staging-data/backups}"
+BACKUP_HELPER="${BACKUP_HELPER:-${PROJECT_DIR}/scripts/ops/postgres_backup.sh}"
+STAGING_DEPLOY_MARKER="${STAGING_DEPLOY_MARKER:-${PROJECT_DIR}/.attested-digest-deploy-v1}"
+PROMETHEUS_CONFIG="${PROMETHEUS_CONFIG:-${PROJECT_DIR}/prometheus/prometheus.yml}"
+PROMETHEUS_RULES="${PROJECT_DIR}/prometheus/alias-alerts.yml"
+PROMETHEUS_IMAGE_MANIFEST="${PROMETHEUS_IMAGE_MANIFEST:-${PROJECT_DIR}/prometheus/image-manifest.json}"
+ALERTMANAGER_CONFIG="${PROJECT_DIR}/alertmanager/alertmanager.yml"
+ALERTMANAGER_TRIVY_IGNORE="${PROJECT_DIR}/alertmanager/trivy-ignore.yaml"
+ALERTMANAGER_SMTP_KEY="${PROJECT_DIR}/secrets/alertmanager_smtp_key"
+# Keep the caller's profile choice authoritative over Compose --env-file values.
+COMPOSE_PROFILES="${COMPOSE_PROFILES-}"
+export COMPOSE_PROFILES
+POSTGRES_IMAGE_MANIFEST="${POSTGRES_IMAGE_MANIFEST:-${PROJECT_DIR}/postgres-pgvector/image-manifest.json}"
+METRICS_SECRET_DIR="${METRICS_SECRET_DIR:-${PROJECT_DIR}/secrets}"
+METRICS_SECRET_FILE="${METRICS_SECRET_FILE:-${METRICS_SECRET_DIR}/pulseplate_metrics_scrape_key}"
+
+if [ -L "$STAGING_DEPLOY_MARKER" ] || [ ! -f "$STAGING_DEPLOY_MARKER" ]; then
+  echo "❌ Missing regular non-symlink staging deploy marker: $STAGING_DEPLOY_MARKER" >&2
+  exit 1
+fi
+
+STAT_BIN="${STAT_BIN:-}"
+if [ -z "$STAT_BIN" ]; then
+  STAT_BIN="$(command -v stat || :)"
+fi
+if [ -z "$STAT_BIN" ] || [ ! -x "$STAT_BIN" ]; then
+  echo "❌ stat executable is required for staging marker validation" >&2
+  exit 1
+fi
+
+# Scoped deploy-tool interpreter input; no PATH discovery or origin claim.
+PYTHON_BIN_OVERRIDE="${PYTHON_BIN:-}"
+TRUSTED_PYTHON_CANDIDATES=(
+  "/usr/bin/python3"
+  "/usr/local/bin/python3"
+  "/opt/homebrew/bin/python3"
+  "/opt/homebrew/opt/python@3.14/libexec/bin/python3"
+)
+if [ -n "$PYTHON_BIN_OVERRIDE" ]; then
+  if [[ "$PYTHON_BIN_OVERRIDE" != /* ]]; then
+    echo "❌ PYTHON_BIN override must be an absolute path" >&2
+    exit 1
+  fi
+  if [ ! -x "$PYTHON_BIN_OVERRIDE" ]; then
+    echo "❌ PYTHON_BIN override is not executable" >&2
+    exit 1
+  fi
+  PYTHON_CANDIDATES=("$PYTHON_BIN_OVERRIDE")
+else
+  PYTHON_CANDIDATES=("${TRUSTED_PYTHON_CANDIDATES[@]}")
+fi
+PYTHON_BIN=""
+for candidate in "${PYTHON_CANDIDATES[@]}"; do
+  if [ ! -x "$candidate" ]; then
+    continue
+  fi
+  if python_identity="$("$candidate" -I -S -c 'import sys; print(sys.implementation.name + ":" + str(sys.version_info.major) + "." + str(sys.version_info.minor))')"; then
+    case "$python_identity" in
+      cpython:3.11|cpython:3.12|cpython:3.13|cpython:3.14)
+        PYTHON_BIN="$candidate"
+        break
+        ;;
+    esac
+  fi
+  if [ -n "$PYTHON_BIN_OVERRIDE" ]; then
+    echo "❌ PYTHON_BIN override requires isolated CPython 3.11, 3.12, 3.13 or 3.14: $candidate" >&2
+    exit 1
+  fi
+done
+if [ -z "$PYTHON_BIN" ]; then
+  echo "❌ PYTHON_BIN requires isolated CPython 3.11, 3.12, 3.13 or 3.14 at a trusted absolute path" >&2
+  exit 1
+fi
+readonly PYTHON_BIN
+
+marker_metadata="$($STAT_BIN -c '%u:%g:%a' "$STAGING_DEPLOY_MARKER")"
+if [ "$marker_metadata" != "0:0:644" ]; then
+  echo "❌ Staging deploy marker must be root-owned with mode 0644; got $marker_metadata" >&2
+  exit 1
+fi
+
+marker_size="$(wc -c < "$STAGING_DEPLOY_MARKER" | tr -d '[:space:]')"
+marker_content=""
+IFS= read -r marker_content < "$STAGING_DEPLOY_MARKER" || [ -n "$marker_content" ]
+if [ "$marker_content" != "$STAGING_DEPLOY_MARKER_CONTENT" ] || \
+   [ "$marker_size" -ne "${#STAGING_DEPLOY_MARKER_CONTENT}" ]; then
+  echo "❌ Staging deploy marker content mismatch" >&2
+  exit 1
+fi
+
+for required_path in \
+  "$ENV_FILE" \
+  "$COMPOSE_FILE" \
+  "$CADDYFILE" \
+  "$PROMETHEUS_CONFIG" \
+  "$PROMETHEUS_RULES" \
+  "$PROMETHEUS_IMAGE_MANIFEST" \
+  "$ALERTMANAGER_CONFIG" \
+  "$ALERTMANAGER_TRIVY_IGNORE" \
+  "$POSTGRES_IMAGE_MANIFEST"; do
+  if [ -L "$required_path" ] || [ ! -f "$required_path" ]; then
+    echo "❌ Staging file must be a regular non-symlink file: $required_path" >&2
+    exit 1
+  fi
+done
+# Default-off checkpoint files are admitted before any Docker/product mutation.
+"$PYTHON_BIN" - "$PROJECT_DIR" <<'PY_CHECKPOINT'
+import hashlib
+import os
+from pathlib import Path
+import stat
+import sys
+
+project = Path(sys.argv[1])
+expected = {
+    'scripts/verify_premium_alias_telemetry.py': 'sha256:906db8d718e5818593f81b7a6a19585a2b273d9d5ff0af8d015d812e8102f829',
+    'scripts/ops/notify_premium_alias_checkpoint_failure.py': 'sha256:6d8ab4b1c0b94f7c067d753fd21d69ecde31f669456bdf8724e9435bef09b2cf',
+    'systemd/pulseplate-premium-alias-checkpoint.service.example': 'sha256:a52742a89b87d02b3b75834b27db741b72a9c6c4a021711611db2a53b197a030',
+    'systemd/pulseplate-premium-alias-checkpoint.timer.example': 'sha256:f6dd053b986cf68b133cf855208b86f44fc975e84dc7acbf490b35a6bb88c9cf',
+    'systemd/pulseplate-premium-alias-checkpoint-failure.service.example': 'sha256:285c5e05bd72f4c99a22c9657a8443becfda4ff93975a21d70feb01812ed1b6d',
+}
+for relative, expected_hash in expected.items():
+    path = project / relative
+    for parent in (path, *path.parents):
+        if parent.is_symlink():
+            raise SystemExit("Checkpoint contract contains a symlink")
+    metadata = path.stat()
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        raise SystemExit("Checkpoint contract must be one regular file")
+    if metadata.st_size <= 0 or metadata.st_size > 4 * 1024 * 1024:
+        raise SystemExit("Checkpoint contract size is invalid")
+    if "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest() != expected_hash:
+        raise SystemExit("Checkpoint contract hash mismatch")
+PY_CHECKPOINT
+
+env_file_mode="$($STAT_BIN -c '%a' "$ENV_FILE")"
+if [ "$env_file_mode" != "600" ]; then
+  echo "❌ Staging env file must use mode 0600; got $env_file_mode" >&2
+  exit 1
+fi
+if [ -L "$BACKUP_HELPER" ] || [ ! -f "$BACKUP_HELPER" ] || [ ! -x "$BACKUP_HELPER" ]; then
+  echo "❌ Postgres backup helper must be a regular executable non-symlink file: $BACKUP_HELPER" >&2
+  exit 1
+fi
+backup_helper_mode="$($STAT_BIN -c '%a' "$BACKUP_HELPER")"
+if (( (8#$backup_helper_mode & 8#22) != 0 )); then
+  echo "❌ Postgres backup helper must not be group- or world-writable; got mode $backup_helper_mode" >&2
+  exit 1
+fi
+
+if [ -L "$METRICS_SECRET_DIR" ] || [ ! -d "$METRICS_SECRET_DIR" ]; then
+  echo "❌ Metrics scrape secret directory must be a regular non-symlink directory" >&2
+  exit 1
+fi
+if [ -L "$METRICS_SECRET_FILE" ] || [ ! -f "$METRICS_SECRET_FILE" ]; then
+  echo "❌ Metrics scrape secret must be a regular non-symlink file" >&2
+  exit 1
+fi
+secret_dir_metadata="$($STAT_BIN -c '%u:%a' "$METRICS_SECRET_DIR")"
+if [ "$secret_dir_metadata" != "${EUID}:700" ]; then
+  echo "❌ Metrics scrape secret directory must be owned by the Compose account with mode 0700" >&2
+  exit 1
+fi
+secret_file_metadata="$($STAT_BIN -c '%u:%a' "$METRICS_SECRET_FILE")"
+if [ "$secret_file_metadata" != "${EUID}:444" ]; then
+  echo "❌ Metrics scrape secret file must be owned by the Compose account with mode 0444" >&2
+  exit 1
+fi
+
+PROMETHEUS_CONTRACT_HELPER="${PROMETHEUS_CONTRACT_HELPER:-${PROJECT_DIR}/scripts/ci/prometheus_source_image.py}"
+PROMETHEUS_CONTRACT_HELPER_SHA256="caeef6254bb44aa0a1ac54c069e0f88c095d91bd17da1adc568c0d57d400e858" # pragma: allowlist secret - public source digest
+readonly PROMETHEUS_CONTRACT_HELPER PROMETHEUS_CONTRACT_HELPER_SHA256
+
+run_trusted_contract() {
+  "$PYTHON_BIN" -I -c '
+import hashlib
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+path, expected = sys.argv[1:3]
+if not os.path.isabs(path) or re.fullmatch(r"[0-9a-f]{64}", expected) is None:
+    raise SystemExit("Invalid trusted contract helper operand")
+for parent in Path(path).parents:
+    if parent.is_symlink() or not parent.is_dir():
+        raise SystemExit("Trusted contract helper parent is not a real directory")
+fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+before = os.fstat(fd)
+if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_uid not in (0, os.getuid())
+        or before.st_mode & 0o022 or not 0 < before.st_size <= 1048576):
+    raise SystemExit("Trusted contract helper leaf is invalid")
+raw = os.read(fd, before.st_size + 1)
+after, current = os.fstat(fd), os.lstat(path)
+if len(raw) != before.st_size or hashlib.sha256(raw).hexdigest() != expected or any(
+    getattr(before, key) != getattr(after, key) or getattr(before, key) != getattr(current, key)
+    for key in ("st_dev", "st_ino", "st_mode", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")
+):
+    raise SystemExit("Trusted current-source contract helper binding changed")
+os.lseek(fd, 0, os.SEEK_SET)
+os.set_inheritable(fd, True)
+os.execv(sys.executable, [sys.executable, "-I", "-S", "/dev/fd/" + str(fd), *sys.argv[3:]])
+' "$@"
+}
+
+ALERTMANAGER_CONTRACT_HELPER="${ALERTMANAGER_CONTRACT_HELPER:-${PROJECT_DIR}/scripts/ci/fetch_docker_source_artifacts.py}"
+ALERTMANAGER_CONTRACT_HELPER_SHA256="b342ae7b525ad6e413dec2fc1c178ad4ebb0b108db822af8e32d994474b624df"  # pragma: allowlist secret - public AM helper SHA-256
+readonly ALERTMANAGER_CONTRACT_HELPER ALERTMANAGER_CONTRACT_HELPER_SHA256
+
+run_prometheus_contract() {
+  run_trusted_contract "$PROMETHEUS_CONTRACT_HELPER" "$PROMETHEUS_CONTRACT_HELPER_SHA256" "$@"
+}
+
+run_alertmanager_contract() {
+  run_trusted_contract "$ALERTMANAGER_CONTRACT_HELPER" "$ALERTMANAGER_CONTRACT_HELPER_SHA256" "$@"
+}
+
+validate_prometheus_image_manifest() {
+  local manifest_path="$1"
+  run_prometheus_contract --operation read-manifest --manifest "$manifest_path" --field runtime_ref
+}
+
+validate_prometheus_compose_identity() {
+  local runtime_ref="$1"
+  "${COMPOSE[@]}" config --format json | "$PYTHON_BIN" -c '
+import json
+import sys
+
+def reject_duplicates(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate rendered Compose key")
+        result[key] = value
+    return result
+
+try:
+    payload = json.load(sys.stdin, object_pairs_hook=reject_duplicates)
+except (TypeError, ValueError, json.JSONDecodeError) as exc:
+    raise SystemExit("Rendered Compose JSON is malformed") from exc
+services = payload.get("services") if type(payload) is dict else None
+prometheus = services.get("prometheus") if type(services) is dict else None
+if type(prometheus) is not dict:
+    raise SystemExit("Rendered Compose must define exactly one Prometheus service")
+if prometheus.get("image") != sys.argv[1] or prometheus.get("platform") != "linux/amd64":
+    raise SystemExit("Rendered Compose Prometheus identity does not match the manifest")
+' "$runtime_ref"
+}
+
+validate_alertmanager_contract() {
+  local compose_path="$COMPOSE_FILE"
+  local prometheus_config="$PROMETHEUS_CONFIG"
+  local rules="$PROMETHEUS_RULES"
+  local alert_config="$ALERTMANAGER_CONFIG"
+  local ignore="$ALERTMANAGER_TRIVY_IGNORE"
+  # Preserve the independently owned complete Prometheus config/rule checks.
+  "$PYTHON_BIN" - "$prometheus_config" "$rules" <<'PY_PROMETHEUS_REVIEWED'
+import hashlib
+from pathlib import Path
+import sys
+for path, expected, diagnostic in (
+    (sys.argv[1], "77c5d05a45798582decb02b055e5a15e93f7ce73471ee07939e818b4a0757960", "Prometheus configuration differs from the admitted complete file"),
+    (sys.argv[2], "82ae2fb2c68b7d580b71fe81b507de64d5e4037d8b62da631449b88ff4fd8e74", "Prometheus rules differ from the admitted complete file"),
+):
+    if hashlib.sha256(Path(path).read_bytes()).hexdigest() != expected:
+        raise SystemExit(diagnostic)
+PY_PROMETHEUS_REVIEWED
+  ALERTMANAGER_SELECTION="$(run_alertmanager_contract --alertmanager-contract-collect \
+    --compose "$compose_path" --installed-compose "$COMPOSE_FILE" \
+    --config "$alert_config" --policy "$ignore" --contour staging \
+    --profiles="${COMPOSE_PROFILES-}" --env-file "$ENV_FILE" --docker "$DOCKER_BIN")"
+  case "$ALERTMANAGER_SELECTION" in
+    'selected old'|'selected accepted'|'off old'|'off accepted') ;;
+    *) return 1 ;;
+  esac
+  ALERTMANAGER_CASE="${ALERTMANAGER_SELECTION#* }"
+  ALERTMANAGER_SELECTION="${ALERTMANAGER_SELECTION%% *}"
+}
+
+
+alertmanager_selected() {
+  [ "${ALERTMANAGER_SELECTION:?Canonical Alertmanager final admission is required}" = selected ]
+}
+
+
+
+validate_alertmanager_secret_if_selected() {
+  if "$PYTHON_BIN" - "$ENV_FILE" <<'PY'
+from pathlib import Path
+import re
+import sys
+text = Path(sys.argv[1]).read_text(encoding="utf-8")
+if re.search(r"(?m)^\s*COMPOSE_PROFILES\s*=", text):
+    raise SystemExit("COMPOSE_PROFILES must be selected by the operator, not the env file")
+PY
+  then
+    :
+  else
+    return 1
+  fi
+  if ! alertmanager_selected; then
+    return 0
+  fi
+  if [ -L "$ALERTMANAGER_SMTP_KEY" ] || [ ! -f "$ALERTMANAGER_SMTP_KEY" ]; then
+    echo "❌ Selected Alertmanager requires a regular non-symlink SMTP key" >&2
+    return 1
+  fi
+  if [ "$($STAT_BIN -c '%u:%a' "$ALERTMANAGER_SMTP_KEY")" != "${EUID}:444" ]; then
+    echo "❌ Alertmanager SMTP key must be owned by the Compose account with mode 0444" >&2
+    return 1
+  fi
+  "$PYTHON_BIN" - "$ALERTMANAGER_SMTP_KEY" <<'PY'
+import os
+import stat
+import sys
+metadata = os.lstat(sys.argv[1])
+if not stat.S_ISREG(metadata.st_mode) or metadata.st_size <= 0:
+    raise SystemExit("Selected Alertmanager requires a nonempty regular SMTP key")
+PY
+}
+
+validate_postgres_image_manifest() {
+  local manifest_path="$1"
+  "$PYTHON_BIN" - "$manifest_path" <<'PY'
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+
+manifest_path = sys.argv[1]
+expected_file_sha256 = "9aa310913af9799c39182428e0170b173fe2144367b302d7d2cafd87c93c03b2"  # pragma: allowlist secret
+expected_keys = set(
+    """
+    schema repository tag platform platform_manifest_digest config_digest runtime_ref
+    source_date_epoch containerfile_sha256 runtime_base_repository runtime_base_tag
+    runtime_base_index_digest runtime_base_platform_manifest_digest runtime_base_config_digest
+    builder_base_repository builder_base_tag builder_base_index_digest
+    builder_base_platform_manifest_digest builder_base_config_digest legacy_repository
+    legacy_tag legacy_index_digest legacy_platform_manifest_digest legacy_config_digest
+    postgres_major postgres_version runtime_user runtime_entrypoint runtime_default_pgdata
+    compose_pgdata compose_volume_target pgvector_version pgvector_source_commit
+    pgvector_source_url pgvector_source_sha256 builder_packages builder_apk_closure_count
+    builder_apk_closure_sha256 pg_config_path pg_config_version make_jobs optflags
+    builder_apk_inputs_sha256 builder_apk_index_sha256 builder_apk_input_count
+    buildkit_platform_manifest_digest buildkit_version buildx_version
+    buildx_linux_amd64_sha256
+    runtime_artifact_count runtime_artifact_inventory_sha256 trivy_version
+    mountpoint_layer_schema mountpoint_layer_digest mountpoint_layer_size
+    mountpoint_layer_diff_id mountpoint_layer_entry_count mountpoint_uid mountpoint_gid
+    mountpoint_mode mountpoint_path mountpoint_leaf_empty
+    mountpoint_base_parent_metadata_equal trivy_linux_archive_sha256 trivy_scan_contract
+    """.split()
+)
+expected_values = {
+    "schema": "pulseplate.postgres_pgvector_image_manifest.v1",
+    "repository": "ghcr.io/katsiarynakavaleuskaya/pulseplate",
+    "tag": "postgres-15.19-pgvector0.8.6-alpine3.23",
+    "platform": "linux/amd64",
+    "platform_manifest_digest": "sha256:d4437ad4970b4099e4cb7d05b7fa625c7e6959949d1374f1f2d4bd4149ae5fa3",
+    "config_digest": "sha256:643c5c00d70c37d83a0ab6db8b0996e4c03fb82c4769a45b03eef0cf3ee2abd5",
+    "runtime_user": "70",
+    "runtime_entrypoint": "/usr/local/bin/docker-entrypoint.sh",
+    "runtime_default_pgdata": "/var/lib/postgresql/15/data",
+    "compose_pgdata": "/var/lib/postgresql/data",
+    "compose_volume_target": "/var/lib/postgresql/data",
+    "postgres_major": "15",
+    "postgres_version": "15.19",
+    "pgvector_version": "0.8.6",
+    "mountpoint_layer_schema": "pulseplate.pgvector_mountpoint_layer.v1",
+    "mountpoint_layer_digest": "sha256:4c539aa857412d283fe8d55b40227fbd17b9fd6f06834f81fd98ec6796ee7396",
+    "mountpoint_layer_size": "162",
+    "mountpoint_layer_diff_id": "sha256:8cb1ace7e0c1f48d719bbdf5b4cfe9705ef407c74a3567ddc4369a6d6f023a23",
+    "mountpoint_layer_entry_count": "4",
+    "mountpoint_uid": "70",
+    "mountpoint_gid": "70",
+    "mountpoint_mode": "0700",
+    "mountpoint_path": "/var/lib/postgresql/data",
+    "mountpoint_leaf_empty": "true",
+    "mountpoint_base_parent_metadata_equal": "true",
+    "trivy_version": "0.74.0",
+    "trivy_scan_contract": "vuln,secret;os,library;HIGH,CRITICAL;exit=1;suppressions=none",
+    "buildkit_version": "0.32.2",
+}
+
+
+def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate PostgreSQL image manifest key")
+        result[key] = value
+    return result
+
+
+no_follow = getattr(os, "O_NOFOLLOW", 0)
+if no_follow <= 0 or not os.path.isabs(manifest_path):
+    raise SystemExit("PostgreSQL image manifest path is not one safe absolute path")
+descriptor = os.open(
+    manifest_path,
+    os.O_RDONLY | no_follow | getattr(os, "O_CLOEXEC", 0),
+)
+try:
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_size <= 0
+        or metadata.st_size > 64 * 1024
+    ):
+        raise SystemExit("PostgreSQL image manifest must be one bounded regular file")
+    payload = os.read(descriptor, metadata.st_size + 1)
+    if len(payload) != metadata.st_size:
+        raise SystemExit("PostgreSQL image manifest changed while being read")
+finally:
+    os.close(descriptor)
+
+if hashlib.sha256(payload).hexdigest() != expected_file_sha256:
+    raise SystemExit("PostgreSQL image manifest bytes do not match the frozen contract")
+try:
+    manifest = json.loads(
+        payload.decode("utf-8"),
+        object_pairs_hook=reject_duplicate_keys,
+        parse_constant=lambda value: (_ for _ in ()).throw(
+            ValueError(f"invalid JSON constant: {value}")
+        ),
+    )
+except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+    raise SystemExit("PostgreSQL image manifest is malformed") from exc
+if type(manifest) is not dict or set(manifest) != expected_keys:
+    raise SystemExit("PostgreSQL image manifest fields do not match the closed contract")
+if any(type(value) is not str for value in manifest.values()):
+    raise SystemExit("PostgreSQL image manifest values must be strings")
+if any(manifest[key] != value for key, value in expected_values.items()):
+    raise SystemExit("PostgreSQL image manifest identity does not match the canonical record")
+for key in (
+    "platform_manifest_digest",
+    "config_digest",
+    "containerfile_sha256",
+    "runtime_base_index_digest",
+    "runtime_base_platform_manifest_digest",
+    "runtime_base_config_digest",
+    "builder_base_index_digest",
+    "builder_base_platform_manifest_digest",
+    "builder_base_config_digest",
+    "legacy_index_digest",
+    "legacy_platform_manifest_digest",
+    "legacy_config_digest",
+    "pgvector_source_sha256",
+    "builder_apk_closure_sha256",
+    "builder_apk_inputs_sha256",
+    "builder_apk_index_sha256",
+    "buildkit_platform_manifest_digest",
+    "buildx_linux_amd64_sha256",
+    "runtime_artifact_inventory_sha256",
+    "mountpoint_layer_digest",
+    "mountpoint_layer_diff_id",
+    "trivy_linux_archive_sha256",
+):
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", manifest[key]) is None:
+        raise SystemExit(f"PostgreSQL image manifest digest is malformed: {key}")
+derived_ref = (
+    f'{manifest["repository"]}:{manifest["tag"]}@'
+    f'{manifest["platform_manifest_digest"]}'
+)
+if manifest["runtime_ref"] != derived_ref:
+    raise SystemExit("PostgreSQL runtime reference is not manifest-digest bound")
+print(manifest["runtime_ref"])
+PY
+}
+
+validate_postgres_compose_identity() {
+  local runtime_ref="$1"
+  "${COMPOSE[@]}" config --format json | "$PYTHON_BIN" -c '
+import json
+import sys
+
+def reject_duplicates(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate rendered Compose key")
+        result[key] = value
+    return result
+
+try:
+    payload = json.load(sys.stdin, object_pairs_hook=reject_duplicates)
+except (TypeError, ValueError, json.JSONDecodeError) as exc:
+    raise SystemExit("Rendered Compose JSON is malformed") from exc
+services = payload.get("services") if type(payload) is dict else None
+postgres = services.get("postgres") if type(services) is dict else None
+if type(postgres) is not dict:
+    raise SystemExit("Rendered staging Compose must define exactly one PostgreSQL service")
+if postgres.get("image") != sys.argv[1] or postgres.get("platform") != "linux/amd64":
+    raise SystemExit("Rendered staging PostgreSQL identity does not match the manifest")
+environment = postgres.get("environment")
+if type(environment) is not dict or environment.get("PGDATA") != "/var/lib/postgresql/data":
+    raise SystemExit("Rendered staging PostgreSQL PGDATA does not preserve the legacy volume root")
+volumes = postgres.get("volumes")
+if type(volumes) is not list:
+    raise SystemExit("Rendered staging PostgreSQL volumes are malformed")
+data_mounts = [
+    item
+    for item in volumes
+    if type(item) is dict and item.get("target") == "/var/lib/postgresql/data"
+]
+if len(data_mounts) != 1 or data_mounts[0].get("type") != "volume":
+    raise SystemExit("Rendered staging PostgreSQL must use one named data volume")
+if postgres.get("ports") not in (None, []):
+    raise SystemExit("Rendered staging PostgreSQL must not publish a host port")
+' "$runtime_ref"
+}
+
+validate_postgres_image_metadata() {
+  local runtime_ref="$1"
+  local inspect_subject="$2"
+  local required_image_id="$3"
+  if [ "$inspect_subject" != "$runtime_ref" ]; then
+    echo "PostgreSQL inspection subject differs from the selected reference" >&2
+    return 1
+  fi
+  local platform_digest="${runtime_ref##*@}"
+  "$DOCKER_BIN" image inspect "$inspect_subject" | "$PYTHON_BIN" -c '
+import json
+import sys
+
+def unique_object(pairs):
+    record = {}
+    for key, value in pairs:
+        if key in record:
+            raise ValueError("duplicate JSON key")
+        record[key] = value
+    return record
+
+def reject_constant(_value):
+    raise ValueError("non-JSON numeric constant")
+
+try:
+    raw = sys.stdin.buffer.read(1048577)
+    if len(raw) > 1048576:
+        raise ValueError("image inspect output too large")
+    payload = json.loads(raw, object_pairs_hook=unique_object, parse_constant=reject_constant)
+except (TypeError, ValueError, UnicodeError, RecursionError) as exc:
+    raise SystemExit("PostgreSQL image inspect JSON is malformed") from exc
+if type(payload) is not list or len(payload) != 1 or type(payload[0]) is not dict:
+    raise SystemExit("PostgreSQL image inspect must return exactly one image")
+record = payload[0]
+image_id = record.get("Id")
+if sys.argv[3] == "ghcr.io/katsiarynakavaleuskaya/pulseplate:postgres-15.19-pgvector0.8.6-alpine3.23@sha256:d4437ad4970b4099e4cb7d05b7fa625c7e6959949d1374f1f2d4bd4149ae5fa3":
+    expected_config = "sha256:643c5c00d70c37d83a0ab6db8b0996e4c03fb82c4769a45b03eef0cf3ee2abd5"
+    expected_platform = "sha256:d4437ad4970b4099e4cb7d05b7fa625c7e6959949d1374f1f2d4bd4149ae5fa3"
+    expected_base = "sha256:3a241134f6d82eb6465622af948258e41806cfb4497e6c8f0f0a64ca6c4d34db"
+elif sys.argv[3] == "ghcr.io/katsiarynakavaleuskaya/pulseplate:postgres-15.19-pgvector0.8.6-alpine3.23@sha256:06c914735c70f82424a2a9b1e57790590a21d0fbfe250504ff79a1cca2559380":
+    expected_config = "sha256:c822c68e22d0358e66cee17e06f7b3ece5d1538cb8b607c1376b59620866ceff"
+    expected_platform = "sha256:06c914735c70f82424a2a9b1e57790590a21d0fbfe250504ff79a1cca2559380"
+    expected_base = "sha256:d94fee7e5e98fcb5cd58db6ad96fc6aa844f1af6dd56aba1f87d9f8e57a7a16d"
+else:
+    raise SystemExit("PostgreSQL image reference is outside the closed transition set")
+if sys.argv[1] != expected_platform:
+    raise SystemExit("PostgreSQL selected platform identity is inconsistent")
+frozen_image_ids = {expected_config, expected_platform}
+if type(image_id) is not str or image_id not in frozen_image_ids:
+    raise SystemExit("PostgreSQL image inspect ID is outside the frozen candidate")
+if sys.argv[2] and image_id != sys.argv[2]:
+    raise SystemExit("Existing PostgreSQL image inspect ID does not match the container")
+config = record.get("Config")
+if type(config) is not dict:
+    raise SystemExit("PostgreSQL image config is malformed")
+if record.get("Os") != "linux" or record.get("Architecture") != "amd64":
+    raise SystemExit("Pulled PostgreSQL image platform is not linux/amd64")
+if config.get("User") != "70" or config.get("Entrypoint") != ["/usr/local/bin/docker-entrypoint.sh"]:
+    raise SystemExit("Pulled PostgreSQL image runtime identity is not canonical")
+environment = config.get("Env")
+required_environment = {
+    "PGDATA": "/var/lib/postgresql/15/data",
+    "PG_MAJOR": "15",
+    "PG_MINOR": "19",
+}
+
+if (
+    type(environment) is not list
+    or any(type(item) is not str for item in environment)
+):
+    raise SystemExit("Pulled PostgreSQL image version or default PGDATA drifted")
+for name, value in required_environment.items():
+    matching = [item for item in environment if item.partition("=")[0] == name]
+    if matching != [f"{name}={value}"]:
+        raise SystemExit("Pulled PostgreSQL image version or default PGDATA drifted")
+labels = config.get("Labels")
+required_labels = {
+    "com.pulseplate.pgvector.version": "0.8.6",
+    "com.pulseplate.pgvector.source-commit": "8ee86c96f0fd72390f890aa8a336fda6d3ab4c6c",
+    "com.pulseplate.postgres.base-manifest": expected_base,
+}
+if type(labels) is not dict or any(labels.get(key) != value for key, value in required_labels.items()):
+    raise SystemExit("Pulled PostgreSQL image labels do not match the closed build")
+repo_digests = record.get("RepoDigests")
+expected = f"ghcr.io/katsiarynakavaleuskaya/pulseplate@{sys.argv[1]}"
+if (
+    type(repo_digests) is not list
+    or any(type(item) is not str for item in repo_digests)
+    or expected not in repo_digests
+):
+    raise SystemExit("Pulled PostgreSQL image is not bound to the canonical GHCR digest")
+' "$platform_digest" "$required_image_id" "$runtime_ref"
+}
+
+validate_pulled_postgres_image() {
+  if [ "$1" != "$POSTGRES_RUNTIME_REF" ]; then
+    echo "Pulled PostgreSQL reference is not the selected current image" >&2
+    return 1
+  fi
+  if validate_postgres_image_metadata "$1" "$1" "" 2>/dev/null; then
+    :
+  else
+    echo "❌ Pulled PostgreSQL image metadata is not the frozen candidate" >&2
+    return 1
+  fi
+}
+
+validate_staging_database_binding() {
+  "${COMPOSE[@]}" --profile '*' config --format json | "$PYTHON_BIN" \
+    "$PROJECT_DIR/scripts/ops/check_staging_security.py" \
+    --project-dir "$PROJECT_DIR" --compose-stdin "$@"
+}
+
+validate_pulled_postgres_mountpoint() {
+  local runtime_ref="$1"
+  "$DOCKER_BIN" run --rm \
+    --platform linux/amd64 \
+    --user 70:70 \
+    --network none \
+    --cap-drop ALL \
+    --security-opt no-new-privileges:true \
+    --entrypoint /bin/sh \
+    "$runtime_ref" \
+    -ec 'test "$(stat -c "%u:%g:%a" /var/lib/postgresql/data)" = "70:70:700"; mountpoint_entry="$(find /var/lib/postgresql/data -mindepth 1 -print -quit)"; test -z "$mountpoint_entry"'
+}
+
+read_rendered_postgres_volume_name() {
+  "${COMPOSE[@]}" config --format json | "$PYTHON_BIN" -c '
+import json
+import re
+import sys
+
+try:
+    payload = json.load(sys.stdin)
+except (TypeError, ValueError, json.JSONDecodeError) as exc:
+    raise SystemExit("Rendered Compose JSON is malformed") from exc
+volumes = payload.get("volumes") if type(payload) is dict else None
+postgres_data = volumes.get("postgres_data") if type(volumes) is dict else None
+name = postgres_data.get("name") if type(postgres_data) is dict else None
+if type(name) is not str or re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}", name) is None:
+    raise SystemExit("Rendered PostgreSQL volume identity is missing or malformed")
+print(name)
+'
+}
+
+require_absent_postgres_volume() {
+  local volume_names=""
+  local volume_status=0
+  if volume_names="$("$DOCKER_BIN" volume ls --quiet)"; then
+    :
+  else
+    volume_status=$?
+    echo "❌ Unable to establish PostgreSQL volume absence; HOLD" >&2
+    return "$volume_status"
+  fi
+
+  local observed_volume=""
+  while IFS= read -r observed_volume; do
+    if [ -z "$observed_volume" ]; then
+      continue
+    fi
+    if [[ ! "$observed_volume" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$ ]]; then
+      echo "❌ Docker PostgreSQL volume listing is malformed; HOLD" >&2
+      return 1
+    fi
+    if [ "$observed_volume" = "$POSTGRES_VOLUME_NAME" ] || \
+       [ "$observed_volume" = "pulseplate-staging_postgres_data" ]; then
+      echo "❌ PostgreSQL volume exists without one trustworthy running container; HOLD" >&2
+      return 1
+    fi
+  done <<< "$volume_names"
+  "$PYTHON_BIN" "$PROJECT_DIR/scripts/ops/check_staging_security.py" \
+    --project-dir "$PROJECT_DIR" --storage-only --fresh-postgres
+}
+
+read_existing_postgres_state() {
+  local container_id="$1"
+  "$DOCKER_BIN" inspect "$container_id" | "$PYTHON_BIN" -c '
+import json
+import re
+import sys
+
+try:
+    payload = json.load(sys.stdin)
+except (TypeError, ValueError, json.JSONDecodeError) as exc:
+    raise SystemExit("Existing PostgreSQL container inspect JSON is malformed") from exc
+if type(payload) is not list or len(payload) != 1 or type(payload[0]) is not dict:
+    raise SystemExit("Existing PostgreSQL inspect must return exactly one container")
+record = payload[0]
+state = record.get("State")
+config = record.get("Config")
+mounts = record.get("Mounts")
+if type(state) is not dict or state.get("Running") is not True:
+    raise SystemExit("Existing PostgreSQL container must be running")
+health = state.get("Health")
+if type(health) is not dict or health.get("Status") != "healthy":
+    raise SystemExit("Existing PostgreSQL container must be healthy")
+if type(config) is not dict or type(config.get("Image")) is not str:
+    raise SystemExit("Existing PostgreSQL configured image is malformed")
+environment = config.get("Env")
+if type(environment) is not list or any(type(item) is not str for item in environment):
+    raise SystemExit("Existing PostgreSQL environment is malformed")
+pgdata_values = [item.removeprefix("PGDATA=") for item in environment if item.startswith("PGDATA=")]
+if pgdata_values != ["/var/lib/postgresql/data"]:
+    raise SystemExit("Existing PostgreSQL must have one exact PGDATA value")
+if type(mounts) is not list:
+    raise SystemExit("Existing PostgreSQL mounts are malformed")
+data_mounts = [item for item in mounts if type(item) is dict and item.get("Destination") == "/var/lib/postgresql/data"]
+if len(data_mounts) != 1:
+    raise SystemExit("Existing PostgreSQL must have one exact data mount")
+mount = data_mounts[0]
+if (
+    mount.get("Type") != "volume"
+    or type(mount.get("Name")) is not str
+    or mount.get("RW") is not True
+):
+    raise SystemExit("Existing PostgreSQL data mount must be one named volume")
+container = record.get("Id")
+image_id = record.get("Image")
+if type(container) is not str or re.fullmatch(r"[0-9a-f]{12,64}", container) is None:
+    raise SystemExit("Existing PostgreSQL container ID is malformed")
+if type(image_id) is not str or re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is None:
+    raise SystemExit("Existing PostgreSQL image ID is malformed")
+print("\t".join((container, image_id, config["Image"], pgdata_values[0], mount["Name"])))
+'
+}
+
+validate_existing_postgres_image_identity() {
+  local image_id="$1"
+  local configured_image="$2"
+  case "$configured_image" in
+    postgres:15-alpine | docker.io/library/postgres:15-alpine | \
+      postgres:15-alpine@sha256:a2c20749c564b4eb73a77bfda626f8a3cde1bbfae020fb97c616a00cdc1a2181 | \
+      docker.io/library/postgres:15-alpine@sha256:a2c20749c564b4eb73a77bfda626f8a3cde1bbfae020fb97c616a00cdc1a2181)
+      if [ "$image_id" != "sha256:aad6289ca337b3ce76896f2e7e61480490152886c7828120371fb28e6b779e1d" ]; then
+        echo "❌ Existing legacy PostgreSQL image ID does not match the frozen predecessor" >&2
+        return 1
+      fi
+      ;;
+    "$POSTGRES_RUNTIME_REF")
+      local platform_image_id="${POSTGRES_RUNTIME_REF##*@}"
+      if [ "$image_id" = "sha256:643c5c00d70c37d83a0ab6db8b0996e4c03fb82c4769a45b03eef0cf3ee2abd5" ] || \
+         [ "$image_id" = "$platform_image_id" ]; then
+        if validate_postgres_image_metadata \
+            "$POSTGRES_RUNTIME_REF" "$POSTGRES_RUNTIME_REF" "$image_id" 2>/dev/null; then
+          :
+        else
+          echo "❌ Existing current PostgreSQL image metadata is not the frozen candidate" >&2
+          return 1
+        fi
+      else
+        echo "❌ Existing current PostgreSQL image ID does not match the frozen candidate" >&2
+        return 1
+      fi
+      ;;
+    "ghcr.io/katsiarynakavaleuskaya/pulseplate:postgres-15.19-pgvector0.8.6-alpine3.23@sha256:06c914735c70f82424a2a9b1e57790590a21d0fbfe250504ff79a1cca2559380")
+      if [ "$image_id" = "sha256:c822c68e22d0358e66cee17e06f7b3ece5d1538cb8b607c1376b59620866ceff" ] || \
+         [ "$image_id" = "sha256:06c914735c70f82424a2a9b1e57790590a21d0fbfe250504ff79a1cca2559380" ]; then
+        if validate_postgres_image_metadata \
+            "$configured_image" "$configured_image" "$image_id" 2>/dev/null; then
+          :
+        else
+          echo "Existing prior PostgreSQL image metadata is not the frozen predecessor" >&2
+          return 1
+        fi
+      else
+        echo "Existing prior PostgreSQL image ID does not match the frozen predecessor" >&2
+        return 1
+      fi
+      ;;
+    *)
+      echo "❌ Existing PostgreSQL configured image is outside the closed transition set" >&2
+      return 1
+      ;;
+  esac
+}
+
+read_existing_postgres_runtime_state() {
+  local container_id="$1"
+  "$DOCKER_BIN" exec "$container_id" sh -ec '
+postgres_uid="$(id -u postgres)"
+server_version_num="$(psql --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" --tuples-only --no-align --quiet --command "SHOW server_version_num")"
+data_directory="$(psql --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" --tuples-only --no-align --quiet --command "SHOW data_directory")"
+test "$postgres_uid" = "70"
+test "$server_version_num" = "150019"
+test "$data_directory" = "/var/lib/postgresql/data"
+printf "%s\t%s\t%s\n" "$postgres_uid" "$server_version_num" "$data_directory"
+'
+}
+
+assert_existing_postgres_unchanged() {
+  local expected_state="$1"
+  local expected_runtime="$2"
+  local current_container=""
+  current_container="$("${COMPOSE[@]}" ps -q postgres | tr -d '\r')"
+  if [ -z "$current_container" ] || [[ "$current_container" == *$'\n'* ]]; then
+    echo "❌ Existing PostgreSQL container identity changed during transition" >&2
+    return 1
+  fi
+  if [ "$(read_existing_postgres_state "$current_container")" != "$expected_state" ]; then
+    echo "❌ Existing PostgreSQL container/image/volume identity drifted" >&2
+    return 1
+  fi
+  if [ "$(read_existing_postgres_runtime_state "$current_container")" != "$expected_runtime" ]; then
+    echo "❌ Existing PostgreSQL runtime identity drifted" >&2
+    return 1
+  fi
+}
+
+capture_running_service_container() {
+  local service="$1"
+  local container_id=""
+  local running_state=""
+  container_id="$("${COMPOSE[@]}" ps -q "$service" | tr -d '\r')"
+  if [[ "$container_id" == *$'\n'* ]]; then
+    echo "❌ Expected at most one ${service} container" >&2
+    return 1
+  fi
+  if [ -z "$container_id" ]; then
+    return 0
+  fi
+  if ! running_state="$("$DOCKER_BIN" inspect --format '{{.State.Running}}' "$container_id" | tr -d '\r')"; then
+    echo "❌ Unable to inspect ${service} container running state" >&2
+    return 1
+  fi
+  case "$running_state" in
+    true) printf '%s\n' "$container_id" ;;
+    false) ;;
+    *)
+      echo "❌ Invalid ${service} container running state" >&2
+      return 1
+      ;;
+  esac
+}
+
+worker_runtime_generation() {
+  local deadline_ns="$1"
+  "$PYTHON_BIN" - "$DOCKER_BIN" "$BACKEND_IMAGE_REF" "$BACKEND_RUNTIME_IMAGE_ID" \
+    "$deadline_ns" "${COMPOSE[@]}" <<'PY_WORKER_GATE'
+import hashlib
+import json
+import os
+import re
+import selectors
+import signal
+import subprocess
+import sys
+import time
+
+
+class GateError(Exception):
+    def __init__(self, code: str) -> None:
+        self.code = code
+
+
+class GatePending(Exception):
+    pass
+
+
+def fail(code: str) -> None:
+    raise GateError(code)
+
+
+def unique(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            fail("WORKER_JSON_UNTRUSTED")
+        value[key] = item
+    return value
+
+
+def parse(raw: bytes) -> object:
+    try:
+        return json.loads(raw, object_pairs_hook=unique,
+            parse_constant=lambda _: (_ for _ in ()).throw(ValueError("nonfinite")))
+    except (ValueError, TypeError, UnicodeError, RecursionError):
+        fail("WORKER_JSON_UNTRUSTED")
+
+
+def native(argv: list[str], *, maximum: int) -> bytes:
+    remaining = (deadline_ns - time.monotonic_ns()) / 1_000_000_000
+    if remaining <= 0:
+        fail("WORKER_GATE_TIMEOUT")
+    process = None
+    completed = False
+    selector = selectors.DefaultSelector()
+    output = bytearray()
+    try:
+        process = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+        if process.stdout is None:
+            fail("WORKER_NATIVE_FAILED")
+        os.set_blocking(process.stdout.fileno(), False)
+        selector.register(process.stdout, selectors.EVENT_READ)
+        command_deadline = min(time.monotonic() + 8, time.monotonic() + remaining)
+        while selector.get_map():
+            wait = command_deadline - time.monotonic()
+            if wait <= 0:
+                fail("WORKER_GATE_TIMEOUT")
+            for key, _ in selector.select(wait):
+                part = os.read(key.fileobj.fileno(), 8192)
+                if not part:
+                    selector.unregister(key.fileobj)
+                else:
+                    output.extend(part)
+                    if len(output) > maximum:
+                        fail("WORKER_NATIVE_OVERSIZE")
+        wait = command_deadline - time.monotonic()
+        if wait <= 0:
+            fail("WORKER_GATE_TIMEOUT")
+        if process.wait(timeout=wait) != 0:
+            fail("WORKER_NATIVE_FAILED")
+        completed = True
+        return bytes(output)
+    except (OSError, subprocess.TimeoutExpired):
+        fail("WORKER_NATIVE_FAILED")
+    finally:
+        selector.close()
+        if process is not None:
+            if not completed:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            try:
+                process.wait(timeout=0.5)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            if process.stdout is not None:
+                process.stdout.close()
+
+
+def census(service: str) -> str:
+    raw = native([docker, "ps", "--all", "--quiet", "--no-trunc",
+        "--filter", "label=com.docker.compose.project=pulseplate-staging",
+        "--filter", "label=com.docker.compose.service=" + service,
+        "--filter", "label=com.docker.compose.oneoff=False"], maximum=256)
+    try:
+        ids = raw.decode("ascii").splitlines()
+    except UnicodeError:
+        fail("WORKER_CENSUS_UNTRUSTED")
+    if service == "worker" and not ids:
+        raise GatePending()
+    if len(ids) != 1 or re.fullmatch(r"[a-f0-9]{64}", ids[0]) is None:
+        fail("WORKER_CENSUS_UNTRUSTED")
+    return ids[0]
+
+
+def inspect(container_id: str, record: object, service: str, worker_hash: str) -> dict[str, object]:
+    if type(record) is not dict:
+        fail("WORKER_INSPECT_UNTRUSTED")
+    config = record.get("config")
+    labels = record.get("labels")
+    state = record.get("state")
+    if type(config) is not dict or type(labels) is not dict or type(state) is not dict:
+        fail("WORKER_INSPECT_UNTRUSTED")
+    config_hash = labels.get("com.docker.compose.config-hash")
+    if (record.get("gate") != "worker_v1" or record.get("id") != container_id
+        or labels.get("com.docker.compose.project") != "pulseplate-staging"
+        or labels.get("com.docker.compose.service") != service
+        or labels.get("com.docker.compose.oneoff") != "False"
+        or config.get("image") != expected_ref
+        or record.get("image") != expected_image_id
+        or type(config_hash) is not str
+        or re.fullmatch(r"[a-f0-9]{64}", config_hash) is None
+        or service == "worker" and config_hash != worker_hash):
+        fail("WORKER_IDENTITY_UNTRUSTED")
+    running = state.get("running")
+    status = state.get("status")
+    exit_code = state.get("exit_code")
+    oom = state.get("oom")
+    dead = state.get("dead")
+    restarting = state.get("restarting")
+    paused = state.get("paused")
+    pid = state.get("pid")
+    restarts = record.get("restart_count")
+    started = state.get("started_at")
+    if (type(running) is not bool or type(status) is not str
+        or type(exit_code) is not int or type(oom) is not bool
+        or type(dead) is not bool or type(restarting) is not bool
+        or type(paused) is not bool or type(pid) is not int
+        or type(restarts) is not int or not 0 <= restarts <= 1_000_000):
+        fail("WORKER_STATE_UNTRUSTED")
+    if service == "worker" and status == "created" and not running and exit_code == 0:
+        raise GatePending()
+    if (not running or status != "running" or exit_code != 0
+        or oom or dead or restarting or paused or pid <= 0
+        or type(started) is not str or not started or started.startswith("0001-")):
+        fail("WORKER_STATE_UNTRUSTED")
+    if service == "worker":
+        healthcheck = config.get("healthcheck")
+        if (type(healthcheck) is not dict
+            or healthcheck.get("Test") != ["NONE"]
+            or state.get("health") is not None):
+            fail("WORKER_HEALTH_UNTRUSTED")
+    return {"id": container_id, "image": record["image"],
+        "config_hash": config_hash, "started_at": started,
+        "pid": pid, "restart_count": restarts}
+
+
+try:
+    docker, expected_ref, expected_image_id, deadline_text, *compose = sys.argv[1:]
+    if (not os.path.isabs(docker) or not os.access(docker, os.X_OK)
+        or compose[:2] != [docker, "compose"]
+        or re.fullmatch(r"ghcr\.io/katsiarynakavaleuskaya/pulseplate@sha256:[a-f0-9]{64}",
+                        expected_ref) is None
+        or re.fullmatch(r"sha256:[a-f0-9]{64}", expected_image_id) is None
+        or re.fullmatch(r"[0-9]{1,20}", deadline_text) is None):
+        fail("WORKER_GATE_INPUT_UNTRUSTED")
+    deadline_ns = int(deadline_text)
+    worker_hash_raw = native([*compose, "--profile", "*", "config", "--hash", "worker"],
+                             maximum=128)
+    if re.fullmatch(rb"worker [a-f0-9]{64}\n", worker_hash_raw) is None:
+        fail("WORKER_HASH_UNTRUSTED")
+    worker_hash = worker_hash_raw.decode("ascii").split(" ", 1)[1].strip()
+    app_id = census("app")
+    worker_id = census("worker")
+    fmt = ('{"gate":"worker_v1","id":{{json .Id}},"image":{{json .Image}},'
+        '"config":{"image":{{json .Config.Image}},'
+        '"healthcheck":{{json (index .Config "Healthcheck")}}},'
+        '"labels":{{json .Config.Labels}},'
+        '"restart_count":{{json .RestartCount}},'
+        '"state":{"running":{{json .State.Running}},'
+        '"status":{{json .State.Status}},'
+        '"exit_code":{{json .State.ExitCode}},'
+        '"oom":{{json .State.OOMKilled}},'
+        '"dead":{{json .State.Dead}},'
+        '"restarting":{{json .State.Restarting}},'
+        '"paused":{{json .State.Paused}},'
+        '"pid":{{json .State.Pid}},'
+        '"started_at":{{json .State.StartedAt}},'
+        '"health":{{json (index .State "Health")}}}}')
+    raw = native([docker, "inspect", "--format", fmt, app_id, worker_id],
+                 maximum=8192)
+    rows = raw.splitlines()
+    if len(rows) != 2:
+        fail("WORKER_INSPECT_UNTRUSTED")
+    app = inspect(app_id, parse(rows[0]), "app", worker_hash)
+    worker = inspect(worker_id, parse(rows[1]), "worker", worker_hash)
+    identity = json.dumps({"app": app, "worker": worker},
+        sort_keys=True, separators=(",", ":")).encode()
+    print(hashlib.sha256(identity).hexdigest())
+except GatePending:
+    raise SystemExit(75)
+except GateError as error:
+    raise SystemExit(error.code) from None
+except (OSError, ValueError, TypeError, IndexError, RecursionError):
+    raise SystemExit("WORKER_GATE_UNTRUSTED") from None
+PY_WORKER_GATE
+}
+
+restart_captured_product_containers() {
+  local cleanup_failed=0
+  local container_id
+  for container_id in "$CAPTURED_APP_ID" "$CAPTURED_CADDY_ID" "$CAPTURED_WORKER_ID"; do
+    if [ -n "$container_id" ]; then
+      if ! "$DOCKER_BIN" start "$container_id" >/dev/null; then
+        cleanup_failed=1
+      fi
+    fi
+  done
+  return "$cleanup_failed"
+}
+
+restart_captured_product_containers_after_failure() {
+  if ! restart_captured_product_containers; then
+    echo "❌ Restart of one or more captured product containers also failed; preserving primary exit" >&2
+  fi
+  return 0
+}
+
+validate_backup_receipt() {
+  local backup_output="$1"
+  local postgres_container_id="$2"
+  local backup_path="${backup_output##*Backup created: }"
+  if [ "$backup_path" = "$backup_output" ] || [[ "$backup_path" != "$BACKUP_DIR"/pulseplate_*.dump ]]; then
+    echo "❌ Postgres backup helper did not return one bounded receipt" >&2
+    return 1
+  fi
+  if [ -L "$backup_path" ] || [ ! -f "$backup_path" ] || [ ! -s "$backup_path" ]; then
+    echo "❌ Postgres backup receipt must be one nonempty regular non-symlink file" >&2
+    return 1
+  fi
+  local backup_mode
+  backup_mode="$($STAT_BIN -c '%a' "$backup_path")"
+  if [ "$backup_mode" != "600" ]; then
+    echo "❌ Postgres backup receipt must use mode 0600; got $backup_mode" >&2
+    return 1
+  fi
+  if ! "$DOCKER_BIN" exec -i "$postgres_container_id" pg_restore --list \
+      < "$backup_path" >/dev/null; then
+    echo "❌ Postgres backup receipt is not a listable custom-format dump" >&2
+    return 1
+  fi
+  local receipt_metadata
+  receipt_metadata="$("$PYTHON_BIN" - "$backup_path" <<'PY'
+import hashlib
+import os
+import stat
+import sys
+
+descriptor = os.open(sys.argv[1], os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+try:
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_size <= 0:
+        raise SystemExit("backup receipt metadata drifted")
+    digest = hashlib.sha256()
+    while chunk := os.read(descriptor, 1024 * 1024):
+        digest.update(chunk)
+finally:
+    os.close(descriptor)
+print(f"size={metadata.st_size} sha256={digest.hexdigest()}")
+PY
+)"
+  printf 'Verified PostgreSQL backup metadata: %s\n' "$receipt_metadata" >&2
+  printf '%s\n' "$backup_path"
+}
+
+validate_pulled_prometheus_image() {
+  local runtime_ref="$1"
+  "$DOCKER_BIN" image inspect "$runtime_ref" | \
+    run_prometheus_contract --operation inspect-image --manifest "$PROMETHEUS_IMAGE_MANIFEST"
+}
+
+validate_pulled_alertmanager_image() {
+  local selected_ref
+  selected_ref="$(run_alertmanager_contract --alertmanager-contract --phase selected-image \
+    --selected-case "$ALERTMANAGER_CASE" --field runtime_ref)"
+  "$DOCKER_BIN" image inspect "$selected_ref" | run_alertmanager_contract \
+    --alertmanager-contract --phase selected-image --selected-case "$ALERTMANAGER_CASE"
+}
+
+
+read_pulled_backend_image_id() {
+  local runtime_ref="$1"
+  "$PYTHON_BIN" - "$DOCKER_BIN" "$runtime_ref" <<'PY_BACKEND_IMAGE'
+import json
+import os
+import re
+import selectors
+import signal
+import subprocess
+import sys
+import time
+
+def unique(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate")
+        result[key] = value
+    return result
+
+process = None
+completed = False
+selector = selectors.DefaultSelector()
+try:
+    docker, expected_ref = sys.argv[1:]
+    if not os.path.isabs(docker) or not os.access(docker, os.X_OK):
+        raise ValueError("docker")
+    process = subprocess.Popen(
+        [docker, "image", "inspect", expected_ref],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    if process.stdout is None:
+        raise ValueError("stdout")
+    os.set_blocking(process.stdout.fileno(), False)
+    selector.register(process.stdout, selectors.EVENT_READ)
+    deadline = time.monotonic() + 8
+    output = bytearray()
+    while selector.get_map():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ValueError("timeout")
+        for key, _ in selector.select(remaining):
+            chunk = os.read(key.fileobj.fileno(), 8192)
+            if not chunk:
+                selector.unregister(key.fileobj)
+            else:
+                output.extend(chunk)
+                if len(output) > 65536:
+                    raise ValueError("oversize")
+    remaining = deadline - time.monotonic()
+    if remaining <= 0 or process.wait(timeout=remaining) != 0:
+        raise ValueError("native")
+    raw = bytes(output)
+    if not raw:
+        raise ValueError("oversize")
+    payload = json.loads(raw, object_pairs_hook=unique,
+        parse_constant=lambda _: (_ for _ in ()).throw(ValueError("nonfinite")))
+    if type(payload) is not list or len(payload) != 1 or type(payload[0]) is not dict:
+        raise ValueError("cardinality")
+    item = payload[0]
+    image_id = item.get("Id")
+    digests = item.get("RepoDigests")
+    if (item.get("Os") != "linux" or item.get("Architecture") != "amd64"
+        or type(image_id) is not str
+        or re.fullmatch(r"sha256:[a-f0-9]{64}", image_id) is None
+        or type(digests) is not list
+        or not all(type(value) is str for value in digests)
+        or expected_ref not in digests):
+        raise ValueError("identity")
+    completed = True
+except (ValueError, TypeError, UnicodeError, OSError, subprocess.TimeoutExpired):
+    raise SystemExit("WORKER_BACKEND_IMAGE_UNTRUSTED") from None
+finally:
+    selector.close()
+    if process is not None:
+        if not completed:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=0.5)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        if process.stdout is not None:
+            process.stdout.close()
+print(image_id)
+PY_BACKEND_IMAGE
+}
+
+export STAGING_IMAGE_REF="$BACKEND_IMAGE_REF"
+export STAGING_CADDY_IMAGE_REF="$CADDY_IMAGE_REF"
+export STAGING_ENV_FILE="$ENV_FILE"
+
+scheduler_mode_seen=0
+scheduler_mode=""
+if [ "${FOOD_UPDATE_SCHEDULER_MODE+x}" = "x" ]; then
+  scheduler_mode="$FOOD_UPDATE_SCHEDULER_MODE"
+  scheduler_mode_seen=1
+else
+  env_line=""
+  while IFS= read -r env_line || [ -n "$env_line" ]; do
+    case "$env_line" in
+      FOOD_UPDATE_SCHEDULER_MODE=*)
+        if [ "$scheduler_mode_seen" -eq 1 ]; then
+          echo "❌ Duplicate FOOD_UPDATE_SCHEDULER_MODE entries in staging env file" >&2
+          exit 1
+        fi
+        raw_scheduler_mode="${env_line#*=}"
+        if [[ "$raw_scheduler_mode" =~ ^[[:space:]]*(external|disabled|in_process_dev)[[:space:]]*$ ]] || \
+           [[ "$raw_scheduler_mode" =~ ^[[:space:]]*(external|disabled|in_process_dev)[[:space:]]+\#.*$ ]]; then
+          scheduler_mode="${BASH_REMATCH[1]}"
+        else
+          scheduler_mode="$raw_scheduler_mode"
+        fi
+        scheduler_mode_seen=1
+        ;;
+    esac
+  done < "$ENV_FILE"
+fi
+if [ "$scheduler_mode_seen" -eq 0 ]; then
+  scheduler_mode="external"
+fi
+case "$scheduler_mode" in
+  external|disabled)
+    ;;
+  in_process_dev)
+    echo "❌ Staging deploy forbids FOOD_UPDATE_SCHEDULER_MODE=in_process_dev" >&2
+    exit 1
+    ;;
+  *)
+    echo "❌ FOOD_UPDATE_SCHEDULER_MODE must be exactly external or disabled" >&2
+    exit 1
+    ;;
+esac
+FOOD_UPDATE_SCHEDULER_MODE="$scheduler_mode"
+export FOOD_UPDATE_SCHEDULER_MODE
+WORKER_TIMEOUT_BIN=""
+if [ "$FOOD_UPDATE_SCHEDULER_MODE" = "external" ]; then
+  if ! WORKER_TIMEOUT_BIN="$(command -v timeout)"; then
+    echo "❌ Bounded worker start requires an absolute timeout executable" >&2
+    exit 1
+  fi
+  if [[ "$WORKER_TIMEOUT_BIN" != /* ]] || [ ! -x "$WORKER_TIMEOUT_BIN" ]; then
+    echo "❌ Bounded worker start requires an absolute timeout executable" >&2
+    exit 1
+  fi
+fi
+readonly WORKER_TIMEOUT_BIN
+
+STAGING_DOMAIN=${STAGING_DOMAIN:?"STAGING_DOMAIN not set"}
+
+DOCKER_BIN="${DOCKER_BIN:-}"
+if [ -z "$DOCKER_BIN" ]; then
+  DOCKER_BIN="$(command -v docker || :)"
+fi
+if [[ "$DOCKER_BIN" != /* ]] || [ ! -x "$DOCKER_BIN" ]; then
+  echo "❌ An absolute docker executable is required" >&2
+  exit 1
+fi
+
+verify_application_database_tls() {
+  "${COMPOSE[@]}" run --rm --no-deps app python -c \
+  'import os; import psycopg; url=os.environ["DATABASE_URL"].replace("postgresql+psycopg://", "postgresql://", 1); connection=psycopg.connect(url, connect_timeout=10); row=connection.execute("SELECT ssl, version FROM pg_stat_ssl WHERE pid=pg_backend_pid()").fetchone(); assert row and row[0] is True and row[1] in ("TLSv1.2", "TLSv1.3"); connection.close()'
+}
+
+COMPOSE=("$DOCKER_BIN" compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE")
+
+PROMETHEUS_RUNTIME_REF="$(validate_prometheus_image_manifest "$PROMETHEUS_IMAGE_MANIFEST")"
+export PROMETHEUS_RUNTIME_REF
+readonly PROMETHEUS_RUNTIME_REF
+PROMETHEUS_PLATFORM_MANIFEST_DIGEST="${PROMETHEUS_RUNTIME_REF##*@}"
+readonly PROMETHEUS_PLATFORM_MANIFEST_DIGEST
+POSTGRES_RUNTIME_REF="$(validate_postgres_image_manifest "$POSTGRES_IMAGE_MANIFEST")"
+readonly POSTGRES_RUNTIME_REF
+
+docker_architecture="$($DOCKER_BIN info --format '{{.Architecture}}')"
+case "$docker_architecture" in
+  amd64|x86_64) ;;
+  *)
+    echo "❌ Staging artifacts are linux/amd64 only; host reports $docker_architecture" >&2
+    exit 1
+    ;;
+esac
+
+"${COMPOSE[@]}" config --quiet
+validate_prometheus_compose_identity "$PROMETHEUS_RUNTIME_REF"
+validate_alertmanager_contract
+validate_alertmanager_secret_if_selected
+validate_postgres_compose_identity "$POSTGRES_RUNTIME_REF"
+validate_staging_database_binding
+admitted_backup_dir="$("$PYTHON_BIN" "$PROJECT_DIR/scripts/ops/check_staging_security.py" --project-dir "$PROJECT_DIR" --storage-only --print-backup-dir)"
+if [ "$BACKUP_DIR" != "$admitted_backup_dir" ]; then
+  echo "Staging backups must use the admitted encrypted mount" >&2
+  exit 1
+fi
+POSTGRES_VOLUME_NAME="$(read_rendered_postgres_volume_name)"
+readonly POSTGRES_VOLUME_NAME
+
+if [ "$PREFLIGHT_ONLY" -eq 1 ]; then
+  echo "✅ Staging deploy preflight passed (contract v${STAGING_DEPLOY_CONTRACT_VERSION})"
+  exit 0
+fi
+
+GHCR_TOKEN=${GHCR_TOKEN:?"GHCR_TOKEN not set"}
+GHCR_USER=${GHCR_USER:?"GHCR_USER not set"}
+
+CURL_BIN="${CURL_BIN:-}"
+if [ -z "$CURL_BIN" ]; then
+  CURL_BIN="$(command -v curl || :)"
+fi
+if [ -z "$CURL_BIN" ] || [ ! -x "$CURL_BIN" ]; then
+  echo "❌ curl executable is required" >&2
+  exit 1
+fi
+
+umask 077
+DOCKER_CONFIG="$(mktemp -d "${TMPDIR:-/tmp}/pulseplate-docker-config.XXXXXX")"
+export DOCKER_CONFIG
+cleanup() {
+  local original_status=$?
+  local cleanup_failed=0
+  trap - EXIT
+  case "$DOCKER_CONFIG" in
+    "${TMPDIR:-/tmp}"/pulseplate-docker-config.*)
+      if [ -d "$DOCKER_CONFIG" ] && [ ! -L "$DOCKER_CONFIG" ]; then
+        if ! rm -rf -- "$DOCKER_CONFIG"; then
+          cleanup_failed=1
+        fi
+      else
+        echo "❌ Refusing cleanup for an unsafe Docker credential path" >&2
+        cleanup_failed=1
+      fi
+      ;;
+    *)
+      echo "❌ Refusing cleanup for an unbounded Docker credential path" >&2
+      cleanup_failed=1
+      ;;
+  esac
+  if [ "$original_status" -eq 0 ] && [ "$cleanup_failed" -ne 0 ]; then
+    original_status=1
+  elif [ "$original_status" -ne 0 ] && [ "$cleanup_failed" -ne 0 ]; then
+    echo "❌ Docker credential cleanup also failed; preserving primary exit $original_status" >&2
+  fi
+  exit "$original_status"
+}
+trap cleanup EXIT
+
+HEALTH_MAX_ATTEMPTS="${HEALTH_MAX_ATTEMPTS:-30}"
+HEALTH_SLEEP_S="${HEALTH_SLEEP_S:-2}"
+HEALTH_CURL_MAX_TIME_S="${HEALTH_CURL_MAX_TIME_S:-10}"
+
+echo "[1/5] Login to GHCR with temporary credentials"
+printf '%s' "$GHCR_TOKEN" | "$DOCKER_BIN" login ghcr.io -u "$GHCR_USER" --password-stdin
+
+echo "[2/5] Pull exact backend, Caddy, PostgreSQL, and Prometheus digests"
+"${COMPOSE[@]}" pull app caddy postgres prometheus
+echo "Pull scheduler worker from the exact backend digest"
+"${COMPOSE[@]}" pull worker
+if alertmanager_selected; then
+  "${COMPOSE[@]}" --profile alerting pull alertmanager
+fi
+if BACKEND_RUNTIME_IMAGE_ID="$(read_pulled_backend_image_id "$BACKEND_IMAGE_REF")"; then
+  readonly BACKEND_RUNTIME_IMAGE_ID
+else
+  echo "❌ Pulled backend image identity is untrusted; HOLD before product mutation" >&2
+  exit 1
+fi
+echo "Validating the pulled Prometheus platform manifest before product mutation"
+validate_pulled_prometheus_image "$PROMETHEUS_RUNTIME_REF"
+if alertmanager_selected; then
+  validate_pulled_alertmanager_image
+fi
+echo "Validating the pulled PostgreSQL platform manifest before product mutation"
+validate_pulled_postgres_image "$POSTGRES_RUNTIME_REF"
+echo "Validating the pulled PostgreSQL empty UID 70 mountpoint before product mutation"
+validate_pulled_postgres_mountpoint "$POSTGRES_RUNTIME_REF"
+
+# Verify the original publisher identity before any product state transition.
+GH_TOKEN="$GHCR_TOKEN" GITHUB_TOKEN="$GHCR_TOKEN" "$PYTHON_BIN" \
+  "$PROJECT_DIR/scripts/ci/check_pgvector_attestations.py" verify \
+  --manifest "$POSTGRES_IMAGE_MANIFEST" \
+  --repo Katsiarynakavaleuskaya/PulsePlate \
+  --signer-workflow Katsiarynakavaleuskaya/PulsePlate/.github/workflows/cd.yml \
+  --source-ref refs/heads/main \
+  --json-out "$DOCKER_CONFIG/postgres-verification.json"
+
+backend_ids="$("$DOCKER_BIN" run --rm --network none --entrypoint python \
+  "$BACKEND_IMAGE_REF" -c 'import os; print(str(os.getuid()) + ":" + str(os.getgid()))')"
+"$PYTHON_BIN" - "$PROJECT_DIR/.staging-storage.json" "$backend_ids" <<'PY_BACKEND_ID'
+import json
+from pathlib import Path
+import sys
+receipt = json.loads(Path(sys.argv[1]).read_text())
+if sys.argv[2] != str(receipt["backend_uid"]) + ":" + str(receipt["backend_gid"]):
+    raise SystemExit("Backend runtime user differs from the protected libpq passfile owner")
+PY_BACKEND_ID
+"$DOCKER_BIN" logout ghcr.io >/dev/null
+if [ -L "$DOCKER_CONFIG/config.json" ]; then
+  echo "❌ Docker credential file became a symlink" >&2
+  exit 1
+fi
+rm -f -- "$DOCKER_CONFIG/config.json"
+unset GHCR_TOKEN GHCR_USER
+
+echo "Validating the exact Prometheus configuration before product mutation"
+"$DOCKER_BIN" run --rm --pull never --platform linux/amd64 --network none --read-only \
+  --user 65532:65532 --cap-drop ALL --security-opt no-new-privileges:true \
+  --mount "type=bind,source=$PROMETHEUS_CONFIG,target=/etc/prometheus/prometheus.yml,readonly" \
+  --mount "type=bind,source=$PROMETHEUS_RULES,target=/etc/prometheus/alias-alerts.yml,readonly" \
+  --mount "type=bind,source=$METRICS_SECRET_FILE,target=/run/secrets/pulseplate_metrics_scrape_key,readonly" \
+  --entrypoint /bin/promtool "$PROMETHEUS_RUNTIME_REF" \
+  check config /etc/prometheus/prometheus.yml
+"$DOCKER_BIN" run --rm --pull never --platform linux/amd64 --network none --read-only \
+  --user 65532:65532 --cap-drop ALL --security-opt no-new-privileges:true \
+  --mount "type=bind,source=$PROMETHEUS_RULES,target=/etc/prometheus/alias-alerts.yml,readonly" \
+  --entrypoint /bin/promtool "$PROMETHEUS_RUNTIME_REF" \
+  check rules /etc/prometheus/alias-alerts.yml
+
+if alertmanager_selected; then
+  "$DOCKER_BIN" run --rm --pull never --platform linux/amd64 --network none --read-only \
+    --user 65534:65534 --cap-drop ALL --security-opt no-new-privileges:true \
+    --mount "type=bind,source=$ALERTMANAGER_CONFIG,target=/etc/alertmanager/alertmanager.yml,readonly" \
+    --entrypoint /bin/amtool \
+    "$(run_alertmanager_contract --alertmanager-contract --phase selected-image --selected-case "$ALERTMANAGER_CASE" --field runtime_ref)" \
+    check-config /etc/alertmanager/alertmanager.yml
+fi
+
+echo "Invoking the canonical application production invariant before product mutation"
+"${COMPOSE[@]}" run --rm --no-deps app python -c \
+  'from app.main import app; from app.security.production_invariants import assert_production_runtime_invariants; assert_production_runtime_invariants(app=app)'
+
+# Recheck mount and TLS immediately before the bounded product transition.
+validate_staging_database_binding
+
+echo "[3/5] Census and quiesce the current product before PostgreSQL transition"
+CAPTURED_WORKER_ID="$(capture_running_service_container worker)"
+CAPTURED_CADDY_ID="$(capture_running_service_container caddy)"
+CAPTURED_APP_ID="$(capture_running_service_container app)"
+readonly CAPTURED_WORKER_ID CAPTURED_CADDY_ID CAPTURED_APP_ID
+
+postgres_container_raw="$("${COMPOSE[@]}" ps -q postgres | tr -d '\r')"
+if [[ "$postgres_container_raw" == *$'\n'* ]]; then
+  echo "❌ Expected at most one existing PostgreSQL container" >&2
+  exit 1
+fi
+postgres_transition="fresh"
+postgres_container=""
+postgres_image_id=""
+postgres_configured_image=""
+_postgres_pgdata=""
+postgres_volume=""
+postgres_state_receipt=""
+postgres_runtime_receipt=""
+if [ -n "$postgres_container_raw" ]; then
+  postgres_transition="existing"
+  postgres_state_receipt="$(read_existing_postgres_state "$postgres_container_raw")"
+  IFS=$'\t' read -r postgres_container postgres_image_id postgres_configured_image \
+    _postgres_pgdata postgres_volume <<< "$postgres_state_receipt"
+  validate_existing_postgres_image_identity "$postgres_image_id" "$postgres_configured_image"
+  postgres_runtime_receipt="$(read_existing_postgres_runtime_state "$postgres_container")"
+  if [ "$postgres_volume" != "$POSTGRES_VOLUME_NAME" ]; then
+    echo "❌ Existing PostgreSQL volume does not match rendered Compose identity" >&2
+    exit 1
+  fi
+  # The password file cannot rotate a persisted role. Prove the exact new app
+  # credentials against the running predecessor over verified TLS before stops.
+  if verify_application_database_tls >/dev/null 2>&1; then
+    :
+  else
+    credential_status=$?
+    echo "❌ Existing PostgreSQL rejected the admitted application TLS/passfile connection; HOLD for an explicit verified credential/TLS migration before quiescence" >&2
+    exit "$credential_status"
+  fi
+else
+  require_absent_postgres_volume
+fi
+
+if "${COMPOSE[@]}" stop worker caddy app; then
+  :
+else
+  transition_status=$?
+  restart_captured_product_containers_after_failure
+  exit "$transition_status"
+fi
+
+if [ "$postgres_transition" = "existing" ]; then
+  if assert_existing_postgres_unchanged "$postgres_state_receipt" "$postgres_runtime_receipt"; then
+    :
+  else
+    identity_status=$?
+    echo "❌ PostgreSQL identity revalidation failed; captured product writers remain quiesced" >&2
+    exit "$identity_status"
+  fi
+  echo "Creating a verified backup from the still-running old PostgreSQL container"
+  backup_output=""
+  if backup_output="$(
+      export DOCKER_BIN BACKUP_DIR PROJECT_DIR COMPOSE_FILE ENV_FILE
+      "$BACKUP_HELPER"
+    )"; then
+    :
+  else
+    backup_status=$?
+    echo "❌ PostgreSQL backup execution failed ambiguously; captured product writers remain quiesced" >&2
+    exit "$backup_status"
+  fi
+  if backup_receipt="$(validate_backup_receipt "$backup_output" "$postgres_container")"; then
+    :
+  else
+    receipt_status=$?
+    echo "❌ PostgreSQL backup receipt validation failed; captured product writers remain quiesced" >&2
+    exit "$receipt_status"
+  fi
+  if assert_existing_postgres_unchanged "$postgres_state_receipt" "$postgres_runtime_receipt"; then
+    :
+  else
+    identity_status=$?
+    echo "❌ PostgreSQL identity revalidation failed; captured product writers remain quiesced" >&2
+    exit "$identity_status"
+  fi
+  echo "Verified pre-transition backup receipt: $backup_receipt"
+  if "$DOCKER_BIN" stop "$postgres_container" >/dev/null; then
+    :
+  else
+    stop_status=$?
+    echo "❌ PostgreSQL stop failed ambiguously; captured product writers remain quiesced" >&2
+    exit "$stop_status"
+  fi
+else
+  echo "Fresh PostgreSQL path admitted: rendered named volume is absent"
+fi
+
+"$PYTHON_BIN" "$PROJECT_DIR/scripts/ops/check_staging_security.py" --project-dir "$PROJECT_DIR" --storage-only
+if [ "$postgres_transition" = "fresh" ]; then
+  if require_absent_postgres_volume; then
+    :
+  else
+    fresh_volume_status=$?
+    echo "❌ Fresh PostgreSQL volume revalidation failed; captured product writers remain quiesced" >&2
+    exit "$fresh_volume_status"
+  fi
+fi
+
+echo "Starting the already pulled exact PostgreSQL candidate without registry access"
+"${COMPOSE[@]}" up -d --pull never postgres
+
+max_wait=60
+wait_count=0
+while [ "$wait_count" -lt "$max_wait" ]; do
+  postgres_container="$("${COMPOSE[@]}" ps -q postgres | tr -d '\n\r ')"
+  postgres_health="unknown"
+  if [ -n "$postgres_container" ]; then
+    if inspected_health="$($DOCKER_BIN inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$postgres_container" 2>/dev/null)"; then
+      postgres_health="$inspected_health"
+    fi
+  fi
+  if [ -n "$postgres_container" ] && [ "$postgres_health" = "healthy" ]; then
+    echo "Postgres is healthy"
+    break
+  fi
+  wait_count=$((wait_count + 1))
+  echo "Waiting for postgres... ($wait_count/$max_wait)"
+  sleep 1
+done
+
+if [ "$wait_count" -eq "$max_wait" ]; then
+  echo "❌ Postgres failed to become healthy within $max_wait seconds" >&2
+  exit 1
+fi
+
+echo "[4/5] Run migrations while public traffic and writers remain quiesced"
+
+echo "Running database migrations in a one-shot container"
+if "${COMPOSE[@]}" run --rm --no-deps app alembic upgrade head; then
+  echo "✅ Database migrations completed successfully"
+else
+  migration_exit_code=$?
+  echo "❌ Database migrations failed (exit code: $migration_exit_code)" >&2
+  echo "Caddy and app remain stopped; restore the pre-migration backup before retrying if needed" >&2
+  exit "$migration_exit_code"
+fi
+
+echo "Verify actual TLS from the application connection before exposing the product"
+verify_application_database_tls
+
+echo "Starting app after successful migrations"
+"${COMPOSE[@]}" up -d --pull never app
+
+max_wait=30
+wait_count=0
+app_container=""
+while [ "$wait_count" -lt "$max_wait" ]; do
+  app_container="$("${COMPOSE[@]}" ps -q app | tr -d '\n\r ')"
+  if [ -n "$app_container" ] && \
+     "$DOCKER_BIN" exec "$app_container" python -c \
+       "import urllib.request; urllib.request.urlopen('http://localhost:8000/ready', timeout=5).read()" \
+       2>/dev/null; then
+    echo "App is ready"
+    break
+  fi
+  wait_count=$((wait_count + 1))
+  echo "Waiting for app readiness... ($wait_count/$max_wait)"
+  sleep 1
+done
+
+if [ "$wait_count" -eq "$max_wait" ]; then
+  echo "❌ App failed to become ready within $max_wait seconds" >&2
+  exit 1
+fi
+
+if [ "$FOOD_UPDATE_SCHEDULER_MODE" = "external" ]; then
+  echo "Starting scheduler worker after app readiness"
+  worker_deadline_ns="$("$PYTHON_BIN" -c 'import time; print(time.monotonic_ns() + 30_000_000_000)')"
+  if "$WORKER_TIMEOUT_BIN" --signal=TERM --kill-after=2s 25s \
+      "${COMPOSE[@]}" up -d --pull never --no-deps worker >/dev/null 2>&1; then
+    :
+  else
+    echo "❌ Worker start failed or timed out; outcome may be partial; HOLD before Caddy" >&2
+    exit 1
+  fi
+  worker_generation=""
+  worker_stable=0
+  worker_attempt=0
+  while [ "$worker_attempt" -lt 5 ]; do
+    if worker_sample="$(worker_runtime_generation "$worker_deadline_ns")"; then
+      if [ -n "$worker_generation" ]; then
+        if [ "$worker_sample" != "$worker_generation" ]; then
+          echo "❌ Worker or app generation changed during startup; HOLD before Caddy" >&2
+          exit 1
+        fi
+        worker_stable=1
+        break
+      fi
+      worker_generation="$worker_sample"
+    else
+      worker_gate_status=$?
+      if [ "$worker_gate_status" -ne 75 ]; then
+        echo "❌ Worker running/identity gate rejected startup; HOLD before Caddy" >&2
+        exit 1
+      fi
+    fi
+    worker_attempt=$((worker_attempt + 1))
+    sleep 1
+  done
+  if [ "$worker_stable" -ne 1 ]; then
+    echo "❌ Worker did not hold one stable running generation; HOLD before Caddy" >&2
+    exit 1
+  fi
+  validate_staging_database_binding --storage-only
+  readonly worker_generation
+else
+  echo "Scheduler mode is disabled; worker container remains absent"
+  "${COMPOSE[@]}" rm -f worker
+fi
+
+echo "[5/5] Start Caddy after successful migrations"
+"${COMPOSE[@]}" up -d --pull never caddy
+
+DOMAIN="$STAGING_DOMAIN"
+HEALTH_URL="https://${DOMAIN}/ready"
+attempt=0
+
+echo "Diagnostic HTTP smoke check..."
+if "$CURL_BIN" -sS -o /dev/null -w "HTTP:%{http_code}\n" \
+  "http://${DOMAIN}/ready" --resolve "${DOMAIN}:80:127.0.0.1" \
+  --max-time "$HEALTH_CURL_MAX_TIME_S"; then
+  :
+else
+  echo "⚠️  HTTP redirect diagnostic failed; continuing to the required HTTPS check" >&2
+fi
+
+while [ "$attempt" -lt "$HEALTH_MAX_ATTEMPTS" ]; do
+  attempt=$((attempt + 1))
+  echo "Health check attempt $attempt/$HEALTH_MAX_ATTEMPTS..."
+  if curl_output="$("$CURL_BIN" -fsS --max-time "$HEALTH_CURL_MAX_TIME_S" \
+    "$HEALTH_URL" --resolve "${DOMAIN}:443:127.0.0.1" 2>&1)"; then
+    echo "✅ Health check successful"
+    break
+  else
+    curl_exit_code=$?
+    echo "❌ Health check failed (exit code: $curl_exit_code)" >&2
+    echo "Error details: $curl_output" >&2
+    if [ "$attempt" -eq "$HEALTH_MAX_ATTEMPTS" ]; then
+      echo "❌ Health check failed after ${HEALTH_MAX_ATTEMPTS} attempts" >&2
+      exit 1
+    fi
+    sleep "$HEALTH_SLEEP_S"
+  fi
+done
+
+if [ "$FOOD_UPDATE_SCHEDULER_MODE" = "external" ]; then
+  echo "Rechecking the same worker and app generation after HTTPS"
+  worker_recheck_deadline_ns="$("$PYTHON_BIN" -c 'import time; print(time.monotonic_ns() + 10_000_000_000)')"
+  if worker_after_https="$(worker_runtime_generation "$worker_recheck_deadline_ns")"; then
+    if [ "$worker_after_https" != "$worker_generation" ]; then
+      echo "❌ Worker or app generation changed after HTTPS; Caddy may be running; HOLD" >&2
+      exit 1
+    fi
+  else
+    echo "❌ Worker running/identity recheck failed after HTTPS; Caddy may be running; HOLD" >&2
+    exit 1
+  fi
+fi
+
+validate_staging_database_binding --storage-only
+echo "Starting Prometheus after complete product health"
+if "${COMPOSE[@]}" up -d --pull never prometheus; then
+  :
+else
+  prometheus_start_status=$?
+  echo "❌ Prometheus failed to start; app and Caddy remain running" >&2
+  exit "$prometheus_start_status"
+fi
+
+prometheus_attempt=0
+prometheus_ready=0
+while [ "$prometheus_attempt" -lt "$HEALTH_MAX_ATTEMPTS" ]; do
+  prometheus_attempt=$((prometheus_attempt + 1))
+  if "${COMPOSE[@]}" exec -T prometheus /bin/promtool check ready \
+      --url=http://localhost:9090 >/dev/null 2>&1 && \
+     "${COMPOSE[@]}" exec -T prometheus /bin/promtool check healthy \
+      --url=http://localhost:9090 >/dev/null 2>&1; then
+    prometheus_ready=1
+    break
+  fi
+  echo "Waiting for Prometheus readiness... ($prometheus_attempt/$HEALTH_MAX_ATTEMPTS)"
+  if [ "$prometheus_attempt" -lt "$HEALTH_MAX_ATTEMPTS" ]; then
+    sleep "$HEALTH_SLEEP_S"
+  fi
+done
+
+if [ "$prometheus_ready" -ne 1 ]; then
+  echo "❌ Prometheus telemetry readiness failed; app and Caddy remain running and prometheus_data is preserved" >&2
+  exit 1
+fi
+
+echo "✅ Staging deployed by attested digests"
+echo "Backend: $BACKEND_IMAGE_REF"
+echo "Caddy:   $CADDY_IMAGE_REF"

@@ -1,0 +1,1728 @@
+"""Deterministic tests for PR-size governance."""
+
+from __future__ import annotations
+
+import io
+import importlib
+import json
+import os
+from pathlib import Path
+import subprocess
+from types import SimpleNamespace
+
+import pytest
+
+import scripts.ci.check_pr_size_governance as size_gate
+from scripts.orchestration.bootstrap_sync_policy import requires_security_review
+
+TRUSTED_EMERGENCY = {"operator-approved", "scope/emergency-approved"}
+TRUSTED_PRIVILEGED = {"operator-approved", "scope/privileged-approved"}
+TRUSTED_FRONTEND_MVP = {"operator-approved", "scope/frontend-mvp-approved"}
+TRUSTED_FRONTEND_MIX = {
+    "operator-approved",
+    "scope/frontend-mvp-approved",
+    "scope/frontend-backend-mix-approved",
+}
+
+
+GENERATED_OPENAPI_PATHS = (
+    "frontend/src/api/openapi.json",
+    "frontend/src/api/schema.ts",
+)
+
+
+@pytest.mark.parametrize("path", GENERATED_OPENAPI_PATHS)
+@pytest.mark.parametrize(
+    ("mode", "object_type", "admitted"),
+    [
+        ("100644", "blob", True),
+        ("120000", "blob", False),
+        ("100755", "blob", False),
+        ("160000", "commit", False),
+    ],
+)
+def test_generated_openapi_exemption_requires_exact_head_regular_blob(
+    path: str,
+    mode: str,
+    object_type: str,
+    admitted: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only a regular head blob can admit either exact generated path."""
+    head_sha = "c" * 40
+    tree_output = f"{mode} {object_type} {'a' * 40}\t{path}\0".encode()
+
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
+        """Assert the tree probe binds both literal paths to the requested head."""
+        assert argv == [
+            size_gate.GIT_BINARY,
+            "ls-tree",
+            "-r",
+            "-z",
+            "--full-tree",
+            head_sha,
+            "--",
+            *sorted(GENERATED_OPENAPI_PATHS),
+        ]
+        assert kwargs["cwd"] == size_gate.REPO_ROOT
+        assert kwargs["check"] is True
+        assert kwargs["capture_output"] is True
+        assert kwargs["text"] is False
+        return SimpleNamespace(stdout=tree_output)
+
+    monkeypatch.setattr(size_gate.subprocess, "run", fake_run)
+    result = size_gate.collect_regular_generated_openapi_paths(head_sha=head_sha)
+    assert result == (frozenset({path}) if admitted else frozenset())
+
+
+@pytest.mark.parametrize(
+    "tree_output",
+    [
+        b"garbage\0",
+        b"100644 blob " + b"a" * 40 + b"\tfrontend/src/api/openapi.json",
+        2 * (b"100644 blob " + b"a" * 40 + b"\tfrontend/src/api/openapi.json\0"),
+        b"100644 blob " + b"a" * 40 + b"\tfrontend/src/api/neighbor.json\0",
+        b"\0",
+    ],
+)
+def test_generated_openapi_tree_output_fails_on_untrusted_records(
+    tree_output: bytes,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reject malformed, duplicated and neighboring Git tree records."""
+    monkeypatch.setattr(
+        size_gate.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(stdout=tree_output),
+    )
+    with pytest.raises(ValueError):
+        size_gate.collect_regular_generated_openapi_paths(head_sha="c" * 40)
+
+
+def test_generated_openapi_tree_allows_missing_paths_but_blocks_git_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing tree path is ineligible while a failed Git probe is fatal."""
+    monkeypatch.setattr(
+        size_gate.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(stdout=b""),
+    )
+    assert size_gate.collect_regular_generated_openapi_paths(head_sha="c" * 40) == frozenset()
+
+    def fail_git(*args: object, **kwargs: object) -> SimpleNamespace:
+        """Model a failed Git tree invocation without weakening the gate."""
+        raise subprocess.CalledProcessError(128, "git ls-tree")
+
+    monkeypatch.setattr(size_gate.subprocess, "run", fail_git)
+    with pytest.raises(subprocess.CalledProcessError):
+        size_gate.collect_regular_generated_openapi_paths(head_sha="c" * 40)
+
+
+@pytest.mark.parametrize("path", GENERATED_OPENAPI_PATHS)
+def test_generated_openapi_without_head_mode_evidence_is_client(path: str) -> None:
+    """A generated spelling without mode proof retains client classification."""
+    assert size_gate._is_product_client_path(path, regular_generated_paths=frozenset())
+    assert size_gate.has_mixed_frontend_backend_runtime(["app/routers/example.py", path])
+    code, lines = size_gate.evaluate_pr_size_policy(
+        total_changed_lines=10,
+        counted_files=2,
+        changed_files=["app/routers/example.py", path],
+        pr_body=_standard_body(),
+    )
+    assert code == 1
+    assert "PR scope category: frontend_vertical_mvp" in lines
+
+
+def test_admission_input_cannot_exempt_any_other_client_path() -> None:
+    """Callers cannot add other paths to the finite generated exception."""
+    assert size_gate._is_product_client_path(
+        "frontend/src/App.tsx", regular_generated_paths=frozenset({"frontend/src/App.tsx"})
+    )
+
+
+def test_main_binds_generated_openapi_exemption_to_explicit_head_sha(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The CLI probes the supplied head before admitting generated paths."""
+    head_sha = "c" * 40
+    observed_heads: list[str] = []
+    monkeypatch.setattr(
+        size_gate,
+        "collect_numstat_output",
+        lambda *, base_sha, head_sha: "10\t0\tapp/routers/example.py\n",
+    )
+    monkeypatch.setattr(
+        size_gate,
+        "collect_changed_files",
+        lambda *, base_sha, head_sha: (
+            ["app/routers/example.py", *GENERATED_OPENAPI_PATHS],
+            frozenset(),
+        ),
+    )
+
+    def fake_regular_paths(*, head_sha: str) -> frozenset[str]:
+        """Record the exact head used for generated-path admission."""
+        observed_heads.append(head_sha)
+        return frozenset(GENERATED_OPENAPI_PATHS)
+
+    monkeypatch.setattr(size_gate, "collect_regular_generated_openapi_paths", fake_regular_paths)
+    code = size_gate.main(["--base-sha", "b" * 40, "--head-sha", head_sha])
+
+    assert code == 0
+    assert observed_heads == [head_sha]
+    assert "PR scope category: micro" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("generated_path", GENERATED_OPENAPI_PATHS)
+def test_main_inbound_rename_to_generated_path_retains_client_gates(
+    generated_path: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An inbound rename to either generated path must retain client classification."""
+    monkeypatch.setattr(
+        size_gate,
+        "collect_numstat_output",
+        lambda *, base_sha, head_sha: "1\t0\tapp/routers/example.py\n",
+    )
+    monkeypatch.setattr(
+        size_gate,
+        "collect_changed_files",
+        lambda *, base_sha, head_sha: (
+            ["contracts/source.txt", generated_path, "app/routers/example.py"],
+            frozenset({"contracts/source.txt", generated_path}),
+        ),
+    )
+    monkeypatch.setattr(
+        size_gate,
+        "collect_regular_generated_openapi_paths",
+        lambda *, head_sha: frozenset({generated_path}),
+    )
+
+    code = size_gate.main(["--base-sha", "b" * 40, "--head-sha", "c" * 40])
+    output = capsys.readouterr().out
+
+    assert code == 1
+    assert "PR scope category: frontend_vertical_mvp" in output
+    assert "frontend vertical MVP proof missing" in output
+
+
+@pytest.mark.parametrize("generated_path", GENERATED_OPENAPI_PATHS)
+@pytest.mark.parametrize("kind", ["inbound", "outbound", "between_generated"])
+@pytest.mark.parametrize("status", ["R100", "C100"])
+def test_main_rename_copy_endpoints_keep_client_classification(
+    generated_path: str,
+    kind: str,
+    status: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Both endpoints of emitted renames and copies stay in client policy."""
+    other_generated = next(path for path in GENERATED_OPENAPI_PATHS if path != generated_path)
+    endpoints = {
+        "inbound": ("contracts/source.txt", generated_path),
+        "outbound": (generated_path, "docs/copied_contract.txt"),
+        "between_generated": (generated_path, other_generated),
+    }[kind]
+    output = f"{status}\0{endpoints[0]}\0{endpoints[1]}\0M\0app/routers/example.py\0".encode()
+    monkeypatch.setattr(
+        size_gate.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(stdout=output),
+    )
+    paths, moved = size_gate.collect_changed_files(base_sha="b" * 40, head_sha="c" * 40)
+    assert paths == [*endpoints, "app/routers/example.py"]
+    assert moved == frozenset(endpoints)
+
+    monkeypatch.setattr(
+        size_gate,
+        "collect_numstat_output",
+        lambda *, base_sha, head_sha: "1\t0\tapp/routers/example.py\n",
+    )
+    monkeypatch.setattr(size_gate, "collect_changed_files", lambda **kwargs: (paths, moved))
+    monkeypatch.setattr(
+        size_gate,
+        "collect_regular_generated_openapi_paths",
+        lambda *, head_sha: frozenset(GENERATED_OPENAPI_PATHS),
+    )
+    code = size_gate.main(["--base-sha", "b" * 40, "--head-sha", "c" * 40])
+    result = capsys.readouterr().out
+    assert code == 1
+    assert "PR scope category: frontend_vertical_mvp" in result
+    assert "Counted files: 3" in result
+
+
+def test_main_mixed_ordinary_generated_and_rename_keeps_endpoint_only(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An ordinary generated change stays eligible beside a renamed sibling."""
+    ordinary, renamed = GENERATED_OPENAPI_PATHS
+    monkeypatch.setattr(
+        size_gate, "collect_numstat_output", lambda **kwargs: "1\t0\tapp/example.py\n"
+    )
+    monkeypatch.setattr(
+        size_gate,
+        "collect_changed_files",
+        lambda **kwargs: (
+            [ordinary, "contracts/source.txt", renamed, "app/example.py"],
+            frozenset({"contracts/source.txt", renamed}),
+        ),
+    )
+    monkeypatch.setattr(
+        size_gate,
+        "collect_regular_generated_openapi_paths",
+        lambda **kwargs: frozenset(GENERATED_OPENAPI_PATHS),
+    )
+    code = size_gate.main(["--base-sha", "b" * 40, "--head-sha", "c" * 40])
+    assert code == 1
+    assert "PR scope category: frontend_vertical_mvp" in capsys.readouterr().out
+
+
+def test_main_inbound_rename_requires_trusted_privileged_client_mix_approval(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A generated rename into a privileged PR keeps the trusted mix gate."""
+    changed = [
+        "scripts/ci/check_pr_size_governance.py",
+        "contracts/schema.ts",
+        "frontend/src/api/schema.ts",
+    ]
+    monkeypatch.setattr(
+        size_gate, "collect_numstat_output", lambda **kwargs: "1\t0\tscripts/ci/check.py\n"
+    )
+    monkeypatch.setattr(
+        size_gate,
+        "collect_changed_files",
+        lambda **kwargs: (changed, frozenset(changed[-2:])),
+    )
+    monkeypatch.setattr(
+        size_gate,
+        "collect_regular_generated_openapi_paths",
+        lambda **kwargs: frozenset({"frontend/src/api/schema.ts"}),
+    )
+    code = size_gate.main(["--base-sha", "b" * 40, "--head-sha", "c" * 40])
+    output = capsys.readouterr().out
+    assert code == 1
+    assert "PR scope category: privileged_ci_security_workflow" in output
+    assert "mixes with frontend product implementation" in output
+
+
+@pytest.mark.parametrize("path", GENERATED_OPENAPI_PATHS)
+def test_exact_generated_openapi_path_is_not_product_client_implementation(path: str) -> None:
+    """Admitted exact generated paths do not create product-client mixing."""
+    admitted = frozenset({path})
+    assert not size_gate._is_product_client_path(path, regular_generated_paths=admitted)
+    assert not size_gate.has_mixed_frontend_backend_runtime(
+        ["app/routers/example.py", path], regular_generated_paths=admitted
+    )
+
+
+@pytest.mark.parametrize("count", [18, 21])
+def test_generated_openapi_paths_keep_standard_file_and_line_limits(count: int) -> None:
+    """Generated files still consume standard file caps and line accounting."""
+    changed_files = [f"app/routers/route_{index}.py" for index in range(count - 2)]
+    changed_files.extend(GENERATED_OPENAPI_PATHS)
+    code, lines = size_gate.evaluate_pr_size_policy(
+        total_changed_lines=1200,
+        counted_files=len(changed_files),
+        changed_files=changed_files,
+        pr_body=_standard_body(
+            "\n## Split Justification\nBackend contract and generated clients travel together.\n"
+        ),
+        regular_generated_paths=frozenset(GENERATED_OPENAPI_PATHS),
+    )
+
+    assert code == (0 if count == 18 else 1), lines
+    assert "PR scope category: standard_governance_design" in lines
+    assert f"Counted files: {count}" in lines
+    assert "Changed lines: 1200" in lines
+    if count == 21:
+        assert any(
+            "standard governance/design PR has 21 files; cap is 20" in line for line in lines
+        )
+
+
+@pytest.mark.parametrize("count", [15, 16])
+def test_generated_openapi_paths_keep_privileged_hard_cap(count: int) -> None:
+    """Generated-path admission never expands the privileged file cap."""
+    changed_files = ["scripts/ci/check_pr_size_governance.py"]
+    changed_files.extend(f"tests/example_{index}.py" for index in range(count - 3))
+    changed_files.extend(GENERATED_OPENAPI_PATHS)
+    code, lines = size_gate.evaluate_pr_size_policy(
+        total_changed_lines=200,
+        counted_files=len(changed_files),
+        changed_files=changed_files,
+        pr_body=_standard_body(),
+        regular_generated_paths=frozenset(GENERATED_OPENAPI_PATHS),
+    )
+
+    assert code == (0 if count == 15 else 1), lines
+    assert "PR scope category: privileged_ci_security_workflow" in lines
+    assert f"Counted files: {count}" in lines
+    assert not any("mixes with frontend product implementation" in line for line in lines)
+    if count == 16:
+        assert any("hard cap is 15" in line for line in lines)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "frontend/src/App.tsx",
+        "ios/App.swift",
+        "frontend/src/api/contract.json",
+        "frontend/src/api/openapi.json.bak",
+        "frontend/src/api/schema.tsx",
+        "frontend/src/api/OpenAPI.json",
+        "frontend/src/api/Schema.ts",
+        "./frontend/src/api/openapi.json",
+        "./frontend/src/api/schema.ts",
+        "frontend/src/api/openapi.json ",
+        "frontend/src/api/schema.ts ",
+        "frontend/src/api/schema_renamed.ts",
+    ],
+)
+def test_other_client_paths_still_require_mixed_scope_approvals(path: str) -> None:
+    """Nearby, aliased and ordinary client paths retain mix approval checks."""
+    assert size_gate._is_product_client_path(path)
+    assert size_gate.has_mixed_frontend_backend_runtime(["app/routers/example.py", path])
+
+    body = _standard_body(
+        "\n## Split Justification\nClient and backend changes ship together.\n"
+        "Operator approval: approved\nFrontend vertical MVP approval: approved\n"
+    )
+    code, lines = size_gate.evaluate_pr_size_policy(
+        total_changed_lines=20,
+        counted_files=2,
+        changed_files=["app/routers/example.py", path],
+        pr_body=body,
+        trusted_approvals=TRUSTED_FRONTEND_MVP,
+    )
+    assert code == 1
+    assert "PR scope category: frontend_vertical_mvp" in lines
+    assert any(
+        "frontend MVP mixes frontend UI with backend/API/AI runtime" in line for line in lines
+    )
+
+    privileged_code, privileged_lines = size_gate.evaluate_pr_size_policy(
+        total_changed_lines=20,
+        counted_files=2,
+        changed_files=["scripts/ci/check.py", path],
+        pr_body=body,
+        trusted_approvals=TRUSTED_FRONTEND_MVP,
+    )
+    assert privileged_code == 1
+    assert "PR scope category: privileged_ci_security_workflow" in privileged_lines
+    assert any("mixes with frontend product implementation" in line for line in privileged_lines)
+
+
+def test_rename_from_generated_openapi_to_client_path_still_requires_approval() -> None:
+    """A generated source cannot exempt an ordinary client destination."""
+    changed_files = [
+        "frontend/src/api/schema.ts",
+        "frontend/src/api/schema_renamed.ts",
+        "app/routers/example.py",
+    ]
+    code, lines = size_gate.evaluate_pr_size_policy(
+        total_changed_lines=10,
+        counted_files=len(changed_files),
+        changed_files=changed_files,
+        pr_body=_standard_body(),
+        regular_generated_paths=frozenset(GENERATED_OPENAPI_PATHS),
+    )
+
+    assert code == 1
+    assert "PR scope category: frontend_vertical_mvp" in lines
+
+
+def test_generated_openapi_paths_count_toward_oversized_body_only_denial() -> None:
+    """A body claim alone does not waive the over-thirty file limit."""
+    changed_files = [f"app/routers/route_{index}.py" for index in range(29)]
+    changed_files.extend(GENERATED_OPENAPI_PATHS)
+    code, lines = size_gate.evaluate_pr_size_policy(
+        total_changed_lines=200,
+        counted_files=len(changed_files),
+        changed_files=changed_files,
+        pr_body=_standard_body("\nOperator approval: approved\nEmergency exception: approved\n"),
+        regular_generated_paths=frozenset(GENERATED_OPENAPI_PATHS),
+    )
+
+    assert code == 1
+    assert "Counted files: 31" in lines
+    assert any(">30 files without emergency/operator exception" in line for line in lines)
+
+
+@pytest.mark.parametrize("client_prefix", ["frontend/", "ios/", "./ios/"])
+@pytest.mark.parametrize("count", [20, 21, 30, 31])
+def test_client_vertical_scope_preserves_size_boundaries(client_prefix: str, count: int) -> None:
+    body = _standard_body(
+        "\n## Split Justification\nOne client flow and its owning tests ship together.\n"
+        "Operator approval: approved\nFrontend vertical MVP approval: approved\n"
+    )
+    code, lines = size_gate.evaluate_pr_size_policy(
+        total_changed_lines=1200,
+        counted_files=count,
+        changed_files=[f"{client_prefix}screen_{index}.swift" for index in range(count)],
+        pr_body=body,
+        trusted_approvals=TRUSTED_FRONTEND_MVP,
+    )
+    assert code == (1 if count > 30 else 0), lines
+    assert any("category: frontend_vertical_mvp" in line for line in lines)
+
+
+@pytest.mark.parametrize("missing", ["operator_label", "lane_label", "body", "justification"])
+def test_native_vertical_scope_rejects_incomplete_approval(missing: str) -> None:
+    body = _standard_body(
+        "\n## Split Justification\nOne native flow and its owning tests ship together.\n"
+        "Operator approval: approved\nFrontend vertical MVP approval: approved\n"
+    )
+    labels = set(TRUSTED_FRONTEND_MVP)
+    if missing == "operator_label":
+        labels.remove("operator-approved")
+    elif missing == "lane_label":
+        labels.remove("scope/frontend-mvp-approved")
+    elif missing == "body":
+        body = body.replace("Frontend vertical MVP approval: approved", "")
+    else:
+        body = body.replace(
+            "## Split Justification\nOne native flow and its owning tests ship together.", ""
+        )
+    code, lines = size_gate.evaluate_pr_size_policy(
+        total_changed_lines=1200,
+        counted_files=22,
+        changed_files=[f"ios/screen_{index}.swift" for index in range(22)],
+        pr_body=body,
+        trusted_approvals=labels,
+    )
+    assert code == 1
+    assert any("frontend vertical MVP proof missing" in line for line in lines)
+
+
+@pytest.mark.parametrize("client_prefix", ["frontend/", "ios/", "./ios/"])
+@pytest.mark.parametrize("mix_approved", [False, True])
+def test_client_backend_mix_requires_specific_approval(
+    client_prefix: str, mix_approved: bool
+) -> None:
+    body = _standard_body(
+        "\n## Split Justification\nOne client flow and its API contract.\n"
+        "Operator approval: approved\nFrontend vertical MVP approval: approved\n"
+        "Frontend/backend mix approval: approved\n"
+    )
+    code, lines = size_gate.evaluate_pr_size_policy(
+        total_changed_lines=20,
+        counted_files=2,
+        changed_files=[f"{client_prefix}screen.swift", "app/routers/example.py"],
+        pr_body=body,
+        trusted_approvals=TRUSTED_FRONTEND_MIX if mix_approved else TRUSTED_FRONTEND_MVP,
+    )
+    assert code == (0 if mix_approved else 1), lines
+    assert any("category: frontend_vertical_mvp" in line for line in lines)
+
+
+@pytest.mark.parametrize("client_prefix", ["frontend/", "ios/", "./ios/"])
+@pytest.mark.parametrize("count", [2, 28, 31])
+@pytest.mark.parametrize("mix_approved", [False, True])
+@pytest.mark.parametrize("size_approved", [False, True])
+def test_privileged_client_mix_preserves_independent_approvals(
+    client_prefix: str, count: int, mix_approved: bool, size_approved: bool
+) -> None:
+    body = _standard_body(
+        "\n## Split Justification\nClient delivery and its required guard correction.\n"
+        "Operator approval: approved\nPrivileged scope exception: approved\n"
+        "Frontend/backend mix approval: approved\n"
+    )
+    labels = {"scope/operator-approved"}
+    if mix_approved:
+        labels.add("scope/frontend-backend-mix-approved")
+    if size_approved:
+        labels.add("scope/privileged-approved")
+    code, lines = size_gate.evaluate_pr_size_policy(
+        total_changed_lines=1200,
+        counted_files=count,
+        changed_files=["scripts/ci/check.py"]
+        + [f"{client_prefix}screen_{index}.swift" for index in range(count - 1)],
+        pr_body=body,
+        trusted_approvals=labels,
+    )
+    expected = 0 if mix_approved and (count <= 15 or size_approved) and count <= 30 else 1
+    assert code == expected, lines
+    assert any("category: privileged_ci_security_workflow" in line for line in lines)
+
+
+@pytest.mark.parametrize("prefix", ["ios-lookalike/", "frontend-copy/", "docs/ios/"])
+def test_client_scope_does_not_admit_lookalike_prefixes(prefix: str) -> None:
+    code, lines = size_gate.evaluate_pr_size_policy(
+        total_changed_lines=1200,
+        counted_files=22,
+        changed_files=[f"{prefix}screen_{index}.swift" for index in range(22)],
+        pr_body=_standard_body(
+            "\n## Split Justification\nOnly declared client roots have this exception.\n"
+            "Operator approval: approved\nFrontend vertical MVP approval: approved\n"
+        ),
+        trusted_approvals=TRUSTED_FRONTEND_MVP,
+    )
+    assert code == 1
+    assert any("category: standard_governance_design" in line for line in lines)
+
+
+def test_repo_root_can_be_overridden_for_trusted_base_script_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    default_root = size_gate.REPO_ROOT
+
+    monkeypatch.setenv("PULSEPLATE_SIZE_GOVERNANCE_REPO_ROOT", str(tmp_path))
+    reloaded_gate = importlib.reload(size_gate)
+
+    assert reloaded_gate.REPO_ROOT == tmp_path.resolve()
+
+    monkeypatch.setenv("PULSEPLATE_SIZE_GOVERNANCE_REPO_ROOT", "   ")
+    reloaded_gate = importlib.reload(reloaded_gate)
+
+    assert reloaded_gate.REPO_ROOT == default_root
+
+    monkeypatch.delenv("PULSEPLATE_SIZE_GOVERNANCE_REPO_ROOT", raising=False)
+    importlib.reload(reloaded_gate)
+
+
+def test_parse_numstat_output_sums_text_rows_and_ignores_binary() -> None:
+    total_lines, counted_files = size_gate.parse_numstat_output(
+        "10\t5\tapp/main.py\n-\t-\tfrontend/src/assets/logo.png\n3\t2\tdocs/runbook.md\n",
+    )
+
+    assert total_lines == 20
+    assert counted_files == 3
+
+
+def test_parse_numstat_details_counts_binary_paths_for_file_policy() -> None:
+    total_lines, counted_files, changed_files = size_gate.parse_numstat_details(
+        "-\t-\tfrontend/src/assets/hero.png\n1\t0\tscripts/ci/check.py\n",
+    )
+
+    assert total_lines == 1
+    assert counted_files == 2
+    assert changed_files == ["frontend/src/assets/hero.png", "scripts/ci/check.py"]
+
+
+def _standard_body(extra: str = "") -> str:
+    return f"## Scope\nPolicy only.\n\n## Out of scope\nRuntime changes.\n\n## Tests\nFocused.\n{extra}"
+
+
+def test_has_split_justification_accepts_heading_and_label() -> None:
+    assert size_gate.has_split_justification("## Split Justification\nNeeded for parity.")
+    assert size_gate.has_split_justification("Split justification: workflow rename parity.")
+    assert size_gate.has_split_justification("## pr size justification\nNeeded for parity.")
+    assert size_gate.has_split_justification("**Split justification:** workflow rename parity.")
+
+
+def test_has_split_justification_rejects_empty_template_stub() -> None:
+    assert not size_gate.has_split_justification("## Split Justification\n")
+    assert not size_gate.has_split_justification(
+        "## Summary\nLarge PR.\n\n## Split Justification\n\n## Risks\nLow.\n",
+    )
+    assert not size_gate.has_split_justification(
+        (
+            "## Split Justification\n\n"
+            "- Why this PR cannot be split safely:\n"
+            "- What invariant, contract, or rollout constraint requires one PR:\n"
+            "- What follow-up PRs remain after this large change:\n"
+        ),
+    )
+    assert not size_gate.has_split_justification(
+        "Split justification: Why this PR cannot be split safely:",
+    )
+    assert not size_gate.has_split_justification("**Split justification:**   ")
+    assert not size_gate.has_split_justification("## Split Justification\nTBD\n")
+    assert not size_gate.has_split_justification("Split justification: N/A")
+    assert not size_gate.has_split_justification("## Split Justification\nTODO\n")
+
+
+def test_has_split_justification_accepts_nested_heading_content() -> None:
+    assert size_gate.has_split_justification(
+        "## Split Justification\n### Constraint\nNeed parity with current workflow wiring.\n",
+    )
+
+
+def test_has_split_justification_ignores_html_comments() -> None:
+    assert not size_gate.has_split_justification(
+        "## Split Justification\n<!-- fill this in -->\n",
+    )
+    assert size_gate.has_split_justification(
+        "## Split Justification\n<!-- scaffold -->\nNeeded for parity.\n",
+    )
+
+
+def test_evaluate_pr_size_policy_passes_for_micro_pr_without_sections() -> None:
+    exit_code, lines = size_gate.evaluate_pr_size_policy(
+        total_changed_lines=1200,
+        counted_files=4,
+        pr_body="",
+        changed_files=[f"docs/example_{index}.md" for index in range(4)],
+    )
+
+    assert exit_code == 0
+    assert any("category: micro" in line for line in lines)
+    assert any("OK (micro PR" in line for line in lines)
+
+
+def test_evaluate_pr_size_policy_passes_for_standard_governance_design_pr() -> None:
+    exit_code, lines = size_gate.evaluate_pr_size_policy(
+        total_changed_lines=1200,
+        counted_files=14,
+        pr_body=_standard_body(),
+        changed_files=[f"docs/design/example_{index}.md" for index in range(14)],
+    )
+
+    assert exit_code == 0
+    assert any("category: standard_governance_design" in line for line in lines)
+    assert any("OK (standard governance/design PR <= 20 files)" in line for line in lines)
+
+
+def test_standard_pr_requires_scope_out_of_scope_and_tests_sections() -> None:
+    exit_code, lines = size_gate.evaluate_pr_size_policy(
+        total_changed_lines=80,
+        counted_files=6,
+        pr_body="## Summary\nPolicy update.\n",
+        changed_files=[f"docs/design/example_{index}.md" for index in range(6)],
+    )
+
+    assert exit_code == 1
+    assert any("Required section missing: ## Scope" in line for line in lines)
+    assert any("Required section missing: ## Out Of Scope" in line for line in lines)
+    assert any("Required section missing: ## Tests" in line for line in lines)
+    assert any("How to fix:" in line for line in lines)
+
+
+def test_standard_pr_over_15_files_requires_split_justification() -> None:
+    exit_code, lines = size_gate.evaluate_pr_size_policy(
+        total_changed_lines=200,
+        counted_files=16,
+        pr_body=_standard_body(),
+        changed_files=[f"docs/design/example_{index}.md" for index in range(16)],
+    )
+
+    assert exit_code == 1
+    assert any("Required section missing: ## Split Justification" in line for line in lines)
+    assert any("file" in line for line in lines)
+
+
+def test_standard_pr_between_16_and_20_files_passes_with_split_justification() -> None:
+    exit_code, lines = size_gate.evaluate_pr_size_policy(
+        total_changed_lines=1200,
+        counted_files=20,
+        pr_body=_standard_body(
+            "\n## Split Justification\nDesign guard and docs proof land together.\n"
+        ),
+        changed_files=[f"docs/design/example_{index}.md" for index in range(20)],
+    )
+
+    assert exit_code == 0
+    assert any("standard governance/design PR <= 20 files" in line for line in lines)
+
+
+def test_standard_pr_over_20_files_fails_closed() -> None:
+    exit_code, lines = size_gate.evaluate_pr_size_policy(
+        total_changed_lines=200,
+        counted_files=21,
+        pr_body=_standard_body("\n## Split Justification\nStill too large.\n"),
+        changed_files=[f"docs/design/example_{index}.md" for index in range(21)],
+    )
+
+    assert exit_code == 1
+    assert any("standard governance/design PR has 21 files; cap is 20" in line for line in lines)
+    assert not any("emergency exception" in line for line in lines)
+
+
+def test_frontend_mvp_pr_passes_only_with_approval_and_split_justification() -> None:
+    changed_files = [f"frontend/src/flow/example_{index}.tsx" for index in range(25)]
+    approved_body = _standard_body(
+        "\n## Split Justification\nOne vertical user flow requires shared component and test updates.\n"
+        "\nOperator approval: approved for frontend vertical MVP one vertical user flow.\n"
+        "\nFrontend vertical MVP approval: approved for one vertical user flow.\n",
+    )
+
+    exit_code, lines = size_gate.evaluate_pr_size_policy(
+        total_changed_lines=1200,
+        counted_files=25,
+        pr_body=approved_body,
+        changed_files=changed_files,
+        trusted_approvals=TRUSTED_FRONTEND_MVP,
+    )
+
+    assert exit_code == 0
+    assert any("frontend vertical MVP <= 30 files" in line for line in lines)
+
+    failed_code, failed_lines = size_gate.evaluate_pr_size_policy(
+        total_changed_lines=1200,
+        counted_files=25,
+        pr_body=_standard_body("\n## Split Justification\nOne flow.\n"),
+        changed_files=changed_files,
+    )
+
+    assert failed_code == 1
+    assert any("operator approval for frontend vertical MVP" in line for line in failed_lines)
+
+
+def test_frontend_mvp_pr_over_30_files_fails() -> None:
+    exit_code, lines = size_gate.evaluate_pr_size_policy(
+        total_changed_lines=400,
+        counted_files=31,
+        pr_body=_standard_body(
+            "\n## Split Justification\nOne vertical flow.\n"
+            "\nOperator approval: approved for frontend vertical MVP one vertical user flow.\n"
+            "\nFrontend vertical MVP approval: approved for one vertical user flow.\n",
+        ),
+        changed_files=[f"frontend/src/flow/example_{index}.tsx" for index in range(31)],
+    )
+
+    assert exit_code == 1
+    assert any(">30 files without emergency/operator exception" in line for line in lines)
+
+
+def test_frontend_mvp_rejects_backend_api_ai_runtime_mix_without_exception() -> None:
+    exit_code, lines = size_gate.evaluate_pr_size_policy(
+        total_changed_lines=400,
+        counted_files=22,
+        pr_body=_standard_body(
+            "\n## Split Justification\nOne vertical flow.\n"
+            "\nOperator approval: approved for frontend vertical MVP one vertical user flow.\n"
+            "\nFrontend vertical MVP approval: approved for one vertical user flow.\n",
+        ),
+        changed_files=[f"frontend/src/flow/example_{index}.tsx" for index in range(21)]
+        + ["app/routers/example.py"],
+        trusted_approvals=TRUSTED_FRONTEND_MVP,
+    )
+
+    assert exit_code == 1
+    assert any(
+        "frontend MVP mixes frontend UI with backend/API/AI runtime" in line for line in lines
+    )
+    assert any("How to fix:" in line for line in lines)
+
+
+def test_standard_sized_frontend_backend_mix_requires_mix_approval() -> None:
+    exit_code, lines = size_gate.evaluate_pr_size_policy(
+        total_changed_lines=180,
+        counted_files=15,
+        pr_body=_standard_body(),
+        changed_files=[f"frontend/src/flow/example_{index}.tsx" for index in range(10)]
+        + [f"app/routers/example_{index}.py" for index in range(5)],
+    )
+
+    assert exit_code == 1
+    assert any("Category: frontend_vertical_mvp" in line for line in lines)
+    assert any("operator approval for frontend vertical MVP" in line for line in lines)
+
+
+def test_micro_sized_frontend_backend_mix_requires_mvp_approval() -> None:
+    exit_code, lines = size_gate.evaluate_pr_size_policy(
+        total_changed_lines=20,
+        counted_files=2,
+        pr_body="",
+        changed_files=["frontend/src/flow/example.tsx", "app/routers/example.py"],
+    )
+
+    assert exit_code == 1
+    assert any("Category: frontend_vertical_mvp" in line for line in lines)
+    assert not any("OK (micro PR" in line for line in lines)
+
+
+def test_frontend_mvp_allows_backend_api_ai_runtime_mix_with_explicit_mix_approval() -> None:
+    exit_code, lines = size_gate.evaluate_pr_size_policy(
+        total_changed_lines=400,
+        counted_files=22,
+        pr_body=_standard_body(
+            "\n## Split Justification\nOne vertical flow needs one contract shim.\n"
+            "\nOperator approval: approved for frontend vertical MVP one vertical user flow.\n"
+            "\nFrontend vertical MVP approval: approved for one vertical user flow.\n"
+            "\nFrontend/backend mix approval: approved for one contract shim.\n",
+        ),
+        changed_files=[f"frontend/src/flow/example_{index}.tsx" for index in range(21)]
+        + ["app/routers/example.py"],
+        trusted_approvals=TRUSTED_FRONTEND_MIX,
+    )
+
+    assert exit_code == 0
+    assert any("frontend vertical MVP <= 30 files" in line for line in lines)
+
+
+def test_privileged_pr_over_15_files_fails_without_exception() -> None:
+    exit_code, lines = size_gate.evaluate_pr_size_policy(
+        total_changed_lines=200,
+        counted_files=16,
+        pr_body=_standard_body("\n## Split Justification\nCI policy and tests.\n"),
+        changed_files=["scripts/ci/check_pr_size_governance.py"]
+        + [f"tests/example_{index}.py" for index in range(15)],
+    )
+
+    assert exit_code == 1
+    assert any("privileged CI/security/workflow PR has 16 files" in line for line in lines)
+    assert any("operator-approved privileged scope exception" in line for line in lines)
+
+
+def test_micro_privileged_pr_uses_privileged_category() -> None:
+    exit_code, lines = size_gate.evaluate_pr_size_policy(
+        total_changed_lines=20,
+        counted_files=2,
+        pr_body="",
+        changed_files=["scripts/ci/check_pr_size_governance.py", "tests/test_check.py"],
+    )
+
+    assert exit_code == 0
+    assert any("category: privileged_ci_security_workflow" in line for line in lines)
+    assert not any("OK (micro PR" in line for line in lines)
+
+
+def test_dotfile_privileged_paths_are_not_normalized_out_of_privileged_lane() -> None:
+    for path in (
+        ".github/workflows/ci.yml",
+        "./.github/workflows/ci.yml",
+        ".trivyignore",
+        "./.trivyignore",
+    ):
+        assert size_gate._is_privileged_path(path)
+
+
+@pytest.mark.parametrize(
+    "path",
+    (
+        ".github/dependabot.yml",
+        "./.github/dependabot.yml",
+        ".github/dependabot.yaml",
+        "./.github/dependabot.yaml",
+    ),
+)
+def test_dependabot_config_spellings_have_security_and_size_governance_parity(
+    path: str,
+) -> None:
+    assert size_gate._is_privileged_path(path)
+    assert requires_security_review([size_gate._normalize_path(path)]) is True
+
+    exit_code, lines = size_gate.evaluate_pr_size_policy(
+        total_changed_lines=1,
+        counted_files=1,
+        pr_body="",
+        changed_files=[path],
+    )
+
+    assert exit_code == 0
+    assert any("category: privileged_ci_security_workflow" in line for line in lines)
+    assert not any("OK (micro PR" in line for line in lines)
+
+
+def test_privileged_pr_cannot_mix_frontend_product_without_exception() -> None:
+    exit_code, lines = size_gate.evaluate_pr_size_policy(
+        total_changed_lines=20,
+        counted_files=2,
+        pr_body="",
+        changed_files=["scripts/ci/check_pr_size_governance.py", "frontend/src/App.tsx"],
+    )
+
+    assert exit_code == 1
+    assert any("mixes with frontend product implementation" in line for line in lines)
+
+
+def test_privileged_pr_over_15_files_passes_with_approved_exception() -> None:
+    exit_code, lines = size_gate.evaluate_pr_size_policy(
+        total_changed_lines=200,
+        counted_files=16,
+        pr_body=_standard_body(
+            "\n## Split Justification\nCI policy and tests.\n"
+            "\nOperator approval: approved for privileged CI scope exception.\n"
+            "\nPrivileged scope exception: approved for current CI unblocker.\n",
+        ),
+        changed_files=["scripts/ci/check_pr_size_governance.py"]
+        + [f"tests/example_{index}.py" for index in range(15)],
+        trusted_approvals=TRUSTED_PRIVILEGED,
+    )
+
+    assert exit_code == 0
+    assert any("privileged CI/security/workflow policy" in line for line in lines)
+
+
+def test_privileged_pr_exception_requires_specific_privileged_label() -> None:
+    exit_code, lines = size_gate.evaluate_pr_size_policy(
+        total_changed_lines=200,
+        counted_files=16,
+        pr_body=_standard_body(
+            "\n## Split Justification\nCI policy and tests.\n"
+            "\nOperator approval: approved for generic exception.\n",
+        ),
+        changed_files=["scripts/ci/check_pr_size_governance.py"]
+        + [f"tests/example_{index}.py" for index in range(15)],
+    )
+
+    assert exit_code == 1
+    assert any("operator-approved privileged scope exception" in line for line in lines)
+
+
+def test_mapping_and_ledger_closeout_files_are_allowed_same_pr() -> None:
+    exit_code, lines = size_gate.evaluate_pr_size_policy(
+        total_changed_lines=200,
+        counted_files=16,
+        pr_body=_standard_body(
+            "\n## Split Justification\nCloseout proof belongs with the governance change.\n"
+        ),
+        changed_files=[f"docs/design/example_{index}.md" for index in range(14)]
+        + ["docs/review/PR_1841_FIXED_MAPPING.md", "docs/roadmap/BACKLOG_LEDGER.md"],
+    )
+
+    assert exit_code == 0
+    assert any("Closeout files allowed in same PR: 2" in line for line in lines)
+
+
+def test_operator_exception_rejects_negated_or_ambiguous_approval() -> None:
+    exit_code, lines = size_gate.evaluate_pr_size_policy(
+        total_changed_lines=40,
+        counted_files=31,
+        pr_body=_standard_body(
+            "\n## Split Justification\nToo large.\n"
+            "\nNo operator-approved scope exception.\n"
+            "\nOperator approval: yes/no\n"
+            "\nScope exception: not approved.\n",
+        ),
+        changed_files=[f"docs/design/example_{index}.md" for index in range(31)],
+    )
+
+    assert exit_code == 1
+    assert any(">30 files without emergency/operator exception" in line for line in lines)
+
+
+def test_operator_exception_rejects_post_approval_negation() -> None:
+    exit_code, lines = size_gate.evaluate_pr_size_policy(
+        total_changed_lines=40,
+        counted_files=31,
+        pr_body=_standard_body(
+            "\n## Split Justification\nToo large.\n"
+            "\nOperator approval: approved but not really\n"
+            "\nEmergency exception: approved but not really\n",
+        ),
+        changed_files=[f"docs/design/example_{index}.md" for index in range(31)],
+    )
+
+    assert exit_code == 1
+    assert any(">30 files without emergency/operator exception" in line for line in lines)
+
+
+def test_operator_exception_allows_unrelated_negation_outside_approval_lines() -> None:
+    exit_code, lines = size_gate.evaluate_pr_size_policy(
+        total_changed_lines=40,
+        counted_files=31,
+        pr_body=_standard_body(
+            "\n## Split Justification\nEmergency CI unblocker must land together.\n"
+            "\nOperator approval: approved for emergency CI unblocker.\n"
+            "\nEmergency exception: approved for current CI unblocker.\n"
+            "\n## Notes\nNo additional exception requested after this PR.\n",
+        ),
+        changed_files=[f"docs/design/example_{index}.md" for index in range(31)],
+        trusted_approvals=TRUSTED_EMERGENCY,
+    )
+
+    assert exit_code == 0
+    assert any(">30 files" in line and "OK" in line for line in lines)
+
+
+def test_self_attested_pr_body_approvals_do_not_bypass_oversized_guard() -> None:
+    exit_code, lines = size_gate.evaluate_pr_size_policy(
+        total_changed_lines=40,
+        counted_files=31,
+        pr_body=_standard_body(
+            "\n## Split Justification\nToo large.\n"
+            "\nOperator approval: approved for emergency CI unblocker.\n"
+            "\nEmergency exception: approved for current CI unblocker.\n",
+        ),
+        changed_files=[f"docs/design/example_{index}.md" for index in range(31)],
+    )
+
+    assert exit_code == 1
+    assert any(">30 files without emergency/operator exception" in line for line in lines)
+
+
+def test_standard_sections_ignore_comments_and_nested_headings() -> None:
+    assert size_gate.missing_standard_sections(
+        "<!--\n## Scope\n## Out of scope\n## Tests\n-->"
+    ) == [
+        "scope",
+        "out of scope",
+        "tests",
+    ]
+    assert size_gate.missing_standard_sections(
+        "## Summary\n### Scope\nText\n### Out of scope\nText\n### Tests\nText\n",
+    ) == ["scope", "out of scope", "tests"]
+
+
+def test_micro_governance_docs_require_standard_sections() -> None:
+    exit_code, lines = size_gate.evaluate_pr_size_policy(
+        total_changed_lines=10,
+        counted_files=1,
+        pr_body="## Summary\nTiny governance doc.\n",
+        changed_files=["docs/policy/PR_SCOPE_RULES.md"],
+    )
+
+    assert exit_code == 1
+    assert any("micro governance/security PR body sections missing" in line for line in lines)
+
+
+def test_micro_non_governance_pr_still_passes_without_sections() -> None:
+    exit_code, lines = size_gate.evaluate_pr_size_policy(
+        total_changed_lines=10,
+        counted_files=1,
+        pr_body="",
+        changed_files=["docs/product/tiny-note.md"],
+    )
+
+    assert exit_code == 0
+    assert any("OK (micro PR" in line for line in lines)
+
+
+def test_frontend_mvp_requires_specific_lane_approval_line() -> None:
+    exit_code, lines = size_gate.evaluate_pr_size_policy(
+        total_changed_lines=100,
+        counted_files=22,
+        pr_body=_standard_body(
+            "\n## Split Justification\nOne vertical flow.\n"
+            "\nOperator approval: approved for this PR.\n"
+            "\nQuoted example: frontend vertical MVP approval may be needed.\n",
+        ),
+        changed_files=[f"frontend/src/flow/example_{index}.tsx" for index in range(22)],
+    )
+
+    assert exit_code == 1
+    assert any("operator approval for frontend vertical MVP" in line for line in lines)
+
+
+def test_collect_changed_files_includes_rename_old_and_new_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeResult:
+        stdout = b"R100\0scripts/ci/old_guard.py\0docs/old_guard.md\0A\0docs/new.md\0"
+
+    def fake_run(*args: object, **kwargs: object) -> FakeResult:
+        return FakeResult()
+
+    monkeypatch.setattr(size_gate.subprocess, "run", fake_run)
+
+    assert size_gate.collect_changed_files(base_sha="base", head_sha="head") == (
+        ["scripts/ci/old_guard.py", "docs/old_guard.md", "docs/new.md"],
+        frozenset({"scripts/ci/old_guard.py", "docs/old_guard.md"}),
+    )
+
+
+def test_collect_changed_files_deduplicates_paths_but_retains_copy_endpoints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A path seen as ordinary and copied remains marked as a copy endpoint."""
+    output = (
+        b"A\0frontend/src/api/schema.ts\0"
+        b"C085\0frontend/src/api/schema.ts\0docs/copy.ts\0"
+        b"M\0frontend/src/api/schema.ts\0T\0docs/copy.ts\0"
+    )
+    monkeypatch.setattr(
+        size_gate.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(stdout=output)
+    )
+    assert size_gate.collect_changed_files(base_sha="base", head_sha="head") == (
+        ["frontend/src/api/schema.ts", "docs/copy.ts"],
+        frozenset({"frontend/src/api/schema.ts", "docs/copy.ts"}),
+    )
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "A\0docs/file.md\0",
+        b"A\0docs/file.md",
+        b"A\0\0",
+        b"\0",
+        b"R100\0docs/old.md\0",
+        b"C100\0docs/old.md\0\0",
+        b"Q\0docs/file.md\0",
+        b"R\0docs/old.md\0docs/new.md\0",
+        b"R101\0docs/old.md\0docs/new.md\0",
+        b"C-1\0docs/old.md\0docs/new.md\0",
+        b"M999\0docs/file.md\0",
+        b"A\0docs/\xff.md\0",
+    ],
+)
+def test_collect_changed_files_rejects_incomplete_or_ambiguous_git_output(
+    output: bytes | str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Invalid status framing or lossy paths cannot yield a partial list."""
+    monkeypatch.setattr(
+        size_gate.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(stdout=output)
+    )
+    with pytest.raises(ValueError):
+        size_gate.collect_changed_files(base_sha="base", head_sha="head")
+
+
+def test_real_git_inbound_rename_keeps_generated_destination_under_client_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Native Git rename detection reaches the same client gate through main."""
+    assert size_gate.GIT_BINARY is not None
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    template = tmp_path / "empty-template"
+    template.mkdir()
+    git_env = {
+        "HOME": str(tmp_path),
+        "PATH": str(Path(size_gate.GIT_BINARY).parent),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_TEMPLATE_DIR": str(template),
+        "GIT_AUTHOR_NAME": "Fixture",
+        "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
+        "GIT_COMMITTER_NAME": "Fixture",
+        "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
+    }
+
+    def run_git(*args: str) -> str:
+        """Run disposable Git setup without host config, templates or hooks."""
+        result = subprocess.run(
+            [
+                size_gate.GIT_BINARY,
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "commit.gpgsign=false",
+                *args,
+            ],
+            cwd=repo,
+            env=git_env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip()
+
+    run_git("init", "--quiet")
+    (repo / "contracts").mkdir()
+    (repo / "contracts/schema.ts").write_text("export const schema = 1;\n", encoding="utf-8")
+    (repo / "app").mkdir()
+    (repo / "app/example.py").write_text("value = 1\n", encoding="utf-8")
+    run_git("add", ".")
+    run_git("commit", "--quiet", "-m", "base")
+    base_sha = run_git("rev-parse", "HEAD")
+    (repo / "frontend/src/api").mkdir(parents=True)
+    run_git("mv", "contracts/schema.ts", "frontend/src/api/schema.ts")
+    (repo / "app/example.py").write_text("value = 2\n", encoding="utf-8")
+    run_git("add", ".")
+    run_git("commit", "--quiet", "-m", "rename")
+    head_sha = run_git("rev-parse", "HEAD")
+
+    # Commit hooks can pass their own repository context to this test process.
+    # Prove that the real collector uses only the disposable repository below.
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "hook.git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(tmp_path / "hook-worktree"))
+    monkeypatch.setenv("GIT_INDEX_FILE", str(tmp_path / "hook-index"))
+    for name in tuple(os.environ):
+        if name.startswith("GIT_"):
+            monkeypatch.delenv(name)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+    monkeypatch.setenv("GIT_TEMPLATE_DIR", str(template))
+
+    monkeypatch.setattr(size_gate, "REPO_ROOT", repo)
+    changed, moved = size_gate.collect_changed_files(base_sha=base_sha, head_sha=head_sha)
+    assert changed == ["app/example.py", "contracts/schema.ts", "frontend/src/api/schema.ts"]
+    assert moved == frozenset({"contracts/schema.ts", "frontend/src/api/schema.ts"})
+    assert size_gate.collect_regular_generated_openapi_paths(head_sha=head_sha) == frozenset(
+        {"frontend/src/api/schema.ts"}
+    )
+    assert size_gate.main(["--base-sha", base_sha, "--head-sha", head_sha]) == 1
+    assert "PR scope category: frontend_vertical_mvp" in capsys.readouterr().out
+
+
+def test_rename_from_privileged_old_path_uses_privileged_category() -> None:
+    exit_code, lines = size_gate.evaluate_pr_size_policy(
+        total_changed_lines=1,
+        counted_files=2,
+        pr_body="",
+        changed_files=["scripts/ci/old_guard.py", "docs/old_guard.md"],
+    )
+
+    assert exit_code == 0
+    assert any("category: privileged_ci_security_workflow" in line for line in lines)
+
+
+def test_guard_is_offline_and_does_not_require_network_for_event_body(tmp_path: Path) -> None:
+    event_path = tmp_path / "event.json"
+    event_path.write_text(
+        json.dumps({"pull_request": {"body": "## Split Justification\nRequired."}}),
+        encoding="utf-8",
+    )
+
+    assert size_gate.extract_pr_body(event_path) == "## Split Justification\nRequired."
+
+
+def test_extract_pr_body_missing_body_without_token_does_not_call_network(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    event_path = tmp_path / "event.json"
+    event_path.write_text(
+        json.dumps({"repository": {"full_name": "owner/repo"}, "pull_request": {"number": 123}}),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+
+    def fail_connect(*args: object, **kwargs: object) -> object:  # pragma: no cover
+        raise AssertionError("network must not be called without a token")
+
+    monkeypatch.setattr(size_gate.http.client, "HTTPSConnection", fail_connect)
+
+    assert size_gate.extract_pr_body(event_path) == ""
+
+
+def test_extract_trusted_approvals_reads_github_event_labels(tmp_path: Path) -> None:
+    event_path = tmp_path / "event.json"
+    event_path.write_text(
+        json.dumps(
+            {
+                "pull_request": {
+                    "labels": [
+                        {"name": "Operator-Approved"},
+                        {"name": "scope/emergency-approved"},
+                        {"name": 123},
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert size_gate.extract_trusted_approvals(event_path) == {
+        "operator-approved",
+        "scope/emergency-approved",
+    }
+
+
+def test_extract_pr_body_reads_github_event_payload(tmp_path: Path) -> None:
+    event_path = tmp_path / "event.json"
+    event_path.write_text(
+        json.dumps({"pull_request": {"body": "## Split Justification\nRequired."}}),
+        encoding="utf-8",
+    )
+
+    assert size_gate.extract_pr_body(event_path) == "## Split Justification\nRequired."
+
+
+def _stub_pr_https(
+    monkeypatch: pytest.MonkeyPatch,
+    raw: bytes,
+    *,
+    status: int = 200,
+    location: str | None = None,
+    content_length: str | None = None,
+    chunked: bool = False,
+    fault: str | None = None,
+) -> list[str]:
+    events: list[str] = []
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setenv("GH_TOKEN", "synthetic-pr-token")
+
+    class Response(io.BytesIO):
+        status: int
+        headers: dict[str, str]
+        chunked: bool
+
+        def getheader(self, name: str) -> str | None:
+            return self.headers.get(name)
+
+        def read(self, size: int = -1) -> bytes:
+            assert size == 4 * 1024**2 + 1
+            events.append("read")
+            return super().read(size)
+
+        def close(self) -> None:
+            events.append("response-close")
+            super().close()
+            if fault == "response-close":
+                raise OSError("synthetic response close failure")
+
+    class Connection:
+        def __init__(self, host: str, *, timeout: int) -> None:
+            assert host == "api.github.com" and timeout == 10
+            events.append("connect")
+            if fault == "constructor":
+                raise OSError("synthetic construction failure")
+
+        def request(self, method: str, path: str, *, headers: dict[str, str]) -> None:
+            assert method == "GET" and path == "/repos/owner/repo/pulls/123"
+            assert headers["Authorization"] == "Bearer synthetic-pr-token"
+            events.append("request")
+
+        def getresponse(self) -> Response:
+            response = Response(raw)
+            response.status = status
+            response.headers = {"Location": location} if location else {}
+            response.chunked = chunked
+            if content_length is not None:
+                response.headers["Content-Length"] = content_length
+            return response
+
+        def close(self) -> None:
+            events.append("connection-close")
+            if fault == "connection-close":
+                raise size_gate.http.client.HTTPException("synthetic close failure")
+
+    monkeypatch.setattr(size_gate.http.client, "HTTPSConnection", Connection)
+    return events
+
+
+def test_extract_pr_body_falls_back_to_api_for_missing_body(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    event_path = tmp_path / "event.json"
+    event_path.write_text(
+        json.dumps(
+            {
+                "repository": {"full_name": "owner/repo"},
+                "pull_request": {"number": 123},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    _stub_pr_https(monkeypatch, b'{"body": "## Split Justification\\nFrom api."}')
+
+    assert size_gate.extract_pr_body(event_path) == "## Split Justification\nFrom api."
+
+
+def test_extract_trusted_approvals_falls_back_to_api_for_missing_labels(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    event_path = tmp_path / "event.json"
+    event_path.write_text(
+        json.dumps(
+            {
+                "repository": {"full_name": "owner/repo"},
+                "pull_request": {"number": 123},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    _stub_pr_https(
+        monkeypatch,
+        b'{"labels": [{"name": "Operator-Approved"}, {"name": "scope/privileged-approved"}]}',
+    )
+
+    assert size_gate.extract_trusted_approvals(event_path) == {
+        "operator-approved",
+        "scope/privileged-approved",
+    }
+
+
+def test_extract_trusted_approvals_unions_live_labels_when_event_labels_are_stale(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    event_path = tmp_path / "event.json"
+    event_path.write_text(
+        json.dumps(
+            {
+                "repository": {"full_name": "owner/repo"},
+                "pull_request": {"number": 123, "labels": []},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    _stub_pr_https(
+        monkeypatch,
+        b'{"labels": [{"name": "scope/operator-approved"}, {"name": "scope/privileged-approved"}]}',
+    )
+
+    assert size_gate.extract_trusted_approvals(event_path) == {
+        "scope/operator-approved",
+        "scope/privileged-approved",
+    }
+
+
+def test_main_uses_event_labels_for_trusted_scope_approvals(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    event_path = tmp_path / "event.json"
+    approved_body = _standard_body(
+        "\n## Split Justification\nCI policy and tests.\n"
+        "\nOperator approval: approved for privileged CI scope exception.\n"
+        "\nPrivileged scope exception: approved for current CI unblocker.\n",
+    )
+    event_path.write_text(
+        json.dumps(
+            {
+                "pull_request": {
+                    "body": approved_body,
+                    "labels": [
+                        {"name": "operator-approved"},
+                        {"name": "scope/privileged-approved"},
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        size_gate,
+        "collect_numstat_output",
+        lambda *, base_sha, head_sha: "200\t0\tscripts/ci/check_pr_size_governance.py\n",
+    )
+    monkeypatch.setattr(
+        size_gate,
+        "collect_changed_files",
+        lambda *, base_sha, head_sha: (
+            ["scripts/ci/check_pr_size_governance.py"]
+            + [f"tests/example_{index}.py" for index in range(15)],
+            frozenset(),
+        ),
+    )
+
+    exit_code = size_gate.main(
+        ["--base-sha", "base", "--head-sha", "head", "--event-path", str(event_path)]
+    )
+    output = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "OK (privileged CI/security/workflow policy)" in output
+
+
+def test_main_rejects_event_body_approvals_without_trusted_labels(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    event_path = tmp_path / "event.json"
+    self_attested_body = _standard_body(
+        "\n## Split Justification\nCI policy and tests.\n"
+        "\nOperator approval: approved for privileged CI scope exception.\n"
+        "\nPrivileged scope exception: approved for current CI unblocker.\n",
+    )
+    event_path.write_text(
+        json.dumps({"pull_request": {"body": self_attested_body, "labels": []}}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        size_gate,
+        "collect_numstat_output",
+        lambda *, base_sha, head_sha: "200\t0\tscripts/ci/check_pr_size_governance.py\n",
+    )
+    monkeypatch.setattr(
+        size_gate,
+        "collect_changed_files",
+        lambda *, base_sha, head_sha: (
+            ["scripts/ci/check_pr_size_governance.py"]
+            + [f"tests/example_{index}.py" for index in range(15)],
+            frozenset(),
+        ),
+    )
+
+    exit_code = size_gate.main(
+        ["--base-sha", "base", "--head-sha", "head", "--event-path", str(event_path)]
+    )
+    output = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "operator-approved privileged scope exception" in output
+
+
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        (["--base-sha"], "Missing value for --base-sha."),
+        (["--base-sha", "--head-sha"], "Missing value for --base-sha."),
+        (["--head-sha"], "Missing value for --head-sha."),
+        (["--body"], "Missing value for --body."),
+        (["--event-path"], "Missing value for --event-path."),
+    ],
+)
+def test_main_fails_cleanly_when_flag_value_is_missing(
+    argv: list[str],
+    message: str,
+) -> None:
+    with pytest.raises(SystemExit, match=message):
+        size_gate.main(argv)
+
+
+@pytest.mark.parametrize("timed_out", (None, "numstat", "name-status", "ls-tree"))
+def test_git_query_deadlines_never_become_empty_policy_inputs(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], timed_out: str | None
+) -> None:
+    """Exercise all main-path queries; a timeout cannot reach policy evaluation."""
+    generated = "frontend/src/api/schema.ts"
+    calls: list[str] = []
+    evaluations: list[dict[str, object]] = []
+    monkeypatch.setattr(size_gate, "GIT_BINARY", "/absolute/git")
+
+    def run(
+        argv: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]:
+        assert argv[0] == "/absolute/git"
+        assert kwargs["timeout"] == size_gate.GIT_COMMAND_TIMEOUT_SECONDS == 30
+        assert kwargs["cwd"] == size_gate.REPO_ROOT and kwargs["check"] is True
+        kind = (
+            "ls-tree"
+            if argv[1] == "ls-tree"
+            else "numstat" if "--numstat" in argv else "name-status"
+        )
+        calls.append(kind)
+        if kind == timed_out:
+            raise subprocess.TimeoutExpired(
+                argv, 30, output=b"synthetic-secret-output", stderr=b"synthetic-secret-error"
+            )
+        if kind == "numstat":
+            return subprocess.CompletedProcess(argv, 0, f"1\t0\t{generated}\n", "")
+        if kind == "name-status":
+            return subprocess.CompletedProcess(argv, 0, b"M\0" + generated.encode() + b"\0", b"")
+        return subprocess.CompletedProcess(
+            argv, 0, b"100644 blob " + b"a" * 40 + b"\t" + generated.encode() + b"\0", b""
+        )
+
+    def policy(**kwargs: object) -> tuple[int, list[str]]:
+        evaluations.append(kwargs)
+        return 0, ["synthetic policy success"]
+
+    monkeypatch.setattr(size_gate.subprocess, "run", run)
+    monkeypatch.setattr(size_gate, "evaluate_pr_size_policy", policy)
+    argv = ["--base-sha", "b" * 40, "--head-sha", "c" * 40]
+    if timed_out is None:
+        assert size_gate.main(argv) == 0
+        assert calls == ["numstat", "name-status", "ls-tree"]
+        assert len(evaluations) == 1
+        assert evaluations[0]["regular_generated_paths"] == frozenset({generated})
+    else:
+        with pytest.raises(RuntimeError, match="timed out after 30 seconds") as error:
+            size_gate.main(argv)
+        assert error.value.__suppress_context__ is True
+        assert calls[-1] == timed_out
+        assert evaluations == []
+        assert "synthetic-secret" not in str(error.value)
+        output = capsys.readouterr()
+        assert "synthetic policy success" not in output.out
+        assert "synthetic-secret" not in output.out + output.err
+
+
+@pytest.mark.parametrize(
+    "location", ["https://elsewhere.invalid/x", "https://api.github.com/other"]
+)
+def test_live_pr_metadata_rejects_redirect_without_forwarding_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, location: str
+) -> None:
+    events = _stub_pr_https(
+        monkeypatch,
+        b'{"labels":[{"name":"scope/emergency-approved"}]}',
+        status=302,
+        location=location,
+    )
+    event = tmp_path / "event.json"
+    event.write_text(
+        json.dumps(
+            {
+                "repository": {"full_name": "owner/repo"},
+                "pull_request": {"number": 123, "labels": [{"name": "operator-approved"}]},
+            }
+        )
+    )
+    assert size_gate.extract_trusted_approvals(event) == {"operator-approved"}
+    assert events == ["connect", "request", "response-close", "connection-close"]
+
+
+@pytest.mark.parametrize(
+    "repo,number",
+    [
+        ("owner/repo", True),
+        ("owner/repo", 0),
+        ("owner/repo", -1),
+        ("owner/..", 123),
+        ("./repo", 123),
+        ("owner/", 123),
+        ("/repo", 123),
+        ("owner/x/y", 123),
+        ("owner/a%2Fb", 123),
+        ("owner/a?b", 123),
+        ("owner/a#b", 123),
+        ("owner/a@b", 123),
+        ("owner/a\\b", 123),
+    ],
+)
+def test_live_pr_metadata_rejects_bad_route_before_connect(
+    monkeypatch: pytest.MonkeyPatch, repo: str, number: int
+) -> None:
+    events = _stub_pr_https(monkeypatch, b"{}")
+    assert size_gate._fetch_pr_metadata_from_api(number, repo) == {}
+    assert events == []
+
+
+@pytest.mark.parametrize("case", ["cap", "oversize", "utf8", "syntax", "non-object", "201"])
+def test_live_pr_metadata_accepts_only_bounded_200_json_object(
+    monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    payload = b'{"body":"live"}'
+    cap = 4 * 1024**2
+    if case in {"cap", "oversize"}:
+        payload = payload.ljust(cap + (case == "oversize"), b" ")
+    elif case in {"utf8", "syntax", "non-object"}:
+        payload = {"utf8": b"\xff", "syntax": b"{", "non-object": b"[]"}[case]
+    events = _stub_pr_https(monkeypatch, payload, status=201 if case == "201" else 200)
+    assert size_gate._fetch_pr_metadata_from_api(123, "owner/repo") == (
+        {"body": "live"} if case == "cap" else {}
+    )
+    assert events.count("request") == 1
+    assert events.count("read") == (case != "201")
+    assert events[-2:] == ["response-close", "connection-close"]
+
+
+@pytest.mark.parametrize("fault", ["constructor", "response-close", "connection-close"])
+def test_live_transport_failure_preserves_event_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    raw = b'{"body":"live","labels":[{"name":"scope/emergency-approved"}]}'
+    events = _stub_pr_https(monkeypatch, raw, fault=fault)
+    event = tmp_path / "event.json"
+    pr = {"number": 123, "body": "event body", "labels": [{"name": "operator-approved"}]}
+    payload = {"repository": {"full_name": "owner/repo"}, "pull_request": pr}
+    event.write_text(json.dumps(payload))
+    assert size_gate.extract_pr_body(event) == "event body"
+    assert events == []
+    assert size_gate.extract_trusted_approvals(event) == {"operator-approved"}
+    del pr["body"]
+    event.write_text(json.dumps(payload))
+    assert size_gate.extract_pr_body(event) == ""
+    assert events.count("connect") == 2
+    assert events.count("request") == (0 if fault == "constructor" else 2)
+
+
+@pytest.mark.parametrize(
+    "length,chunked,reads,accepted",
+    [
+        ("13", False, 1, True),
+        ("14", False, 1, False),
+        ("12", False, 1, False),
+        ("4194305", False, 0, False),
+        ("1, 2", False, 0, False),
+        ("-1", False, 0, False),
+        ("14", True, 1, True),
+    ],
+)
+def test_live_metadata_checks_declared_nonchunked_length(
+    monkeypatch: pytest.MonkeyPatch, length: str, chunked: bool, reads: int, accepted: bool
+) -> None:
+    payload = b'{"body":"ok"}'
+    events = _stub_pr_https(monkeypatch, payload, content_length=length, chunked=chunked)
+    result = size_gate._fetch_pr_metadata_from_api(123, "owner/repo")
+    assert result == ({"body": "ok"} if accepted else {})
+    assert events.count("read") == reads
+    assert events.count("request") == 1
+    assert events[-2:] == ["response-close", "connection-close"]

@@ -1,0 +1,576 @@
+# Agent instructions (scope: deploy/ and subdirectories)
+
+## Scope and layout
+- This AGENTS.md applies to: `deploy/` and below.
+- Key files: `deploy/Caddyfile`, `deploy/Caddyfile.production`, `deploy/docker-compose.staging.yaml`,
+  `deploy/docker-compose.production.yaml`, `deploy/docker-compose.production.selfhosted.yaml`,
+  `deploy/postgres-pgvector/Containerfile`, `deploy/postgres-pgvector/image-manifest.json`,
+  `frontend/Dockerfile.caddy-spa`, root `Dockerfile`, root `docker-compose.yaml`.
+- **METATRON offensive lab (out-of-band):** `deploy/metatron-lab/` — optional isolated-network
+  stub only; see `deploy/metatron-lab/README.md:1` and ADR
+  `docs/architecture/ADR_METATRON_OFFENSIVE_LAB_OUT_OF_BAND_2026-04-06.md:1`.
+
+## Production Caddy + SPA (apex)
+
+- **Contract:** [`docs/deploy/SPA_APEX_ROUTING_CONTRACT.md`](../docs/deploy/SPA_APEX_ROUTING_CONTRACT.md) — path/method split (legacy POST/OPTIONS/GET vs SPA GET on `/bmi`), proxy prefixes, default `VITE_API_BASE=/api/v1` (same-origin). FastAPI legacy HTML surfaces under `/legacy*` are proxied via the `@api` matcher (`deploy/Caddyfile.production:42`) so they are not swallowed by SPA `try_files`.
+- **Build Caddy image** (from repo root; compose uses `frontend/` as build context so root `.dockerignore` stays backend-focused):
+
+```bash
+docker compose -f deploy/docker-compose.production.yaml build caddy
+```
+
+- **Self-hosted Postgres lane** (colocated `postgres` + `app` + `caddy`): `deploy/docker-compose.production.selfhosted.yaml`. Build Caddy the same way with that file:
+
+```bash
+docker compose --project-directory deploy -f deploy/docker-compose.production.selfhosted.yaml build caddy
+```
+
+- **Override API base at image build time** (staging / alternate host):
+
+```bash
+VITE_API_BASE=https://staging.example.com/api/v1 docker compose -f deploy/docker-compose.production.yaml build caddy
+```
+
+- **`deploy/docker-compose.production.yaml`** references `env_file: .env` for the `app` service (path relative to `deploy/`). Create a local `deploy/.env` (gitignored) before `docker compose config` / up, or Compose will error if the file is missing.
+- **Validate Caddyfile** with the repo-owned hardened image (requires Docker daemon + placeholder env for `{$PRODUCTION_DOMAIN}`):
+
+```bash
+docker build -f frontend/Dockerfile.caddy-spa -t pulseplate-caddy:contract frontend
+PRODUCTION_DOMAIN=example.com STAGING_FALLBACK_DOMAIN=staging.example.com \
+  docker run --rm -e PRODUCTION_DOMAIN -e STAGING_FALLBACK_DOMAIN \
+  -v "$PWD/deploy/Caddyfile.production:/etc/caddy/Caddyfile:ro" \
+  pulseplate-caddy:contract caddy validate --config /etc/caddy/Caddyfile
+```
+
+- Staging deploys accept only two distinct operator-supplied
+  `ghcr.io/katsiarynakavaleuskaya/pulseplate@sha256:<digest>` references
+  (backend and Caddy). PostgreSQL is not a third CLI argument: its sole identity
+  comes from `deploy/postgres-pgvector/image-manifest.json` and the matching
+  digest-pinned Compose service. Floating tags and `latest` are forbidden.
+- `STAGING_ATTESTED_DIGEST_READY=true` may be enabled only after the server-local Compose, Caddyfile, deploy script, Postgres backup helper, root-owned contract marker, and current-commit hashes are synchronized. The staging `.env` must be a regular non-symlink file with mode `0600`; it is Compose data and must never be shell-sourced by the deploy path. Merge alone does not update `/srv/pulseplate-staging`.
+
+### Caddy CI retained candidate and temporary risk boundary
+
+- Under the direct owner decision of 2026-10-30, PR #2497 permits one final
+  fourth CI build after the required gates and publication. The three original
+  starts remain spent. Keep exact failed P (`40809053754` / `123234862421`), Q
+  (`40874768112` / `123450755201`) and R (`40971831227` / `123790320307`)
+  permanently charged, each attempt 1, with all three source ancestries checked.
+  Only one fresh first-attempt S on corrected published source,
+  created strictly after R's job completed at `2026-10-29T23:19:41Z`, may fill
+  the fourth slot. Any S start spends it; there is no fifth. Reuse requires the
+  unique successful S and every unchanged source/artifact/runtime/security/date
+  check. Failed predecessors, unknown history and caches never supply a slot.
+- Run the frontend `caddy-contract` producer and consumers on `ubuntu-24.04`.
+  A runner or image-store change requires native requalification under the
+  unchanged compiler/config, archive-import and report identity checks; the
+  runner selection alone does not prove native acceptance.
+- The existing frontend `caddy-contract` job owns one explicitly selected candidate
+  producer after two independent compiler-free metadata derivations. Ordinary PR
+  and accepted exact merge-to-main observations import its authenticated original
+  artifact, independently authenticate its accepted PR lineage and original Git
+  blobs (including the expiry checker), and verify actual image/config/binary identity;
+  absent, expired, failed, ambiguous or changed inputs are HOLD, never a rebuild.
+  A started producer counts even when it fails. Require complete distinct native
+  API identities/relationships and no-follow authenticated transport; ambiguous
+  history is HOLD. Keep image exports private until complete security acceptance,
+  and recheck accepted dates immediately before build. Cache reuse is not a build grant.
+- The explicit CVE-2026-116587 D decision is limited to that isolated loaded CI
+  configuration and exact one v3.0.5 HIGH after actual v4.1.6 proof. Generic report
+  validation, backend/default policy and strict CD remain unchanged. Preserve the
+  unfiltered native report and require successful strict/D native controls; an
+  error is never proof of policy rejection. Native runtime evidence is bounded to
+  its actual immutable config, process and listeners, not deployed reachability.
+- Mocked Caddy observer outputs prove branch behavior, not native compatibility.
+  Bind only the required HOME/TMPDIR properties through the pinned serving
+  process's existing static-response placeholders and exact loopback response.
+  Keep literal placeholders in the immutable config; configured values alone,
+  a separate exec process or startup logs cannot supply actual-process proof.
+  Preserve raw CR/LF, private tmpfs and final same-instance checks. Do not model
+  the complete runtime environment or retain unexpected values in diagnostics;
+  phase/predicate/length/hash notes do not establish native acceptance.
+- Follow the individual owner/review/expiry/removal contract in
+  [the CVE owner](../docs/security/CVE-2026-116587-caddy-go-jose.md).
+  The original suppression-free CD/release outcome remains open; permanent v3/CD
+  remediation belongs to the human-assigned PR #2494. No deployment, new source
+  fork, capability retirement or additional compiler invocation follows from D.
+
+## Incoming deployment bundle validation
+
+- Validate incoming Compose/config/policy bytes at their original bundle paths,
+  separately from the trusted installed Compose project directory. Render both
+  pending and installed models with that explicitly selected installed directory;
+  compare normalized bind and secret paths to their intended installed targets.
+  A candidate model or its project name must never choose the installed context.
+- An explicit `--env-file` supplies interpolation values; it does not replace a
+  service relative `env_file`. Keep missing installed environment files fatal and
+  never copy or symlink a production `.env` into an incoming bundle.
+- Changes to relative `env_file`, bind or secret resolution require a real native
+  Compose configuration-only regression using synthetic files, an absent incoming
+  `.env` and the existing native fixture. Stubbed JSON alone cannot prove those
+  path semantics. No image execution or deployment authority follows.
+
+## Commands (run from repo root)
+- Build images: `make docker-build`, `make docker-build-dev`
+- Run containers: `make docker-run`, `make docker-run-dev`
+- Stop containers: `make docker-stop`
+
+## Experiment Runner image
+
+- `deploy/experiment-runner/Containerfile` is a local evidence image, not a
+  production or devcontainer image.
+- Keep its Python base tag pinned by OCI digest, install only locked
+  `runtime-dev` requirements through BuildKit secrets, and keep the final user
+  non-root.
+- Image builds require the genuine Linux aarch64 CPython 3.13 SDK export,
+  qualified against its actual pinned producer and complete payload before
+  passing `--psycopg-sdk-root` to the dispatcher. Curated context transport is
+  separate from canonical in-UBI SDK/wheel admission. Never run a source backend
+  with proxy secrets or copy libc, libpython, loaders, host HOME or credentials.
+- Acquire the Runner profile with existing `--prefetch-only` while only static
+  SDK wheel/receipt data is present. No supplied DSO/provider/config or SDK
+  loader state may be active with proxy credentials. Complete owned acquisition
+  HOME/TMP/cache cleanup, then use trusted-base `--validate-psycopg-sdk` with
+  explicit SDK/native-root operands under actual network-none and clean startup.
+  Activate only the checked qualified payload and consume the exact wheelhouse
+  offline. Final native COPY comes from that builder, never external inputs
+  again. Static hashes prove consistency; producer/export origin and final
+  loaded-library/kernel/TLS/strict-successor admission remain independent.
+- Preserve the actual original UBI default CA bundle and connect the SDK OpenSSL
+  compiled default paths to it. Native system `_ssl`, HTTP/default trust,
+  providers, loaded DSO hashes and database consumers must be observed on the
+  final image; a custom test CA or matching version is not that proof.
+- Image builds may use the approved private proxy. Experiment runs must use a
+  prebuilt immutable `name@sha256:<digest>` reference and must not install
+  dependencies or pull images after the strict backend probe.
+- Post-build admission must inspect image history/config for private-proxy
+  secret names and values. Apple runs use the exact inspected
+  `name@sha256:<digest>`; Docker runs use the verified local digest with
+  `--pull never` and re-check the name-to-digest binding before execution.
+- Do not add Compose services, runtime sockets, host home/keychain mounts,
+  `SYS_ADMIN`, or other broad capabilities for this image.
+
+## Conventions
+- Keep staging and production configs in sync with documented env vars.
+- Avoid changes that alter runtime ports without updating clients and docs.
+
+## Private Prometheus contour
+
+- Canonical image and scrape contracts live only in
+  `deploy/prometheus/image-manifest.json` and `deploy/prometheus/prometheus.yml`.
+  Exact alias/target alert expressions live in `deploy/prometheus/alias-alerts.yml`.
+  Mount the rule file read-only in all three Compose contours and carry it through
+  both deploy paths and CD file admission. Before product mutation, run full
+  pinned-image `promtool check config` and `promtool check rules`; CI also runs
+  `promtool test rules` with `deploy/prometheus/alias-alerts.test.yml`.
+  All three Compose contours must keep one equivalent `prometheus` service:
+  exact linux/amd64 manifest digest, user `65532:65532`, `cap_drop: ALL`,
+  `no-new-privileges`, named `prometheus_data`, and the sole retention carrier
+  `--storage.tsdb.retention.time=45d`.
+- `observability` is an internal network. Only `app` and `prometheus` join it;
+  Prometheus does not join `web`, publish port `9090`, or receive a Caddy route.
+  Only `app` and `prometheus` receive the
+  `pulseplate_metrics_scrape_key` Compose secret.
+- Compose file secrets are bind mounts and do not remap file ownership or mode.
+  The account running Compose owns a regular non-symlink `secrets/` directory
+  with mode `0700` and a regular non-symlink
+  `secrets/pulseplate_metrics_scrape_key` file with mode `0444`. Deploy tooling
+  validates metadata but must never source, print, archive, or independently
+  parse the value; semantic validation stays in
+  `app/security/production_invariants.py`.
+- The staging contract version comes from `scripts/deploy.sh`; version `5`
+  uses the finite bundle in `.github/workflows/cd.yml` staging fingerprint
+  and admission steps. Keep that existing bundle as the file inventory owner.
+  Merge does not synchronize a host or enable
+  `STAGING_ATTESTED_DIGEST_READY`; secret bootstrap and staging/production
+  activation remain human actions. Follow
+  `docs/deploy/OPERATIONAL_SIGNALS.md` for the operator sequence and rollback.
+- Optional OBS2A Alertmanager is an `alerting` profile in all three contours.
+  Both readers reject every normalized incoming dependency to Alertmanager in
+  the invocation's native all-profile model, including optional and indirect
+  coupling; native Compose owns normalization and valid non-AM dependencies
+  remain allowed.
+  It is not part of ordinary app/DB/metrics startup. Its exact image, private
+  network topology, `environment` label authority, config and exact empty Trivy
+  policy must pass CD and both deploy admissions before product mutation.
+  Only selected alerting requires a Compose-account-owned mode-0444 SMTP key
+  in the existing protected mode-0700 secrets directory; the bind mount makes
+  the file readable to Alertmanager UID 65534 without ownership remapping.
+  Neither the key nor its contents belongs in a bundle. Preserve an already
+  running Alertmanager across production `--remove-orphans` app/Caddy updates.
+  Each Alertmanager network attachment must retain explicit normalized
+  `gw_priority`: `alerting=1`, `smtp-egress=2`, so SMTP egress is the default
+  gateway. A Compose host that cannot preserve both values is `HOLD`.
+  `smtp-egress` is outbound networking, not a destination firewall. Actual
+  received email and host activation require separate evidence; see
+  `docs/deploy/OPERATIONAL_SIGNALS.md` and
+  `docs/security/CVE-2026-84445-alertmanager.md`.
+- Alertmanager module qualification, support inspection, candidate builds and
+  publication use the qualified `ubuntu-24.04` runner. Runner or Docker image-store
+  changes require native requalification while preserving the exact config,
+  manifest and ordered-layer checks.
+- OBS2A deploy admission binds the complete reviewed Prometheus config, alias
+  rules and Alertmanager Trivy ignore bytes, plus the exact reviewed
+  Alertmanager route. A change to any of these files requires reviewing the
+  complete replacement, updating both existing deploy readers and their
+  focused negative tests, and repeating native config/security admission.
+  Do not append text checks to admit an unreviewed YAML extension.
+- Runtime `COMPOSE_PROFILES` belongs to the caller. Snapshot its presence and
+  value before production env loading, reject changes introduced by that
+  load, and export the caller value for every Compose command. An absent
+  caller choice becomes an exported empty value so Compose `--env-file`
+  cannot activate a profile. Configuration-only profile rendering does not
+  authorize runtime activation. Prove precedence with native Compose;
+  arbitrary sourced-shell behavior is outside this bounded profile check.
+- The old vulnerable Alertmanager subject expires at `2026-10-21T00:00:00Z`.
+  The remediated accepted subject and exact empty policy remain date independent.
+  Both readers use the same trusted fetcher owner for a read-only all-state census
+  of the installed Compose project even when alerting is off. Production also
+  checks its independently installed model before a first incoming bundle adds
+  the service. Staging is installed-only: missing AM files/context remain HOLD,
+  not proof of absence or a successful migration. Bind the full container ID, labels,
+  strict state and running image's config/RepoDigest/Linux-amd64 tuple. A selected
+  corrected image cannot hide an old running instance at the cutoff. Unknown IDs,
+  states, images or capture status remain HOLD; absent/proven stopped instances
+  need no SMTP file when the profile is off. Rejection precedes product mutation
+  and never automatically starts or stops Alertmanager. This is a bounded
+  admission observation, not continuous or whole-host monitoring.
+
+## Immutable PostgreSQL 15 plus pgvector contour
+
+- The sole repository image record is
+  `deploy/postgres-pgvector/image-manifest.json`. It binds the exact DHI
+  PostgreSQL 15.19 Alpine 3.23 runtime/dev platform manifests, pgvector 0.8.6
+  source commit/archive hash, exact APK build closure and acquisition record,
+  supplier-signed index, pinned Buildx/BuildKit inputs, reproducible build
+  epoch, Containerfile hash, derived GHCR platform/config digests, and Trivy
+  0.74 suppression-free scan contract.
+- `deploy/postgres-pgvector/Containerfile` is a two-stage build. Source enters
+  only as the preverified `pgvector-v0.8.6.tar.gz` context file; the source archive
+  and APK archives are not tracked. The hash-bound `builder-apk-inputs.tsv` and
+  original `builder-apk-index.tar.gz` are reviewed build inputs, not diagnostic
+  artifacts. Preserve the supplier's index bytes and signature; never generate
+  an unsigned subset or add trust keys. The existing source-context step owns
+  exact archive acquisition. Native APK authenticates the signed local index
+  and indexed package identities using the pinned base keys. A standalone APK
+  signature and authenticated repository installation are different native
+  trust paths; use the demonstrated repository path without `--allow-untrusted`.
+  Install only the complete hash-bound local archive set with network and cache
+  access disabled, and compile inside `RUN --network=none`. An installed-package
+  checksum alone cannot freeze transitive inputs. Base refreshes require a new
+  base/acquisition/final inventory reconciliation and native output proof.
+  The builder must use
+  `/usr/libexec/postgresql15/pg_config`, `make -j1`, empty `OPTFLAGS`, and the
+  closed artifact inventory. Do not add curl, git, floating APK packages, a
+  second source path, or a host build toolchain.
+- Native pre-publication proof must reach each affected image consumer. The
+  existing PG publisher owns a 240-minute job budget and env-defined scan,
+  process, pull and inspect budgets. Collect all four exact subjects against
+  one frozen Trivy 0.74 database, retaining later available observations after
+  a finding or tool failure, then reject any failed aggregate. Full collection
+  exit zero is not acceptance: retain the separate native HIGH/CRITICAL gate.
+  Keep full raw JSON/stdout/stderr private outside every upload root. Publish
+  only byte-identical Docker-image reports admitted by the existing structural
+  image owner and empty/omitted Secrets projection; this is not a universal
+  sanitizer. Final verified OCI layout reports stay private, with only bounded
+  status/hash/size and the existing proven subject digest public. Do not pass
+  OCI paths to the Docker report helper or rewrite native reports. Always-upload
+  includes only the explicit public directory. Private hosted-runner files have
+  no presumed durable retrieval channel; retain complete originals in the OWN
+  qualified environment for owner consumption. Matching build digests, partial
+  public reports or collection success do not prove full security acceptance.
+- Native PostgreSQL directory admission requires successful native `find`
+  completion before consuming empty output, a count, sorted paths, or a hash-bound
+  inventory. Capture output in a standalone assignment under the existing
+  fail-fast shell; retain the native diagnostic and nonzero child/Docker/caller
+  status before initialization or product mutation. A matching partial inventory
+  or empty stdout after failure is not successful discovery. Keep the query
+  projection bounded to its existing owner and preserve independent type,
+  stat, UID/GID, mode, source and caller-order checks. Use genuine native error,
+  partial-output, forbidden-entry, nonempty and successful-empty controls;
+  wiring fixtures do not replace native execution.
+- The selected current image and one exact frozen prior derived image use whole
+  config/platform/base/required-RepoDigest tuples selected by exact full ref in
+  the existing deploy readers. Preserve the separate original Docker Hub legacy
+  case. Inspect each selected ref itself and bind its returned ID to the captured
+  container image; new candidate pulls admit only current. Do not combine tuple
+  members across cases, recognize digest suffixes, or create a history picker,
+  helper or manifest field. A recognized prior service remains only an admitted
+  forward-transition starting state, with its original vulnerability evidence.
+- OCI counts, config and layer identities come from actual reproduced bytes.
+  Bind each compatibility-layer directory's metadata separately: parents equal
+  the selected runtime base, while the empty leaf retains `70:70:0700`.
+  A Docker store may expose the exact selected config ID or platform ID; admit
+  only those two bound forms and preserve their distinct meanings.
+- For a comparable native-status repair, retain bounded process lesson metrics
+  in the existing role evidence: repeat failures and escaped native-status
+  findings, with the next comparable PR as the observation window and explicit
+  user-impact, business-risk and project-development gaps. Control counts are
+  process evidence, not measured product improvement, runtime telemetry, memory
+  promotion or graph truth.
+- In CD, `staging-postgres-native-integration` admits configuration with the
+  existing checker's `--configure-only` mode before the PostgreSQL publisher and
+  backend build/deploy job. Keep their literal `needs` and success predicates
+  aligned; failed, cancelled or unexpectedly skipped prerequisites reject.
+  A successful non-material classifier may intentionally skip configuration
+  execution. This predecessor never requires a published image or chooses a
+  mode from availability. The trusted publisher must execute full native
+  manifest/TLS/crash/restart/restore proof after candidate three-proof pullback
+  and before canonical promotion, on every admitted publication path. Native
+  failure blocks promotion; configuration success is not runtime proof.
+- The final image adds one and only one compatibility mountpoint layer:
+  `/var/lib/postgresql/data` is an empty real directory, owner `70:70`, mode
+  `0700`, copied from one verified empty builder directory. This lets the
+  tested Docker engine seed a brand-new named-volume root for the inherited
+  non-root UID 70 entrypoint. It does not repair, chown, migrate, or prove any
+  existing volume. Final-stage `RUN`, `USER`, `ENV`, `VOLUME`, wrapper scripts,
+  marker files, broad `/out/var` copies, Compose user overrides, and host-side
+  ownership workarounds are forbidden.
+- Only staging and `production.selfhosted` use the derived image. Both retain
+  the named `postgres_data` mount at `/var/lib/postgresql/data`, explicitly set
+  `PGDATA` to that legacy-compatible target, select `linux/amd64`, and publish
+  no database port. Managed production remains external and has no Compose
+  `postgres` service.
+
+### PostgreSQL publication and protected staging
+
+- PostgreSQL image admission requires native GitHub SLSA provenance, the
+  distinct `https://pulseplate.app/attestations/postgres-pgvector-materials/v1`
+  predicate and SPDX together. Use `scripts/ci/check_pgvector_attestations.py`
+  for original certificate source/workflow/run/attempt binding, exact material
+  comparison and the entire original SPDX predicate hash. Use the declared
+  sorted compact UTF-8 JSON encoding with no ASCII escapes or non-finite
+  values; preserve array order and every field. Read-only reuse retains the
+  original signed document, with a fresh image scan separately required.
+  Do not compare regenerated SPDX by expanding ignored fields. Reuse never claims a
+  new build. An actual rebuilt image may complete its own execution tuple;
+  retain historical proofs and reject conflicts within an execution.
+- The same helper owns the finite existing CI PostgreSQL compatibility rules
+  plus its explicit deployment/test owners. Compare both Git trees, including
+  additions and deletions, at classification and terminal promotion/reuse.
+  Do not recreate independent inline material lists or generic glob semantics.
+- After the workflow definition is registered on the default branch, run the
+  synthetic probe by manual dispatch on an explicit same-repository
+  `refs/heads/*` ref. Supply the full source SHA equal to that run's exact
+  `GITHUB_SHA`. It builds a synthetic subject and uses only a test tag; it
+  receives no DHI credentials and has no runtime promotion or deploy path.
+  Main-only manual reuse is read-only.
+- Initialize credentials for the pinned `actions/attest` JavaScript publisher:
+  its OCI SDK reads inline GHCR auth from `$HOME/.docker/config.json`, independently
+  of the private publisher's `DOCKER_CONFIG`. Use the bounded
+  `ghcr_attestation_credentials.py` adapter to install native-generated
+  GHCR-only auth in a fresh `0700` directory with a `0600` config. Preserve the
+  entire pre-existing default directory as an opaque object in a private sibling
+  holder; do not read its children or require its original UID/GID/mode to match
+  newly authored credentials. Restore the same original directory before deleting
+  authored files or the recovery journal. All four directory moves use the native
+  no-replace primitive; unsupported or ambiguous state is HOLD, with the original
+  and journal retained. Journal/topology recovery can continue in a fresh process
+  while the filesystem remains available; it does not promise recovery of a lost
+  hosted VM. One placement at a time is supported in the isolated job HOME, with
+  no other writer or consumer requiring the original default context during that
+  interval. Kernel no-replace protects occupied destinations, not source exclusion.
+  Keep `HOME` and the private DHI/Buildx/Scout context unchanged. Successful
+  ordinary `gh` authentication or Docker push does not prove this OCI reader
+  received credentials; diagnose each consumer at its real boundary. The
+  separate Go `gh attestation verify` reader honors inherited `DOCKER_CONFIG`;
+  authenticate that private directory before verification without extending
+  the JavaScript publisher's HOME bridge to the Go reader.
+- Execute deployment file-admission negatives through the actual shell.
+  Under `set -e`, a failed first command in `check_a && check_b` does not stop
+  the script. Use standalone rejecting checks for symlink/type admission,
+  and verify rejection before hashing or invoking protected helpers.
+- Staging contract v5 uses PostgreSQL TLS >=1.2, SCRAM, and passwordless
+  `postgresql+psycopg` URLs with `verify-full`, the exact CA and libpq passfile.
+  Derive database identity from the selected rendered Compose, never ambient
+  host variables. Real PostgreSQL session proof remains required in addition
+  to configuration/certificate checks.
+- The selected DHI PostgreSQL entrypoint executes `postgres "$@"` itself.
+  Compose passes only the admitted `-c` arguments, without another executable
+  name. Native integration must exercise that actual entrypoint and retain
+  bounded redacted container diagnostics before cleaning up failed probes.
+- Staging storage receipt `.staging-storage.json` is a root-owned local
+  provisioning record, never a committed artifact. Authenticate the selected
+  DigitalOcean Volume separately; native device/UUID/mount/directory checks
+  then bind PostgreSQL, Prometheus, backups and credential files to it.
+  Docker and backup systemd lifecycles must depend on that mount, with live
+  restore disabled. A missing mount must stop writers instead of creating
+  unencrypted root-disk directories. Do not silently rebind existing named
+  volumes or initialize discovered data.
+- Staging admission checks the installed backup service/timer bytes against the
+  admitted bundle and the manager's loaded systemd properties, including exact
+  commands, environment-file identity, mount dependencies and persistent daily
+  timer. A staged example alone is insufficient. The timer must be enabled and
+  active; stale loaded state or extra drop-ins holds deployment.
+- Before Prometheus recreation, census the existing Compose service and its
+  actual v5 data-volume mount. Retained legacy history requires a manual first
+  copy and verified v5 service before automatic deploy; preserve the old volume
+  for rollback. Only absent legacy/v5 objects plus an empty backing directory
+  admit a fresh installation. Run preflight promtool against the exact image
+  with only config/credential mounts, so validation cannot create a service
+  data volume. Repeat the history census immediately before recreation.
+- For an existing staging Droplet, bind its provider ID to the retained
+  provisioning record and inventory dedicated SSH/known-hosts carriers first.
+  Verify the recorded operator login with strict saved-host-key checking
+  before requesting new access details or proposing credential changes.
+- Backups validate the complete native archive and substantive table inventory
+  before publishing/pruning. Restore requires an explicit mode; verification
+  creates a distinct `pulseplate_restore_check_*` database and never replaces
+  a pre-existing target. A successful listing is not restore/data proof.
+
+- Pull-request execution is DHI-secret-free and registry-write-free. Only an
+  exact trusted push to `refs/heads/main` may read `DHI_USERNAME` and
+  `DHI_ACCESS_TOKEN`, reproduce the frozen digest twice, scan exact bases,
+  builder, and final image with Trivy 0.74 and an empty ignore file, publish to
+  the existing GHCR PulsePlate package, and attach derived provenance/SBOM.
+- DHI Community is the only admitted Docker entitlement. Docker documents its
+  Community core as free to use, share, and build on under Apache 2.0. The
+  existing `pulseplate` GHCR package was authenticated in the GitHub UI as
+  `public` on 2026-08-27; workflow publication must require that exact existing
+  owner/name/source/visibility before and after writes and must never create a
+  package, change visibility, purchase a subscription, or claim Select,
+  Enterprise, Docker support, official DHI, or mirror status.
+- Treat the output only as a PulsePlate-owned incorporated deployment
+  component built from DHI Community. Preserve inherited notices and upstream
+  PostgreSQL/pgvector attribution. The bounded public-package disposition is
+  tied to Docker's DHI Community docs and Terms observed on 2026-08-27; any
+  terms, tier, source-image, package, or topology drift is `HOLD`.
+- Install Docker Scout from the exact checksum-pinned official `v1.24.0`
+  archive and require its exact binary build identity. Source-attestation
+  verification must bind the two exact DHI linux/amd64 subjects. Docker's
+  documented `--skip-tlog` path verifies the Docker signature without public
+  Rekor/transparency proof; it is source-subject-only and never a scanner,
+  VEX, derived-attestation, provenance, or security-gate suppression.
+- Deploy scripts must validate the manifest and rendered Compose first, pull
+  the exact PostgreSQL digest under temporary GHCR credentials, inspect its
+  platform/config/labels, and remove credentials. An existing self-hosted
+  transition then captures container/image/volume identity, quiesces worker,
+  Caddy, and app, and requires the closed predecessor/current image identity,
+  UID 70, exact PGDATA, PostgreSQL 15.19, stable runtime identity, and a
+  mode-0600 custom dump accepted by `pg_restore --list` from the still-running
+  old database before stopping it. Only then may the candidate use
+  `--pull never`; orphan or ambiguous identities/volumes fail closed. Hosts
+  never receive DHI credentials. The backup helper must receive the same
+  explicitly selected Compose `ENV_FILE` as its parent deploy command and pass
+  it through `docker compose --env-file`; it must not fall back to a sibling
+  project `.env` during an override-based deployment. The app, Caddy, and
+  worker running-state census must also fail closed on Docker inspect failure
+  or any value other than the exact booleans `true` and `false`; an unknown
+  running state must never be treated as an absent restart target.
+- The checked main workflow must prove the exact four-directory mountpoint
+  layer inventory and then attach a uniquely named fresh empty volume with a
+  non-initializing command. The mounted root must be empty `70:70:0700` before
+  normal PostgreSQL initialization. This is bounded Docker-engine evidence,
+  not universal runtime or existing-volume evidence.
+- A fresh PostgreSQL transition must prove the rendered named volume absent
+  and its admitted backing directory ordinary, readable and exactly empty
+  twice: once before product quiesce and once immediately before the single
+  no-pull Compose start. The second census is the declared fresh-volume
+  handoff boundary; hidden entries, populated copied data, replacement links,
+  any volume appearance, malformed listing, or listing error leave
+  captured writers quiesced and returns `HOLD`. Do not add further same-step
+  polling or rollback writes; concurrent manual Compose/Docker mutation is
+  outside the admitted transition and requires a separate host-lock design.
+  The exact retained legacy PostgreSQL volume also blocks fresh admission,
+  even with no current service and an empty destination. Keep that old volume
+  only alongside the verified existing-v5 transition after manual migration.
+- The `postgres-pgvector-publish` canonical-tag write is provisional until an
+  immediate exact-main revalidation of the closed PostgreSQL material set
+  gates `runtime_ref` output and admission. If that post-write check detects a
+  superseding main commit, the publisher must fail without inspection output
+  or downstream admission. Do not roll the tag back or add another write: the
+  serialized replacement publisher is the sole repair owner, while consumers
+  remain bound to the immutable digest. This post-write gate is the declared
+  transaction boundary; stronger exclusivity requires a separate ownership
+  and threat-model lane rather than additional same-job race checks.
+- The PostgreSQL material classifier must cover the complete finite
+  compatibility surface owned by the canonical CI `pgvector_compat` filter,
+  plus the publication workflow itself. A main push that changes any migration,
+  dependency, Compose, deploy, pgvector runtime, or compatibility-test owner
+  must take the credential-free compatibility and publisher path; it must not
+  fall through to reuse.
+- Read-only PostgreSQL reuse has one terminal transaction boundary after scans,
+  attestations, and runtime checks: a main run must refetch `main`, prove that
+  the complete compatibility surface is unchanged from its exact run SHA, and
+  all reuse events must recheck that the canonical tag still selects the frozen
+  digest. This final check is read-only and single-pass. Do not add a polling
+  loop or tag rollback; stronger exclusion requires a separate ownership/lock
+  lane.
+- The preceding `postgres-pgvector-ci-admission` compatibility job must remain
+  credential-free even on its trusted main-only path. It must run the complete
+  canonical CI `pgvector-compat` pytest file list; a single migration node is
+  not binding, vector-query, RLS or autogenerate compatibility proof.
+  It may consume only the
+  single-line, credential-free repository proxy variables; it must not receive
+  `DEVPI_CI_*`, publication credentials, an environment-secret grant, or any
+  other `secrets.*` expression. The protected `pgvector-publish` environment
+  begins only at the publisher job after compatibility admission succeeds.
+- Normalize a relative production `ENV_FILE` against the parent-selected
+  absolute `DEPLOY_DIR` before reading it. Parent Compose and the backup helper
+  must receive that same absolute path even when the helper's `PROJECT_DIR`
+  is the separate Compose directory; a missing selection has no sibling fallback.
+- Repository/image admission is not activation. Volume census, backup,
+  deployment, restore, production release, volume deletion, and the Prometheus
+  `T₀` remain separate human-authorized actions.
+
+For a vendor trust-store refresh, admission must verify the actual final default
+container CA bytes and the named removed certificate identities through the
+existing source-image owner. Mounted test roots and a successful compiler upgrade
+do not replace this check. Keep the existing real TLS positive/negative controls;
+source preparation alone grants no image activation or deployment authority.
+
+### Official Prometheus image updates
+
+- The v3 record distinguishes preparation from a real selected candidate.
+  All three Compose contours require the canonical reader's exported
+  `PROMETHEUS_RUNTIME_REF`; an ambient value or floating fallback is insufficient.
+  Keep the same non-root user, network, storage and retention contracts.
+- The producer and event rules live in
+  [scripts/AGENTS.md](../scripts/AGENTS.md#official-prometheus-image-selection).
+  Staging contract version 6 also binds the installed standalone helper hash.
+  Production transfers that helper separately as trusted code, then checks and
+  syncs the archive copy as data through the existing destination transaction.
+  An incoming archive must never choose executable host code for its own checks.
+- Image selection does not deploy or migrate a host, change volume ownership,
+  enable staging attestation flags, or start the production observation clock.
+
+## Production tag gate
+- Semver production tags stay build-only until all three deploy inputs agree: `PROD_DEPLOY_MODE`,
+  `WEB_IOS_RELEASE_READY=true`, and `PRODUCTION_ENV_READY=true`.
+- `PRODUCTION_ENV_READY=true` is infra-owned and can be set only after the target host already has
+  the server-local runtime env file (`/srv/pulseplate-production/.env` or `$DEPLOY_DIR/.env`).
+- If the default `github.token` cannot read production-scoped Actions variables, the bridge job may
+  retry through `PRODUCTION_ENV_READ_TOKEN`; keep that secret aligned with the deploy runbook.
+
+## Dedicated scheduler worker admission
+
+- Only the three no-ingress `worker` services select literal
+  `PRIVATE_EXPORTS_ENABLED=false`; API production export guards stay enabled and
+  fail closed. Never copy the API env file or signing secret into a worker.
+- The existing Docker validation job runs the actual candidate scheduler CLI
+  through `scripts/ci/check_scheduler_worker_runtime.py` with isolated synthetic
+  PostgreSQL/cache. Independent SQL success or an initial running state is not
+  worker lifecycle proof. Require a leased no-update cycle, correlated live
+  PostgreSQL session after unlock, stable process/restart0 and graceful TERM.
+- Both CD backend producers must author the exact checkout OCI revision and
+  verify it on immutable image pullback. Signed provenance does not supply a
+  missing image-config revision. Keep provenance and runtime observations as
+  separate evidence; neither admits a host deployment or starts production T0.
+
+## Docker entrypoint invariants
+Docker must run FastAPI as:
+- `app.main:app`
+
+Do not COPY missing legacy files (e.g., app.py) after refactors.
+
+Verify with:
+```bash
+# Check for obsolete app.py copies
+rg -n "COPY .*app\.py|COPY .*legacy_app\.py" Dockerfile
+
+# Verify uvicorn entrypoint
+rg -n "uvicorn\s+app(:|.main:app)|legacy_app" Dockerfile Makefile docker-compose.yaml -S
+
+# Should use app.main:app
+rg -n "app\.main:app" Dockerfile Makefile docker-compose.yaml -S
+```

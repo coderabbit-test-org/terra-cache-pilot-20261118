@@ -1,0 +1,2987 @@
+#!/usr/bin/env python3
+"""Strict execution-backend dispatcher for the PulsePlate Experiment Runner.
+
+The dispatcher is deliberately a local evidence tool.  It selects one backend
+before an experiment starts, proves the backend's isolation properties, and
+never retries an experiment with a weaker backend or network policy.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+from contextlib import contextmanager
+from dataclasses import dataclass
+import ipaddress
+import json
+import os
+from pathlib import Path, PurePosixPath
+import platform
+import re
+import shutil
+import socket
+import stat
+import subprocess  # nosec B404: bounded absolute runtime/git argv only (remove-by: 2027-02-01, ref: ledger-p1-experiment-runner-macos-strict-backend)
+import sys
+import tempfile
+import threading
+from typing import Any, Iterator
+import uuid
+
+DISPATCH_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(DISPATCH_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(DISPATCH_REPO_ROOT))
+
+from core.evidence.fingerprints import fingerprint_payload
+from scripts.orchestration.context_pack import REPO_ROOT
+from scripts.orchestration.creative_code_patch_workspace import (
+    git_env_without_parent_state as _sanitized_git_env_without_parent_state,
+    safe_git_config_args as _safe_git_config_args,
+)
+from scripts.orchestration.experiment_contract import (
+    CONTRIBUTION_KINDS,
+    IMAGE_DIGEST_RE,
+    MAX_CANDIDATE_PATCH_BYTES,
+    ORACLE_ONLY_GOVERNANCE_REVIEWER_MODE,
+    validate_contribution_attribution,
+    validate_experiment_packet,
+    validate_experiment_result,
+)
+
+CAPABILITY_SCHEMA_VERSION = "1.0"
+CAPABILITY_ARTIFACT_TYPE = "experiment_runner_backend_capability.v1"
+CAPABILITY_ARTIFACT_DIR = REPO_ROOT / "artifacts" / "orchestration" / "experiments" / "capabilities"
+RESULT_ARTIFACT_DIR = REPO_ROOT / "artifacts" / "orchestration" / "experiments" / "results"
+CONTAINERFILE = REPO_ROOT / "deploy" / "experiment-runner" / "Containerfile"
+
+BACKENDS = ("auto", "apple-container", "docker", "native-linux")
+CONTAINER_BACKENDS = ("apple-container", "docker")
+CPU_LIMIT = "2"
+MEMORY_LIMIT = "4g"
+TMPFS_SIZE = "1g"
+APPLE_TMPFS_SIZE = "1G"
+CONTAINER_PYTHON = "/opt/venv/bin/python"
+CONTAINER_UNSHARE = "/usr/bin/unshare"
+CONTAINER_REPO = "/repo"
+CONTAINER_INPUT = "/repo/.experiment-runner-input"
+CONTAINER_RESULT_DIR = "/repo/artifacts/orchestration/experiments/results"
+CONTAINER_PRIVATE_TMP = Path("/", "tmp").as_posix()
+RESULT_VOLUME_SIZE = "2M"
+MAX_RESULT_BYTES = 2 * 1024 * 1024
+PUBLIC_STATUS_ACCEPTED = "accepted"
+PUBLIC_STATUS_REJECTED = "rejected"
+RUNNER_CAPABILITY_EXIT_CODE = 3
+RUNNER_REJECTED_EXIT_CODE = 4
+RUNNER_CAPABILITY_ERROR = "runner_capability_mismatch"
+IMAGE_REF_RE = re.compile(
+    r"^(?P<name>[A-Za-z0-9][A-Za-z0-9._:/-]{0,254})@(?P<digest>sha256:[0-9a-f]{64})$"
+)
+TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,254}$")
+VERSION_RE = re.compile(r"(?<![0-9])([0-9]+\.[0-9]+\.[0-9]+)(?![0-9])")
+BLOCKER_CODES = frozenset(
+    {
+        "unsupported_host",
+        "unsupported_arch",
+        "runtime_cli_missing",
+        "runtime_stopped",
+        "apple_kernel_not_configured",
+        "runtime_not_ready",
+        "image_required",
+        "image_missing",
+        "image_digest_drift",
+        "guest_platform_mismatch",
+        "guest_unshare_unavailable",
+        "filesystem_isolation_unavailable",
+        "strict_network_budget_required",
+        "host_listener_unavailable",
+        "network_isolation_failed",
+        "network_gateway_unavailable",
+        "mount_contract_failed",
+        "result_volume_failed",
+        "container_cleanup_failed",
+        "probe_execution_failed",
+    }
+)
+
+PROBE_RESULT_KEYS = (
+    "runtime_available",
+    "image_digest_verified",
+    "guest_platform_supported",
+    "host_listener_ready",
+    "outer_host_control",
+    "outer_dns_blocked",
+    "outer_direct_ip_blocked",
+    "inner_host_blocked",
+    "inner_dns_blocked",
+    "inner_direct_ip_blocked",
+    "unshare_without_broad_capabilities",
+    "source_read_only",
+    "input_read_only",
+    "root_read_only",
+    "result_volume_writable",
+    "private_tmpfs",
+    "cleanup_completed",
+)
+HOST_PLATFORM_CLASSES = frozenset(
+    {
+        "macos_arm64",
+        "macos_amd64",
+        "macos_unsupported",
+        "linux_arm64",
+        "linux_amd64",
+        "linux_unsupported",
+        "unsupported",
+    }
+)
+GUEST_PLATFORM_CLASSES = frozenset({"linux_arm64", "linux_amd64", "linux_unsupported"})
+REQUIRED_PROBE_KEYS = {
+    "apple-container": PROBE_RESULT_KEYS,
+    "docker": PROBE_RESULT_KEYS,
+    "native-linux": (
+        "runtime_available",
+        "guest_platform_supported",
+        "host_listener_ready",
+        "outer_host_control",
+        "inner_host_blocked",
+        "inner_dns_blocked",
+        "inner_direct_ip_blocked",
+        "unshare_without_broad_capabilities",
+        "cleanup_completed",
+    ),
+}
+
+
+def _probe_values_match_backend(
+    backend: str,
+    results: dict[str, bool | None],
+    keys: tuple[str, ...],
+) -> bool:
+    """Docker's network-none outer control must be blocked; Apple must reach."""
+
+    return all(
+        results.get(key) is (backend != "docker" or key != "outer_host_control") for key in keys
+    )
+
+
+def _canary_code(host: str, port: int) -> str:
+    return rf"""
+import json, os, platform, socket
+
+def blocked_write(path):
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("blocked")
+    except OSError:
+        return True
+    return False
+
+def blocked_connect(host, port):
+    try:
+        with socket.create_connection((host, port), timeout=0.5):
+            return False
+    except OSError:
+        return True
+
+host = {host!r}
+port = {port}
+output_path = "/repo/artifacts/orchestration/experiments/results/probe-write.json"
+tmp_path = "/tmp/probe-write"
+output_writable = False
+private_tmpfs = False
+try:
+    with open(output_path, "w", encoding="utf-8") as handle:
+        handle.write("{{}}")
+    os.unlink(output_path)
+    output_writable = True
+except OSError:
+    pass
+try:
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        handle.write("ok")
+    os.unlink(tmp_path)
+    private_tmpfs = True
+except OSError:
+    pass
+payload = {{
+    "guest_platform_supported": platform.system() == "Linux" and platform.machine() in {{"aarch64", "arm64", "x86_64", "amd64"}},
+    "host_reachable": not blocked_connect(host, port),
+    "dns_blocked": blocked_connect("example.com", 443),
+    "direct_ip_blocked": blocked_connect("1.1.1.1", 443),
+    "source_read_only": blocked_write("/repo/probe-source-write"),
+    "input_read_only": blocked_write("/repo/.experiment-runner-input/probe-input-write"),
+    "root_read_only": blocked_write("/probe-root-write"),
+    "result_volume_writable": output_writable,
+    "private_tmpfs": private_tmpfs,
+}}
+print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+""".strip()
+
+
+_COLLECTOR_CODE = rf"""
+import base64, json, os, stat
+path = os.environ["RESULT_PATH"]
+flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+fd = os.open(path, flags)
+try:
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_size > {MAX_RESULT_BYTES}:
+        raise SystemExit(71)
+    payload = os.read(fd, {MAX_RESULT_BYTES} + 1)
+    if len(payload) != info.st_size or len(payload) > {MAX_RESULT_BYTES}:
+        raise SystemExit(72)
+finally:
+    os.close(fd)
+print(json.dumps({{"payload_b64": base64.b64encode(payload).decode("ascii")}}, separators=(",", ":")))
+""".strip()
+
+
+class DispatchError(RuntimeError):
+    """Stable dispatcher failure without raw host/runtime output."""
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
+
+
+class PreRunCapabilityError(DispatchError):
+    """Deterministic backend drift detected after selection but before execution."""
+
+
+@dataclass(frozen=True)
+class ImageReference:
+    name: str
+    digest: str
+
+    def runtime_ref(self, backend: str) -> str:
+        if backend == "apple-container":
+            return f"{self.name}@{self.digest}"
+        return self.digest
+
+
+@dataclass(frozen=True)
+class BackendProbe:
+    backend: str
+    host_platform: str
+    guest_platform: str
+    runtime_version: str
+    image_digest: str | None
+    isolation_method: str
+    probe_results: dict[str, bool | None]
+    blocking_reasons: tuple[str, ...]
+
+    @property
+    def strict(self) -> bool:
+        return not self.blocking_reasons and _probe_values_match_backend(
+            self.backend, self.probe_results, REQUIRED_PROBE_KEYS[self.backend]
+        )
+
+    def to_artifact(self) -> dict[str, Any]:
+        payload = {
+            "schema_version": CAPABILITY_SCHEMA_VERSION,
+            "artifact_type": CAPABILITY_ARTIFACT_TYPE,
+            "authority": "evidence_only",
+            "backend": self.backend,
+            "host_platform": self.host_platform,
+            "guest_platform": self.guest_platform,
+            "runtime_version": self.runtime_version,
+            "image_digest": self.image_digest,
+            "isolation_method": self.isolation_method,
+            "probe_results": dict(sorted(self.probe_results.items())),
+            "blocking_reasons": list(self.blocking_reasons),
+            "strict_isolation": self.strict,
+            "sanitized": True,
+        }
+        return validate_capability_artifact(payload)
+
+
+def _host_platform_class() -> str:
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+    if machine in {"aarch64", "arm64"}:
+        normalized_machine = "arm64"
+    elif machine in {"x86_64", "amd64"}:
+        normalized_machine = "amd64"
+    else:
+        normalized_machine = "unsupported"
+    if system == "darwin":
+        system = "macos"
+    elif system != "linux":
+        return "unsupported"
+    return f"{system}_{normalized_machine}"
+
+
+def _guest_platform_class() -> str:
+    machine = platform.machine().lower()
+    if machine in {"aarch64", "arm64"}:
+        normalized_machine = "arm64"
+    elif machine in {"x86_64", "amd64"}:
+        normalized_machine = "amd64"
+    else:
+        normalized_machine = "unsupported"
+    return f"linux_{normalized_machine}"
+
+
+def _isolation_method(backend: str) -> str:
+    return {
+        "native-linux": "linux_unshare",
+        "apple-container": "apple_internal_no_dns_plus_linux_unshare",
+        "docker": "docker_network_none_plus_linux_unshare",
+    }[backend]
+
+
+def _safe_env() -> dict[str, str]:
+    allowed = ("HOME", "LANG", "LC_ALL", "LC_CTYPE", "PATH", "TMPDIR")
+    return {key: os.environ[key] for key in allowed if os.environ.get(key)}
+
+
+def _run(
+    argv: list[str],
+    *,
+    cwd: Path,
+    timeout: int = 30,
+    input_text: str | None = None,
+    secret_env_keys: tuple[str, ...] = (),
+    env_override: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    if not argv or not Path(argv[0]).is_absolute():
+        raise DispatchError("runtime_cli_missing")
+    try:
+        child_env = dict(env_override) if env_override is not None else _safe_env()
+        child_env.update({key: os.environ[key] for key in secret_env_keys if os.environ.get(key)})
+        return subprocess.run(  # nosec B603: argv begins with resolved absolute executable, no shell (remove-by: 2027-01-01, ref: ledger-p1-experiment-runner-macos-strict-backend)
+            argv,
+            cwd=str(cwd),
+            env=child_env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+            input=input_text,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    raise DispatchError("probe_execution_failed")
+
+
+def _resolve_cli(name: str) -> str | None:
+    discovered = shutil.which(name)
+    if discovered is None:
+        return None
+    resolved = Path(discovered).expanduser().resolve(strict=True)
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        return None
+    return str(resolved)
+
+
+def _runtime_version(cli: str) -> str:
+    result = _run([cli, "--version"], cwd=REPO_ROOT)
+    if result.returncode != 0:
+        return "unavailable"
+    match = VERSION_RE.search(result.stdout or result.stderr)
+    return match.group(1) if match else "unknown"
+
+
+def parse_image_reference(raw: str) -> ImageReference:
+    match = IMAGE_REF_RE.fullmatch(raw.strip())
+    if match is None:
+        raise ValueError("--image must use immutable name@sha256:<64 lowercase hex> syntax.")
+    return ImageReference(name=match.group("name"), digest=match.group("digest"))
+
+
+def _primary_image_digest(payload: Any) -> str:
+    record = payload[0] if isinstance(payload, list) and payload else payload
+    if not isinstance(record, dict):
+        raise DispatchError("image_missing")
+    configuration = record.get("configuration")
+    if isinstance(configuration, dict):
+        descriptor = configuration.get("descriptor")
+        if isinstance(descriptor, dict):
+            digest = descriptor.get("digest")
+            if isinstance(digest, str) and IMAGE_DIGEST_RE.fullmatch(digest):
+                return digest
+    for key in ("Id", "id"):
+        digest = record.get(key)
+        if isinstance(digest, str):
+            normalized = digest if digest.startswith("sha256:") else f"sha256:{digest}"
+            if IMAGE_DIGEST_RE.fullmatch(normalized):
+                return normalized
+    raise DispatchError("image_missing")
+
+
+def _inspect_image(cli: str, backend: str, image: ImageReference) -> str:
+    del backend
+    argv = [cli, "image", "inspect", image.name]
+    result = _run(argv, cwd=REPO_ROOT)
+    if result.returncode != 0:
+        raise DispatchError("image_missing")
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise DispatchError("image_missing") from exc
+    if image.digest != _primary_image_digest(payload):
+        raise DispatchError("image_digest_drift")
+    return image.digest
+
+
+def _base_probe_results(backend: str) -> dict[str, bool | None]:
+    results: dict[str, bool | None] = {key: None for key in PROBE_RESULT_KEYS}
+    for key in REQUIRED_PROBE_KEYS[backend]:
+        results[key] = False
+    return results
+
+
+def _failed_probe(
+    backend: str,
+    reason: str,
+    *,
+    runtime_version: str = "unavailable",
+    image_digest: str | None = None,
+    results: dict[str, bool | None] | None = None,
+) -> BackendProbe:
+    if reason not in BLOCKER_CODES:
+        raise ValueError(f"Unsupported blocker code: {reason}")
+    return BackendProbe(
+        backend=backend,
+        host_platform=_host_platform_class(),
+        guest_platform=_guest_platform_class(),
+        runtime_version=runtime_version,
+        image_digest=image_digest,
+        isolation_method=_isolation_method(backend),
+        probe_results=results or _base_probe_results(backend),
+        blocking_reasons=(reason,),
+    )
+
+
+def _probe_with_blocker(probe: BackendProbe, reason: str) -> BackendProbe:
+    if reason not in BLOCKER_CODES:
+        raise ValueError(f"Unsupported blocker code: {reason}")
+    return BackendProbe(
+        backend=probe.backend,
+        host_platform=probe.host_platform,
+        guest_platform=probe.guest_platform,
+        runtime_version=probe.runtime_version,
+        image_digest=probe.image_digest,
+        isolation_method=probe.isolation_method,
+        probe_results=probe.probe_results,
+        blocking_reasons=(reason,),
+    )
+
+
+def _docker_mount(source: Path, target: str, *, readonly: bool) -> str:
+    suffix = ",readonly" if readonly else ""
+    return f"type=bind,source={source},target={target}{suffix}"
+
+
+def _apple_mount(source: Path, target: str, *, readonly: bool) -> str:
+    suffix = ",readonly" if readonly else ""
+    return f"source={source},target={target}{suffix}"
+
+
+def _volume_mount(volume: str, target: str, *, readonly: bool) -> str:
+    suffix = ",readonly" if readonly else ""
+    return f"type=volume,source={volume},target={target}{suffix}"
+
+
+def _container_run_argv(
+    *,
+    cli: str,
+    backend: str,
+    image_ref: str,
+    container_name: str,
+    result_volume: str,
+    command: list[str],
+    repository: Path | None = None,
+    material_repository: Path | None = None,
+    input_dir: Path | None = None,
+    apple_network: str | None = None,
+    user: str = "65532:65532",
+    result_readonly: bool = False,
+    extra_env: tuple[str, ...] = (),
+) -> list[str]:
+    if backend == "docker":
+        argv = [
+            cli,
+            "run",
+            "--name",
+            container_name,
+            "--pull",
+            "never",
+            "--network",
+            "none",
+            "--read-only",
+            "--user",
+            user,
+            "--cpus",
+            CPU_LIMIT,
+            "--memory",
+            MEMORY_LIMIT,
+            "--tmpfs",
+            f"{CONTAINER_PRIVATE_TMP}:rw,noexec,nosuid,size={TMPFS_SIZE}",
+        ]
+        if repository is not None and input_dir is not None:
+            argv.extend(
+                [
+                    "--mount",
+                    _docker_mount(repository, CONTAINER_REPO, readonly=True),
+                    "--mount",
+                    _docker_mount(input_dir, CONTAINER_INPUT, readonly=True),
+                ]
+            )
+    elif backend == "apple-container" and apple_network:
+        argv = [
+            cli,
+            "run",
+            "--name",
+            container_name,
+            "--network",
+            apple_network,
+            "--no-dns",
+            "--read-only",
+            "--user",
+            user,
+            "--cpus",
+            CPU_LIMIT,
+            "--memory",
+            MEMORY_LIMIT,
+            "--mount",
+            (
+                "type=tmpfs,"
+                f"destination={CONTAINER_PRIVATE_TMP},"
+                f"size={APPLE_TMPFS_SIZE},mode=1777"
+            ),
+        ]
+        if repository is not None and input_dir is not None:
+            argv.extend(
+                [
+                    "--mount",
+                    _apple_mount(repository, CONTAINER_REPO, readonly=True),
+                    "--mount",
+                    _apple_mount(input_dir, CONTAINER_INPUT, readonly=True),
+                ]
+            )
+    else:
+        raise DispatchError("probe_execution_failed")
+    if material_repository is not None:
+        mount = _docker_mount if backend == "docker" else _apple_mount
+        argv.extend(["--mount", mount(material_repository, "/material", readonly=True)])
+    argv.extend(
+        [
+            "--mount",
+            _volume_mount(result_volume, CONTAINER_RESULT_DIR, readonly=result_readonly),
+            "--env",
+            f"VENV_PYTHON={CONTAINER_PYTHON}",
+            "--env",
+            f"PYTHONPATH={CONTAINER_REPO}",
+        ]
+    )
+    for entry in extra_env:
+        argv.extend(["--env", entry])
+    argv.extend([image_ref, *command])
+    return argv
+
+
+def _cleanup_container(cli: str, backend: str, name: str) -> bool:
+    stop_args = [cli, "stop", "--time", "1", name]
+    try:
+        _run(stop_args, cwd=REPO_ROOT)
+    except DispatchError:
+        pass
+    delete_args = (
+        [cli, "delete", "--force", name]
+        if backend == "apple-container"
+        else [cli, "rm", "--force", name]
+    )
+    try:
+        return _run(delete_args, cwd=REPO_ROOT).returncode == 0
+    except DispatchError:
+        return False
+
+
+def _create_result_volume(cli: str, backend: str) -> str:
+    name = f"pp-er-result-{uuid.uuid4().hex[:12]}"
+    argv = (
+        [cli, "volume", "create", "-s", RESULT_VOLUME_SIZE, name]
+        if backend == "apple-container"
+        else [
+            cli,
+            "volume",
+            "create",
+            "--driver",
+            "local",
+            "--opt",
+            "type=tmpfs",
+            "--opt",
+            "device=tmpfs",
+            "--opt",
+            f"o=size={RESULT_VOLUME_SIZE.lower()},mode=0700",
+            name,
+        ]
+    )
+    if _run(argv, cwd=REPO_ROOT).returncode != 0:
+        raise DispatchError("result_volume_failed")
+    return name
+
+
+def _delete_result_volume(cli: str, backend: str, name: str) -> bool:
+    argv = (
+        [cli, "volume", "delete", name]
+        if backend == "apple-container"
+        else [cli, "volume", "rm", "--force", name]
+    )
+    try:
+        return _run(argv, cwd=REPO_ROOT).returncode == 0
+    except DispatchError:
+        return False
+
+
+def _initialize_result_volume(
+    *,
+    cli: str,
+    backend: str,
+    image_ref: str,
+    volume: str,
+    apple_network: str | None,
+) -> bool:
+    name = f"pp-er-init-{uuid.uuid4().hex[:12]}"
+    argv = _container_run_argv(
+        cli=cli,
+        backend=backend,
+        image_ref=image_ref,
+        container_name=name,
+        result_volume=volume,
+        apple_network=apple_network,
+        user="0:0",
+        command=["/usr/bin/chown", "65532:65532", CONTAINER_RESULT_DIR],
+    )
+    try:
+        completed = _run(argv, cwd=REPO_ROOT, timeout=30)
+    except BaseException as exc:
+        if not _cleanup_container(cli, backend, name):
+            raise DispatchError("container_cleanup_failed") from exc
+        raise
+    if not _cleanup_container(cli, backend, name):
+        raise DispatchError("container_cleanup_failed")
+    return completed.returncode == 0
+
+
+def _address_is_bindable(address: str) -> bool:
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.bind((address, 0))
+    except OSError:
+        return False
+    finally:
+        probe.close()
+    return True
+
+
+def _discover_host_bind_address() -> str:
+    """Require one safe host-bindable IPv4 address without selection-order fallback."""
+
+    return _discover_apple_host_bind_address(())
+
+
+def _find_apple_ipv4_subnets(value: Any) -> tuple[ipaddress.IPv4Network, ...]:
+    """Return Apple runtime IPv4 subnets used only to exclude host candidates."""
+
+    subnets: set[ipaddress.IPv4Network] = set()
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            if str(key).lower() == "ipv4subnet":
+                if not isinstance(nested, str):
+                    raise DispatchError("network_gateway_unavailable")
+                try:
+                    subnet = ipaddress.ip_network(nested.strip(), strict=True)
+                except ValueError as exc:
+                    raise DispatchError("network_gateway_unavailable") from exc
+                if not isinstance(subnet, ipaddress.IPv4Network):
+                    raise DispatchError("network_gateway_unavailable")
+                subnets.add(subnet)
+            subnets.update(_find_apple_ipv4_subnets(nested))
+    elif isinstance(value, list):
+        for nested in value:
+            subnets.update(_find_apple_ipv4_subnets(nested))
+    return tuple(
+        sorted(subnets, key=lambda subnet: (int(subnet.network_address), subnet.prefixlen))
+    )
+
+
+def _discover_apple_runtime_subnets(cli: str) -> tuple[ipaddress.IPv4Network, ...]:
+    completed = _run([cli, "network", "inspect", "default"], cwd=REPO_ROOT)
+    if completed.returncode != 0:
+        raise DispatchError("network_gateway_unavailable")
+    try:
+        subnets = _find_apple_ipv4_subnets(json.loads(completed.stdout))
+    except json.JSONDecodeError as exc:
+        raise DispatchError("network_gateway_unavailable") from exc
+    if len(subnets) != 1:
+        raise DispatchError("network_gateway_unavailable")
+    return subnets
+
+
+def _discover_apple_host_bind_address(
+    runtime_subnets: tuple[ipaddress.IPv4Network, ...],
+) -> str:
+    """Require one safe, bindable hostname IPv4 outside Apple runtime subnets."""
+
+    try:
+        records = socket.getaddrinfo(
+            socket.gethostname(),
+            None,
+            family=socket.AF_INET,
+            type=socket.SOCK_STREAM,
+        )
+    except OSError as exc:
+        raise DispatchError("host_listener_unavailable") from exc
+
+    safe_candidates: set[str] = set()
+    for family, kind, _proto, _canonical, sockaddr in records:
+        if family != socket.AF_INET or kind != socket.SOCK_STREAM:
+            continue
+        candidate = str(sockaddr[0])
+        try:
+            address = ipaddress.ip_address(candidate)
+        except ValueError:
+            continue
+        if not isinstance(address, ipaddress.IPv4Address):
+            continue
+        if (
+            address.is_loopback
+            or address.is_unspecified
+            or address.is_multicast
+            or address.is_link_local
+            or address.is_reserved
+            or any(address in subnet for subnet in runtime_subnets)
+        ):
+            continue
+        safe_candidates.add(candidate)
+    candidates = {candidate for candidate in safe_candidates if _address_is_bindable(candidate)}
+    if len(candidates) != 1:
+        raise DispatchError("host_listener_unavailable")
+    return candidates.pop()
+
+
+@contextmanager
+def _host_listener(bind_address: str | None = None) -> Iterator[tuple[str, int, bool]]:
+    normalize_bind_failure = bind_address is not None
+    if bind_address is None:
+        bind_address = _discover_host_bind_address()
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind((bind_address, 0))
+        listener.listen(8)
+        listener.settimeout(0.2)
+    except OSError as exc:
+        listener.close()
+        if normalize_bind_failure:
+            raise DispatchError("host_listener_unavailable") from exc
+        raise
+    stop = threading.Event()
+
+    def serve() -> None:
+        while not stop.is_set():
+            try:
+                connection, _address = listener.accept()
+            except (TimeoutError, OSError):
+                if stop.is_set():
+                    return
+                continue
+            with connection:
+                connection.sendall(b"pulseplate-strict-canary")
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    port = int(listener.getsockname()[1])
+    ready = False
+    try:
+        try:
+            with socket.create_connection((bind_address, port), timeout=1):
+                ready = True
+        except OSError as exc:
+            if normalize_bind_failure:
+                raise DispatchError("host_listener_unavailable") from exc
+            raise
+        yield bind_address, port, ready
+    finally:
+        stop.set()
+        listener.close()
+        thread.join(timeout=1)
+
+
+def _find_gateway(value: Any) -> str | None:
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            if str(key).lower() in {
+                "gateway",
+                "gatewayaddress",
+                "gateway_address",
+                "ipv4gateway",
+            }:
+                candidate = str(nested).strip()
+                if re.fullmatch(r"(?:[0-9]{1,3}\.){3}[0-9]{1,3}", candidate):
+                    return candidate
+            found = _find_gateway(nested)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for nested in value:
+            found = _find_gateway(nested)
+            if found:
+                return found
+    return None
+
+
+def _discover_gateway(cli: str, backend: str, apple_network: str | None) -> str:
+    argv = (
+        [cli, "network", "inspect", apple_network]
+        if backend == "apple-container" and apple_network
+        else [cli, "network", "inspect", "bridge"]
+    )
+    completed = _run(argv, cwd=REPO_ROOT)
+    if completed.returncode != 0:
+        raise DispatchError("network_gateway_unavailable")
+    try:
+        gateway = _find_gateway(json.loads(completed.stdout))
+    except json.JSONDecodeError as exc:
+        raise DispatchError("network_gateway_unavailable") from exc
+    if gateway is None:
+        raise DispatchError("network_gateway_unavailable")
+    return gateway
+
+
+def _parse_canary(completed: subprocess.CompletedProcess[str]) -> dict[str, bool]:
+    if completed.returncode != 0:
+        raise DispatchError("probe_execution_failed")
+    try:
+        payload = json.loads(completed.stdout.strip().splitlines()[-1])
+    except (IndexError, json.JSONDecodeError) as exc:
+        raise DispatchError("probe_execution_failed") from exc
+    if not isinstance(payload, dict) or not all(
+        isinstance(value, bool) for value in payload.values()
+    ):
+        raise DispatchError("probe_execution_failed")
+    return payload
+
+
+def _runtime_readiness_reason(cli: str, backend: str) -> str | None:
+    argv = (
+        [cli, "info", "--format", "{{.ServerVersion}}"]
+        if backend == "docker"
+        else [cli, "system", "status"]
+    )
+    result = _run(argv, cwd=REPO_ROOT)
+    if result.returncode == 0:
+        return None
+    if backend == "docker":
+        return "runtime_stopped"
+    diagnostic = f"{result.stdout}\n{result.stderr}".lower()
+    if "kernel" in diagnostic:
+        return "apple_kernel_not_configured"
+    return "runtime_not_ready"
+
+
+def _create_apple_network(cli: str) -> str:
+    name = f"pp-er-{uuid.uuid4().hex[:12]}"
+    result = _run([cli, "network", "create", "--internal", name], cwd=REPO_ROOT)
+    if result.returncode != 0:
+        raise DispatchError("network_isolation_failed")
+    return name
+
+
+def _delete_apple_network(cli: str, name: str) -> bool:
+    try:
+        return _run([cli, "network", "delete", name], cwd=REPO_ROOT).returncode == 0
+    except DispatchError:
+        return False
+
+
+def _cleanup_container_resources(
+    *,
+    cli: str,
+    backend: str,
+    volume: str | None,
+    apple_network: str | None,
+    prior_cleanup_ok: bool,
+) -> bool:
+    cleanup_ok = prior_cleanup_ok
+    if volume is not None:
+        cleanup_ok = _delete_result_volume(cli, backend, volume) and cleanup_ok
+    if apple_network is not None:
+        cleanup_ok = _delete_apple_network(cli, apple_network) and cleanup_ok
+    return cleanup_ok
+
+
+def _run_container_canary(
+    cli: str,
+    backend: str,
+    image: ImageReference,
+) -> dict[str, bool | None]:
+    with tempfile.TemporaryDirectory(prefix="pp-er-probe-") as raw_temp:
+        root = Path(raw_temp)
+        repository = root / "repo"
+        input_dir = root / "input"
+        for directory in (repository, input_dir):
+            directory.mkdir()
+        (repository / CONTAINER_INPUT.removeprefix(f"{CONTAINER_REPO}/")).mkdir()
+        (repository / CONTAINER_RESULT_DIR.removeprefix(f"{CONTAINER_REPO}/")).mkdir(parents=True)
+        (repository / "probe-source").write_text("source", encoding="utf-8")
+        (input_dir / "probe-input").write_text("input", encoding="utf-8")
+        apple_network: str | None = None
+        volume: str | None = None
+        cleanup_completed = True
+        try:
+            if backend == "apple-container":
+                runtime_subnets = _discover_apple_runtime_subnets(cli)
+                host_address = _discover_apple_host_bind_address(runtime_subnets)
+                apple_network = _create_apple_network(cli)
+            else:
+                # The Docker bridge is VM-owned on Desktop. Keep its metadata
+                # prerequisite, but bind only to a unique reachable host address.
+                _discover_gateway(cli, backend, apple_network)
+                host_address = _discover_host_bind_address()
+            volume = _create_result_volume(cli, backend)
+            runtime_ref = image.runtime_ref(backend)
+            if not _initialize_result_volume(
+                cli=cli,
+                backend=backend,
+                image_ref=runtime_ref,
+                volume=volume,
+                apple_network=apple_network,
+            ):
+                raise DispatchError("result_volume_failed")
+            results = _base_probe_results(backend)
+            results["runtime_available"] = True
+            results["image_digest_verified"] = True
+            with _host_listener(host_address) as (listener_address, port, listener_ready):
+                results["host_listener_ready"] = listener_ready
+                if not listener_ready:
+                    raise DispatchError("host_listener_unavailable")
+                outer_name = f"pp-er-outer-{uuid.uuid4().hex[:12]}"
+                inner_name = f"pp-er-inner-{uuid.uuid4().hex[:12]}"
+                code = _canary_code(listener_address, port)
+                try:
+                    outer = _run(
+                        _container_run_argv(
+                            cli=cli,
+                            backend=backend,
+                            image_ref=runtime_ref,
+                            container_name=outer_name,
+                            result_volume=volume,
+                            repository=repository,
+                            input_dir=input_dir,
+                            apple_network=apple_network,
+                            command=[CONTAINER_PYTHON, "-c", code],
+                        ),
+                        cwd=REPO_ROOT,
+                        timeout=45,
+                    )
+                    outer_payload = _parse_canary(outer)
+                finally:
+                    cleanup_completed = (
+                        _cleanup_container(cli, backend, outer_name) and cleanup_completed
+                    )
+                if outer_payload["host_reachable"] is not (backend == "apple-container"):
+                    raise DispatchError("network_isolation_failed")
+                try:
+                    inner = _run(
+                        _container_run_argv(
+                            cli=cli,
+                            backend=backend,
+                            image_ref=runtime_ref,
+                            container_name=inner_name,
+                            result_volume=volume,
+                            repository=repository,
+                            input_dir=input_dir,
+                            apple_network=apple_network,
+                            command=[
+                                CONTAINER_UNSHARE,
+                                "--net",
+                                "--map-root-user",
+                                CONTAINER_PYTHON,
+                                "-c",
+                                code,
+                            ],
+                        ),
+                        cwd=REPO_ROOT,
+                        timeout=45,
+                    )
+                    inner_payload = _parse_canary(inner)
+                    results["unshare_without_broad_capabilities"] = True
+                finally:
+                    cleanup_completed = (
+                        _cleanup_container(cli, backend, inner_name) and cleanup_completed
+                    )
+            results["guest_platform_supported"] = outer_payload["guest_platform_supported"]
+            results["outer_host_control"] = outer_payload["host_reachable"]
+            results["outer_dns_blocked"] = outer_payload["dns_blocked"]
+            results["outer_direct_ip_blocked"] = outer_payload["direct_ip_blocked"]
+            results["inner_host_blocked"] = not inner_payload["host_reachable"]
+            results["inner_dns_blocked"] = inner_payload["dns_blocked"]
+            results["inner_direct_ip_blocked"] = inner_payload["direct_ip_blocked"]
+            for key in (
+                "source_read_only",
+                "input_read_only",
+                "root_read_only",
+                "result_volume_writable",
+                "private_tmpfs",
+            ):
+                results[key] = inner_payload[key]
+        except BaseException as exc:
+            cleanup_completed = _cleanup_container_resources(
+                cli=cli,
+                backend=backend,
+                volume=volume,
+                apple_network=apple_network,
+                prior_cleanup_ok=cleanup_completed,
+            )
+            if not cleanup_completed:
+                raise DispatchError("container_cleanup_failed") from exc
+            raise
+        cleanup_completed = _cleanup_container_resources(
+            cli=cli,
+            backend=backend,
+            volume=volume,
+            apple_network=apple_network,
+            prior_cleanup_ok=cleanup_completed,
+        )
+        results["cleanup_completed"] = cleanup_completed
+        return results
+
+
+def probe_backend(backend: str, image: ImageReference | None = None) -> BackendProbe:
+    if backend == "native-linux":
+        if image is None:
+            return _failed_probe(backend, "image_required")
+        if platform.system() != "Linux":
+            return _failed_probe(backend, "unsupported_host", image_digest=image.digest)
+        if platform.machine().lower() not in {"arm64", "aarch64", "x86_64", "amd64"}:
+            return _failed_probe(backend, "unsupported_arch", image_digest=image.digest)
+        unshare = _resolve_cli("unshare")
+        if unshare is None:
+            return _failed_probe(backend, "runtime_cli_missing", image_digest=image.digest)
+        results = _base_probe_results(backend)
+        results["runtime_available"] = True
+        try:
+            with _host_listener("127.0.0.1") as (listener_address, port, ready):
+                results["host_listener_ready"] = ready
+                results["outer_host_control"] = ready
+                if not ready:
+                    raise DispatchError("host_listener_unavailable")
+                completed = _run(
+                    [
+                        unshare,
+                        "--net",
+                        "--map-root-user",
+                        sys.executable,
+                        "-c",
+                        _canary_code(listener_address, port),
+                    ],
+                    cwd=REPO_ROOT,
+                )
+        except DispatchError as exc:
+            reason = str(exc)
+            if reason not in BLOCKER_CODES:
+                reason = "probe_execution_failed"
+            return _failed_probe(
+                backend,
+                reason,
+                runtime_version=platform.release(),
+                image_digest=image.digest,
+                results=results,
+            )
+        if completed.returncode != 0:
+            return _failed_probe(
+                backend,
+                "guest_unshare_unavailable",
+                runtime_version=platform.release(),
+                image_digest=image.digest,
+                results=results,
+            )
+        inner = _parse_canary(completed)
+        results["guest_platform_supported"] = inner["guest_platform_supported"]
+        results["inner_host_blocked"] = not inner["host_reachable"]
+        results["inner_dns_blocked"] = inner["dns_blocked"]
+        results["inner_direct_ip_blocked"] = inner["direct_ip_blocked"]
+        results["unshare_without_broad_capabilities"] = True
+        results["cleanup_completed"] = True
+        native_blockers = ["filesystem_isolation_unavailable"]
+        if not _probe_values_match_backend(backend, results, REQUIRED_PROBE_KEYS[backend]):
+            native_blockers.append("network_isolation_failed")
+        return BackendProbe(
+            backend=backend,
+            host_platform=_host_platform_class(),
+            guest_platform=_guest_platform_class(),
+            runtime_version=platform.release(),
+            image_digest=image.digest,
+            isolation_method=_isolation_method(backend),
+            probe_results=results,
+            blocking_reasons=tuple(sorted(native_blockers)),
+        )
+
+    expected_cli = "container" if backend == "apple-container" else "docker"
+    if backend == "apple-container":
+        if platform.system() != "Darwin":
+            return _failed_probe(
+                backend, "unsupported_host", image_digest=image.digest if image else None
+            )
+        if platform.machine().lower() not in {"arm64", "aarch64"}:
+            return _failed_probe(
+                backend, "unsupported_arch", image_digest=image.digest if image else None
+            )
+    cli = _resolve_cli(expected_cli)
+    if cli is None:
+        return _failed_probe(
+            backend, "runtime_cli_missing", image_digest=image.digest if image else None
+        )
+    version = _runtime_version(cli)
+    readiness_reason = _runtime_readiness_reason(cli, backend)
+    if readiness_reason is not None:
+        return _failed_probe(
+            backend,
+            readiness_reason,
+            runtime_version=version,
+            image_digest=image.digest if image else None,
+        )
+    if image is None:
+        results = _base_probe_results(backend)
+        results["runtime_available"] = True
+        return _failed_probe(backend, "image_required", runtime_version=version, results=results)
+    try:
+        _inspect_image(cli, backend, image)
+        results = _run_container_canary(cli, backend, image)
+    except DispatchError as exc:
+        reason = str(exc)
+        if reason not in BLOCKER_CODES:
+            reason = "probe_execution_failed"
+        return _failed_probe(
+            backend,
+            reason,
+            runtime_version=version,
+            image_digest=image.digest,
+        )
+    container_blockers: list[str] = []
+    if results["guest_platform_supported"] is not True:
+        container_blockers.append("guest_platform_mismatch")
+    if results["unshare_without_broad_capabilities"] is not True:
+        container_blockers.append("guest_unshare_unavailable")
+    network_keys: tuple[str, ...] = (
+        "host_listener_ready",
+        "outer_host_control",
+        "outer_dns_blocked",
+        "outer_direct_ip_blocked",
+        "inner_host_blocked",
+        "inner_dns_blocked",
+        "inner_direct_ip_blocked",
+    )
+    if not _probe_values_match_backend(backend, results, network_keys):
+        container_blockers.append("network_isolation_failed")
+    if not all(
+        results[key] is True
+        for key in (
+            "source_read_only",
+            "input_read_only",
+            "root_read_only",
+            "result_volume_writable",
+            "private_tmpfs",
+        )
+    ):
+        container_blockers.append("mount_contract_failed")
+    if results["cleanup_completed"] is not True:
+        container_blockers.append("container_cleanup_failed")
+    return BackendProbe(
+        backend=backend,
+        host_platform=_host_platform_class(),
+        guest_platform=_guest_platform_class(),
+        runtime_version=version,
+        image_digest=image.digest,
+        isolation_method=_isolation_method(backend),
+        probe_results=results,
+        blocking_reasons=tuple(sorted(set(container_blockers))),
+    )
+
+
+def select_backend(
+    requested: str, image: ImageReference
+) -> tuple[BackendProbe | None, list[BackendProbe]]:
+    if requested != "auto":
+        probe = probe_backend(requested, image)
+        return (probe if probe.strict else None), [probe]
+    candidates = (
+        ("native-linux",) if platform.system() == "Linux" else ("apple-container", "docker")
+    )
+    attempts: list[BackendProbe] = []
+    for backend in candidates:
+        probe = probe_backend(backend, image)
+        attempts.append(probe)
+        if "container_cleanup_failed" in probe.blocking_reasons:
+            return None, attempts
+        if probe.strict:
+            return probe, attempts
+    return None, attempts
+
+
+def _strict_network_budget_probe(requested: str, image: ImageReference) -> BackendProbe:
+    """Build a deterministic fail-closed probe without contacting a runtime."""
+
+    if requested != "auto":
+        backend = requested
+    elif platform.system() == "Darwin":
+        backend = "apple-container"
+    elif platform.system() == "Linux":
+        backend = "native-linux"
+    else:
+        backend = "docker"
+    return _failed_probe(
+        backend,
+        "strict_network_budget_required",
+        image_digest=image.digest,
+    )
+
+
+def validate_capability_artifact(payload: dict[str, Any]) -> dict[str, Any]:
+    expected = {
+        "schema_version",
+        "artifact_type",
+        "authority",
+        "backend",
+        "host_platform",
+        "guest_platform",
+        "runtime_version",
+        "image_digest",
+        "isolation_method",
+        "probe_results",
+        "blocking_reasons",
+        "strict_isolation",
+        "sanitized",
+    }
+    if set(payload) != expected:
+        raise ValueError("Capability artifact has unexpected or missing fields.")
+    if payload["schema_version"] != CAPABILITY_SCHEMA_VERSION:
+        raise ValueError("Capability artifact schema_version is unsupported.")
+    if payload["artifact_type"] != CAPABILITY_ARTIFACT_TYPE:
+        raise ValueError("Capability artifact type is unsupported.")
+    if payload["authority"] != "evidence_only" or payload["sanitized"] is not True:
+        raise ValueError("Capability artifact must remain sanitized evidence_only output.")
+    if payload["backend"] not in BACKENDS[1:]:
+        raise ValueError("Capability artifact backend is unsupported.")
+    backend = str(payload["backend"])
+    if payload["host_platform"] not in HOST_PLATFORM_CLASSES:
+        raise ValueError("Capability artifact host_platform is unsupported.")
+    if payload["guest_platform"] not in GUEST_PLATFORM_CLASSES:
+        raise ValueError("Capability artifact guest_platform is unsupported.")
+    runtime_version = payload["runtime_version"]
+    if not isinstance(runtime_version, str) or not re.fullmatch(
+        r"[A-Za-z0-9._+-]{1,64}", runtime_version
+    ):
+        raise ValueError("Capability artifact runtime_version is invalid.")
+    if payload["isolation_method"] != _isolation_method(backend):
+        raise ValueError("Capability artifact isolation_method is inconsistent.")
+    digest = payload["image_digest"]
+    if digest is not None and not IMAGE_DIGEST_RE.fullmatch(str(digest)):
+        raise ValueError("Capability artifact image_digest is invalid.")
+    reasons = payload["blocking_reasons"]
+    if not isinstance(reasons, list) or reasons != sorted(set(reasons)):
+        raise ValueError("Capability artifact blocking_reasons must be sorted and unique.")
+    if any(reason not in BLOCKER_CODES for reason in reasons):
+        raise ValueError("Capability artifact blocker code is unsupported.")
+    probe_results = payload["probe_results"]
+    if set(probe_results) != set(PROBE_RESULT_KEYS) or not all(
+        isinstance(value, bool) or value is None for value in probe_results.values()
+    ):
+        raise ValueError(
+            "Capability artifact probe_results must contain the exact boolean/null contract."
+        )
+    strict = not reasons and _probe_values_match_backend(
+        backend, probe_results, REQUIRED_PROBE_KEYS[backend]
+    )
+    if payload["strict_isolation"] is not strict:
+        raise ValueError("Capability artifact strict_isolation is inconsistent.")
+    return dict(payload)
+
+
+def _reject_symlink_components(path: Path) -> None:
+    absolute = path.absolute()
+    for component in reversed((absolute, *absolute.parents)):
+        if component.exists() or component.is_symlink():
+            if component.is_symlink():
+                raise ValueError("Artifact paths must not contain symlinked components.")
+
+
+def _resolve_local_output(raw: str, *, root: Path, suffix: str = ".json") -> Path:
+    candidate = Path(raw)
+    if candidate.is_absolute() or candidate.name != raw or not raw.endswith(suffix):
+        raise ValueError(f"Output must be a local {suffix} filename without path separators.")
+    _reject_symlink_components(root)
+    root.mkdir(parents=True, exist_ok=True)
+    _reject_symlink_components(root)
+    resolved = (root / candidate).resolve()
+    if resolved.parent != root.resolve() or resolved.is_symlink():
+        raise ValueError("Output path escaped the canonical local artifact directory.")
+    return resolved
+
+
+def _read_candidate_patch_for_fingerprint(path: Path) -> str:
+    """Read a bounded patch only when the packet requires fingerprint verification."""
+
+    try:
+        with path.open("rb") as handle:
+            raw_patch = handle.read(MAX_CANDIDATE_PATCH_BYTES + 1)
+    except OSError as exc:
+        raise ValueError("Candidate patch could not be read.") from exc
+    if len(raw_patch) > MAX_CANDIDATE_PATCH_BYTES:
+        raise ValueError("Candidate patch exceeds the host fingerprint limit.")
+    try:
+        return raw_patch.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("Candidate patch could not be read.") from exc
+
+
+def _normalize_candidate_patch_target(raw_path: str) -> str:
+    """Normalize one diff target without importing runner application dependencies."""
+
+    stripped = raw_path.strip()
+    if stripped in {"", "/dev/null"}:
+        return ""
+    if stripped.startswith(("a/", "b/")):
+        stripped = stripped[2:]
+    pure_path = PurePosixPath(stripped)
+    if pure_path.is_absolute() or any(part == ".." for part in pure_path.parts):
+        raise DispatchError("result_validation_failed")
+    normalized_parts = [part for part in pure_path.parts if part not in {"", "."}]
+    if not normalized_parts:
+        raise DispatchError("result_validation_failed")
+    return PurePosixPath(*normalized_parts).as_posix()
+
+
+def _extract_candidate_mutated_paths(patch_text: str) -> list[str]:
+    """Extract changed paths on dispatcher-only hosts without loading the runner app."""
+
+    if patch_text.strip() == "":
+        return []
+
+    mutated_paths: set[str] = set()
+    saw_diff_marker = False
+    for raw_line in patch_text.splitlines():
+        if raw_line.startswith("diff --git "):
+            saw_diff_marker = True
+            parts = raw_line.split()
+            if len(parts) >= 4:
+                target = _normalize_candidate_patch_target(parts[3])
+                if target:
+                    mutated_paths.add(target)
+            continue
+        if raw_line.startswith(("rename to ", "copy to ")):
+            saw_diff_marker = True
+            target = _normalize_candidate_patch_target(raw_line.split(" ", 2)[2])
+            if target:
+                mutated_paths.add(target)
+            continue
+        if raw_line.startswith("rename from "):
+            saw_diff_marker = True
+            source = _normalize_candidate_patch_target(raw_line.split(" ", 2)[2])
+            if source:
+                mutated_paths.add(source)
+            continue
+        if raw_line.startswith("+++ "):
+            saw_diff_marker = True
+            target = _normalize_candidate_patch_target(raw_line[4:])
+            if target:
+                mutated_paths.add(target)
+
+    if not mutated_paths and saw_diff_marker:
+        return []
+    if not mutated_paths:
+        raise DispatchError("result_validation_failed")
+    return sorted(mutated_paths)
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    _reject_symlink_components(path.parent)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _reject_symlink_components(path.parent)
+    if path.is_symlink():
+        raise ValueError("Refusing to write through a symlinked artifact path.")
+    fd, raw_temp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temp_path = Path(raw_temp)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def _public_result_status(result: dict[str, Any]) -> str:
+    status = result.get("status")
+    if status == "accepted":
+        return PUBLIC_STATUS_ACCEPTED
+    if status == "rejected":
+        return PUBLIC_STATUS_REJECTED
+    raise DispatchError("result_validation_failed")
+
+
+def _require_repo_local_file(raw: str, *, suffix: str) -> Path:
+    candidate = Path(raw)
+    if candidate.is_absolute():
+        raise ValueError("Input paths must be repository-relative.")
+    repo_root = Path(REPO_ROOT).resolve()
+    resolved = (repo_root / candidate).resolve(strict=True)
+    try:
+        resolved.relative_to(repo_root)
+    except ValueError as exc:
+        raise ValueError("Input paths must stay inside the repository.") from exc
+    if not resolved.is_file() or resolved.suffix != suffix:
+        raise ValueError(f"Input must be an existing repository-local {suffix} file.")
+    return resolved
+
+
+def _git_binary() -> str:
+    git = _resolve_cli("git")
+    if git is None:
+        raise DispatchError("runtime_cli_missing")
+    return git
+
+
+def _safe_git_config_args_for(cwd: Path, *, bind_work_tree: bool = True) -> tuple[Path, list[str]]:
+    """Resolve one Git cwd and clamp local config before trusting it."""
+
+    try:
+        resolved_cwd = cwd.expanduser().resolve(strict=True)
+    except OSError as exc:
+        raise DispatchError("probe_execution_failed") from exc
+    if not resolved_cwd.is_dir():
+        raise DispatchError("probe_execution_failed")
+    args = [
+        *_safe_git_config_args(),
+        "-c",
+        f"core.worktree={resolved_cwd}",
+        "-c",
+        f"safe.directory={resolved_cwd}",
+    ]
+    if bind_work_tree:
+        args.insert(0, f"--work-tree={resolved_cwd}")
+    return resolved_cwd, args
+
+
+def _git(
+    args: list[str],
+    *,
+    cwd: Path,
+    input_text: str | None = None,
+    bind_work_tree: bool = True,
+    allowed_returncodes: tuple[int, ...] = (0,),
+) -> subprocess.CompletedProcess[str]:
+    resolved_cwd, safe_config = _safe_git_config_args_for(cwd, bind_work_tree=bind_work_tree)
+    result = _run(
+        [_git_binary(), *safe_config, *args],
+        cwd=resolved_cwd,
+        input_text=input_text,
+        env_override=_sanitized_git_env_without_parent_state(),
+    )
+    if result.returncode not in allowed_returncodes:
+        raise DispatchError("probe_execution_failed")
+    return result
+
+
+def _material_file(root: Path, relative: str, *, maximum_bytes: int | None = None) -> bytes:
+    """Read an explicitly admitted regular file under the cooperative boundary."""
+
+    if maximum_bytes is None:
+        maximum_bytes = MAX_RESULT_BYTES
+    if type(maximum_bytes) is not int or not 0 < maximum_bytes <= 16 * 1024**2:
+        raise ValueError("Admitted material has an invalid byte bound.")
+
+    path = root / relative
+    _reject_symlink_components(path)
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise ValueError("Admitted material must be a regular, single-link file.")
+        if before.st_size > maximum_bytes:
+            raise ValueError("Admitted material exceeds the bounded file size.")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            data = handle.read(maximum_bytes + 1)
+        after = os.fstat(descriptor)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ) or len(
+            data
+        ) != before.st_size:
+            raise ValueError("Admitted material changed during acquisition.")
+        namespace = path.lstat()
+        if any(
+            getattr(before, field) != getattr(namespace, field)
+            or getattr(before, field) != getattr(after, field)
+            for field in (
+                "st_dev",
+                "st_ino",
+                "st_mode",
+                "st_nlink",
+                "st_uid",
+                "st_size",
+                "st_mtime_ns",
+                "st_ctime_ns",
+            )
+        ):
+            raise ValueError("Admitted material namespace or metadata changed during acquisition.")
+        return data
+    finally:
+        os.close(descriptor)
+
+
+def _tracked_content_digest(root: Path, admitted_new_files: tuple[str, ...] = ()) -> str:
+    """Hash native HEAD/index membership and actual bytes without clean filters."""
+
+    paths = set(_git(["ls-tree", "-r", "-z", "--name-only", "HEAD"], cwd=root).stdout.split("\0"))
+    for relative in _git(["ls-files", "-z"], cwd=root).stdout.split("\0"):
+        if relative and relative not in paths:
+            try:
+                (root / relative).lstat()
+            except FileNotFoundError:
+                continue
+            paths.add(relative)
+    paths.update(admitted_new_files)
+    paths.discard("")
+    head_modes: dict[str, tuple[str, str]] = {}
+    for row in _git(["ls-tree", "-r", "-z", "HEAD"], cwd=root).stdout.split("\0"):
+        if row:
+            header, relative = row.split("\t", 1)
+            mode, _, commit = header.split(" ", 2)
+            head_modes[relative] = (mode, commit)
+    index_modes: dict[str, tuple[str, str]] = {}
+    for row in _git(["ls-files", "--stage", "-z"], cwd=root).stdout.split("\0"):
+        if row:
+            header, relative = row.split("\t", 1)
+            mode, commit, stage = header.split(" ")
+            if stage != "0":
+                raise ValueError("Unmerged tracked material cannot supply content binding.")
+            index_modes[relative] = (mode, commit)
+    if len(paths) > 25_000:
+        raise ValueError("Tracked material inventory exceeds its bound.")
+    digest = hashlib.sha256()
+    total = 0
+    for relative in sorted(paths):
+        if relative.startswith("/") or any(
+            part in {"", ".", "..", ".git"} for part in relative.split("/")
+        ):
+            raise ValueError("Native tracked material path is unsafe.")
+        path = root / relative
+        _reject_symlink_components(path.parent)
+        digest.update(relative.encode() + b"\0")
+        mode_and_object = index_modes.get(relative, head_modes.get(relative))
+        if mode_and_object is not None and mode_and_object[0] == "160000":
+            commit = mode_and_object[1]
+            if path.is_symlink():
+                raise ValueError("Gitlink material must not be a symlink.")
+            if not path.exists():
+                state = "absent"
+            elif path.is_dir() and next(path.iterdir(), None) is None:
+                state = "uninitialized_empty"
+            else:
+                raise ValueError("Initialized or populated Gitlink material is unsupported.")
+            digest.update(b"gitlink\0" + commit.encode() + b"\0" + state.encode() + b"\0")
+            continue
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            digest.update(b"absent\0")
+            continue
+        if stat.S_ISLNK(metadata.st_mode):
+            digest.update(b"symlink\0" + os.readlink(path).encode() + b"\0")
+            continue
+        file_bound = 32 * MAX_RESULT_BYTES
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_size > file_bound
+        ):
+            raise ValueError("Tracked material is not an admitted bounded regular file.")
+        total += metadata.st_size
+        if total > 512 * MAX_RESULT_BYTES:
+            raise ValueError("Tracked material exceeds the aggregate byte bound.")
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        content = hashlib.sha256()
+        try:
+            before = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or before.st_size > file_bound
+                or (
+                    before.st_dev,
+                    before.st_ino,
+                    before.st_mode,
+                    before.st_size,
+                    before.st_mtime_ns,
+                    before.st_ctime_ns,
+                )
+                != (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                    metadata.st_mode,
+                    metadata.st_size,
+                    metadata.st_mtime_ns,
+                    metadata.st_ctime_ns,
+                )
+            ):
+                raise ValueError("Tracked source identity changed before content acquisition.")
+            read_count = 0
+            with os.fdopen(descriptor, "rb", closefd=False) as handle:
+                while read_count <= file_bound:
+                    chunk = handle.read(min(65_536, file_bound + 1 - read_count))
+                    if not chunk:
+                        break
+                    read_count += len(chunk)
+                    content.update(chunk)
+            after = os.fstat(descriptor)
+            if (
+                read_count > file_bound
+                or read_count != before.st_size
+                or (
+                    before.st_dev,
+                    before.st_ino,
+                    before.st_size,
+                    before.st_mtime_ns,
+                    before.st_ctime_ns,
+                )
+                != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+            ):
+                raise ValueError("Tracked source changed during content acquisition.")
+        finally:
+            os.close(descriptor)
+        digest_mode = b"100755" if metadata.st_mode & 0o111 else b"100644"
+        digest.update(digest_mode + b"\0" + content.digest() + b"\0")
+    return digest.hexdigest()
+
+
+def capture_source_material(root: Path, admitted_new_files: tuple[str, ...] = ()) -> dict[str, Any]:
+    """Bind separate staging/final material observations; never mutate source Git."""
+
+    from scripts.orchestration.experiment_runner_pr_creative_context import _git_identity
+
+    _reject_symlink_components(root)
+    if not root.is_absolute() or root.resolve() != root or not root.is_dir():
+        raise ValueError("Material capture requires a canonical absolute checkout.")
+    if len(admitted_new_files) > 32 or len(set(admitted_new_files)) != len(admitted_new_files):
+        raise ValueError("Admitted new files must be bounded and unique.")
+    repository, base, head = _git_identity(root)
+    flags = _git(["ls-files", "-v", "-z"], cwd=root).stdout
+    if any(row and (row[0].islower() or row[0] == "S") for row in flags.split("\0")):
+        raise ValueError("Hidden assume-unchanged/skip-worktree index flags are unsupported.")
+    filters = _git(["config", "--get-regexp", "^filter\\."], cwd=root, allowed_returncodes=(0, 1))
+    if filters.returncode == 0:
+        raise ValueError(
+            "Effective Git filter configuration is unsupported for exact raw material."
+        )
+    index = _git(["ls-files", "--stage", "-z"], cwd=root).stdout
+    for entry in index.split("\0"):
+        if entry and entry.split("\t", 1)[0].split(" ")[-1] != "0":
+            raise ValueError("Unmerged index cannot supply oracle material.")
+    staged = _git(
+        ["diff", "--no-ext-diff", "--no-textconv", "--binary", "--cached", "HEAD"], cwd=root
+    ).stdout
+    unstaged = _git(["diff", "--no-ext-diff", "--no-textconv", "--binary"], cwd=root).stdout
+    final_diff = _git(
+        ["diff", "--no-ext-diff", "--no-textconv", "--binary", "HEAD"], cwd=root
+    ).stdout
+    admitted: list[dict[str, Any]] = []
+    total = 0
+    for relative in sorted(admitted_new_files):
+        parts = relative.split("/")
+        if (
+            not relative
+            or relative.startswith("/")
+            or "\\" in relative
+            or any(part in {"", ".", "..", ".git"} for part in parts)
+            or parts[0] in {"artifacts", "worktrees", ".venv", "node_modules"}
+        ):
+            raise ValueError("Admitted new-file path is unsafe.")
+        untracked = _git(
+            [
+                "--literal-pathspecs",
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "-z",
+                "--",
+                relative,
+            ],
+            cwd=root,
+        ).stdout
+        if untracked != relative + "\0":
+            raise ValueError("New-file admission requires one non-ignored untracked file.")
+        data = _material_file(root, relative)
+        total += len(data)
+        if total > 8 * MAX_RESULT_BYTES:
+            raise ValueError("Admitted material exceeds the aggregate bound.")
+        mode = "100755" if (root / relative).stat().st_mode & 0o111 else "100644"
+        admitted.append(
+            {"path": relative, "mode": mode, "sha256": hashlib.sha256(data).hexdigest()}
+        )
+    untracked_inventory = _git(
+        ["ls-files", "--others", "--exclude-standard", "-z"], cwd=root
+    ).stdout
+    if set(untracked_inventory.split("\0")) - {""} != set(admitted_new_files):
+        raise ValueError("Non-ignored untracked inventory must equal admitted new files.")
+    return {
+        "repository": repository,
+        "base_sha": base,
+        "head_sha": head,
+        "index_sha256": hashlib.sha256(index.encode()).hexdigest(),
+        "staged_diff_sha256": hashlib.sha256(staged.encode()).hexdigest(),
+        "unstaged_diff_sha256": hashlib.sha256(unstaged.encode()).hexdigest(),
+        "worktree_diff_sha256": hashlib.sha256(final_diff.encode()).hexdigest(),
+        "admitted_new_files": admitted,
+        "tracked_content_sha256": _tracked_content_digest(root, admitted_new_files),
+    }
+
+
+def _create_snapshot(
+    root: Path,
+    destination: Path,
+    *,
+    admitted_new_files: tuple[str, ...] = (),
+    source_material: dict[str, Any] | None = None,
+    snapshot_proof: dict[str, Any] | None = None,
+) -> str:
+    if (
+        source_material is not None
+        and capture_source_material(root, admitted_new_files) != source_material
+    ):
+        raise ValueError("Source material changed before snapshot.")
+    before = _git(["status", "--short", "--untracked-files=no"], cwd=root).stdout
+    _git(
+        [
+            "clone",
+            "--quiet",
+            "--no-checkout",
+            "--no-hardlinks",
+            str(root),
+            str(destination),
+        ],
+        cwd=root,
+        bind_work_tree=False,
+    )
+    head = _git(["rev-parse", "HEAD"], cwd=root).stdout.strip()
+    _git(["checkout", "--quiet", "--detach", head], cwd=destination)
+    tracked_diff = _git(
+        ["diff", "--no-ext-diff", "--no-textconv", "--binary", "HEAD"],
+        cwd=root,
+    ).stdout
+    if tracked_diff:
+        _git(["apply", "--index", "--binary", "-"], cwd=destination, input_text=tracked_diff)
+    copied: list[dict[str, Any]] = []
+    for row in (source_material or {}).get("admitted_new_files", []):
+        relative = row["path"]
+        data = _material_file(root, relative)
+        if hashlib.sha256(data).hexdigest() != row["sha256"]:
+            raise ValueError("New-file bytes changed before snapshot copy.")
+        target = destination / relative
+        _reject_symlink_components(target.parent)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("xb") as handle:
+            handle.write(data)
+        target.chmod(0o755 if row["mode"] == "100755" else 0o644)
+        if _material_file(destination, relative) != data:
+            raise ValueError("Copied snapshot bytes differ.")
+        _git(["--literal-pathspecs", "add", "--", relative], cwd=destination)
+        copied.append(dict(row))
+    after = _git(["status", "--short", "--untracked-files=no"], cwd=root).stdout
+    if before != after:
+        raise DispatchError("probe_execution_failed")
+    if source_material is not None:
+        snapshot_content = _tracked_content_digest(destination)
+        if snapshot_content != source_material["tracked_content_sha256"]:
+            raise ValueError("Copied scratch material differs from actual source bytes or modes.")
+        if capture_source_material(root, admitted_new_files) != source_material:
+            raise ValueError("Source material changed during snapshot copy.")
+        if snapshot_proof is not None:
+            snapshot_proof.update(
+                {
+                    "source_material": source_material,
+                    "snapshot_diff_sha256": hashlib.sha256(
+                        _git(
+                            ["diff", "--no-ext-diff", "--no-textconv", "--binary", "HEAD"],
+                            cwd=destination,
+                        ).stdout.encode()
+                    ).hexdigest(),
+                    "copied_new_files": copied,
+                    "snapshot_content_sha256": snapshot_content,
+                }
+            )
+    return tracked_diff
+
+
+def _require_candidate_checkout(packet: dict[str, Any], *, root: Path) -> None:
+    """Bind candidate dispatch to the packet's clean base checkout."""
+
+    if packet["runner_mode"] == ORACLE_ONLY_GOVERNANCE_REVIEWER_MODE:
+        return
+    expected_base = packet.get("base_commit_sha")
+    patch_fingerprint = packet.get("candidate_patch_fingerprint")
+    if (expected_base is None) != (patch_fingerprint is None):
+        raise DispatchError("result_validation_failed")
+    if expected_base is None:
+        return
+    tracked_status = _git(["status", "--short", "--untracked-files=no"], cwd=root).stdout
+    if tracked_status:
+        raise DispatchError("result_validation_failed")
+    head = _git(["rev-parse", "HEAD"], cwd=root).stdout.strip()
+    if not isinstance(expected_base, str) or head != expected_base:
+        raise DispatchError("result_validation_failed")
+
+
+def _candidate_checkout_proof(
+    packet: dict[str, Any],
+    *,
+    root: Path,
+    candidate_patch_text: str | None = None,
+) -> dict[str, Any]:
+    """Return sanitized checkout proof for fingerprinted candidate dispatch."""
+
+    if packet["runner_mode"] == ORACLE_ONLY_GOVERNANCE_REVIEWER_MODE:
+        return {}
+    expected_base = packet.get("base_commit_sha")
+    if expected_base is None:
+        return {}
+    proof = {
+        "source_checkout_head_sha": expected_base,
+        "source_checkout_clean": True,
+    }
+    if candidate_patch_text is not None:
+        proof["candidate_changed_files"] = len(
+            _extract_candidate_mutated_paths(candidate_patch_text)
+        )
+    return proof
+
+
+def _execution_backend_payload(probe: BackendProbe, *, passed: bool) -> dict[str, str]:
+    if probe.image_digest is None:
+        raise ValueError("Execution backend provenance requires an image digest.")
+    return {
+        "name": probe.backend,
+        "guest_platform": probe.guest_platform,
+        "runtime_version": probe.runtime_version,
+        "image_digest": probe.image_digest,
+        "network_isolation": probe.isolation_method,
+        "preflight_status": "passed" if passed else "failed",
+    }
+
+
+def _validated_experiment_result(result: dict[str, Any]) -> dict[str, Any]:
+    validated: dict[str, Any] = validate_experiment_result(result)
+    return validated
+
+
+def _capability_mismatch_result(
+    packet: dict[str, Any],
+    image: ImageReference,
+    probe: BackendProbe,
+) -> dict[str, Any]:
+    experiment_id = packet["experiment_id"]
+    runner_mode = packet["runner_mode"]
+    candidate_patch = (
+        ORACLE_ONLY_GOVERNANCE_REVIEWER_MODE
+        if runner_mode == ORACLE_ONLY_GOVERNANCE_REVIEWER_MODE
+        else "candidate.patch"
+    )
+    result = {
+        "schema_version": "1.0",
+        "experiment_id": experiment_id,
+        "runner_mode": runner_mode,
+        "candidate_patch": candidate_patch,
+        "status": "rejected",
+        "failure_class": "capability_mismatch",
+        "mutated_paths": [],
+        "oracle_results": [],
+        "budget_observations": {
+            "configured_budgets": dict(packet["budgets"]),
+            "oracle_commands_configured": len(packet["immutable_oracles"]),
+            "oracle_commands_executed": 0,
+            "attempts": 0,
+            "retries_consumed": 0,
+            "runner_error": probe.blocking_reasons[0],
+        },
+        "shared_tree_untouched": True,
+        "promotion_ready": False,
+        "contribution_kind": "none",
+        "coauthor_required": False,
+        "coauthor_reason": "",
+        "execution_backend": _execution_backend_payload(
+            BackendProbe(
+                backend=probe.backend,
+                host_platform=probe.host_platform,
+                guest_platform=probe.guest_platform,
+                runtime_version=probe.runtime_version,
+                image_digest=image.digest,
+                isolation_method=probe.isolation_method,
+                probe_results=probe.probe_results,
+                blocking_reasons=probe.blocking_reasons,
+            ),
+            passed=False,
+        ),
+    }
+    if "candidate_patch_fingerprint" in packet:
+        result["candidate_patch_fingerprint"] = packet["candidate_patch_fingerprint"]
+    return _validated_experiment_result(result)
+
+
+def _infra_flake_result(
+    packet: dict[str, Any],
+    image: ImageReference,
+    probe: BackendProbe,
+    error_code: str,
+) -> dict[str, Any]:
+    runner_mode = packet["runner_mode"]
+    candidate_patch = (
+        ORACLE_ONLY_GOVERNANCE_REVIEWER_MODE
+        if runner_mode == ORACLE_ONLY_GOVERNANCE_REVIEWER_MODE
+        else "candidate.patch"
+    )
+    result = {
+        "schema_version": "1.0",
+        "experiment_id": packet["experiment_id"],
+        "runner_mode": runner_mode,
+        "candidate_patch": candidate_patch,
+        "status": "rejected",
+        "failure_class": "infra_flake",
+        "mutated_paths": [],
+        "oracle_results": [],
+        "budget_observations": {
+            "configured_budgets": dict(packet["budgets"]),
+            "oracle_commands_configured": len(packet["immutable_oracles"]),
+            "oracle_commands_executed": 0,
+            "attempts": 1,
+            "retries_consumed": 0,
+            "runner_error": error_code,
+        },
+        "shared_tree_untouched": True,
+        "promotion_ready": False,
+        "contribution_kind": "none",
+        "coauthor_required": False,
+        "coauthor_reason": "",
+        "execution_backend": _execution_backend_payload(probe, passed=True),
+    }
+    if "candidate_patch_fingerprint" in packet:
+        result["candidate_patch_fingerprint"] = packet["candidate_patch_fingerprint"]
+    return _validated_experiment_result(_redact_result_value(result))
+
+
+def _post_preflight_capability_mismatch_result(
+    packet: dict[str, Any],
+    image: ImageReference,
+    probe: BackendProbe,
+    *,
+    candidate_checkout_proof: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the sole publishable result for the runner's owned capability signal."""
+
+    runner_mode = packet["runner_mode"]
+    candidate_patch = (
+        ORACLE_ONLY_GOVERNANCE_REVIEWER_MODE
+        if runner_mode == ORACLE_ONLY_GOVERNANCE_REVIEWER_MODE
+        else "candidate.patch"
+    )
+    result = {
+        "schema_version": "1.0",
+        "experiment_id": packet["experiment_id"],
+        "runner_mode": runner_mode,
+        "candidate_patch": candidate_patch,
+        "status": "rejected",
+        "failure_class": "capability_mismatch",
+        "mutated_paths": [],
+        "oracle_results": [],
+        "budget_observations": {
+            "configured_budgets": dict(packet["budgets"]),
+            "oracle_commands_configured": len(packet["immutable_oracles"]),
+            "oracle_commands_executed": 0,
+            "attempts": 1,
+            "retries_consumed": 0,
+            "runner_error": RUNNER_CAPABILITY_ERROR,
+        },
+        "shared_tree_untouched": True,
+        "promotion_ready": False,
+        "contribution_kind": "none",
+        "coauthor_required": False,
+        "coauthor_reason": "",
+        "execution_backend": _execution_backend_payload(probe, passed=True),
+    }
+    if "candidate_patch_fingerprint" in packet:
+        result["candidate_patch_fingerprint"] = packet["candidate_patch_fingerprint"]
+    if candidate_checkout_proof:
+        result["budget_observations"].update(candidate_checkout_proof)
+    return _validated_experiment_result(result)
+
+
+_SECRET_TEXT_PATTERNS = (
+    re.compile(r"(?i)(token|secret|password|api[_-]?key)\s*[:=]\s*[^\s,;]+"),
+    re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,})\b"),
+)
+
+
+def _redact_result_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _redact_result_value(nested) for key, nested in value.items()}
+    if isinstance(value, list):
+        return [_redact_result_value(nested) for nested in value]
+    if not isinstance(value, str):
+        return value
+    redacted = value
+    path_replacements = (
+        (str(REPO_ROOT), "<repo>"),
+        (str(Path.home()), "<home>"),
+        (tempfile.gettempdir(), "<tmp>"),
+    )
+    for raw, replacement in path_replacements:
+        if raw and len(raw) > 1:
+            redacted = redacted.replace(raw, replacement)
+    for key, secret in os.environ.items():
+        if any(token in key.upper() for token in ("TOKEN", "SECRET", "PASSWORD", "SALT", "KEY")):
+            if len(secret) >= 6:
+                redacted = redacted.replace(secret, "<redacted>")
+    for pattern in _SECRET_TEXT_PATTERNS:
+        redacted = pattern.sub("<redacted>", redacted)
+    return redacted
+
+
+def _sanitize_result(
+    result: dict[str, Any],
+    probe: BackendProbe,
+    *,
+    expected_candidate_patch_fingerprint: str | None = None,
+    candidate_checkout_proof: dict[str, Any] | None = None,
+    requested_contribution_kind: str = "none",
+    requested_coauthor_required: bool = False,
+    requested_coauthor_reason: str = "",
+) -> dict[str, Any]:
+    trusted_backend = _execution_backend_payload(probe, passed=True)
+    result_with_trusted_backend = {**result, "execution_backend": trusted_backend}
+    try:
+        if candidate_checkout_proof:
+            budget_observations = dict(result_with_trusted_backend.get("budget_observations", {}))
+            budget_observations.update(candidate_checkout_proof)
+            result_with_trusted_backend["budget_observations"] = budget_observations
+        validated = _validated_experiment_result(result_with_trusted_backend)
+    except (TypeError, ValueError) as exc:
+        raise DispatchError("result_validation_failed") from exc
+    if (
+        expected_candidate_patch_fingerprint is not None
+        and validated.get("candidate_patch_fingerprint") != expected_candidate_patch_fingerprint
+    ):
+        raise DispatchError("result_validation_failed")
+    sanitized = _redact_result_value(validated)
+    if not isinstance(sanitized, dict):
+        raise DispatchError("result_redaction_failed")
+    sanitized["execution_backend"] = trusted_backend
+    if candidate_checkout_proof:
+        budget_observations = dict(sanitized.get("budget_observations", {}))
+        budget_observations.update(candidate_checkout_proof)
+        sanitized["budget_observations"] = budget_observations
+    oracle_results = []
+    for raw_oracle in sanitized.get("oracle_results", []):
+        oracle = dict(raw_oracle)
+        oracle["cwd"] = "/workspace"
+        oracle_results.append(oracle)
+    sanitized["oracle_results"] = oracle_results
+    try:
+        sanitized = _validated_experiment_result(sanitized)
+        requested_attribution = validate_contribution_attribution(
+            contribution_kind=requested_contribution_kind,
+            coauthor_required=requested_coauthor_required,
+            coauthor_reason=requested_coauthor_reason,
+        )
+    except (TypeError, ValueError) as exc:
+        raise DispatchError("result_validation_failed") from exc
+    expected_attribution = (
+        requested_attribution if sanitized["status"] == "accepted" else ("none", False, "")
+    )
+    actual_attribution = (
+        sanitized["contribution_kind"],
+        sanitized["coauthor_required"],
+        sanitized["coauthor_reason"],
+    )
+    if actual_attribution != expected_attribution:
+        raise DispatchError("result_validation_failed")
+    return sanitized
+
+
+def _require_result_status_matches_runner_exit(
+    result: dict[str, Any], runner_returncode: int
+) -> None:
+    """Bind lower-trust result status to the container runtime's exit evidence."""
+
+    expected_returncode = 0 if result["status"] == "accepted" else RUNNER_REJECTED_EXIT_CODE
+    if runner_returncode != expected_returncode:
+        raise DispatchError("result_validation_failed")
+
+
+def _collect_result_volume(
+    *,
+    cli: str,
+    backend: str,
+    image_ref: str,
+    volume: str,
+    output_name: str,
+    apple_network: str | None,
+) -> dict[str, Any]:
+    collector = f"pp-er-collector-{uuid.uuid4().hex[:12]}"
+    try:
+        completed = _run(
+            _container_run_argv(
+                cli=cli,
+                backend=backend,
+                image_ref=image_ref,
+                container_name=collector,
+                result_volume=volume,
+                result_readonly=True,
+                apple_network=apple_network,
+                extra_env=(f"RESULT_PATH={CONTAINER_RESULT_DIR}/{output_name}",),
+                command=[
+                    CONTAINER_UNSHARE,
+                    "--net",
+                    "--map-root-user",
+                    CONTAINER_PYTHON,
+                    "-c",
+                    _COLLECTOR_CODE,
+                ],
+            ),
+            cwd=REPO_ROOT,
+            timeout=30,
+        )
+        if completed.returncode != 0:
+            raise DispatchError("result_extraction_failed")
+        try:
+            envelope = json.loads(completed.stdout.strip().splitlines()[-1])
+            encoded = envelope["payload_b64"]
+            payload_bytes = base64.b64decode(encoded, validate=True)
+            payload = json.loads(payload_bytes.decode("utf-8"))
+        except (
+            IndexError,
+            KeyError,
+            TypeError,
+            ValueError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+        ) as exc:
+            raise DispatchError("result_extraction_failed") from exc
+        if len(payload_bytes) > MAX_RESULT_BYTES or not isinstance(payload, dict):
+            raise DispatchError("result_extraction_failed")
+        return payload
+    finally:
+        if not _cleanup_container(cli, backend, collector):
+            raise DispatchError("container_cleanup_failed")
+
+
+def _invoke_container_runner(
+    *,
+    probe: BackendProbe,
+    image: ImageReference,
+    packet_path: Path,
+    candidate_patch: Path | None,
+    output_name: str,
+    expected_packet: dict[str, Any] | None = None,
+    contribution_kind: str = "none",
+    coauthor_required: bool = False,
+    coauthor_reason: str = "",
+    admitted_new_files: tuple[str, ...] = (),
+    snapshot_proof: dict[str, Any] | None = None,
+    accepted_observations: dict[str, Any] | None = None,
+    material_root: Path | None = None,
+) -> dict[str, Any]:
+    execution_root = REPO_ROOT if material_root is None else material_root
+    cli_name = "container" if probe.backend == "apple-container" else "docker"
+    cli = _resolve_cli(cli_name)
+    if cli is None:
+        raise PreRunCapabilityError("runtime_cli_missing")
+    packet = validate_experiment_packet(_read_packet(packet_path))
+    if expected_packet is not None and packet != expected_packet:
+        raise DispatchError("result_validation_failed")
+    _require_candidate_checkout(packet, root=execution_root)
+    candidate_patch_text: str | None = None
+    if candidate_patch is not None:
+        expected_patch_fingerprint = packet.get("candidate_patch_fingerprint")
+        if expected_patch_fingerprint is not None:
+            candidate_patch_text = _read_candidate_patch_for_fingerprint(candidate_patch)
+            if expected_patch_fingerprint != fingerprint_payload(
+                {"candidate_patch": candidate_patch_text}
+            ):
+                raise DispatchError("result_validation_failed")
+    candidate_checkout_proof = _candidate_checkout_proof(
+        packet,
+        root=execution_root,
+    )
+    with tempfile.TemporaryDirectory(prefix="pp-er-run-") as raw_temp:
+        temp_root = Path(raw_temp).resolve(strict=True)
+        snapshot = temp_root / "repo"
+        input_dir = temp_root / "input"
+        input_dir.mkdir()
+        source_material = (
+            capture_source_material(execution_root, admitted_new_files)
+            if snapshot_proof is not None or admitted_new_files
+            else None
+        )
+        if source_material is None:
+            tracked_diff = _create_snapshot(execution_root, snapshot)
+        else:
+            tracked_diff = _create_snapshot(
+                execution_root,
+                snapshot,
+                admitted_new_files=admitted_new_files,
+                source_material=source_material,
+                snapshot_proof=snapshot_proof,
+            )
+        tool_snapshot = snapshot
+        tool_source = None
+        if material_root is not None:
+            tool_source = capture_source_material(Path(REPO_ROOT).resolve())
+            tool_snapshot = temp_root / "tool"
+            _create_snapshot(Path(REPO_ROOT).resolve(), tool_snapshot, source_material=tool_source)
+        _require_candidate_checkout(packet, root=execution_root)
+        if (
+            packet["runner_mode"] != ORACLE_ONLY_GOVERNANCE_REVIEWER_MODE
+            and packet.get("base_commit_sha") is not None
+            and tracked_diff
+        ):
+            raise DispatchError("result_validation_failed")
+        (tool_snapshot / CONTAINER_INPUT.removeprefix(f"{CONTAINER_REPO}/")).mkdir()
+        (tool_snapshot / CONTAINER_RESULT_DIR.removeprefix(f"{CONTAINER_REPO}/")).mkdir(
+            parents=True, exist_ok=True
+        )
+        (input_dir / "packet.json").write_text(
+            json.dumps(packet, sort_keys=True),
+            encoding="utf-8",
+        )
+        if candidate_patch_text is not None:
+            (input_dir / "candidate.patch").write_text(
+                candidate_patch_text,
+                encoding="utf-8",
+            )
+        elif candidate_patch is not None:
+            shutil.copyfile(candidate_patch, input_dir / "candidate.patch")
+        command = [
+            CONTAINER_PYTHON,
+            "-I",
+            f"{CONTAINER_REPO}/scripts/orchestration/experiment_runner.py",
+            "--packet",
+            f"{CONTAINER_INPUT}/packet.json",
+            "--output",
+            output_name,
+        ]
+        if material_root is not None:
+            command.extend(["--execution-root", "/material"])
+        if candidate_patch is not None:
+            command.extend(["--candidate-patch", f"{CONTAINER_INPUT}/candidate.patch"])
+        if contribution_kind != "none":
+            command.extend(
+                [
+                    "--contribution-kind",
+                    contribution_kind,
+                    "--coauthor-required",
+                    "--coauthor-reason",
+                    coauthor_reason,
+                ]
+            )
+        apple_network: str | None = None
+        volume: str | None = None
+        runner_name = f"pp-er-runner-{uuid.uuid4().hex[:12]}"
+        cleanup_completed = True
+        try:
+            try:
+                if probe.backend == "apple-container":
+                    apple_network = _create_apple_network(cli)
+                _inspect_image(cli, probe.backend, image)
+                runtime_ref = image.runtime_ref(probe.backend)
+                volume = _create_result_volume(cli, probe.backend)
+                if not _initialize_result_volume(
+                    cli=cli,
+                    backend=probe.backend,
+                    image_ref=runtime_ref,
+                    volume=volume,
+                    apple_network=apple_network,
+                ):
+                    raise DispatchError("result_volume_failed")
+            except DispatchError as exc:
+                raise PreRunCapabilityError(exc.code) from exc
+            timeout = int(packet["budgets"]["wall_clock_seconds"]) + 60
+            try:
+                completed = _run(
+                    _container_run_argv(
+                        cli=cli,
+                        backend=probe.backend,
+                        image_ref=runtime_ref,
+                        container_name=runner_name,
+                        result_volume=volume,
+                        repository=tool_snapshot,
+                        material_repository=snapshot if material_root is not None else None,
+                        input_dir=input_dir,
+                        command=command,
+                        apple_network=apple_network,
+                    ),
+                    cwd=REPO_ROOT,
+                    timeout=timeout,
+                )
+            finally:
+                cleanup_completed = (
+                    _cleanup_container(cli, probe.backend, runner_name) and cleanup_completed
+                )
+            if not cleanup_completed:
+                raise DispatchError("container_cleanup_failed")
+            runner_capability_signal = completed.returncode == RUNNER_CAPABILITY_EXIT_CODE
+            if completed.returncode not in {
+                0,
+                RUNNER_CAPABILITY_EXIT_CODE,
+                RUNNER_REJECTED_EXIT_CODE,
+            }:
+                raise DispatchError("runner_execution_failed")
+            payload = None
+            if not runner_capability_signal:
+                payload = _collect_result_volume(
+                    cli=cli,
+                    backend=probe.backend,
+                    image_ref=runtime_ref,
+                    volume=volume,
+                    output_name=output_name,
+                    apple_network=apple_network,
+                )
+        except BaseException as exc:
+            cleanup_completed = _cleanup_container_resources(
+                cli=cli,
+                backend=probe.backend,
+                volume=volume,
+                apple_network=apple_network,
+                prior_cleanup_ok=cleanup_completed,
+            )
+            if not cleanup_completed:
+                raise DispatchError("container_cleanup_failed") from exc
+            raise
+        cleanup_completed = _cleanup_container_resources(
+            cli=cli,
+            backend=probe.backend,
+            volume=volume,
+            apple_network=apple_network,
+            prior_cleanup_ok=cleanup_completed,
+        )
+        if not cleanup_completed:
+            raise DispatchError("container_cleanup_failed")
+        if runner_capability_signal:
+            capability_checkout_proof = _candidate_checkout_proof(
+                packet,
+                root=execution_root,
+                candidate_patch_text=candidate_patch_text,
+            )
+            return _post_preflight_capability_mismatch_result(
+                packet,
+                image,
+                probe,
+                candidate_checkout_proof=capability_checkout_proof,
+            )
+        if payload is None:
+            raise DispatchError("result_extraction_failed")
+        if snapshot_proof is not None and any(
+            key in payload
+            for key in (
+                "snapshot_proof",
+                "source_material",
+                "copied_new_files",
+                "tool_source",
+                "tool_snapshot_content_sha256",
+            )
+        ):
+            raise DispatchError("result_validation_failed")
+        sanitized = _sanitize_result(
+            payload,
+            probe,
+            expected_candidate_patch_fingerprint=packet.get("candidate_patch_fingerprint"),
+            candidate_checkout_proof=candidate_checkout_proof,
+            requested_contribution_kind=contribution_kind,
+            requested_coauthor_required=coauthor_required,
+            requested_coauthor_reason=coauthor_reason,
+        )
+        _require_result_status_matches_runner_exit(sanitized, completed.returncode)
+        if tool_source is not None:
+            if capture_source_material(Path(REPO_ROOT).resolve()) != tool_source:
+                raise DispatchError("result_validation_failed")
+            if snapshot_proof is not None:
+                snapshot_proof.update(
+                    {
+                        "tool_source": tool_source,
+                        "tool_snapshot_content_sha256": _tracked_content_digest(tool_snapshot),
+                    }
+                )
+        if source_material is not None:
+            if capture_source_material(execution_root, admitted_new_files) != source_material:
+                raise DispatchError("result_validation_failed")
+            if snapshot_proof is not None:
+                if sanitized["status"] == "accepted":
+                    if accepted_observations is not None:
+                        accepted_observations.update(
+                            {
+                                "schema_version": "experiment_runner_private_observations.v1",
+                                "authority": "local_observation_only",
+                                "oracle_results": [
+                                    dict(row) for row in sanitized["oracle_results"]
+                                ],
+                            }
+                        )
+                    for oracle in sanitized["oracle_results"]:
+                        oracle["stdout"] = ""
+                        oracle["stderr"] = ""
+                        oracle["cwd"] = "owned_guest_checkout"
+                    sanitized = _validated_experiment_result(sanitized)
+                snapshot_proof.update(
+                    {
+                        "schema_version": "experiment_runner_checked_snapshot.v1",
+                        "authority": "evidence_only",
+                        "experiment_packet_fingerprint": fingerprint_payload(packet),
+                        "result_fingerprint": fingerprint_payload(sanitized),
+                        "execution_backend": dict(sanitized["execution_backend"]),
+                        "result_projection": "sanitized_command_observations_v1",
+                    }
+                )
+        return sanitized
+
+
+# These are filesystem transport members of the one curated native export, not
+# a second SDK/source/ABI recognizer. Root qualifies the producer/export first;
+# the canonical installer inside UBI owns the wheel and receipt semantics.
+_RUNNER_BUILD_FILES = (
+    "deploy/experiment-runner/Containerfile",
+    "requirements-lock.txt",
+    "constraints.txt",
+    "scripts/ci/install_locked_python_requirements.py",
+    "scripts/ci/check_python_startup_hooks.py",
+    "scripts/ci/emergency_python_wheels.json",
+    "scripts/ci/check_private_python_proxy_health.py",
+    "tests/fixtures/dependency_security_schema.json",
+)
+_RUNNER_SDK_FILES = frozenset(
+    {
+        "psycopg-sdk/psycopg-c-sdk.json",
+        "usr/local/lib/libpq.so.5.18",
+        "usr/local/lib/libssl.so.3",
+        "usr/local/lib/libcrypto.so.3",
+        "usr/local/share/doc/pulseplate-native/OPENSSL-LICENSE",
+        "usr/local/share/doc/pulseplate-native/LIBPQ-COPYRIGHT",
+        "usr/local/share/doc/pulseplate-native/openssl.cnf",
+    }
+)
+_RUNNER_SDK_ALIASES = {"usr/local/lib/libpq.so.5": "libpq.so.5.18"}
+_RUNNER_OPTIONAL_PROVIDER = "usr/local/lib/ossl-modules/legacy.so"
+_RUNNER_STAGE_FILE_BYTES = 16 * 1024**2
+_RUNNER_STAGE_TOTAL_BYTES = 64 * 1024**2
+
+
+def _runner_stage_census(
+    root: Path, *, admitted_members: frozenset[str], opaque_sdk_wheel: bool = False
+) -> dict[str, tuple[str, int, bytes | str | None]]:
+    """Bound transport reads under a private cooperative root, without origin claims."""
+    rows: dict[str, tuple[str, int, bytes | str | None]] = {}
+    pending = [root]
+    total = 0
+    while pending:
+        directory = pending.pop()
+        _reject_symlink_components(directory)
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if len(rows) >= 64:
+                    raise ValueError("Runner build transport has too many members.")
+                path = directory / entry.name
+                relative = path.relative_to(root).as_posix()
+                if relative not in admitted_members and not (
+                    opaque_sdk_wheel and re.fullmatch(r"psycopg-sdk/[A-Za-z0-9_.-]+\.whl", relative)
+                ):
+                    raise ValueError("Runner build transport contains an unadmitted member.")
+                before = path.lstat()
+                mode = stat.S_IMODE(before.st_mode)
+                if before.st_uid != os.getuid():
+                    raise ValueError("Runner build transport is not owned by this operator.")
+                if stat.S_ISLNK(before.st_mode):
+                    alias_target = os.readlink(path)
+                    after = path.lstat()
+                    if any(
+                        getattr(before, key) != getattr(after, key)
+                        for key in (
+                            "st_dev",
+                            "st_ino",
+                            "st_mode",
+                            "st_uid",
+                            "st_mtime_ns",
+                            "st_ctime_ns",
+                        )
+                    ):
+                        raise ValueError("Runner build transport alias changed during inspection.")
+                    rows[relative] = ("symlink", mode, alias_target)
+                elif stat.S_ISDIR(before.st_mode):
+                    if mode & 0o7022:
+                        raise ValueError("Runner build transport directory has unsafe permissions.")
+                    rows[relative] = ("directory", mode, None)
+                    pending.append(path)
+                elif stat.S_ISREG(before.st_mode):
+                    if mode & 0o7022 or before.st_nlink != 1:
+                        raise ValueError(
+                            "Runner build transport file has unsafe permissions or links."
+                        )
+                    payload = _material_file(root, relative, maximum_bytes=_RUNNER_STAGE_FILE_BYTES)
+                    total += len(payload)
+                    if total > _RUNNER_STAGE_TOTAL_BYTES:
+                        raise ValueError("Runner build transport exceeds its total byte bound.")
+                    rows[relative] = ("file", mode, payload)
+                else:
+                    raise ValueError("Runner build transport contains a special node.")
+    return rows
+
+
+@contextmanager
+def _runner_build_context(raw_sdk_root: str | None) -> Iterator[Path]:
+    """Stage exact bytes; native producer/export admission remains a prior Root act."""
+    if (
+        not isinstance(raw_sdk_root, str)
+        or not raw_sdk_root.startswith("/")
+        or raw_sdk_root.startswith("//")
+        or "\\" in raw_sdk_root
+        or any(part in ("", ".", "..") for part in raw_sdk_root.split("/")[1:])
+        or any(ord(char) < 32 for char in raw_sdk_root)
+        or len(raw_sdk_root) > 4096
+    ):
+        raise ValueError("--psycopg-sdk-root must be one absolute canonical owned export root.")
+    sdk = Path(raw_sdk_root)
+    _reject_symlink_components(sdk)
+    info = sdk.lstat()
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.getuid()
+        or stat.S_IMODE(info.st_mode) != 0o700
+        or sdk.resolve(strict=True) != sdk
+    ):
+        raise ValueError("Runner SDK export root must be private, owned and unlinked.")
+    sdk_members = set(_RUNNER_SDK_FILES) | set(_RUNNER_SDK_ALIASES) | {_RUNNER_OPTIONAL_PROVIDER}
+    sdk_members.update(
+        str(parent)
+        for name in tuple(sdk_members)
+        for parent in PurePosixPath(name).parents
+        if str(parent) != "."
+    )
+    admitted_sdk = frozenset(sdk_members)
+    source = _runner_stage_census(sdk, admitted_members=admitted_sdk, opaque_sdk_wheel=True)
+    wheels = [
+        name
+        for name, row in source.items()
+        if row[0] == "file"
+        and name.startswith("psycopg-sdk/")
+        and name.count("/") == 1
+        and re.fullmatch(r"psycopg-sdk/[A-Za-z0-9_.-]+\.whl", name)
+    ]
+    if len(wheels) != 1:
+        raise ValueError("Runner SDK transport requires exactly one opaque wheel file.")
+    regular = set(_RUNNER_SDK_FILES) | set(wheels)
+    if _RUNNER_OPTIONAL_PROVIDER in source:
+        regular.add(_RUNNER_OPTIONAL_PROVIDER)
+    expected = regular | set(_RUNNER_SDK_ALIASES)
+    directories = {
+        str(parent)
+        for name in expected
+        for parent in PurePosixPath(name).parents
+        if str(parent) != "."
+    }
+    if set(source) != expected | directories or any(source[name][0] != "file" for name in regular):
+        raise ValueError("Runner SDK transport differs from the finite curated export.")
+    if any(source[name][0] != "directory" for name in directories):
+        raise ValueError("Runner SDK transport parent is not a directory.")
+    for name, target in _RUNNER_SDK_ALIASES.items():
+        if source[name][0] != "symlink" or source[name][2] != target:
+            raise ValueError("Runner SDK SONAME alias differs from its declared internal target.")
+        if (PurePosixPath(name).parent / target).as_posix() not in regular:
+            raise ValueError("Runner SDK SONAME alias has no declared regular target.")
+    staged: dict[str, tuple[str, int, bytes | str | None]] = {
+        "sdk-inputs": ("directory", 0o700, None)
+    }
+    staged.update({"sdk-inputs/" + name: row for name, row in source.items()})
+    repo_rows: dict[str, tuple[str, int, bytes | str | None]] = {}
+    for relative in _RUNNER_BUILD_FILES:
+        before = (REPO_ROOT / relative).lstat()
+        data = _material_file(REPO_ROOT, relative)
+        if before.st_uid != os.getuid() or stat.S_IMODE(before.st_mode) & 0o7022:
+            raise ValueError("Runner build source has unsafe owner or permissions.")
+        repo_rows[relative] = ("file", stat.S_IMODE(before.st_mode), data)
+        for parent in PurePosixPath(relative).parents:
+            if str(parent) != ".":
+                repo_rows.setdefault(str(parent), ("directory", 0o755, None))
+    staged.update(repo_rows)
+    # The fresh system temp directory is canonicalized after creation; an
+    # untrusted SDK input is never admitted by resolving its aliases first.
+    with tempfile.TemporaryDirectory(prefix="pulseplate-runner-build-") as temporary:
+        context = Path(temporary).resolve(strict=True)
+        context.chmod(0o700)
+        for relative, (kind, mode, _directory_payload) in sorted(
+            staged.items(), key=lambda item: item[0].count("/")
+        ):
+            if kind == "directory":
+                (context / relative).mkdir(mode=mode)
+                (context / relative).chmod(mode)
+        for relative, (kind, mode, file_payload) in staged.items():
+            if kind == "file":
+                if not isinstance(file_payload, bytes):
+                    raise ValueError("Runner staged file payload is not bytes.")
+                with (context / relative).open("xb") as output:
+                    output.write(file_payload)
+                (context / relative).chmod(mode)
+        for relative, (kind, _alias_mode, link_value) in staged.items():
+            if kind == "symlink":
+                if not isinstance(link_value, str):
+                    raise ValueError("Runner staged alias payload is not text.")
+                alias = context / relative
+                alias.symlink_to(link_value)
+                # macOS records symlink modes; Linux creates them as 0777.
+                # Preserve the admitted host mode without following the alias.
+                if stat.S_IMODE(alias.lstat().st_mode) != _alias_mode:
+                    alias.chmod(_alias_mode, follow_symlinks=False)
+        if (
+            _runner_stage_census(context, admitted_members=frozenset(staged)) != staged
+            or _runner_stage_census(sdk, admitted_members=admitted_sdk, opaque_sdk_wheel=True)
+            != source
+        ):
+            raise ValueError("Runner source or actual staged transport changed before build.")
+        for relative in _RUNNER_BUILD_FILES:
+            current = (REPO_ROOT / relative).lstat()
+            if (
+                _material_file(REPO_ROOT, relative) != repo_rows[relative][2]
+                or stat.S_IMODE(current.st_mode) != repo_rows[relative][1]
+                or current.st_uid != os.getuid()
+            ):
+                raise ValueError("Runner source changed before the secret-bearing build.")
+        yield context
+
+
+def _build_image(backend: str, tag: str, *, psycopg_sdk_root: str | None = None) -> dict[str, str]:
+    if not TAG_RE.fullmatch(tag) or "@" in tag:
+        raise ValueError("--tag must be a bounded mutable local image tag without a digest.")
+    with _runner_build_context(psycopg_sdk_root) as context:
+        cli_name = "container" if backend == "apple-container" else "docker"
+        cli = _resolve_cli(cli_name)
+        if cli is None:
+            raise DispatchError("runtime_cli_missing")
+        readiness_reason = _runtime_readiness_reason(cli, backend)
+        if readiness_reason is not None:
+            raise DispatchError(readiness_reason)
+        argv = [
+            cli,
+            "build",
+            "--file",
+            str(context / "deploy/experiment-runner/Containerfile"),
+            "--tag",
+            tag,
+        ]
+        for env_name, secret_id in (
+            ("PULSEPLATE_PYTHON_INDEX_URL", "pp_py_index"),
+            ("PULSEPLATE_PYTHON_TRUSTED_HOST", "pp_py_host"),
+            ("PULSEPLATE_PYTHON_NETRC", "pp_netrc"),
+        ):
+            if os.environ.get(env_name):
+                argv.extend(["--secret", f"id={secret_id},env={env_name}"])
+        argv.append(str(context))
+        secret_env_keys = tuple(
+            env_name
+            for env_name in (
+                "PULSEPLATE_PYTHON_INDEX_URL",
+                "PULSEPLATE_PYTHON_TRUSTED_HOST",
+                "PULSEPLATE_PYTHON_NETRC",
+            )
+            if os.environ.get(env_name)
+        )
+        completed = _run(
+            argv,
+            cwd=REPO_ROOT,
+            timeout=1800,
+            secret_env_keys=secret_env_keys,
+        )
+        if completed.returncode != 0:
+            raise DispatchError("probe_execution_failed")
+        inspect = _run([cli, "image", "inspect", tag], cwd=REPO_ROOT)
+        if inspect.returncode != 0:
+            raise DispatchError("image_missing")
+        try:
+            digest = _primary_image_digest(json.loads(inspect.stdout))
+        except json.JSONDecodeError as exc:
+            raise DispatchError("image_missing") from exc
+        history = ""
+        if backend == "docker":
+            history_result = _run(
+                [cli, "history", "--no-trunc", "--format", "{{json .CreatedBy}}", tag],
+                cwd=REPO_ROOT,
+            )
+            if history_result.returncode != 0:
+                raise DispatchError("image_hygiene_failed")
+            history = history_result.stdout
+        immutable_ref = f"{tag}@{digest}"
+        if backend == "apple-container":
+            registered = _run(
+                [cli, "image", "tag", tag, immutable_ref],
+                cwd=REPO_ROOT,
+            )
+            if registered.returncode != 0:
+                raise DispatchError("image_digest_drift")
+            immutable_inspect = _run(
+                [cli, "image", "inspect", immutable_ref],
+                cwd=REPO_ROOT,
+            )
+            if immutable_inspect.returncode != 0:
+                raise DispatchError("image_digest_drift")
+            try:
+                if _primary_image_digest(json.loads(immutable_inspect.stdout)) != digest:
+                    raise DispatchError("image_digest_drift")
+            except json.JSONDecodeError as exc:
+                raise DispatchError("image_digest_drift") from exc
+            inspect = immutable_inspect
+        image_metadata = f"{inspect.stdout}\n{history}"
+        forbidden_names = secret_env_keys
+        forbidden_values = tuple(
+            os.environ[key] for key in secret_env_keys if len(os.environ.get(key, "")) >= 6
+        )
+        if any(name in image_metadata for name in forbidden_names) or any(
+            value in image_metadata for value in forbidden_values
+        ):
+            raise DispatchError("image_hygiene_failed")
+        return {"backend": backend, "image": immutable_ref, "sanitized": "true"}
+
+
+def _read_packet(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Unable to read a valid experiment packet JSON.") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("Experiment packet must be a JSON object.")
+    return payload
+
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="experiment_runner_dispatch",
+        description="Select and execute a strict Experiment Runner backend without downgrade.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    probe = subparsers.add_parser("probe")
+    probe.add_argument("--backend", choices=BACKENDS, default="auto")
+    probe.add_argument("--image", required=True)
+    probe.add_argument("--output", required=True)
+    build = subparsers.add_parser("build-image")
+    build.add_argument("--backend", choices=CONTAINER_BACKENDS, required=True)
+    build.add_argument("--tag", required=True)
+    build.add_argument("--psycopg-sdk-root", required=True)
+    run = subparsers.add_parser("run")
+    run.add_argument("--backend", choices=BACKENDS, default="auto")
+    run.add_argument("--material-root", type=Path, default=None)
+    run.add_argument("--packet", required=True)
+    run.add_argument("--candidate-patch", default=None)
+    run.add_argument("--image", required=True)
+    run.add_argument("--output", required=True)
+    run.add_argument("--admitted-new-file", action="append", default=[])
+    run.add_argument("--snapshot-proof-output", default=None)
+    run.add_argument(
+        "--contribution-kind",
+        default="none",
+        choices=CONTRIBUTION_KINDS,
+        help=(
+            "Material Experiment Runner contribution kind for oracle-only governance "
+            "evidence; candidate-patch mode rejects material/non-default attribution."
+        ),
+    )
+    run.add_argument(
+        "--coauthor-required",
+        action="store_true",
+        help=(
+            "Mark an accepted oracle-only result as requiring the canonical Experiment "
+            "Runner co-author trailer if it materially shapes the engineering decision."
+        ),
+    )
+    run.add_argument(
+        "--coauthor-reason",
+        default="",
+        help=(
+            "Non-empty material-contribution reason required with --coauthor-required "
+            "in oracle-only mode."
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        args = _parse_args(argv)
+        if args.command == "probe":
+            image = parse_image_reference(args.image)
+            if args.backend == "auto":
+                selected, attempts = select_backend("auto", image)
+                probe = selected or attempts[-1]
+            else:
+                probe = probe_backend(args.backend, image)
+            output = _resolve_local_output(args.output, root=CAPABILITY_ARTIFACT_DIR)
+            _atomic_write_json(output, probe.to_artifact())
+            print(
+                json.dumps(
+                    {"artifact": output.name, "strict_isolation": probe.strict}, sort_keys=True
+                )
+            )
+            return 0 if probe.strict else 2
+        if args.command == "build-image":
+            print(
+                json.dumps(
+                    _build_image(args.backend, args.tag, psycopg_sdk_root=args.psycopg_sdk_root),
+                    sort_keys=True,
+                )
+            )
+            return 0
+
+        image = parse_image_reference(args.image)
+        packet_path = _require_repo_local_file(args.packet, suffix=".json")
+        candidate_patch = (
+            _require_repo_local_file(args.candidate_patch, suffix=".patch")
+            if args.candidate_patch
+            else None
+        )
+        output_path = _resolve_local_output(args.output, root=RESULT_ARTIFACT_DIR)
+        packet = validate_experiment_packet(_read_packet(packet_path))
+        material_root = getattr(args, "material_root", None)
+        if material_root is not None:
+            _reject_symlink_components(material_root)
+            if (
+                not material_root.is_absolute()
+                or material_root.resolve() != material_root
+                or not material_root.is_dir()
+                or material_root.is_relative_to(Path(REPO_ROOT).resolve())
+                or Path(REPO_ROOT).resolve().is_relative_to(material_root)
+            ):
+                raise ValueError("Material root must be canonical and distinct from controls.")
+        admitted_new_files = tuple(getattr(args, "admitted_new_file", []))
+        proof_output_raw = getattr(args, "snapshot_proof_output", None)
+        snapshot_proof: dict[str, Any] | None = {} if proof_output_raw else None
+        accepted_observations: dict[str, Any] = {}
+        proof_output = (
+            _resolve_local_output(proof_output_raw, root=RESULT_ARTIFACT_DIR)
+            if proof_output_raw
+            else None
+        )
+        if proof_output is not None:
+            if proof_output == output_path or proof_output.exists() or output_path.exists():
+                raise ValueError("Snapshot evidence requires fresh distinct owned output slots.")
+        if admitted_new_files and proof_output is None:
+            raise ValueError("Explicit new-file admission requires snapshot proof output.")
+        if admitted_new_files or proof_output is not None:
+            if packet["runner_mode"] != ORACLE_ONLY_GOVERNANCE_REVIEWER_MODE:
+                raise ValueError("Snapshot proof intake is oracle-only.")
+            if any(
+                not any(
+                    path == surface or path.startswith(surface.rstrip("/") + "/")
+                    for surface in packet["mutable_candidate_surface"]
+                )
+                for path in admitted_new_files
+            ):
+                raise ValueError("New-file admission exceeds the approved context surface.")
+        contribution_kind, coauthor_required, coauthor_reason = validate_contribution_attribution(
+            contribution_kind=getattr(args, "contribution_kind", "none"),
+            coauthor_required=getattr(args, "coauthor_required", False),
+            coauthor_reason=getattr(args, "coauthor_reason", ""),
+        )
+        if packet["runner_mode"] == ORACLE_ONLY_GOVERNANCE_REVIEWER_MODE:
+            if candidate_patch is not None:
+                raise ValueError("Oracle-only packets must not include --candidate-patch.")
+        else:
+            if contribution_kind != "none" or coauthor_required or coauthor_reason:
+                raise ValueError(
+                    "contribution attribution flags are supported only in oracle-only mode"
+                )
+            if candidate_patch is None:
+                raise ValueError("Candidate-patch packets require --candidate-patch.")
+            expected_patch_fingerprint = packet.get("candidate_patch_fingerprint")
+            if expected_patch_fingerprint is not None:
+                candidate_patch_text = _read_candidate_patch_for_fingerprint(candidate_patch)
+                if expected_patch_fingerprint != fingerprint_payload(
+                    {"candidate_patch": candidate_patch_text}
+                ):
+                    raise ValueError("Candidate patch fingerprint does not match the packet.")
+        if (
+            platform.system() == "Darwin"
+            and packet["runner_mode"] == ORACLE_ONLY_GOVERNANCE_REVIEWER_MODE
+            and args.backend != "apple-container"
+        ):
+            raise ValueError(
+                "macOS oracle-only governance review requires explicit --backend apple-container"
+            )
+        if int(packet["budgets"]["network_budget"]) != 0:
+            probe = _strict_network_budget_probe(args.backend, image)
+            result = _capability_mismatch_result(packet, image, probe)
+            public_status = _public_result_status(result)
+            _atomic_write_json(output_path, result)
+            print(
+                json.dumps(
+                    {"artifact": output_path.name, "status": public_status},
+                    sort_keys=True,
+                )
+            )
+            return 0 if public_status == PUBLIC_STATUS_ACCEPTED else RUNNER_REJECTED_EXIT_CODE
+        selected, attempts = select_backend(args.backend, image)
+        if selected is None:
+            result = _capability_mismatch_result(packet, image, attempts[-1])
+        else:
+            try:
+                if selected.backend not in CONTAINER_BACKENDS:
+                    raise PreRunCapabilityError("filesystem_isolation_unavailable")
+                result = _invoke_container_runner(
+                    probe=selected,
+                    image=image,
+                    packet_path=packet_path,
+                    candidate_patch=candidate_patch,
+                    output_name=output_path.name,
+                    expected_packet=packet,
+                    contribution_kind=contribution_kind,
+                    coauthor_required=coauthor_required,
+                    coauthor_reason=coauthor_reason,
+                    admitted_new_files=admitted_new_files,
+                    snapshot_proof=snapshot_proof,
+                    accepted_observations=accepted_observations,
+                    **({"material_root": material_root} if material_root is not None else {}),
+                )
+            except PreRunCapabilityError as exc:
+                result = _capability_mismatch_result(
+                    packet,
+                    image,
+                    _probe_with_blocker(selected, exc.code),
+                )
+            except DispatchError as exc:
+                result = _infra_flake_result(packet, image, selected, exc.code)
+            except (OSError, ValueError):
+                result = _infra_flake_result(packet, image, selected, "result_validation_failed")
+        public_status = _public_result_status(result)
+        _atomic_write_json(output_path, result)
+        if proof_output is not None and snapshot_proof:
+            if accepted_observations:
+                observation_path = proof_output.with_name(proof_output.stem + ".observations.json")
+                if observation_path.exists() or observation_path.is_symlink():
+                    raise ValueError("Private observation slot is occupied.")
+                _atomic_write_json(observation_path, accepted_observations)
+            _atomic_write_json(proof_output, snapshot_proof)
+        print(json.dumps({"artifact": output_path.name, "status": public_status}, sort_keys=True))
+        return 0 if public_status == PUBLIC_STATUS_ACCEPTED else RUNNER_REJECTED_EXIT_CODE
+    except (DispatchError, OSError, ValueError) as exc:
+        print(f"experiment_runner_dispatch: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

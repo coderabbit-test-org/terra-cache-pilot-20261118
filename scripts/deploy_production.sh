@@ -1,0 +1,3281 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+MODE="deploy"
+if [ "$#" -gt 1 ]; then
+  echo "❌ Usage: $0 [--preflight-only]" >&2
+  exit 1
+fi
+if [ "$#" -eq 1 ]; then
+  case "$1" in
+    --preflight-only)
+      MODE="preflight-only"
+      ;;
+    *)
+      echo "❌ Unsupported argument: $1" >&2
+      echo "Usage: $0 [--preflight-only]" >&2
+      exit 1
+      ;;
+  esac
+fi
+readonly MODE
+
+DEPLOY_IMAGE_REF="${IMAGE_REF:-}"
+DEPLOY_TAG="${TAG:-}"
+if [ "$MODE" != "preflight-only" ]; then
+  : "${IMAGE_REF:?IMAGE_REF is required (ghcr.io/<image>@sha256:...)}"
+  : "${TAG:?TAG is required (prod-vX.Y.Z)}"
+fi
+
+# Healthcheck configuration
+HEALTH_MAX_ATTEMPTS="${HEALTH_MAX_ATTEMPTS:-12}"
+HEALTH_SLEEP_S="${HEALTH_SLEEP_S:-2}"
+HEALTH_CURL_MAX_TIME_S="${HEALTH_CURL_MAX_TIME_S:-10}"
+
+COMPOSE_FILE="${COMPOSE_FILE:-}"
+COMPOSE_FILE_WAS_EXPLICIT=0
+if [ -n "$COMPOSE_FILE" ]; then
+  COMPOSE_FILE_WAS_EXPLICIT=1
+fi
+RESOLVED_COMPOSE_FILE="${COMPOSE_FILE:-}"
+DEPLOY_DIR="${DEPLOY_DIR:-}"
+ENV_FILE="${ENV_FILE:-}"
+SHELL_BUNDLE_DIR="${SHELL_BUNDLE_DIR:-}"
+SHELL_BUNDLE_ARCHIVE="${SHELL_BUNDLE_ARCHIVE:-}"
+DOCKER_BIN_OVERRIDE="${DOCKER_BIN:-}"
+PYTHON_BIN_OVERRIDE="${PYTHON_BIN:-}"
+STAT_BIN_OVERRIDE="${STAT_BIN:-}"
+CURL_BIN_OVERRIDE="${CURL_BIN:-}"
+TRUSTED_DOCKER_CANDIDATES=(
+  "/usr/bin/docker"
+  "/usr/local/bin/docker"
+  "/snap/bin/docker"
+)
+TRUSTED_DOCKER_CANDIDATES_TEXT="/usr/bin/docker, /usr/local/bin/docker, /snap/bin/docker"
+TRUSTED_PYTHON_CANDIDATES=(
+  "/usr/bin/python3"
+  "/usr/local/bin/python3"
+  "/opt/homebrew/bin/python3"
+  "/opt/homebrew/opt/python@3.14/libexec/bin/python3"
+)
+TRUSTED_STAT_CANDIDATES=("/usr/bin/stat" "/bin/stat")
+TRUSTED_CURL_CANDIDATES=("/usr/bin/curl" "/usr/local/bin/curl")
+ARCHIVE_EXTRACT_DIR=""
+GHCR_DOCKER_CONFIG=""
+
+# RU: Сохраняем credentials из workflow/окружения до загрузки .env,
+# чтобы локальный deploy/.env не подменял registry contract из CI.
+# EN: Snapshot caller-provided credentials before sourcing .env so a host-local
+# deploy/.env cannot override the CI-provided registry contract.
+ORIGINAL_GHCR_USER="${GHCR_USER:-}"
+ORIGINAL_GHCR_TOKEN="${GHCR_TOKEN:-}"
+PULSEPLATE_CALLER_COMPOSE_PROFILES_PRESENT="${COMPOSE_PROFILES+x}"
+PULSEPLATE_CALLER_COMPOSE_PROFILES="${COMPOSE_PROFILES-}"
+readonly PULSEPLATE_CALLER_COMPOSE_PROFILES_PRESENT PULSEPLATE_CALLER_COMPOSE_PROFILES
+
+resolve_docker_bin() {
+  local candidate
+
+  if [ -n "$DOCKER_BIN_OVERRIDE" ]; then
+    # RU: Разрешаем только абсолютный путь, чтобы не запускать docker-wrapper из PATH.
+    # EN: Accept only an absolute path to avoid executing a PATH-injected docker wrapper.
+    if [[ "$DOCKER_BIN_OVERRIDE" != /* ]]; then
+      echo "❌ DOCKER_BIN must be an absolute path: $DOCKER_BIN_OVERRIDE" >&2
+      return 1
+    fi
+    if [ ! -x "$DOCKER_BIN_OVERRIDE" ]; then
+      echo "❌ DOCKER_BIN is not executable: $DOCKER_BIN_OVERRIDE" >&2
+      return 1
+    fi
+
+    printf '%s\n' "$DOCKER_BIN_OVERRIDE"
+    return 0
+  fi
+
+  for candidate in "${TRUSTED_DOCKER_CANDIDATES[@]}"; do
+    if [ -x "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+resolve_absolute_executable() {
+  local override="$1"
+  local label="$2"
+  shift 2
+  local candidate
+  local python_identity
+
+  if [ -n "$override" ]; then
+    if [[ "$override" != /* ]]; then
+      echo "❌ ${label} override must be an absolute path" >&2
+      return 1
+    fi
+    if [ ! -x "$override" ]; then
+      echo "❌ ${label} override is not executable" >&2
+      return 1
+    fi
+    set -- "$override"
+  fi
+
+  for candidate in "$@"; do
+    if [ -x "$candidate" ]; then
+      if [ "$label" = "PYTHON_BIN" ]; then
+        # Scoped deploy-tool compatibility, not interpreter-origin authority.
+        if python_identity="$("$candidate" -I -S -c 'import sys; print(sys.implementation.name + ":" + str(sys.version_info.major) + "." + str(sys.version_info.minor))')"; then
+          case "$python_identity" in
+            cpython:3.11|cpython:3.12|cpython:3.13|cpython:3.14)
+              printf '%s\n' "$candidate"
+              return 0
+              ;;
+          esac
+        fi
+        if [ -n "$override" ]; then
+          echo "❌ PYTHON_BIN override requires isolated CPython 3.11, 3.12, 3.13 or 3.14: $candidate" >&2
+          return 1
+        fi
+        continue
+      fi
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  if [ "$label" = "PYTHON_BIN" ]; then
+    echo "❌ PYTHON_BIN requires isolated CPython 3.11, 3.12, 3.13 or 3.14 at a trusted absolute path" >&2
+  else
+    echo "❌ ${label} executable is required" >&2
+  fi
+  return 1
+}
+
+if ! DOCKER_BIN="$(resolve_docker_bin)"; then
+  if [ -n "$DOCKER_BIN_OVERRIDE" ]; then
+    echo "❌ docker binary not found. DOCKER_BIN override: $DOCKER_BIN_OVERRIDE. Trusted paths: $TRUSTED_DOCKER_CANDIDATES_TEXT" >&2
+  else
+    echo "❌ docker binary not found. Checked trusted paths: $TRUSTED_DOCKER_CANDIDATES_TEXT" >&2
+  fi
+  exit 1
+fi
+readonly DOCKER_BIN
+
+if ! PYTHON_BIN="$(resolve_absolute_executable \
+  "$PYTHON_BIN_OVERRIDE" "PYTHON_BIN" "${TRUSTED_PYTHON_CANDIDATES[@]}")"; then
+  exit 1
+fi
+readonly PYTHON_BIN
+
+if ! STAT_BIN="$(resolve_absolute_executable \
+  "$STAT_BIN_OVERRIDE" "STAT_BIN" "${TRUSTED_STAT_CANDIDATES[@]}")"; then
+  exit 1
+fi
+readonly STAT_BIN
+
+if ! CURL_BIN="$(resolve_absolute_executable \
+  "$CURL_BIN_OVERRIDE" "CURL_BIN" "${TRUSTED_CURL_CANDIDATES[@]}")"; then
+  exit 1
+fi
+readonly CURL_BIN
+
+resolve_deploy_dir() {
+  if [ -n "$DEPLOY_DIR" ]; then
+    if [ -d "$DEPLOY_DIR" ]; then
+      echo "$DEPLOY_DIR"
+      return 0
+    fi
+    echo "⚠️  DEPLOY_DIR is set but does not exist: $DEPLOY_DIR" >&2
+    echo "    Falling back to auto-detect..." >&2
+  fi
+
+  if [ -d "/opt/pulseplate" ]; then
+    echo "/opt/pulseplate"
+    return 0
+  fi
+
+  if [ -d "/srv/pulseplate-production" ]; then
+    echo "/srv/pulseplate-production"
+    return 0
+  fi
+
+  return 1
+}
+
+if resolved_deploy_dir="$(resolve_deploy_dir)"; then
+  DEPLOY_DIR="$resolved_deploy_dir"
+else
+  DEPLOY_DIR=""
+fi
+if [ -z "$DEPLOY_DIR" ]; then
+  echo "❌ Could not find deploy directory." >&2
+  echo "Set DEPLOY_DIR or create /opt/pulseplate or /srv/pulseplate-production." >&2
+  exit 1
+fi
+
+REQUESTED_DEPLOY_DIR="$DEPLOY_DIR"
+if [[ "$REQUESTED_DEPLOY_DIR" != /* ]]; then
+  echo "❌ DEPLOY_DIR must be an absolute path" >&2
+  exit 1
+fi
+readonly REQUESTED_DEPLOY_DIR
+DEPLOY_DIR="$(cd "$DEPLOY_DIR" && pwd -P)"
+cd "$DEPLOY_DIR"
+
+compose_args=()
+if [ "$COMPOSE_FILE_WAS_EXPLICIT" -eq 0 ]; then
+  RESOLVED_COMPOSE_FILE="deploy/docker-compose.production.yaml"
+else
+  case "$RESOLVED_COMPOSE_FILE" in
+    deploy/docker-compose.production.yaml | deploy/docker-compose.production.selfhosted.yaml)
+      ;;
+    "$DEPLOY_DIR/deploy/docker-compose.production.yaml" | \
+      "$DEPLOY_DIR/deploy/docker-compose.production.selfhosted.yaml")
+      ;;
+    *)
+      echo "❌ COMPOSE_FILE must select one exact canonical production Compose identity" >&2
+      exit 1
+      ;;
+  esac
+fi
+
+if [ ! -f "$RESOLVED_COMPOSE_FILE" ]; then
+  echo "❌ RESOLVED_COMPOSE_FILE does not exist: $RESOLVED_COMPOSE_FILE" >&2
+  exit 1
+fi
+compose_args=(-f "$RESOLVED_COMPOSE_FILE")
+
+if [[ "$RESOLVED_COMPOSE_FILE" = /* ]]; then
+  COMPOSE_CONTRACT_PATH="$RESOLVED_COMPOSE_FILE"
+else
+  COMPOSE_CONTRACT_PATH="$DEPLOY_DIR/${RESOLVED_COMPOSE_FILE#./}"
+fi
+case "$COMPOSE_CONTRACT_PATH" in
+  "$DEPLOY_DIR"/*)
+    ;;
+  *)
+    echo "❌ COMPOSE_FILE must stay within DEPLOY_DIR" >&2
+    exit 1
+    ;;
+esac
+COMPOSE_CONTRACT_DIR="${COMPOSE_CONTRACT_PATH%/*}"
+COMPOSE_RELATIVE_IDENTITY="${COMPOSE_CONTRACT_PATH#"$DEPLOY_DIR"/}"
+PROMETHEUS_CONFIG="$COMPOSE_CONTRACT_DIR/prometheus/prometheus.yml"
+PROMETHEUS_RULES="$COMPOSE_CONTRACT_DIR/prometheus/alias-alerts.yml"
+PROMETHEUS_IMAGE_MANIFEST="$COMPOSE_CONTRACT_DIR/prometheus/image-manifest.json"
+ALERTMANAGER_CONFIG="$COMPOSE_CONTRACT_DIR/alertmanager/alertmanager.yml"
+ALERTMANAGER_TRIVY_IGNORE="$COMPOSE_CONTRACT_DIR/alertmanager/trivy-ignore.yaml"
+ALERTMANAGER_SMTP_KEY="$COMPOSE_CONTRACT_DIR/secrets/alertmanager_smtp_key"
+POSTGRES_IMAGE_MANIFEST="$COMPOSE_CONTRACT_DIR/postgres-pgvector/image-manifest.json"
+BACKUP_DIR="${BACKUP_DIR:-$DEPLOY_DIR/backups}"
+BACKUP_HELPER="${BACKUP_HELPER:-$DEPLOY_DIR/scripts/ops/postgres_backup.sh}"
+METRICS_SECRET_DIR="$COMPOSE_CONTRACT_DIR/secrets"
+METRICS_SECRET_FILE="$METRICS_SECRET_DIR/pulseplate_metrics_scrape_key"
+
+PRODUCTION_DB_TOPOLOGY="managed"
+if [ "${RESOLVED_COMPOSE_FILE##*/}" = "docker-compose.production.selfhosted.yaml" ]; then
+  if [ "$COMPOSE_FILE_WAS_EXPLICIT" -ne 1 ]; then
+    echo "❌ Self-hosted PostgreSQL Compose requires an explicit COMPOSE_FILE" >&2
+    exit 1
+  fi
+  PRODUCTION_DB_TOPOLOGY="self-hosted"
+fi
+readonly COMPOSE_CONTRACT_PATH COMPOSE_CONTRACT_DIR
+readonly COMPOSE_RELATIVE_IDENTITY
+readonly PROMETHEUS_CONFIG PROMETHEUS_IMAGE_MANIFEST POSTGRES_IMAGE_MANIFEST
+readonly ALERTMANAGER_CONFIG ALERTMANAGER_TRIVY_IGNORE ALERTMANAGER_SMTP_KEY
+readonly BACKUP_DIR BACKUP_HELPER
+readonly METRICS_SECRET_DIR METRICS_SECRET_FILE PRODUCTION_DB_TOPOLOGY
+
+if [ -z "$ENV_FILE" ]; then
+  if [[ "$RESOLVED_COMPOSE_FILE" = deploy/* || "$RESOLVED_COMPOSE_FILE" = "$DEPLOY_DIR"/deploy/* ]]; then
+    ENV_FILE="$DEPLOY_DIR/deploy/.env"
+  else
+    ENV_FILE="$DEPLOY_DIR/.env"
+  fi
+fi
+
+if [[ "$ENV_FILE" != /* ]]; then
+  ENV_FILE="$DEPLOY_DIR/${ENV_FILE#./}"
+fi
+
+if [ ! -f "$ENV_FILE" ]; then
+  echo "❌ Missing production env file: $ENV_FILE" >&2
+  echo "Create this server-local runtime file before deploy; GitHub Actions does not provision it." >&2
+  echo "See deploy/PRODUCTION.md for the canonical bootstrap contract." >&2
+  exit 1
+fi
+
+set -a
+# shellcheck disable=SC1090
+. "$ENV_FILE"
+set +a
+
+profile_source_drift=0
+if [ "${COMPOSE_PROFILES+x}" != "$PULSEPLATE_CALLER_COMPOSE_PROFILES_PRESENT" ] || \
+   [ "${COMPOSE_PROFILES-}" != "$PULSEPLATE_CALLER_COMPOSE_PROFILES" ]; then
+  profile_source_drift=1
+fi
+COMPOSE_PROFILES="$PULSEPLATE_CALLER_COMPOSE_PROFILES"
+export COMPOSE_PROFILES
+if [ "$profile_source_drift" -ne 0 ]; then
+  echo "❌ Production env file changed caller-owned COMPOSE_PROFILES" >&2
+  exit 1
+fi
+
+IMAGE_REF="$DEPLOY_IMAGE_REF"
+TAG="$DEPLOY_TAG"
+
+if [ -n "$ORIGINAL_GHCR_USER" ]; then
+  GHCR_USER="$ORIGINAL_GHCR_USER"
+fi
+if [ -n "$ORIGINAL_GHCR_TOKEN" ]; then
+  GHCR_TOKEN="$ORIGINAL_GHCR_TOKEN"
+fi
+
+export IMAGE_REF TAG
+
+: "${PRODUCTION_DOMAIN:?PRODUCTION_DOMAIN is required}"
+
+export PRODUCTION_DOMAIN
+
+echo "Deploy dir: $DEPLOY_DIR"
+if [ ${#compose_args[@]} -gt 0 ]; then
+  echo "Compose file: ${compose_args[*]}"
+else
+  echo "Compose file: <default>"
+fi
+echo "TAG: $TAG"
+echo "IMAGE_REF: $IMAGE_REF"
+echo "ENV_FILE: $ENV_FILE"
+
+dc() {
+  local base=("$DOCKER_BIN" compose --env-file "$ENV_FILE")
+  if [ ${#compose_args[@]} -gt 0 ]; then
+    base+=("${compose_args[@]}")
+  fi
+  "${base[@]}" "$@"
+}
+
+login_to_ghcr_if_configured() {
+  if [ -z "${GHCR_TOKEN:-}" ]; then
+    return 0
+  fi
+
+  if [ -z "${GHCR_USER:-}" ]; then
+    echo "❌ GHCR_USER is required when GHCR_TOKEN is provided" >&2
+    exit 1
+  fi
+
+  umask 077
+  GHCR_DOCKER_CONFIG="$(mktemp -d /tmp/pulseplate-production-docker-config.XXXXXX)"
+  case "$GHCR_DOCKER_CONFIG" in
+    /tmp/pulseplate-production-docker-config.*)
+      ;;
+    *)
+      echo "❌ Refusing an unbounded Docker credential directory" >&2
+      exit 1
+      ;;
+  esac
+  if [ -L "$GHCR_DOCKER_CONFIG" ] || [ ! -d "$GHCR_DOCKER_CONFIG" ]; then
+    echo "❌ Docker credential directory must be a real directory" >&2
+    exit 1
+  fi
+  chmod 700 "$GHCR_DOCKER_CONFIG"
+  export DOCKER_CONFIG="$GHCR_DOCKER_CONFIG"
+
+  echo "Logging in to ghcr.io with temporary deploy credentials..."
+  printf '%s\n' "$GHCR_TOKEN" | "$DOCKER_BIN" login ghcr.io -u "$GHCR_USER" --password-stdin >/dev/null
+}
+
+cleanup_ghcr_credentials() {
+  if [ -z "$GHCR_DOCKER_CONFIG" ]; then
+    return 0
+  fi
+  local cleanup_failed=0
+  if [ -d "$GHCR_DOCKER_CONFIG" ] && [ ! -L "$GHCR_DOCKER_CONFIG" ]; then
+    if [ -f "$GHCR_DOCKER_CONFIG/config.json" ] && \
+       [ ! -L "$GHCR_DOCKER_CONFIG/config.json" ]; then
+      "$DOCKER_BIN" logout ghcr.io >/dev/null 2>&1 || cleanup_failed=1
+      if ! rm -f -- "$GHCR_DOCKER_CONFIG/config.json"; then
+        cleanup_failed=1
+      fi
+    elif [ -L "$GHCR_DOCKER_CONFIG/config.json" ]; then
+      echo "❌ Docker credential file became a symlink" >&2
+      cleanup_failed=1
+    fi
+    case "$GHCR_DOCKER_CONFIG" in
+      /tmp/pulseplate-production-docker-config.*)
+        if ! rm -rf -- "$GHCR_DOCKER_CONFIG"; then
+          cleanup_failed=1
+        fi
+        ;;
+      *)
+        echo "❌ Refusing cleanup for an unbounded Docker credential directory" >&2
+        cleanup_failed=1
+        ;;
+    esac
+  else
+    echo "❌ Refusing cleanup for an unsafe Docker credential directory" >&2
+    cleanup_failed=1
+  fi
+  if [ "$cleanup_failed" -eq 0 ]; then
+    unset DOCKER_CONFIG
+    GHCR_DOCKER_CONFIG=""
+  fi
+  return "$cleanup_failed"
+}
+
+validate_regular_non_symlink_file() {
+  local path="$1"
+  local label="$2"
+  if [ -L "$path" ] || [ ! -f "$path" ]; then
+    echo "❌ ${label} must be a regular non-symlink file" >&2
+    return 1
+  fi
+}
+
+read_owner_mode() {
+  local path="$1"
+  local metadata=""
+  if metadata="$($STAT_BIN -c '%u:%a' "$path" 2>/dev/null)"; then
+    printf '%s\n' "$metadata"
+    return 0
+  fi
+  if metadata="$($STAT_BIN -f '%u:%Lp' "$path" 2>/dev/null)"; then
+    printf '%s\n' "$metadata"
+    return 0
+  fi
+  echo "❌ Unable to inspect owner and mode metadata" >&2
+  return 1
+}
+
+validate_metrics_secret_metadata() {
+  if [ -L "$METRICS_SECRET_DIR" ] || [ ! -d "$METRICS_SECRET_DIR" ]; then
+    echo "❌ Metrics scrape secret directory must be a regular non-symlink directory" >&2
+    return 1
+  fi
+  if [ -L "$METRICS_SECRET_FILE" ] || [ ! -f "$METRICS_SECRET_FILE" ]; then
+    echo "❌ Metrics scrape secret must be a regular non-symlink file" >&2
+    return 1
+  fi
+
+  local directory_metadata
+  directory_metadata="$(read_owner_mode "$METRICS_SECRET_DIR")"
+  if [ "$directory_metadata" != "${EUID}:700" ]; then
+    echo "❌ Metrics scrape secret directory must be owned by the Compose account with mode 0700" >&2
+    return 1
+  fi
+
+  local file_metadata
+  file_metadata="$(read_owner_mode "$METRICS_SECRET_FILE")"
+  if [ "$file_metadata" != "${EUID}:444" ]; then
+    echo "❌ Metrics scrape secret file must be owned by the Compose account with mode 0444" >&2
+    return 1
+  fi
+}
+
+validate_prometheus_contract_files() {
+  validate_regular_non_symlink_file "$PROMETHEUS_CONFIG" "Prometheus configuration"
+  validate_regular_non_symlink_file "$PROMETHEUS_RULES" "Prometheus rules"
+  validate_regular_non_symlink_file "$PROMETHEUS_IMAGE_MANIFEST" "Prometheus image manifest"
+}
+
+validate_alertmanager_contract_files() {
+  validate_regular_non_symlink_file "$ALERTMANAGER_CONFIG" "Alertmanager configuration"
+  validate_regular_non_symlink_file "$ALERTMANAGER_TRIVY_IGNORE" "Alertmanager Trivy exception"
+}
+
+alertmanager_selected() {
+  [ "${ALERTMANAGER_SELECTION:?Canonical Alertmanager final admission is required}" = selected ]
+}
+
+
+
+validate_alertmanager_secret_if_selected() {
+  if "$PYTHON_BIN" - "$ENV_FILE" <<'PY'
+from pathlib import Path
+import re
+import sys
+text = Path(sys.argv[1]).read_text(encoding="utf-8")
+if re.search(r"(?m)^\s*COMPOSE_PROFILES\s*=", text):
+    raise SystemExit("COMPOSE_PROFILES must be selected by the operator, not the env file")
+PY
+  then
+    :
+  else
+    return 1
+  fi
+  if ! alertmanager_selected; then
+    return 0
+  fi
+  if [ -L "$ALERTMANAGER_SMTP_KEY" ] || [ ! -f "$ALERTMANAGER_SMTP_KEY" ]; then
+    echo "❌ Selected Alertmanager requires a regular non-symlink SMTP key" >&2
+    return 1
+  fi
+  if [ "$(read_owner_mode "$ALERTMANAGER_SMTP_KEY")" != "${EUID}:444" ]; then
+    echo "❌ Alertmanager SMTP key must be owned by the Compose account with mode 0444" >&2
+    return 1
+  fi
+  "$PYTHON_BIN" - "$ALERTMANAGER_SMTP_KEY" <<'PY'
+import os
+import stat
+import sys
+metadata = os.lstat(sys.argv[1])
+if not stat.S_ISREG(metadata.st_mode) or metadata.st_size <= 0:
+    raise SystemExit("Selected Alertmanager requires a nonempty regular SMTP key")
+PY
+}
+
+
+
+validate_postgres_contract_files() {
+  validate_regular_non_symlink_file "$POSTGRES_IMAGE_MANIFEST" \
+    "PostgreSQL image manifest"
+}
+
+PROMETHEUS_CONTRACT_HELPER="${PROMETHEUS_CONTRACT_HELPER:-${DEPLOY_DIR}/scripts/ci/prometheus_source_image.py}"
+PROMETHEUS_CONTRACT_HELPER_SHA256="caeef6254bb44aa0a1ac54c069e0f88c095d91bd17da1adc568c0d57d400e858" # pragma: allowlist secret - public source digest
+readonly PROMETHEUS_CONTRACT_HELPER PROMETHEUS_CONTRACT_HELPER_SHA256
+
+run_trusted_contract() {
+  "$PYTHON_BIN" -I -c '
+import hashlib
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+path, expected = sys.argv[1:3]
+if not os.path.isabs(path) or re.fullmatch(r"[0-9a-f]{64}", expected) is None:
+    raise SystemExit("Invalid trusted contract helper operand")
+for parent in Path(path).parents:
+    if parent.is_symlink() or not parent.is_dir():
+        raise SystemExit("Trusted contract helper parent is not a real directory")
+fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+before = os.fstat(fd)
+if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_uid not in (0, os.getuid())
+        or before.st_mode & 0o022 or not 0 < before.st_size <= 1048576):
+    raise SystemExit("Trusted contract helper leaf is invalid")
+raw = os.read(fd, before.st_size + 1)
+after, current = os.fstat(fd), os.lstat(path)
+if len(raw) != before.st_size or hashlib.sha256(raw).hexdigest() != expected or any(
+    getattr(before, key) != getattr(after, key) or getattr(before, key) != getattr(current, key)
+    for key in ("st_dev", "st_ino", "st_mode", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")
+):
+    raise SystemExit("Trusted current-source contract helper binding changed")
+os.lseek(fd, 0, os.SEEK_SET)
+os.set_inheritable(fd, True)
+os.execv(sys.executable, [sys.executable, "-I", "-S", "/dev/fd/" + str(fd), *sys.argv[3:]])
+' "$@"
+}
+
+ALERTMANAGER_CONTRACT_HELPER="${ALERTMANAGER_CONTRACT_HELPER:-${DEPLOY_DIR}/scripts/ci/fetch_docker_source_artifacts.py}"
+ALERTMANAGER_CONTRACT_HELPER_SHA256="b342ae7b525ad6e413dec2fc1c178ad4ebb0b108db822af8e32d994474b624df"  # pragma: allowlist secret - public AM helper SHA-256
+readonly ALERTMANAGER_CONTRACT_HELPER ALERTMANAGER_CONTRACT_HELPER_SHA256
+
+run_prometheus_contract() {
+  run_trusted_contract "$PROMETHEUS_CONTRACT_HELPER" "$PROMETHEUS_CONTRACT_HELPER_SHA256" "$@"
+}
+
+run_alertmanager_contract() {
+  run_trusted_contract "$ALERTMANAGER_CONTRACT_HELPER" "$ALERTMANAGER_CONTRACT_HELPER_SHA256" "$@"
+}
+
+read_prometheus_runtime_ref() {
+  local manifest_path="$1"
+  run_prometheus_contract --operation read-manifest --manifest "$manifest_path" --field runtime_ref
+}
+
+read_postgres_runtime_ref() {
+  local manifest_path="$1"
+  "$PYTHON_BIN" - "$manifest_path" <<'PY'
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+
+manifest_path = sys.argv[1]
+expected_file_sha256 = "9aa310913af9799c39182428e0170b173fe2144367b302d7d2cafd87c93c03b2"  # pragma: allowlist secret
+expected_keys = set(
+    """
+    schema repository tag platform platform_manifest_digest config_digest runtime_ref
+    source_date_epoch containerfile_sha256 runtime_base_repository runtime_base_tag
+    runtime_base_index_digest runtime_base_platform_manifest_digest runtime_base_config_digest
+    builder_base_repository builder_base_tag builder_base_index_digest
+    builder_base_platform_manifest_digest builder_base_config_digest legacy_repository
+    legacy_tag legacy_index_digest legacy_platform_manifest_digest legacy_config_digest
+    postgres_major postgres_version runtime_user runtime_entrypoint runtime_default_pgdata
+    compose_pgdata compose_volume_target pgvector_version pgvector_source_commit
+    pgvector_source_url pgvector_source_sha256 builder_packages builder_apk_closure_count
+    builder_apk_closure_sha256 pg_config_path pg_config_version make_jobs optflags
+    builder_apk_inputs_sha256 builder_apk_index_sha256 builder_apk_input_count
+    buildkit_platform_manifest_digest buildkit_version buildx_version
+    buildx_linux_amd64_sha256
+    runtime_artifact_count runtime_artifact_inventory_sha256 trivy_version
+    mountpoint_layer_schema mountpoint_layer_digest mountpoint_layer_size
+    mountpoint_layer_diff_id mountpoint_layer_entry_count mountpoint_uid mountpoint_gid
+    mountpoint_mode mountpoint_path mountpoint_leaf_empty
+    mountpoint_base_parent_metadata_equal trivy_linux_archive_sha256 trivy_scan_contract
+    """.split()
+)
+expected_values = {
+    "schema": "pulseplate.postgres_pgvector_image_manifest.v1",
+    "repository": "ghcr.io/katsiarynakavaleuskaya/pulseplate",
+    "tag": "postgres-15.19-pgvector0.8.6-alpine3.23",
+    "platform": "linux/amd64",
+    "platform_manifest_digest": "sha256:d4437ad4970b4099e4cb7d05b7fa625c7e6959949d1374f1f2d4bd4149ae5fa3",
+    "config_digest": "sha256:643c5c00d70c37d83a0ab6db8b0996e4c03fb82c4769a45b03eef0cf3ee2abd5",
+    "runtime_user": "70",
+    "runtime_entrypoint": "/usr/local/bin/docker-entrypoint.sh",
+    "runtime_default_pgdata": "/var/lib/postgresql/15/data",
+    "compose_pgdata": "/var/lib/postgresql/data",
+    "compose_volume_target": "/var/lib/postgresql/data",
+    "postgres_major": "15",
+    "postgres_version": "15.19",
+    "pgvector_version": "0.8.6",
+    "mountpoint_layer_schema": "pulseplate.pgvector_mountpoint_layer.v1",
+    "mountpoint_layer_digest": "sha256:4c539aa857412d283fe8d55b40227fbd17b9fd6f06834f81fd98ec6796ee7396",
+    "mountpoint_layer_size": "162",
+    "mountpoint_layer_diff_id": "sha256:8cb1ace7e0c1f48d719bbdf5b4cfe9705ef407c74a3567ddc4369a6d6f023a23",
+    "mountpoint_layer_entry_count": "4",
+    "mountpoint_uid": "70",
+    "mountpoint_gid": "70",
+    "mountpoint_mode": "0700",
+    "mountpoint_path": "/var/lib/postgresql/data",
+    "mountpoint_leaf_empty": "true",
+    "mountpoint_base_parent_metadata_equal": "true",
+    "trivy_version": "0.74.0",
+    "trivy_scan_contract": "vuln,secret;os,library;HIGH,CRITICAL;exit=1;suppressions=none",
+    "buildkit_version": "0.32.2",
+}
+
+
+def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate PostgreSQL image manifest key")
+        result[key] = value
+    return result
+
+
+no_follow = getattr(os, "O_NOFOLLOW", 0)
+if no_follow <= 0 or not os.path.isabs(manifest_path):
+    raise SystemExit("PostgreSQL image manifest path is not one safe absolute path")
+descriptor = os.open(
+    manifest_path,
+    os.O_RDONLY | no_follow | getattr(os, "O_CLOEXEC", 0),
+)
+try:
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_size <= 0
+        or metadata.st_size > 64 * 1024
+    ):
+        raise SystemExit("PostgreSQL image manifest must be one bounded regular file")
+    payload = os.read(descriptor, metadata.st_size + 1)
+    if len(payload) != metadata.st_size:
+        raise SystemExit("PostgreSQL image manifest changed while being read")
+finally:
+    os.close(descriptor)
+
+if hashlib.sha256(payload).hexdigest() != expected_file_sha256:
+    raise SystemExit("PostgreSQL image manifest bytes do not match the frozen contract")
+try:
+    manifest = json.loads(
+        payload.decode("utf-8"),
+        object_pairs_hook=reject_duplicate_keys,
+        parse_constant=lambda value: (_ for _ in ()).throw(
+            ValueError(f"invalid JSON constant: {value}")
+        ),
+    )
+except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+    raise SystemExit("PostgreSQL image manifest is malformed") from exc
+if type(manifest) is not dict or set(manifest) != expected_keys:
+    raise SystemExit("PostgreSQL image manifest fields do not match the closed contract")
+if any(type(value) is not str for value in manifest.values()):
+    raise SystemExit("PostgreSQL image manifest values must be strings")
+if any(manifest[key] != value for key, value in expected_values.items()):
+    raise SystemExit("PostgreSQL image manifest identity does not match the canonical record")
+for key in (
+    "platform_manifest_digest",
+    "config_digest",
+    "containerfile_sha256",
+    "runtime_base_index_digest",
+    "runtime_base_platform_manifest_digest",
+    "runtime_base_config_digest",
+    "builder_base_index_digest",
+    "builder_base_platform_manifest_digest",
+    "builder_base_config_digest",
+    "legacy_index_digest",
+    "legacy_platform_manifest_digest",
+    "legacy_config_digest",
+    "pgvector_source_sha256",
+    "builder_apk_closure_sha256",
+    "builder_apk_inputs_sha256",
+    "builder_apk_index_sha256",
+    "buildkit_platform_manifest_digest",
+    "buildx_linux_amd64_sha256",
+    "runtime_artifact_inventory_sha256",
+    "mountpoint_layer_digest",
+    "mountpoint_layer_diff_id",
+    "trivy_linux_archive_sha256",
+):
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", manifest[key]) is None:
+        raise SystemExit(f"PostgreSQL image manifest digest is malformed: {key}")
+derived_ref = (
+    f'{manifest["repository"]}:{manifest["tag"]}@'
+    f'{manifest["platform_manifest_digest"]}'
+)
+if manifest["runtime_ref"] != derived_ref:
+    raise SystemExit("PostgreSQL runtime reference is not manifest-digest bound")
+print(manifest["runtime_ref"])
+PY
+}
+
+validate_prometheus_compose_identity() {
+  local compose_path="$1"
+  local runtime_ref="$2"
+  "$DOCKER_BIN" compose --env-file "$ENV_FILE" --project-directory "$COMPOSE_CONTRACT_DIR" -f "$compose_path" config --format json | \
+    "$PYTHON_BIN" -c '
+import json
+import sys
+
+def reject_duplicates(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate rendered Compose key")
+        result[key] = value
+    return result
+
+try:
+    payload = json.load(sys.stdin, object_pairs_hook=reject_duplicates)
+except (TypeError, ValueError, json.JSONDecodeError) as exc:
+    raise SystemExit("Rendered Compose JSON is malformed") from exc
+services = payload.get("services") if type(payload) is dict else None
+prometheus = services.get("prometheus") if type(services) is dict else None
+if type(prometheus) is not dict:
+    raise SystemExit("Rendered Compose must define exactly one Prometheus service")
+if prometheus.get("image") != sys.argv[1] or prometheus.get("platform") != "linux/amd64":
+    raise SystemExit("Rendered Compose Prometheus identity does not match the manifest")
+' "$runtime_ref"
+}
+
+validate_alertmanager_contract() {
+  local compose_path="$1"
+  local prometheus_config="$2"
+  local rules="$3"
+  local alert_config="$4"
+  local ignore="$5"
+  # Preserve the independently owned complete Prometheus config/rule checks.
+  "$PYTHON_BIN" - "$prometheus_config" "$rules" <<'PY_PROMETHEUS_REVIEWED'
+import hashlib
+from pathlib import Path
+import sys
+for path, expected, diagnostic in (
+    (sys.argv[1], "77c5d05a45798582decb02b055e5a15e93f7ce73471ee07939e818b4a0757960", "Prometheus configuration differs from the admitted complete file"),
+    (sys.argv[2], "82ae2fb2c68b7d580b71fe81b507de64d5e4037d8b62da631449b88ff4fd8e74", "Prometheus rules differ from the admitted complete file"),
+):
+    if hashlib.sha256(Path(path).read_bytes()).hexdigest() != expected:
+        raise SystemExit(diagnostic)
+PY_PROMETHEUS_REVIEWED
+  ALERTMANAGER_SELECTION="$(run_alertmanager_contract --alertmanager-contract-collect \
+    --compose "$compose_path" --installed-compose "$COMPOSE_CONTRACT_PATH" \
+    --config "$alert_config" --policy "$ignore" --contour production \
+    --profiles="${COMPOSE_PROFILES-}" --env-file "$ENV_FILE" --docker "$DOCKER_BIN")"
+  case "$ALERTMANAGER_SELECTION" in
+    'selected old'|'selected accepted'|'off old'|'off accepted') ;;
+    *) return 1 ;;
+  esac
+  ALERTMANAGER_CASE="${ALERTMANAGER_SELECTION#* }"
+  ALERTMANAGER_SELECTION="${ALERTMANAGER_SELECTION%% *}"
+}
+
+
+validate_prometheus_contract_identity() {
+  local manifest_path="$1"
+  local compose_path="$2"
+  local runtime_ref
+  runtime_ref="$(read_prometheus_runtime_ref "$manifest_path")"
+  if [ "${PROMETHEUS_RUNTIME_REF-}" != "$runtime_ref" ]; then
+    export PROMETHEUS_RUNTIME_REF="$runtime_ref"
+  fi
+  validate_prometheus_compose_identity "$compose_path" "$runtime_ref"
+}
+
+validate_postgres_compose_identity() {
+  local compose_path="$1"
+  local runtime_ref="$2"
+  "$DOCKER_BIN" compose --env-file "$ENV_FILE" --project-directory "$COMPOSE_CONTRACT_DIR" -f "$compose_path" config --format json | \
+    "$PYTHON_BIN" -c '
+import json
+import sys
+
+def reject_duplicates(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate rendered Compose key")
+        result[key] = value
+    return result
+
+try:
+    payload = json.load(sys.stdin, object_pairs_hook=reject_duplicates)
+except (TypeError, ValueError, json.JSONDecodeError) as exc:
+    raise SystemExit("Rendered Compose JSON is malformed") from exc
+services = payload.get("services") if type(payload) is dict else None
+postgres = services.get("postgres") if type(services) is dict else None
+if type(postgres) is not dict:
+    raise SystemExit("Rendered self-hosted Compose must define exactly one PostgreSQL service")
+if postgres.get("image") != sys.argv[1] or postgres.get("platform") != "linux/amd64":
+    raise SystemExit("Rendered self-hosted PostgreSQL identity does not match the manifest")
+environment = postgres.get("environment")
+if type(environment) is not dict or environment.get("PGDATA") != "/var/lib/postgresql/data":
+    raise SystemExit("Rendered self-hosted PostgreSQL PGDATA does not preserve the volume root")
+volumes = postgres.get("volumes")
+if type(volumes) is not list:
+    raise SystemExit("Rendered self-hosted PostgreSQL volumes are malformed")
+data_mounts = [
+    item
+    for item in volumes
+    if type(item) is dict and item.get("target") == "/var/lib/postgresql/data"
+]
+if len(data_mounts) != 1 or data_mounts[0].get("type") != "volume":
+    raise SystemExit("Rendered self-hosted PostgreSQL must use one named data volume")
+if postgres.get("ports") not in (None, []):
+    raise SystemExit("Rendered self-hosted PostgreSQL must not publish a host port")
+' "$runtime_ref"
+}
+
+validate_postgres_contract_identity() {
+  local manifest_path="$1"
+  local compose_path="$2"
+  local runtime_ref
+  runtime_ref="$(read_postgres_runtime_ref "$manifest_path")"
+  validate_postgres_compose_identity "$compose_path" "$runtime_ref"
+}
+
+validate_pulled_prometheus_image() {
+  local runtime_ref="$1"
+  "$DOCKER_BIN" image inspect "$runtime_ref" | \
+    run_prometheus_contract --operation inspect-image --manifest "$PROMETHEUS_IMAGE_MANIFEST"
+}
+
+validate_pulled_alertmanager_image() {
+  local selected_ref
+  selected_ref="$(run_alertmanager_contract --alertmanager-contract --phase selected-image \
+    --selected-case "$ALERTMANAGER_CASE" --field runtime_ref)"
+  "$DOCKER_BIN" image inspect "$selected_ref" | run_alertmanager_contract \
+    --alertmanager-contract --phase selected-image --selected-case "$ALERTMANAGER_CASE"
+}
+
+
+validate_postgres_image_metadata() {
+  local runtime_ref="$1"
+  local inspect_subject="$2"
+  local required_image_id="$3"
+  if [ "$inspect_subject" != "$runtime_ref" ]; then
+    echo "PostgreSQL inspection subject differs from the selected reference" >&2
+    return 1
+  fi
+  local platform_digest="${runtime_ref##*@}"
+  "$DOCKER_BIN" image inspect "$inspect_subject" | "$PYTHON_BIN" -c '
+import json
+import sys
+
+def unique_object(pairs):
+    record = {}
+    for key, value in pairs:
+        if key in record:
+            raise ValueError("duplicate JSON key")
+        record[key] = value
+    return record
+
+def reject_constant(_value):
+    raise ValueError("non-JSON numeric constant")
+
+try:
+    raw = sys.stdin.buffer.read(1048577)
+    if len(raw) > 1048576:
+        raise ValueError("image inspect output too large")
+    payload = json.loads(raw, object_pairs_hook=unique_object, parse_constant=reject_constant)
+except (TypeError, ValueError, UnicodeError, RecursionError) as exc:
+    raise SystemExit("PostgreSQL image inspect JSON is malformed") from exc
+if type(payload) is not list or len(payload) != 1 or type(payload[0]) is not dict:
+    raise SystemExit("PostgreSQL image inspect must return exactly one image")
+record = payload[0]
+image_id = record.get("Id")
+if sys.argv[3] == "ghcr.io/katsiarynakavaleuskaya/pulseplate:postgres-15.19-pgvector0.8.6-alpine3.23@sha256:d4437ad4970b4099e4cb7d05b7fa625c7e6959949d1374f1f2d4bd4149ae5fa3":
+    expected_config = "sha256:643c5c00d70c37d83a0ab6db8b0996e4c03fb82c4769a45b03eef0cf3ee2abd5"
+    expected_platform = "sha256:d4437ad4970b4099e4cb7d05b7fa625c7e6959949d1374f1f2d4bd4149ae5fa3"
+    expected_base = "sha256:3a241134f6d82eb6465622af948258e41806cfb4497e6c8f0f0a64ca6c4d34db"
+elif sys.argv[3] == "ghcr.io/katsiarynakavaleuskaya/pulseplate:postgres-15.19-pgvector0.8.6-alpine3.23@sha256:06c914735c70f82424a2a9b1e57790590a21d0fbfe250504ff79a1cca2559380":
+    expected_config = "sha256:c822c68e22d0358e66cee17e06f7b3ece5d1538cb8b607c1376b59620866ceff"
+    expected_platform = "sha256:06c914735c70f82424a2a9b1e57790590a21d0fbfe250504ff79a1cca2559380"
+    expected_base = "sha256:d94fee7e5e98fcb5cd58db6ad96fc6aa844f1af6dd56aba1f87d9f8e57a7a16d"
+else:
+    raise SystemExit("PostgreSQL image reference is outside the closed transition set")
+if sys.argv[1] != expected_platform:
+    raise SystemExit("PostgreSQL selected platform identity is inconsistent")
+frozen_image_ids = {expected_config, expected_platform}
+if type(image_id) is not str or image_id not in frozen_image_ids:
+    raise SystemExit("PostgreSQL image inspect ID is outside the frozen candidate")
+if sys.argv[2] and image_id != sys.argv[2]:
+    raise SystemExit("Existing PostgreSQL image inspect ID does not match the container")
+config = record.get("Config")
+if type(config) is not dict:
+    raise SystemExit("PostgreSQL image config is malformed")
+if record.get("Os") != "linux" or record.get("Architecture") != "amd64":
+    raise SystemExit("Pulled PostgreSQL image platform is not linux/amd64")
+if config.get("User") != "70" or config.get("Entrypoint") != ["/usr/local/bin/docker-entrypoint.sh"]:
+    raise SystemExit("Pulled PostgreSQL image runtime identity is not canonical")
+environment = config.get("Env")
+required_environment = {
+    "PGDATA": "/var/lib/postgresql/15/data",
+    "PG_MAJOR": "15",
+    "PG_MINOR": "19",
+}
+
+if (
+    type(environment) is not list
+    or any(type(item) is not str for item in environment)
+):
+    raise SystemExit("Pulled PostgreSQL image version or default PGDATA drifted")
+for name, value in required_environment.items():
+    matching = [item for item in environment if item.partition("=")[0] == name]
+    if matching != [f"{name}={value}"]:
+        raise SystemExit("Pulled PostgreSQL image version or default PGDATA drifted")
+labels = config.get("Labels")
+required_labels = {
+    "com.pulseplate.pgvector.version": "0.8.6",
+    "com.pulseplate.pgvector.source-commit": "8ee86c96f0fd72390f890aa8a336fda6d3ab4c6c",
+    "com.pulseplate.postgres.base-manifest": expected_base,
+}
+if type(labels) is not dict or any(labels.get(key) != value for key, value in required_labels.items()):
+    raise SystemExit("Pulled PostgreSQL image labels do not match the closed build")
+repo_digests = record.get("RepoDigests")
+expected = f"ghcr.io/katsiarynakavaleuskaya/pulseplate@{sys.argv[1]}"
+if (
+    type(repo_digests) is not list
+    or any(type(item) is not str for item in repo_digests)
+    or expected not in repo_digests
+):
+    raise SystemExit("Pulled PostgreSQL image is not bound to the canonical GHCR digest")
+' "$platform_digest" "$required_image_id" "$runtime_ref"
+}
+
+validate_pulled_postgres_image() {
+  if [ "$1" != "$POSTGRES_RUNTIME_REF" ]; then
+    echo "Pulled PostgreSQL reference is not the selected current image" >&2
+    return 1
+  fi
+  if validate_postgres_image_metadata "$1" "$1" "" 2>/dev/null; then
+    :
+  else
+    echo "❌ Pulled PostgreSQL image metadata is not the frozen candidate" >&2
+    return 1
+  fi
+}
+
+validate_pulled_postgres_mountpoint() {
+  local runtime_ref="$1"
+  "$DOCKER_BIN" run --rm \
+    --platform linux/amd64 \
+    --user 70:70 \
+    --network none \
+    --cap-drop ALL \
+    --security-opt no-new-privileges:true \
+    --entrypoint /bin/sh \
+    "$runtime_ref" \
+    -ec 'test "$(stat -c "%u:%g:%a" /var/lib/postgresql/data)" = "70:70:700"; mountpoint_entry="$(find /var/lib/postgresql/data -mindepth 1 -print -quit)"; test -z "$mountpoint_entry"'
+}
+
+contract_destination_transaction() {
+  local operation="$1"
+  local source_compose="${2:-}"
+  local source_prometheus_config="${3:-}"
+  local source_prometheus_rules="${4:-}"
+  local source_prometheus_manifest="${5:-}"
+  local source_alertmanager_config="${6:-}"
+  local source_alertmanager_ignore="${7:-}"
+  local source_postgres_manifest="${8:-}"
+  local source_frontend="${9:-}"
+  local source_caddyfile="${10:-}"
+  local source_diagnose="${11:-}"
+  local source_redeploy="${12:-}"
+  local source_backup_helper="${13:-}"
+
+  "$PYTHON_BIN" - \
+    "$operation" \
+    "$REQUESTED_DEPLOY_DIR" \
+    "$source_compose" \
+    "$COMPOSE_RELATIVE_IDENTITY" \
+    "$source_prometheus_config" \
+    "deploy/prometheus/prometheus.yml" \
+    "$source_prometheus_rules" \
+    "deploy/prometheus/alias-alerts.yml" \
+    "$source_prometheus_manifest" \
+    "deploy/prometheus/image-manifest.json" \
+    "$source_alertmanager_config" \
+    "deploy/alertmanager/alertmanager.yml" \
+    "$source_alertmanager_ignore" \
+    "deploy/alertmanager/trivy-ignore.yaml" \
+    "$source_postgres_manifest" \
+    "deploy/postgres-pgvector/image-manifest.json" \
+    "$source_frontend" \
+    "frontend" \
+    "$source_caddyfile" \
+    "deploy/Caddyfile.production" \
+    "$source_diagnose" \
+    "scripts/diagnose_web.sh" \
+    "$source_redeploy" \
+    "scripts/redeploy_caddy.sh" \
+    "$source_backup_helper" \
+    "scripts/ops/postgres_backup.sh" \
+    "$PROMETHEUS_CONTRACT_HELPER_SHA256" "$ALERTMANAGER_CONTRACT_HELPER_SHA256" <<'PY'
+from __future__ import annotations
+
+import errno
+import hashlib
+import os
+from pathlib import Path, PurePosixPath
+import secrets
+import stat
+import sys
+
+operation = sys.argv[1]
+requested_deploy_dir = sys.argv[2]
+source_compose = sys.argv[3]
+compose_target = sys.argv[4]
+source_config = sys.argv[5]
+config_target = sys.argv[6]
+source_rules = sys.argv[7]
+rules_target = sys.argv[8]
+source_manifest = sys.argv[9]
+manifest_target = sys.argv[10]
+source_alertmanager_config = sys.argv[11]
+alertmanager_config_target = sys.argv[12]
+source_alertmanager_ignore = sys.argv[13]
+alertmanager_ignore_target = sys.argv[14]
+source_postgres_manifest = sys.argv[15]
+postgres_manifest_target = sys.argv[16]
+source_frontend = sys.argv[17]
+frontend_target = sys.argv[18]
+source_caddy = sys.argv[19]
+caddy_target = sys.argv[20]
+source_diagnose = sys.argv[21]
+diagnose_target = sys.argv[22]
+source_redeploy = sys.argv[23]
+redeploy_target = sys.argv[24]
+source_backup_helper = sys.argv[25]
+backup_helper_target = sys.argv[26]
+prometheus_helper_target = "scripts/ci/prometheus_source_image.py"
+prometheus_helper_hash = "sha256:" + sys.argv[27]
+prometheus_helper_source = str(Path(source_backup_helper).parents[2] / prometheus_helper_target) if source_backup_helper else ""
+checkpoint_contracts = {
+    "scripts/ci/fetch_docker_source_artifacts.py": "sha256:" + sys.argv[28],
+    'scripts/verify_premium_alias_telemetry.py': 'sha256:906db8d718e5818593f81b7a6a19585a2b273d9d5ff0af8d015d812e8102f829',
+    'scripts/ops/notify_premium_alias_checkpoint_failure.py': 'sha256:6d8ab4b1c0b94f7c067d753fd21d69ecde31f669456bdf8724e9435bef09b2cf',
+    'deploy/systemd/pulseplate-premium-alias-checkpoint.service.example': 'sha256:a52742a89b87d02b3b75834b27db741b72a9c6c4a021711611db2a53b197a030',
+    'deploy/systemd/pulseplate-premium-alias-checkpoint.timer.example': 'sha256:f6dd053b986cf68b133cf855208b86f44fc975e84dc7acbf490b35a6bb88c9cf',
+    'deploy/systemd/pulseplate-premium-alias-checkpoint-failure.service.example': 'sha256:285c5e05bd72f4c99a22c9657a8443becfda4ff93975a21d70feb01812ed1b6d',
+}
+
+if operation not in {
+    "validate-checkpoint-installed",
+    "validate-contracts",
+    "publish-contracts",
+    "validate-full",
+    "publish-full",
+}:
+    raise SystemExit("unsupported contract destination transaction")
+if not os.path.isabs(requested_deploy_dir) or os.path.normpath(requested_deploy_dir) != requested_deploy_dir:
+    raise SystemExit("DEPLOY_DIR must be one canonical absolute path")
+
+allowed_compose_targets = {
+    "deploy/docker-compose.production.yaml",
+    "deploy/docker-compose.production.selfhosted.yaml",
+}
+if compose_target not in allowed_compose_targets:
+    raise SystemExit("selected Compose destination is not canonical")
+if config_target != "deploy/prometheus/prometheus.yml":
+    raise SystemExit("Prometheus configuration destination is not canonical")
+if rules_target != "deploy/prometheus/alias-alerts.yml":
+    raise SystemExit("Prometheus rules destination is not canonical")
+if manifest_target != "deploy/prometheus/image-manifest.json":
+    raise SystemExit("Prometheus image manifest destination is not canonical")
+if alertmanager_config_target != "deploy/alertmanager/alertmanager.yml":
+    raise SystemExit("Alertmanager configuration destination is not canonical")
+if alertmanager_ignore_target != "deploy/alertmanager/trivy-ignore.yaml":
+    raise SystemExit("Alertmanager Trivy exception destination is not canonical")
+if postgres_manifest_target != "deploy/postgres-pgvector/image-manifest.json":
+    raise SystemExit("PostgreSQL image manifest destination is not canonical")
+if frontend_target != "frontend":
+    raise SystemExit("frontend destination is not canonical")
+if caddy_target != "deploy/Caddyfile.production":
+    raise SystemExit("Caddy destination is not canonical")
+if diagnose_target != "scripts/diagnose_web.sh":
+    raise SystemExit("diagnose helper destination is not canonical")
+if redeploy_target != "scripts/redeploy_caddy.sh":
+    raise SystemExit("redeploy helper destination is not canonical")
+if backup_helper_target != "scripts/ops/postgres_backup.sh":
+    raise SystemExit("PostgreSQL backup helper destination is not canonical")
+
+no_follow = getattr(os, "O_NOFOLLOW", 0)
+directory_flag = getattr(os, "O_DIRECTORY", 0)
+if no_follow <= 0 or directory_flag <= 0:
+    raise SystemExit("descriptor no-follow directory validation is unavailable")
+directory_open_flags = os.O_RDONLY | directory_flag | no_follow | getattr(os, "O_CLOEXEC", 0)
+file_read_flags = os.O_RDONLY | no_follow | getattr(os, "O_CLOEXEC", 0)
+max_contract_bytes = 4 * 1024 * 1024
+max_tree_members = 20_000
+max_tree_bytes = 512 * 1024 * 1024
+max_tree_depth = 32
+
+
+def open_existing_directory(parent_fd: int, component: str, *, label: str) -> int:
+    try:
+        metadata = os.stat(component, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError as exc:
+        raise SystemExit(f"{label} directory is missing") from exc
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise SystemExit(f"{label} must be a real directory")
+    try:
+        descriptor = os.open(component, directory_open_flags, dir_fd=parent_fd)
+    except OSError as exc:
+        raise SystemExit(f"{label} cannot be opened safely") from exc
+    opened_metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(opened_metadata.st_mode)
+        or opened_metadata.st_dev != metadata.st_dev
+        or opened_metadata.st_ino != metadata.st_ino
+    ):
+        os.close(descriptor)
+        raise SystemExit(f"{label} identity changed")
+    return descriptor
+
+
+def ensure_directory(parent_fd: int, component: str, *, create: bool, label: str) -> int | None:
+    try:
+        return open_existing_directory(parent_fd, component, label=label)
+    except SystemExit:
+        try:
+            metadata = os.stat(component, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            if not create:
+                return None
+            try:
+                os.mkdir(component, 0o755, dir_fd=parent_fd)
+                os.fsync(parent_fd)
+            except OSError as exc:
+                raise SystemExit(f"{label} cannot be created safely") from exc
+            return open_existing_directory(parent_fd, component, label=label)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise SystemExit(f"{label} must be a real directory")
+        raise
+
+
+def validate_regular_leaf(parent_fd: int, leaf: str, *, label: str) -> None:
+    try:
+        metadata = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        raise SystemExit(f"{label} must be absent or one regular file")
+
+
+def open_absolute_directory(raw_path: str, *, label: str) -> int:
+    if not os.path.isabs(raw_path) or os.path.normpath(raw_path) != raw_path:
+        raise SystemExit(f"{label} path must be canonical and absolute")
+    root_fd = os.open("/", directory_open_flags)
+    walk_fd = root_fd
+    try:
+        for component in Path(raw_path).parts[1:]:
+            next_fd = open_existing_directory(walk_fd, component, label=label)
+            if walk_fd != root_fd:
+                os.close(walk_fd)
+            walk_fd = next_fd
+        if walk_fd == root_fd:
+            raise SystemExit(f"{label} cannot be the filesystem root")
+        return walk_fd
+    finally:
+        os.close(root_fd)
+
+
+def open_absolute_file(raw_path: str, *, label: str, max_bytes: int) -> tuple[int, os.stat_result]:
+    if not os.path.isabs(raw_path) or os.path.normpath(raw_path) != raw_path:
+        raise SystemExit(f"{label} path must be canonical and absolute")
+    parts = Path(raw_path).parts[1:]
+    if not parts:
+        raise SystemExit(f"{label} path is not a file")
+    root_fd = os.open("/", directory_open_flags)
+    walk_fd = root_fd
+    try:
+        for component in parts[:-1]:
+            next_fd = open_existing_directory(walk_fd, component, label=f"{label} parent")
+            if walk_fd != root_fd:
+                os.close(walk_fd)
+            walk_fd = next_fd
+        leaf = parts[-1]
+        try:
+            before = os.stat(leaf, dir_fd=walk_fd, follow_symlinks=False)
+            descriptor = os.open(leaf, file_read_flags, dir_fd=walk_fd)
+        except OSError as exc:
+            raise SystemExit(f"{label} cannot be opened safely") from exc
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or opened.st_size <= 0
+            or opened.st_size > max_bytes
+            or opened.st_dev != before.st_dev
+            or opened.st_ino != before.st_ino
+        ):
+            os.close(descriptor)
+            raise SystemExit(f"{label} must be one bounded regular file")
+        return descriptor, opened
+    finally:
+        if walk_fd != root_fd:
+            os.close(walk_fd)
+        os.close(root_fd)
+
+
+def copy_open_file(
+    source_fd: int,
+    source_metadata: os.stat_result,
+    destination_fd: int,
+    *,
+    label: str,
+    expected_hash: str | None = None,
+) -> None:
+    digest = hashlib.sha256() if expected_hash is not None else None
+    remaining = source_metadata.st_size
+    while remaining:
+        chunk = os.read(source_fd, min(1024 * 1024, remaining))
+        if not chunk:
+            raise SystemExit(f"{label} changed during publication")
+        if digest is not None:
+            digest.update(chunk)
+        view = memoryview(chunk)
+        while view:
+            written = os.write(destination_fd, view)
+            if written <= 0:
+                raise SystemExit(f"{label} destination write failed")
+            view = view[written:]
+        remaining -= len(chunk)
+    if os.read(source_fd, 1):
+        raise SystemExit(f"{label} grew during publication")
+    after = os.fstat(source_fd)
+    if (
+        after.st_size != source_metadata.st_size
+        or after.st_mtime_ns != source_metadata.st_mtime_ns
+        or after.st_ctime_ns != source_metadata.st_ctime_ns
+    ):
+        raise SystemExit(f"{label} identity changed during publication")
+    if digest is not None and "sha256:" + digest.hexdigest() != expected_hash:
+        raise SystemExit("Checkpoint contract hash mismatch")
+
+
+def tree_walk(
+    source_fd: int,
+    *,
+    destination_fd: int | None,
+    state: dict[str, int],
+    depth: int,
+    label: str,
+) -> None:
+    if depth > max_tree_depth:
+        raise SystemExit(f"{label} tree depth is out of bounds")
+    entries = sorted(os.scandir(source_fd), key=lambda entry: entry.name)
+    for entry in entries:
+        name = entry.name
+        metadata = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
+        state["members"] += 1
+        if state["members"] > max_tree_members:
+            raise SystemExit(f"{label} tree member count is out of bounds")
+        if stat.S_ISDIR(metadata.st_mode):
+            child_source = open_existing_directory(source_fd, name, label=f"{label} directory")
+            child_destination: int | None = None
+            try:
+                if destination_fd is not None:
+                    os.mkdir(name, 0o755, dir_fd=destination_fd)
+                    child_destination = open_existing_directory(
+                        destination_fd,
+                        name,
+                        label=f"{label} staging directory",
+                    )
+                tree_walk(
+                    child_source,
+                    destination_fd=child_destination,
+                    state=state,
+                    depth=depth + 1,
+                    label=label,
+                )
+                if child_destination is not None:
+                    os.fsync(child_destination)
+            finally:
+                if child_destination is not None:
+                    os.close(child_destination)
+                os.close(child_source)
+            continue
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise SystemExit(f"{label} tree contains a link or special file")
+        if metadata.st_size < 0 or metadata.st_size > max_tree_bytes:
+            raise SystemExit(f"{label} tree file size is out of bounds")
+        state["bytes"] += metadata.st_size
+        if state["bytes"] > max_tree_bytes:
+            raise SystemExit(f"{label} tree expanded size is out of bounds")
+        source_file = os.open(name, file_read_flags, dir_fd=source_fd)
+        try:
+            opened = os.fstat(source_file)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+                or opened.st_dev != metadata.st_dev
+                or opened.st_ino != metadata.st_ino
+                or opened.st_size != metadata.st_size
+            ):
+                raise SystemExit(f"{label} tree file identity changed")
+            if destination_fd is not None:
+                destination_file = os.open(
+                    name,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | no_follow
+                    | getattr(os, "O_CLOEXEC", 0),
+                    0o600,
+                    dir_fd=destination_fd,
+                )
+                try:
+                    copy_open_file(
+                        source_file,
+                        opened,
+                        destination_file,
+                        label=f"{label} tree file",
+                    )
+                    os.fchmod(destination_file, 0o644)
+                    os.fsync(destination_file)
+                finally:
+                    os.close(destination_file)
+        finally:
+            os.close(source_file)
+
+
+def remove_tree_at(parent_fd: int, name: str, *, label: str) -> None:
+    try:
+        metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise SystemExit(f"{label} cleanup target must be a real directory")
+    tree_fd = open_existing_directory(parent_fd, name, label=label)
+    try:
+        entries = sorted(os.scandir(tree_fd), key=lambda entry: entry.name)
+        for entry in entries:
+            metadata = os.stat(entry.name, dir_fd=tree_fd, follow_symlinks=False)
+            if stat.S_ISDIR(metadata.st_mode):
+                remove_tree_at(tree_fd, entry.name, label=label)
+            elif stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1:
+                os.unlink(entry.name, dir_fd=tree_fd)
+            else:
+                raise SystemExit(f"{label} cleanup encountered a link or special file")
+        os.fsync(tree_fd)
+    finally:
+        os.close(tree_fd)
+    os.rmdir(name, dir_fd=parent_fd)
+    os.fsync(parent_fd)
+
+
+def split_target(raw_target: str) -> tuple[str, ...]:
+    pure_path = PurePosixPath(raw_target)
+    if pure_path.is_absolute() or str(pure_path) != raw_target:
+        raise SystemExit("contract destination path is not canonical")
+    if any(part in {"", ".", ".."} for part in pure_path.parts):
+        raise SystemExit("contract destination path is not bounded")
+    return pure_path.parts
+
+
+if operation in {"validate-full", "publish-contracts"}:
+    source_fd, metadata = open_absolute_file(prometheus_helper_source, label="Prometheus helper data source", max_bytes=max_contract_bytes)
+    try:
+        raw = os.read(source_fd, metadata.st_size + 1)
+        if len(raw) != metadata.st_size or "sha256:" + hashlib.sha256(raw).hexdigest() != prometheus_helper_hash:
+            raise SystemExit("Incoming helper data differs from the separately trusted current-source helper")
+    finally:
+        os.close(source_fd)
+
+if operation in {"validate-full", "publish-contracts", "validate-checkpoint-installed"}:
+    checkpoint_root = (
+        Path(source_backup_helper).parents[2]
+        if source_backup_helper else Path(requested_deploy_dir)
+    )
+    for target, expected_hash in checkpoint_contracts.items():
+        source_fd, metadata = open_absolute_file(
+            str(checkpoint_root / target), label="checkpoint source", max_bytes=max_contract_bytes,
+        )
+        try:
+            payload = os.read(source_fd, metadata.st_size + 1)
+            if len(payload) != metadata.st_size or "sha256:" + hashlib.sha256(payload).hexdigest() != expected_hash:
+                raise SystemExit("Checkpoint contract hash mismatch")
+        finally:
+            os.close(source_fd)
+
+
+deploy_fd = open_absolute_directory(requested_deploy_dir, label="contract destination")
+directory_fds: list[int] = [deploy_fd]
+try:
+    targets = [
+        compose_target,
+        config_target,
+        rules_target,
+        manifest_target,
+        alertmanager_config_target,
+        alertmanager_ignore_target,
+        postgres_manifest_target,
+        frontend_target,
+        caddy_target,
+        diagnose_target,
+        redeploy_target,
+        backup_helper_target,
+        prometheus_helper_target,
+        *checkpoint_contracts,
+    ]
+    target_parts = {target: split_target(target) for target in targets}
+    deploy_contract_fd = ensure_directory(
+        deploy_fd,
+        "deploy",
+        create=False,
+        label="canonical deploy contract directory",
+    )
+    if deploy_contract_fd is None:
+        raise SystemExit("canonical deploy contract directory is missing")
+    directory_fds.append(deploy_contract_fd)
+
+    prometheus_fd = ensure_directory(
+        deploy_contract_fd,
+        "prometheus",
+        create=operation == "publish-contracts",
+        label="Prometheus contract directory",
+    )
+    if prometheus_fd is not None:
+        directory_fds.append(prometheus_fd)
+
+    alertmanager_fd = ensure_directory(
+        deploy_contract_fd,
+        "alertmanager",
+        create=operation == "publish-contracts",
+        label="Alertmanager contract directory",
+    )
+    if alertmanager_fd is not None:
+        directory_fds.append(alertmanager_fd)
+
+    postgres_pgvector_fd = ensure_directory(
+        deploy_contract_fd,
+        "postgres-pgvector",
+        create=operation == "publish-contracts",
+        label="PostgreSQL image contract directory",
+    )
+    if postgres_pgvector_fd is not None:
+        directory_fds.append(postgres_pgvector_fd)
+
+    scripts_fd = ensure_directory(
+        deploy_fd,
+        "scripts",
+        create=operation in {"publish-contracts", "publish-full"},
+        label="production scripts directory",
+    )
+    if scripts_fd is not None:
+        directory_fds.append(scripts_fd)
+
+    scripts_ops_fd = None
+    if scripts_fd is not None:
+        scripts_ops_fd = ensure_directory(
+            scripts_fd,
+            "ops",
+            create=operation in {"publish-contracts", "publish-full"},
+            label="production ops scripts directory",
+        )
+        if scripts_ops_fd is not None:
+            directory_fds.append(scripts_ops_fd)
+
+    scripts_ci_fd = None
+    if scripts_fd is not None:
+        scripts_ci_fd = ensure_directory(scripts_fd, "ci", create=operation == "publish-contracts", label="Prometheus contract helper directory")
+        if scripts_ci_fd is not None:
+            directory_fds.append(scripts_ci_fd)
+
+    systemd_fd = ensure_directory(
+        deploy_contract_fd, "systemd", create=operation == "publish-contracts",
+        label="checkpoint unit directory",
+    )
+    if systemd_fd is not None:
+        directory_fds.append(systemd_fd)
+
+    parent_by_target: dict[str, int | None] = {
+        compose_target: deploy_contract_fd,
+        config_target: prometheus_fd,
+        rules_target: prometheus_fd,
+        manifest_target: prometheus_fd,
+        alertmanager_config_target: alertmanager_fd,
+        alertmanager_ignore_target: alertmanager_fd,
+        postgres_manifest_target: postgres_pgvector_fd,
+        caddy_target: deploy_contract_fd,
+        diagnose_target: scripts_fd,
+        redeploy_target: scripts_fd,
+        backup_helper_target: scripts_ops_fd,
+        prometheus_helper_target: scripts_ci_fd,
+    }
+    parent_by_target.update({
+        target: systemd_fd if target.startswith("deploy/systemd/") else
+        scripts_ops_fd if target.startswith("scripts/ops/") else scripts_ci_fd if target.startswith("scripts/ci/") else scripts_fd
+        for target in checkpoint_contracts
+    })
+    for target in (
+        compose_target,
+        config_target,
+        rules_target,
+        manifest_target,
+        alertmanager_config_target,
+        alertmanager_ignore_target,
+        postgres_manifest_target,
+        caddy_target,
+        diagnose_target,
+        redeploy_target,
+        backup_helper_target,
+        prometheus_helper_target,
+        *checkpoint_contracts,
+    ):
+        parent_fd = parent_by_target[target]
+        if parent_fd is not None:
+            validate_regular_leaf(
+                parent_fd,
+                target_parts[target][-1],
+                label=f"{target} destination",
+            )
+
+    try:
+        frontend_metadata = os.stat(frontend_target, dir_fd=deploy_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        frontend_metadata = None
+    if frontend_metadata is not None:
+        if not stat.S_ISDIR(frontend_metadata.st_mode):
+            raise SystemExit("frontend destination must be absent or a real directory")
+        existing_frontend_fd = open_existing_directory(
+            deploy_fd,
+            frontend_target,
+            label="frontend destination",
+        )
+        try:
+            tree_walk(
+                existing_frontend_fd,
+                destination_fd=None,
+                state={"members": 0, "bytes": 0},
+                depth=0,
+                label="frontend destination",
+            )
+        finally:
+            os.close(existing_frontend_fd)
+
+    if operation == "validate-checkpoint-installed":
+        raise SystemExit(0)
+
+    if operation == "validate-contracts":
+        raise SystemExit(0)
+
+    if operation == "publish-contracts":
+        if prometheus_fd is None:
+            raise SystemExit("Prometheus contract directory was not created")
+        if alertmanager_fd is None:
+            raise SystemExit("Alertmanager contract directory was not created")
+        if postgres_pgvector_fd is None:
+            raise SystemExit("PostgreSQL image contract directory was not created")
+        if scripts_ops_fd is None:
+            raise SystemExit("production ops scripts directory was not created")
+        sources = {
+            compose_target: source_compose,
+            config_target: source_config,
+            rules_target: source_rules,
+            manifest_target: source_manifest,
+            alertmanager_config_target: source_alertmanager_config,
+            alertmanager_ignore_target: source_alertmanager_ignore,
+            postgres_manifest_target: source_postgres_manifest,
+            backup_helper_target: source_backup_helper,
+            prometheus_helper_target: prometheus_helper_source,
+        }
+        sources.update({target: str(checkpoint_root / target) for target in checkpoint_contracts})
+        modes = {
+            compose_target: 0o644,
+            config_target: 0o644,
+            rules_target: 0o644,
+            manifest_target: 0o644,
+            alertmanager_config_target: 0o644,
+            alertmanager_ignore_target: 0o644,
+            postgres_manifest_target: 0o644,
+            backup_helper_target: 0o755,
+            prometheus_helper_target: 0o644,
+        }
+        modes.update({target: 0o644 for target in checkpoint_contracts})
+        prepared_contracts: list[tuple[int, str, str]] = []
+        try:
+            for target in (
+                config_target,
+                rules_target,
+                manifest_target,
+                alertmanager_config_target,
+                alertmanager_ignore_target,
+                postgres_manifest_target,
+                compose_target,
+                backup_helper_target,
+                prometheus_helper_target,
+                *checkpoint_contracts,
+            ):
+                source_fd, source_metadata = open_absolute_file(
+                    sources[target],
+                    label=f"{target} source",
+                    max_bytes=max_contract_bytes,
+                )
+                try:
+                    mode = modes[target]
+                    if target == backup_helper_target and stat.S_IMODE(
+                        source_metadata.st_mode
+                    ) != mode:
+                        raise SystemExit(
+                            "PostgreSQL backup helper source mode does not match the reviewed contract"
+                        )
+                    parent_fd = parent_by_target[target]
+                    if parent_fd is None:
+                        raise SystemExit("contract destination parent is unavailable")
+                    leaf = target_parts[target][-1]
+                    temp_name = (
+                        f".pulseplate-{leaf}.tmp-{os.getpid()}-{secrets.token_hex(8)}"
+                    )
+                    temp_fd = os.open(
+                        temp_name,
+                        os.O_WRONLY
+                        | os.O_CREAT
+                        | os.O_EXCL
+                        | no_follow
+                        | getattr(os, "O_CLOEXEC", 0),
+                        0o600,
+                        dir_fd=parent_fd,
+                    )
+                    prepared_contracts.append((parent_fd, temp_name, leaf))
+                    try:
+                        copy_open_file(
+                            source_fd,
+                            source_metadata,
+                            temp_fd,
+                            label=f"{target} source",
+                            expected_hash=prometheus_helper_hash if target == prometheus_helper_target else checkpoint_contracts.get(target),
+                        )
+                        os.fchmod(temp_fd, mode)
+                        os.fsync(temp_fd)
+                    finally:
+                        os.close(temp_fd)
+                finally:
+                    os.close(source_fd)
+
+            for parent_fd, temp_name, leaf in prepared_contracts:
+                os.replace(
+                    temp_name,
+                    leaf,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
+                os.fsync(parent_fd)
+        finally:
+            for parent_fd, temp_name, _leaf in prepared_contracts:
+                try:
+                    os.unlink(temp_name, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    pass
+        raise SystemExit(0)
+
+    frontend_source_fd = open_absolute_directory(source_frontend, label="frontend source")
+    try:
+        if operation == "validate-full":
+            tree_walk(
+                frontend_source_fd,
+                destination_fd=None,
+                state={"members": 0, "bytes": 0},
+                depth=0,
+                label="frontend source",
+            )
+            for source_path, label, required_mode in (
+                (source_caddy, "Caddy source", None),
+                (source_redeploy, "redeploy helper source", None),
+                (source_backup_helper, "PostgreSQL backup helper source", 0o755),
+            ):
+                source_fd, source_metadata = open_absolute_file(
+                    source_path,
+                    label=label,
+                    max_bytes=max_contract_bytes,
+                )
+                if required_mode is not None and stat.S_IMODE(
+                    source_metadata.st_mode
+                ) != required_mode:
+                    os.close(source_fd)
+                    raise SystemExit(f"{label} mode does not match the reviewed contract")
+                os.close(source_fd)
+            if source_diagnose:
+                source_fd, _metadata = open_absolute_file(
+                    source_diagnose,
+                    label="diagnose helper source",
+                    max_bytes=max_contract_bytes,
+                )
+                os.close(source_fd)
+            raise SystemExit(0)
+
+        if scripts_fd is None or scripts_ops_fd is None:
+            raise SystemExit("production scripts directory was not created")
+
+        temp_frontend = (
+            f".pulseplate-frontend.tmp-{os.getpid()}-{secrets.token_hex(8)}"
+        )
+        os.mkdir(temp_frontend, 0o755, dir_fd=deploy_fd)
+        temp_frontend_fd = open_existing_directory(
+            deploy_fd,
+            temp_frontend,
+            label="frontend staging directory",
+        )
+        try:
+            tree_walk(
+                frontend_source_fd,
+                destination_fd=temp_frontend_fd,
+                state={"members": 0, "bytes": 0},
+                depth=0,
+                label="frontend source",
+            )
+            os.fsync(temp_frontend_fd)
+        finally:
+            os.close(temp_frontend_fd)
+
+        prepared_files: list[tuple[int, str, str]] = []
+        regular_sources = [
+            (source_caddy, deploy_contract_fd, "Caddyfile.production", 0o644, "Caddy source"),
+            (source_redeploy, scripts_fd, "redeploy_caddy.sh", 0o755, "redeploy helper source"),
+        ]
+        if source_diagnose:
+            regular_sources.append(
+                (source_diagnose, scripts_fd, "diagnose_web.sh", 0o755, "diagnose helper source")
+            )
+        backup_frontend = ""
+        try:
+            for source_path, parent_fd, leaf, mode, label in regular_sources:
+                source_fd, source_metadata = open_absolute_file(
+                    source_path,
+                    label=label,
+                    max_bytes=max_contract_bytes,
+                )
+                try:
+                    temp_name = (
+                        f".pulseplate-{leaf}.tmp-{os.getpid()}-{secrets.token_hex(8)}"
+                    )
+                    temp_fd = os.open(
+                        temp_name,
+                        os.O_WRONLY
+                        | os.O_CREAT
+                        | os.O_EXCL
+                        | no_follow
+                        | getattr(os, "O_CLOEXEC", 0),
+                        0o600,
+                        dir_fd=parent_fd,
+                    )
+                    try:
+                        copy_open_file(source_fd, source_metadata, temp_fd, label=label)
+                        os.fchmod(temp_fd, mode)
+                        os.fsync(temp_fd)
+                    finally:
+                        os.close(temp_fd)
+                    prepared_files.append((parent_fd, temp_name, leaf))
+                finally:
+                    os.close(source_fd)
+
+            for parent_fd, temp_name, leaf in prepared_files:
+                os.replace(
+                    temp_name,
+                    leaf,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
+                os.fsync(parent_fd)
+
+            if not source_diagnose:
+                try:
+                    os.unlink("diagnose_web.sh", dir_fd=scripts_fd)
+                except FileNotFoundError:
+                    pass
+                os.fsync(scripts_fd)
+
+            if frontend_metadata is not None:
+                backup_frontend = (
+                    f".pulseplate-frontend.old-{os.getpid()}-{secrets.token_hex(8)}"
+                )
+                os.rename(
+                    frontend_target,
+                    backup_frontend,
+                    src_dir_fd=deploy_fd,
+                    dst_dir_fd=deploy_fd,
+                )
+                os.fsync(deploy_fd)
+            try:
+                os.rename(
+                    temp_frontend,
+                    frontend_target,
+                    src_dir_fd=deploy_fd,
+                    dst_dir_fd=deploy_fd,
+                )
+                os.fsync(deploy_fd)
+            except BaseException:
+                if backup_frontend:
+                    os.rename(
+                        backup_frontend,
+                        frontend_target,
+                        src_dir_fd=deploy_fd,
+                        dst_dir_fd=deploy_fd,
+                    )
+                    backup_frontend = ""
+                    os.fsync(deploy_fd)
+                raise
+
+            if backup_frontend:
+                remove_tree_at(deploy_fd, backup_frontend, label="previous frontend tree")
+                backup_frontend = ""
+        finally:
+            for parent_fd, temp_name, _leaf in prepared_files:
+                try:
+                    os.unlink(temp_name, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    pass
+            remove_tree_at(deploy_fd, temp_frontend, label="frontend staging tree")
+            if backup_frontend:
+                if frontend_target not in {
+                    entry.name for entry in os.scandir(deploy_fd)
+                }:
+                    os.rename(
+                        backup_frontend,
+                        frontend_target,
+                        src_dir_fd=deploy_fd,
+                        dst_dir_fd=deploy_fd,
+                    )
+                    os.fsync(deploy_fd)
+                else:
+                    raise SystemExit("previous frontend backup requires operator disposition")
+    finally:
+        os.close(frontend_source_fd)
+finally:
+    for descriptor in reversed(directory_fds):
+        try:
+            os.close(descriptor)
+        except OSError as exc:
+            if exc.errno != errno.EBADF:
+                raise
+PY
+}
+
+validate_contract_destinations_safely() {
+  contract_destination_transaction validate-contracts "" "" "" "" ""
+}
+
+publish_contract_files_safely() {
+  local source_compose="$1"
+  local source_prometheus_config="$2"
+  local source_prometheus_rules="$3"
+  local source_prometheus_manifest="$4"
+  local source_alertmanager_config="$5"
+  local source_alertmanager_ignore="$6"
+  local source_postgres_manifest="$7"
+  local source_backup_helper="$8"
+  contract_destination_transaction publish-contracts \
+    "$source_compose" \
+    "$source_prometheus_config" \
+    "$source_prometheus_rules" \
+    "$source_prometheus_manifest" \
+    "$source_alertmanager_config" \
+    "$source_alertmanager_ignore" \
+    "$source_postgres_manifest" \
+    "" "" "" "" \
+    "$source_backup_helper"
+}
+
+validate_full_bundle_safely() {
+  local source_frontend="$1"
+  local source_caddyfile="$2"
+  local source_diagnose="$3"
+  local source_redeploy="$4"
+  local source_backup_helper="$5"
+  contract_destination_transaction validate-full \
+    "" "" "" "" "" "" "" \
+    "$source_frontend" \
+    "$source_caddyfile" \
+    "$source_diagnose" \
+    "$source_redeploy" \
+    "$source_backup_helper"
+}
+
+publish_full_bundle_safely() {
+  local source_frontend="$1"
+  local source_caddyfile="$2"
+  local source_diagnose="$3"
+  local source_redeploy="$4"
+  contract_destination_transaction publish-full \
+    "" "" "" "" "" "" "" \
+    "$source_frontend" \
+    "$source_caddyfile" \
+    "$source_diagnose" \
+    "$source_redeploy"
+}
+
+process_shell_bundle_archive() {
+  local operation="$1"
+  local private_root="$2"
+
+  "$PYTHON_BIN" - "$SHELL_BUNDLE_ARCHIVE" "$private_root" "$operation" <<'PY'
+from __future__ import annotations
+
+import os
+from pathlib import Path, PurePosixPath
+import re
+import shutil
+import stat
+import sys
+import tarfile
+
+source_path = Path(sys.argv[1])
+private_root = Path(sys.argv[2])
+operation = sys.argv[3]
+if operation not in {"validate", "extract"}:
+    raise SystemExit("unsupported archive operation")
+if not re.fullmatch(r"/tmp/pulseplate-shell-bundle-[0-9]+-[0-9]+[.]tgz", str(source_path)):
+    raise SystemExit("production shell archive path is not canonical")
+
+no_follow = getattr(os, "O_NOFOLLOW", 0)
+source_fd = os.open(source_path, os.O_RDONLY | no_follow | getattr(os, "O_CLOEXEC", 0))
+try:
+    source_metadata = os.fstat(source_fd)
+    if not stat.S_ISREG(source_metadata.st_mode) or source_metadata.st_nlink != 1:
+        raise SystemExit("production shell archive must be one regular file")
+    if source_metadata.st_size <= 0 or source_metadata.st_size > 512 * 1024 * 1024:
+        raise SystemExit("production shell archive size is out of bounds")
+
+    copied_archive = private_root / "bundle.tgz"
+    copied_fd = os.open(
+        copied_archive,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | no_follow | getattr(os, "O_CLOEXEC", 0),
+        0o600,
+    )
+    try:
+        with os.fdopen(os.dup(source_fd), "rb") as source, os.fdopen(
+            copied_fd, "wb", closefd=False
+        ) as destination:
+            shutil.copyfileobj(source, destination, length=1024 * 1024)
+            destination.flush()
+            os.fsync(destination.fileno())
+    finally:
+        os.close(copied_fd)
+finally:
+    os.close(source_fd)
+
+required_files = {
+    "deploy/Caddyfile.production",
+    "deploy/docker-compose.production.yaml",
+    "deploy/docker-compose.production.selfhosted.yaml",
+    "deploy/postgres-pgvector/image-manifest.json",
+    "deploy/prometheus/image-manifest.json",
+    "deploy/prometheus/prometheus.yml",
+    "deploy/prometheus/alias-alerts.yml",
+    "deploy/alertmanager/alertmanager.yml",
+    "deploy/alertmanager/trivy-ignore.yaml",
+    "scripts/diagnose_web.sh",
+    "scripts/ci/prometheus_source_image.py",
+    "scripts/ci/fetch_docker_source_artifacts.py",
+    "scripts/ops/postgres_backup.sh",
+    'scripts/verify_premium_alias_telemetry.py',
+    'scripts/ops/notify_premium_alias_checkpoint_failure.py',
+    'deploy/systemd/pulseplate-premium-alias-checkpoint.service.example',
+    'deploy/systemd/pulseplate-premium-alias-checkpoint.timer.example',
+    'deploy/systemd/pulseplate-premium-alias-checkpoint-failure.service.example',
+    "scripts/redeploy_caddy.sh",
+}
+allowed_directories = {
+    "frontend",
+    "deploy",
+    "deploy/postgres-pgvector",
+    "deploy/prometheus",
+    "deploy/alertmanager",
+    "deploy/systemd",
+    "scripts",
+    "scripts/ops",
+    "scripts/ci",
+}
+max_members = 20_000
+max_expanded_bytes = 512 * 1024 * 1024
+
+with tarfile.open(copied_archive, mode="r:gz") as archive:
+    members = archive.getmembers()
+    if not members or len(members) > max_members:
+        raise SystemExit("production shell archive member count is out of bounds")
+
+    seen: set[str] = set()
+    files_seen: set[str] = set()
+    expanded_bytes = 0
+    normalized_members: list[tuple[tarfile.TarInfo, str]] = []
+    for member in members:
+        raw_name = member.name
+        if not raw_name or "\\" in raw_name:
+            raise SystemExit("production shell archive contains an invalid member name")
+        pure_path = PurePosixPath(raw_name)
+        normalized_name = str(pure_path)
+        if (
+            pure_path.is_absolute()
+            or normalized_name != raw_name
+            or any(part in {"", ".", ".."} for part in pure_path.parts)
+        ):
+            raise SystemExit("production shell archive contains a non-canonical path")
+        if normalized_name in seen:
+            raise SystemExit("production shell archive contains a duplicate member")
+        seen.add(normalized_name)
+
+        allowed = (
+            normalized_name in required_files
+            or normalized_name in allowed_directories
+            or normalized_name.startswith("frontend/")
+        )
+        if not allowed:
+            raise SystemExit("production shell archive contains an unexpected member")
+        if not member.isfile() and not member.isdir():
+            raise SystemExit("production shell archive contains a non-data member")
+        if member.size < 0 or member.size > max_expanded_bytes:
+            raise SystemExit("production shell archive member size is out of bounds")
+        expanded_bytes += member.size
+        if expanded_bytes > max_expanded_bytes:
+            raise SystemExit("production shell archive expanded size is out of bounds")
+        if member.isfile():
+            if normalized_name == "scripts/ops/postgres_backup.sh" and (
+                member.mode & 0o777
+            ) != 0o755:
+                raise SystemExit("PostgreSQL backup helper archive mode drifted")
+            files_seen.add(normalized_name)
+        normalized_members.append((member, normalized_name))
+
+    if not required_files.issubset(files_seen) or "frontend" not in seen:
+        raise SystemExit("production shell archive is missing a canonical member")
+
+    if operation == "extract":
+        payload_root = private_root / "payload"
+        payload_root.mkdir(mode=0o700)
+        for member, normalized_name in sorted(
+            normalized_members,
+            key=lambda item: (len(PurePosixPath(item[1]).parts), item[1]),
+        ):
+            target = payload_root.joinpath(*PurePosixPath(normalized_name).parts)
+            if member.isdir():
+                target.mkdir(mode=0o755, parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+            source = archive.extractfile(member)
+            if source is None:
+                raise SystemExit("production shell archive member cannot be read")
+            target_fd = os.open(
+                target,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | no_follow | getattr(os, "O_CLOEXEC", 0),
+                member.mode & 0o777,
+            )
+            try:
+                os.fchmod(target_fd, member.mode & 0o777)
+                with source, os.fdopen(target_fd, "wb", closefd=False) as destination:
+                    shutil.copyfileobj(source, destination, length=1024 * 1024)
+                    destination.flush()
+                    os.fsync(destination.fileno())
+            finally:
+                os.close(target_fd)
+PY
+}
+
+validate_shell_bundle_archive() {
+  if [ -z "$SHELL_BUNDLE_ARCHIVE" ]; then
+    return 0
+  fi
+  if [ -n "$SHELL_BUNDLE_DIR" ]; then
+    echo "❌ SHELL_BUNDLE_ARCHIVE and SHELL_BUNDLE_DIR are mutually exclusive" >&2
+    return 1
+  fi
+
+  local resolved_tmp
+  resolved_tmp="$(cd /tmp && pwd -P)"
+  local validation_root
+  validation_root="$(mktemp -d "$resolved_tmp/pulseplate-shell-bundle-validation.XXXXXX")"
+  chmod 700 "$validation_root"
+  validation_root="$(cd "$validation_root" && pwd -P)"
+  local validation_status=0
+  local cleanup_failed=0
+  local original_bundle_dir="$SHELL_BUNDLE_DIR"
+  if process_shell_bundle_archive extract "$validation_root"; then
+    SHELL_BUNDLE_DIR="$validation_root/payload"
+    if validate_shell_bundle_contract; then
+      validation_status=0
+    else
+      validation_status=$?
+    fi
+  else
+    validation_status=$?
+  fi
+  SHELL_BUNDLE_DIR="$original_bundle_dir"
+  case "$validation_root" in
+    "$resolved_tmp"/pulseplate-shell-bundle-validation.*)
+      if [ -d "$validation_root" ] && [ ! -L "$validation_root" ]; then
+        if ! rm -rf -- "$validation_root"; then
+          cleanup_failed=1
+        fi
+      else
+        cleanup_failed=1
+      fi
+      ;;
+    *)
+      echo "❌ Refusing cleanup for an unbounded shell-bundle validation directory" >&2
+      cleanup_failed=1
+      ;;
+  esac
+  if [ "$validation_status" -eq 0 ] && [ "$cleanup_failed" -ne 0 ]; then
+    return 1
+  elif [ "$validation_status" -ne 0 ] && [ "$cleanup_failed" -ne 0 ]; then
+    echo "❌ Shell-bundle validation cleanup also failed; preserving primary exit $validation_status" >&2
+  fi
+  return "$validation_status"
+}
+
+extract_shell_bundle_archive() {
+  if [ -z "$SHELL_BUNDLE_ARCHIVE" ]; then
+    return 0
+  fi
+
+  ARCHIVE_EXTRACT_DIR="$(mktemp -d /tmp/pulseplate-shell-bundle-extract.XXXXXX)"
+  chmod 700 "$ARCHIVE_EXTRACT_DIR"
+  ARCHIVE_EXTRACT_DIR="$(cd "$ARCHIVE_EXTRACT_DIR" && pwd -P)"
+  process_shell_bundle_archive extract "$ARCHIVE_EXTRACT_DIR"
+  SHELL_BUNDLE_DIR="$ARCHIVE_EXTRACT_DIR/payload"
+}
+
+cleanup_shell_bundle_archive() {
+  local cleanup_failed=0
+  if [ -n "$ARCHIVE_EXTRACT_DIR" ]; then
+    local resolved_tmp
+    resolved_tmp="$(cd /tmp && pwd -P)"
+    case "$ARCHIVE_EXTRACT_DIR" in
+      "$resolved_tmp"/pulseplate-shell-bundle-extract.*)
+        if ! rm -rf -- "$ARCHIVE_EXTRACT_DIR"; then
+          cleanup_failed=1
+        fi
+        ;;
+      *)
+        echo "❌ Refusing to clean an unexpected shell-bundle extraction path" >&2
+        cleanup_failed=1
+        ;;
+    esac
+  fi
+  if [ -n "$SHELL_BUNDLE_ARCHIVE" ]; then
+    if [[ "$SHELL_BUNDLE_ARCHIVE" =~ ^/tmp/pulseplate-shell-bundle-[0-9]+-[0-9]+\.tgz$ ]] && \
+       [ -f "$SHELL_BUNDLE_ARCHIVE" ] && [ ! -L "$SHELL_BUNDLE_ARCHIVE" ]; then
+      if ! rm -f -- "$SHELL_BUNDLE_ARCHIVE"; then
+        cleanup_failed=1
+      fi
+    elif [ -e "$SHELL_BUNDLE_ARCHIVE" ] || [ -L "$SHELL_BUNDLE_ARCHIVE" ]; then
+      echo "❌ Refusing to clean an unsafe shell-bundle archive path" >&2
+      cleanup_failed=1
+    fi
+  fi
+  return "$cleanup_failed"
+}
+
+cleanup_deploy_runtime() {
+  local original_status=$?
+  local cleanup_failed=0
+  trap - EXIT
+  if ! cleanup_ghcr_credentials; then
+    cleanup_failed=1
+  fi
+  if ! cleanup_shell_bundle_archive; then
+    cleanup_failed=1
+  fi
+  if [ "$original_status" -eq 0 ] && [ "$cleanup_failed" -ne 0 ]; then
+    original_status=1
+  elif [ "$original_status" -ne 0 ] && [ "$cleanup_failed" -ne 0 ]; then
+    echo "❌ Deploy cleanup also failed; preserving primary exit $original_status" >&2
+  fi
+  exit "$original_status"
+}
+
+sync_shell_bundle() {
+  local sync_mode="${1:-full}"
+  case "$sync_mode" in
+    compose-only|full)
+      ;;
+    *)
+      echo "❌ Unsupported shell bundle sync mode: $sync_mode" >&2
+      exit 1
+      ;;
+  esac
+
+  if [ -z "$SHELL_BUNDLE_DIR" ]; then
+    return 0
+  fi
+
+  if [ -z "$DEPLOY_DIR" ]; then
+    echo "❌ DEPLOY_DIR is required when SHELL_BUNDLE_DIR is set" >&2
+    exit 1
+  fi
+
+  local source_frontend="$SHELL_BUNDLE_DIR/frontend"
+  local source_caddyfile="$SHELL_BUNDLE_DIR/deploy/Caddyfile.production"
+  local source_compose=""
+  local source_prometheus_config="$SHELL_BUNDLE_DIR/deploy/prometheus/prometheus.yml"
+  local source_prometheus_rules="$SHELL_BUNDLE_DIR/deploy/prometheus/alias-alerts.yml"
+  local source_prometheus_manifest="$SHELL_BUNDLE_DIR/deploy/prometheus/image-manifest.json"
+  local source_alertmanager_config="$SHELL_BUNDLE_DIR/deploy/alertmanager/alertmanager.yml"
+  local source_alertmanager_ignore="$SHELL_BUNDLE_DIR/deploy/alertmanager/trivy-ignore.yaml"
+  local source_postgres_manifest="$SHELL_BUNDLE_DIR/deploy/postgres-pgvector/image-manifest.json"
+  local source_diagnose="$SHELL_BUNDLE_DIR/scripts/diagnose_web.sh"
+  local source_redeploy="$SHELL_BUNDLE_DIR/scripts/redeploy_caddy.sh"
+  local source_backup_helper="$SHELL_BUNDLE_DIR/scripts/ops/postgres_backup.sh"
+  local compose_relative_path="$COMPOSE_RELATIVE_IDENTITY"
+
+  if [ -z "$RESOLVED_COMPOSE_FILE" ]; then
+    echo "❌ Could not resolve a compose filename for shell bundle sync" >&2
+    exit 1
+  fi
+
+  source_compose="$SHELL_BUNDLE_DIR/$compose_relative_path"
+
+  if [ -L "$source_frontend" ] || [ ! -d "$source_frontend" ]; then
+    echo "❌ SHELL_BUNDLE_DIR is missing frontend/: $source_frontend" >&2
+    exit 1
+  fi
+
+  if [ -L "$source_caddyfile" ] || [ ! -f "$source_caddyfile" ]; then
+    echo "❌ SHELL_BUNDLE_DIR is missing deploy/Caddyfile.production: $source_caddyfile" >&2
+    exit 1
+  fi
+
+  if [ -L "$source_compose" ] || [ ! -f "$source_compose" ]; then
+    echo "❌ SHELL_BUNDLE_DIR is missing $compose_relative_path: $source_compose" >&2
+    exit 1
+  fi
+
+  validate_regular_non_symlink_file "$source_prometheus_config" \
+    "Incoming Prometheus configuration"
+  validate_regular_non_symlink_file "$source_prometheus_rules" \
+    "Incoming Prometheus rules"
+  validate_regular_non_symlink_file "$source_prometheus_manifest" \
+    "Incoming Prometheus image manifest"
+  validate_regular_non_symlink_file "$source_alertmanager_config" \
+    "Incoming Alertmanager configuration"
+  validate_regular_non_symlink_file "$source_alertmanager_ignore" \
+    "Incoming Alertmanager Trivy exception"
+  validate_regular_non_symlink_file "$source_postgres_manifest" \
+    "Incoming PostgreSQL image manifest"
+
+  if [ -L "$source_redeploy" ] || [ ! -f "$source_redeploy" ]; then
+    echo "❌ SHELL_BUNDLE_DIR is missing scripts/redeploy_caddy.sh: $source_redeploy" >&2
+    exit 1
+  fi
+  validate_regular_non_symlink_file "$source_backup_helper" \
+    "Incoming PostgreSQL backup helper"
+
+  if [ -L "$source_diagnose" ]; then
+    echo "❌ Optional diagnose helper must not be a symlink" >&2
+    exit 1
+  fi
+  if [ ! -f "$source_diagnose" ]; then
+    source_diagnose=""
+  fi
+
+  if [ "$sync_mode" = "compose-only" ]; then
+    publish_contract_files_safely \
+      "$source_compose" \
+      "$source_prometheus_config" \
+      "$source_prometheus_rules" \
+      "$source_prometheus_manifest" \
+      "$source_alertmanager_config" \
+      "$source_alertmanager_ignore" \
+      "$source_postgres_manifest" \
+      "$source_backup_helper"
+    echo "Synced production Compose, Prometheus, PostgreSQL image, and reviewed backup-helper contracts before worker operations"
+    return 0
+  fi
+
+  echo "Syncing production shell bundle from: $SHELL_BUNDLE_DIR"
+  publish_full_bundle_safely \
+    "$source_frontend" \
+    "$source_caddyfile" \
+    "$source_diagnose" \
+    "$source_redeploy"
+}
+
+wait_for_app_ready() {
+  local max_wait="${1:-30}"
+  local wait_count=0
+
+  while [ "$wait_count" -lt "$max_wait" ]; do
+    local app_container
+    app_container="$(dc ps -q app | tr -d '\n\r ')"
+    if [ -n "${app_container:-}" ] && "$DOCKER_BIN" exec "$app_container" python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/ready').read()" 2>/dev/null; then
+      echo "app is ready"
+      return 0
+    fi
+    wait_count=$((wait_count + 1))
+    echo "Waiting for app readiness... ($wait_count/$max_wait)"
+    sleep 1
+  done
+
+  echo "❌ App failed to become ready within $max_wait seconds" >&2
+  return 1
+}
+
+wait_for_postgres_ready() {
+  local max_wait="${1:-60}"
+  local wait_count=0
+
+  while [ "$wait_count" -lt "$max_wait" ]; do
+    local postgres_container=""
+    local postgres_health="unknown"
+    postgres_container="$(dc ps -q postgres | tr -d '\n\r ')"
+    if [ -n "$postgres_container" ]; then
+      if inspected_health="$($DOCKER_BIN inspect \
+          --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
+          "$postgres_container" 2>/dev/null)"; then
+        postgres_health="$inspected_health"
+      fi
+    fi
+    if [ -n "$postgres_container" ] && [ "$postgres_health" = "healthy" ]; then
+      echo "PostgreSQL is healthy"
+      return 0
+    fi
+    wait_count=$((wait_count + 1))
+    echo "Waiting for PostgreSQL readiness... ($wait_count/$max_wait)"
+    sleep 1
+  done
+
+  echo "❌ PostgreSQL failed to become healthy within $max_wait seconds" >&2
+  return 1
+}
+
+read_rendered_postgres_volume_name() {
+  dc config --format json | "$PYTHON_BIN" -c '
+import json
+import re
+import sys
+
+try:
+    payload = json.load(sys.stdin)
+except (TypeError, ValueError, json.JSONDecodeError) as exc:
+    raise SystemExit("Rendered Compose JSON is malformed") from exc
+volumes = payload.get("volumes") if type(payload) is dict else None
+postgres_data = volumes.get("postgres_data") if type(volumes) is dict else None
+name = postgres_data.get("name") if type(postgres_data) is dict else None
+if type(name) is not str or re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}", name) is None:
+    raise SystemExit("Rendered PostgreSQL volume identity is missing or malformed")
+print(name)
+'
+}
+
+require_absent_postgres_volume() {
+  local volume_names=""
+  local volume_status=0
+  if volume_names="$("$DOCKER_BIN" volume ls --quiet)"; then
+    :
+  else
+    volume_status=$?
+    echo "❌ Unable to establish PostgreSQL volume absence; HOLD" >&2
+    return "$volume_status"
+  fi
+
+  local observed_volume=""
+  while IFS= read -r observed_volume; do
+    if [ -z "$observed_volume" ]; then
+      continue
+    fi
+    if [[ ! "$observed_volume" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$ ]]; then
+      echo "❌ Docker PostgreSQL volume listing is malformed; HOLD" >&2
+      return 1
+    fi
+    if [ "$observed_volume" = "$POSTGRES_VOLUME_NAME" ]; then
+      echo "❌ PostgreSQL volume exists without one trustworthy running container; HOLD" >&2
+      return 1
+    fi
+  done <<< "$volume_names"
+}
+
+read_existing_postgres_state() {
+  local container_id="$1"
+  "$DOCKER_BIN" inspect "$container_id" | "$PYTHON_BIN" -c '
+import json
+import re
+import sys
+
+try:
+    payload = json.load(sys.stdin)
+except (TypeError, ValueError, json.JSONDecodeError) as exc:
+    raise SystemExit("Existing PostgreSQL container inspect JSON is malformed") from exc
+if type(payload) is not list or len(payload) != 1 or type(payload[0]) is not dict:
+    raise SystemExit("Existing PostgreSQL inspect must return exactly one container")
+record = payload[0]
+state = record.get("State")
+config = record.get("Config")
+mounts = record.get("Mounts")
+if type(state) is not dict or state.get("Running") is not True:
+    raise SystemExit("Existing PostgreSQL container must be running")
+health = state.get("Health")
+if type(health) is not dict or health.get("Status") != "healthy":
+    raise SystemExit("Existing PostgreSQL container must be healthy")
+if type(config) is not dict or type(config.get("Image")) is not str:
+    raise SystemExit("Existing PostgreSQL configured image is malformed")
+environment = config.get("Env")
+if type(environment) is not list or any(type(item) is not str for item in environment):
+    raise SystemExit("Existing PostgreSQL environment is malformed")
+pgdata_values = [item.removeprefix("PGDATA=") for item in environment if item.startswith("PGDATA=")]
+if pgdata_values != ["/var/lib/postgresql/data"]:
+    raise SystemExit("Existing PostgreSQL must have one exact PGDATA value")
+if type(mounts) is not list:
+    raise SystemExit("Existing PostgreSQL mounts are malformed")
+data_mounts = [item for item in mounts if type(item) is dict and item.get("Destination") == "/var/lib/postgresql/data"]
+if len(data_mounts) != 1:
+    raise SystemExit("Existing PostgreSQL must have one exact data mount")
+mount = data_mounts[0]
+if (
+    mount.get("Type") != "volume"
+    or type(mount.get("Name")) is not str
+    or mount.get("RW") is not True
+):
+    raise SystemExit("Existing PostgreSQL data mount must be one named volume")
+container = record.get("Id")
+image_id = record.get("Image")
+if type(container) is not str or re.fullmatch(r"[0-9a-f]{12,64}", container) is None:
+    raise SystemExit("Existing PostgreSQL container ID is malformed")
+if type(image_id) is not str or re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is None:
+    raise SystemExit("Existing PostgreSQL image ID is malformed")
+print("\t".join((container, image_id, config["Image"], pgdata_values[0], mount["Name"])))
+'
+}
+
+validate_existing_postgres_image_identity() {
+  local image_id="$1"
+  local configured_image="$2"
+  case "$configured_image" in
+    postgres:15-alpine | docker.io/library/postgres:15-alpine | \
+      postgres:15-alpine@sha256:a2c20749c564b4eb73a77bfda626f8a3cde1bbfae020fb97c616a00cdc1a2181 | \
+      docker.io/library/postgres:15-alpine@sha256:a2c20749c564b4eb73a77bfda626f8a3cde1bbfae020fb97c616a00cdc1a2181)
+      if [ "$image_id" != "sha256:aad6289ca337b3ce76896f2e7e61480490152886c7828120371fb28e6b779e1d" ]; then
+        echo "❌ Existing legacy PostgreSQL image ID does not match the frozen predecessor" >&2
+        return 1
+      fi
+      ;;
+    "$POSTGRES_RUNTIME_REF")
+      local platform_image_id="${POSTGRES_RUNTIME_REF##*@}"
+      if [ "$image_id" = "sha256:643c5c00d70c37d83a0ab6db8b0996e4c03fb82c4769a45b03eef0cf3ee2abd5" ] || \
+         [ "$image_id" = "$platform_image_id" ]; then
+        if validate_postgres_image_metadata \
+            "$POSTGRES_RUNTIME_REF" "$POSTGRES_RUNTIME_REF" "$image_id" 2>/dev/null; then
+          :
+        else
+          echo "❌ Existing current PostgreSQL image metadata is not the frozen candidate" >&2
+          return 1
+        fi
+      else
+        echo "❌ Existing current PostgreSQL image ID does not match the frozen candidate" >&2
+        return 1
+      fi
+      ;;
+    "ghcr.io/katsiarynakavaleuskaya/pulseplate:postgres-15.19-pgvector0.8.6-alpine3.23@sha256:06c914735c70f82424a2a9b1e57790590a21d0fbfe250504ff79a1cca2559380")
+      if [ "$image_id" = "sha256:c822c68e22d0358e66cee17e06f7b3ece5d1538cb8b607c1376b59620866ceff" ] || \
+         [ "$image_id" = "sha256:06c914735c70f82424a2a9b1e57790590a21d0fbfe250504ff79a1cca2559380" ]; then
+        if validate_postgres_image_metadata \
+            "$configured_image" "$configured_image" "$image_id" 2>/dev/null; then
+          :
+        else
+          echo "Existing prior PostgreSQL image metadata is not the frozen predecessor" >&2
+          return 1
+        fi
+      else
+        echo "Existing prior PostgreSQL image ID does not match the frozen predecessor" >&2
+        return 1
+      fi
+      ;;
+    *)
+      echo "❌ Existing PostgreSQL configured image is outside the closed transition set" >&2
+      return 1
+      ;;
+  esac
+}
+
+read_existing_postgres_runtime_state() {
+  local container_id="$1"
+  "$DOCKER_BIN" exec "$container_id" sh -ec '
+postgres_uid="$(id -u postgres)"
+server_version_num="$(psql --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" --tuples-only --no-align --quiet --command "SHOW server_version_num")"
+data_directory="$(psql --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" --tuples-only --no-align --quiet --command "SHOW data_directory")"
+test "$postgres_uid" = "70"
+test "$server_version_num" = "150019"
+test "$data_directory" = "/var/lib/postgresql/data"
+printf "%s\t%s\t%s\n" "$postgres_uid" "$server_version_num" "$data_directory"
+'
+}
+
+assert_existing_postgres_unchanged() {
+  local expected_state="$1"
+  local expected_runtime="$2"
+  local current_container=""
+  current_container="$(dc ps -q postgres | tr -d '\r')"
+  if [ -z "$current_container" ] || [[ "$current_container" == *$'\n'* ]]; then
+    echo "❌ Existing PostgreSQL container identity changed during transition" >&2
+    return 1
+  fi
+  if [ "$(read_existing_postgres_state "$current_container")" != "$expected_state" ]; then
+    echo "❌ Existing PostgreSQL container/image/volume identity drifted" >&2
+    return 1
+  fi
+  if [ "$(read_existing_postgres_runtime_state "$current_container")" != "$expected_runtime" ]; then
+    echo "❌ Existing PostgreSQL runtime identity drifted" >&2
+    return 1
+  fi
+}
+
+capture_running_service_container() {
+  local service="$1"
+  local container_id=""
+  local running_state=""
+  container_id="$(dc ps -q "$service" | tr -d '\r')"
+  if [[ "$container_id" == *$'\n'* ]]; then
+    echo "❌ Expected at most one ${service} container" >&2
+    return 1
+  fi
+  if [ -z "$container_id" ]; then
+    return 0
+  fi
+  if ! running_state="$("$DOCKER_BIN" inspect --format '{{.State.Running}}' "$container_id" | tr -d '\r')"; then
+    echo "❌ Unable to inspect ${service} container running state" >&2
+    return 1
+  fi
+  case "$running_state" in
+    true) printf '%s\n' "$container_id" ;;
+    false) ;;
+    *)
+      echo "❌ Invalid ${service} container running state" >&2
+      return 1
+      ;;
+  esac
+}
+
+restart_captured_product_containers() {
+  local cleanup_failed=0
+  local container_id
+  for container_id in "$CAPTURED_APP_ID" "$CAPTURED_CADDY_ID" "$CAPTURED_WORKER_ID"; do
+    if [ -n "$container_id" ]; then
+      if ! "$DOCKER_BIN" start "$container_id" >/dev/null; then
+        cleanup_failed=1
+      fi
+    fi
+  done
+  return "$cleanup_failed"
+}
+
+restart_captured_product_containers_after_failure() {
+  if ! restart_captured_product_containers; then
+    echo "❌ Restart of one or more captured product containers also failed; preserving primary exit" >&2
+  fi
+  return 0
+}
+
+validate_backup_receipt() {
+  local backup_output="$1"
+  local postgres_container_id="$2"
+  local backup_path="${backup_output##*Backup created: }"
+  if [ "$backup_path" = "$backup_output" ] || [[ "$backup_path" != "$BACKUP_DIR"/pulseplate_*.dump ]]; then
+    echo "❌ PostgreSQL backup helper did not return one bounded receipt" >&2
+    return 1
+  fi
+  if [ -L "$backup_path" ] || [ ! -f "$backup_path" ] || [ ! -s "$backup_path" ]; then
+    echo "❌ PostgreSQL backup receipt must be one nonempty regular non-symlink file" >&2
+    return 1
+  fi
+  local backup_metadata
+  local backup_mode
+  if ! backup_metadata="$(read_owner_mode "$backup_path")"; then
+    return 1
+  fi
+  backup_mode="${backup_metadata##*:}"
+  if [ "$backup_mode" != "600" ]; then
+    echo "❌ PostgreSQL backup receipt must use mode 0600; got $backup_mode" >&2
+    return 1
+  fi
+  if ! "$DOCKER_BIN" exec -i "$postgres_container_id" pg_restore --list \
+      < "$backup_path" >/dev/null; then
+    echo "❌ PostgreSQL backup receipt is not a listable custom-format dump" >&2
+    return 1
+  fi
+  local receipt_metadata
+  receipt_metadata="$("$PYTHON_BIN" - "$backup_path" <<'PY'
+import hashlib
+import os
+import stat
+import sys
+
+descriptor = os.open(sys.argv[1], os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+try:
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_size <= 0:
+        raise SystemExit("backup receipt metadata drifted")
+    digest = hashlib.sha256()
+    while chunk := os.read(descriptor, 1024 * 1024):
+        digest.update(chunk)
+finally:
+    os.close(descriptor)
+print(f"size={metadata.st_size} sha256={digest.hexdigest()}")
+PY
+)"
+  printf 'Verified PostgreSQL backup metadata: %s\n' "$receipt_metadata" >&2
+  printf '%s\n' "$backup_path"
+}
+
+validate_managed_postgres_contract() {
+  case "${DATABASE_URL:-}" in
+    postgresql+psycopg://*)
+      ;;
+    *)
+      echo "❌ DATABASE_URL must use canonical Postgres DSN (postgresql+psycopg://...)" >&2
+      exit 1
+      ;;
+  esac
+
+  case "$DATABASE_URL" in
+    *@postgres:*/* | *@postgres/*)
+      echo "❌ Production deploy expects external managed PostgreSQL, not compose-local @postgres" >&2
+      exit 1
+      ;;
+  esac
+
+  local service
+  while IFS= read -r service; do
+    if [ "$service" = "postgres" ]; then
+      echo "❌ Managed production Compose must not contain a local postgres service" >&2
+      exit 1
+    fi
+  done < <(dc config --services)
+}
+
+validate_self_hosted_postgres_contract() {
+  : "${POSTGRES_DB:?POSTGRES_DB is required for self-hosted PostgreSQL}"
+  : "${POSTGRES_USER:?POSTGRES_USER is required for self-hosted PostgreSQL}"
+  : "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required for self-hosted PostgreSQL}"
+  if [ -z "$SHELL_BUNDLE_DIR" ] && [ -z "$SHELL_BUNDLE_ARCHIVE" ]; then
+    echo "❌ Self-hosted PostgreSQL deploy requires one reviewed shell-bundle carrier" >&2
+    exit 1
+  fi
+  if [ "$BACKUP_HELPER" != "$DEPLOY_DIR/scripts/ops/postgres_backup.sh" ]; then
+    echo "❌ Self-hosted PostgreSQL backup helper must use the canonical deployed path" >&2
+    exit 1
+  fi
+  case "$BACKUP_DIR" in
+    /*)
+      ;;
+    *)
+      echo "❌ Self-hosted PostgreSQL BACKUP_DIR must be absolute" >&2
+      exit 1
+      ;;
+  esac
+
+  local postgres_seen=0
+  local service
+  while IFS= read -r service; do
+    if [ "$service" = "postgres" ]; then
+      postgres_seen=$((postgres_seen + 1))
+    fi
+  done < <(dc config --services)
+  if [ "$postgres_seen" -ne 1 ]; then
+    echo "❌ Self-hosted production Compose must contain exactly one postgres service" >&2
+    exit 1
+  fi
+}
+
+validate_published_backup_helper_binding() {
+  if [ -z "$SHELL_BUNDLE_DIR" ]; then
+    echo "❌ Reviewed shell bundle is unavailable for backup-helper binding" >&2
+    return 1
+  fi
+  validate_contract_destinations_safely
+  local source_backup_helper="$SHELL_BUNDLE_DIR/scripts/ops/postgres_backup.sh"
+  "$PYTHON_BIN" - "$source_backup_helper" "$BACKUP_HELPER" <<'PY'
+from __future__ import annotations
+
+import os
+import stat
+import sys
+
+max_bytes = 4 * 1024 * 1024
+no_follow = getattr(os, "O_NOFOLLOW", 0)
+if no_follow <= 0:
+    raise SystemExit("backup-helper no-follow validation is unavailable")
+
+
+def read_reviewed_file(raw_path: str, *, label: str) -> bytes:
+    if not os.path.isabs(raw_path) or os.path.normpath(raw_path) != raw_path:
+        raise SystemExit(f"{label} path must be canonical and absolute")
+    try:
+        descriptor = os.open(
+            raw_path,
+            os.O_RDONLY | no_follow | getattr(os, "O_CLOEXEC", 0),
+        )
+    except OSError as exc:
+        raise SystemExit(f"{label} cannot be opened safely") from exc
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != 0o755
+            or before.st_uid != os.geteuid()
+            or before.st_size <= 0
+            or before.st_size > max_bytes
+        ):
+            raise SystemExit(f"{label} metadata does not match the reviewed contract")
+        remaining = before.st_size
+        chunks: list[bytes] = []
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise SystemExit(f"{label} changed while being read")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise SystemExit(f"{label} grew while being read")
+        after = os.fstat(descriptor)
+        if (
+            after.st_dev != before.st_dev
+            or after.st_ino != before.st_ino
+            or after.st_size != before.st_size
+            or after.st_mtime_ns != before.st_mtime_ns
+            or after.st_ctime_ns != before.st_ctime_ns
+        ):
+            raise SystemExit(f"{label} identity changed while being read")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+source_bytes = read_reviewed_file(sys.argv[1], label="reviewed backup-helper source")
+published_bytes = read_reviewed_file(sys.argv[2], label="published backup-helper destination")
+if published_bytes != source_bytes:
+    raise SystemExit("published backup helper does not match the reviewed shell bundle")
+PY
+}
+
+validate_production_database_contract() {
+  case "$PRODUCTION_DB_TOPOLOGY" in
+    managed)
+      validate_managed_postgres_contract
+      ;;
+    self-hosted)
+      validate_self_hosted_postgres_contract
+      ;;
+    *)
+      echo "❌ Unsupported production database topology" >&2
+      exit 1
+      ;;
+  esac
+}
+
+validate_scheduler_mode_contract() {
+  FOOD_UPDATE_SCHEDULER_MODE="${FOOD_UPDATE_SCHEDULER_MODE-external}"
+  case "$FOOD_UPDATE_SCHEDULER_MODE" in
+    external|disabled)
+      ;;
+    in_process_dev)
+      echo "❌ Production deploy forbids FOOD_UPDATE_SCHEDULER_MODE=in_process_dev" >&2
+      exit 1
+      ;;
+    *)
+      echo "❌ FOOD_UPDATE_SCHEDULER_MODE must be exactly external or disabled" >&2
+      exit 1
+      ;;
+  esac
+  export FOOD_UPDATE_SCHEDULER_MODE
+}
+
+validate_shell_bundle_contract() {
+  local source_frontend=""
+  local source_caddyfile=""
+  local source_compose=""
+  local source_prometheus_config=""
+  local source_prometheus_rules=""
+  local source_prometheus_manifest=""
+  local source_alertmanager_config=""
+  local source_alertmanager_ignore=""
+  local source_postgres_manifest=""
+  local compose_relative_path=""
+  local required_redeploy=""
+  local required_backup_helper=""
+  local optional_diagnose=""
+
+  if [ -z "$SHELL_BUNDLE_DIR" ]; then
+    return 0
+  fi
+
+  if [ -z "$DEPLOY_DIR" ]; then
+    echo "❌ DEPLOY_DIR is required when SHELL_BUNDLE_DIR is set" >&2
+    exit 1
+  fi
+
+  if [ -z "$RESOLVED_COMPOSE_FILE" ]; then
+    echo "❌ Could not resolve a compose filename for shell bundle validation" >&2
+    exit 1
+  fi
+
+  source_frontend="$SHELL_BUNDLE_DIR/frontend"
+  source_caddyfile="$SHELL_BUNDLE_DIR/deploy/Caddyfile.production"
+  source_prometheus_config="$SHELL_BUNDLE_DIR/deploy/prometheus/prometheus.yml"
+  source_prometheus_rules="$SHELL_BUNDLE_DIR/deploy/prometheus/alias-alerts.yml"
+  source_prometheus_manifest="$SHELL_BUNDLE_DIR/deploy/prometheus/image-manifest.json"
+  source_alertmanager_config="$SHELL_BUNDLE_DIR/deploy/alertmanager/alertmanager.yml"
+  source_alertmanager_ignore="$SHELL_BUNDLE_DIR/deploy/alertmanager/trivy-ignore.yaml"
+  source_postgres_manifest="$SHELL_BUNDLE_DIR/deploy/postgres-pgvector/image-manifest.json"
+  required_backup_helper="$SHELL_BUNDLE_DIR/scripts/ops/postgres_backup.sh"
+
+  if [[ "$RESOLVED_COMPOSE_FILE" = /* ]]; then
+    case "$RESOLVED_COMPOSE_FILE" in
+      "$DEPLOY_DIR"/*)
+        compose_relative_path="${RESOLVED_COMPOSE_FILE#"$DEPLOY_DIR"/}"
+        ;;
+      *)
+        echo "❌ COMPOSE_FILE must stay within DEPLOY_DIR: $RESOLVED_COMPOSE_FILE" >&2
+        exit 1
+        ;;
+    esac
+  else
+    compose_relative_path="${RESOLVED_COMPOSE_FILE#./}"
+    case "$compose_relative_path" in
+      ""|"."|..|../*|*/../*|*/..)
+        echo "❌ COMPOSE_FILE must stay within DEPLOY_DIR: $RESOLVED_COMPOSE_FILE" >&2
+        exit 1
+        ;;
+    esac
+  fi
+
+  if [[ "$compose_relative_path" = deploy/* ]]; then
+    source_compose="$SHELL_BUNDLE_DIR/$compose_relative_path"
+  else
+    source_compose="$SHELL_BUNDLE_DIR/deploy/$compose_relative_path"
+  fi
+
+  if [ -L "$source_frontend" ] || [ ! -d "$source_frontend" ]; then
+    echo "❌ SHELL_BUNDLE_DIR is missing frontend/: $source_frontend" >&2
+    exit 1
+  fi
+
+  if [ -L "$source_caddyfile" ] || [ ! -f "$source_caddyfile" ]; then
+    echo "❌ SHELL_BUNDLE_DIR is missing deploy/Caddyfile.production: $source_caddyfile" >&2
+    exit 1
+  fi
+
+  if [ -L "$source_compose" ] || [ ! -f "$source_compose" ]; then
+    echo "❌ SHELL_BUNDLE_DIR is missing $compose_relative_path: $source_compose" >&2
+    exit 1
+  fi
+
+  validate_regular_non_symlink_file "$source_prometheus_config" \
+    "Incoming Prometheus configuration"
+  validate_regular_non_symlink_file "$source_prometheus_rules" \
+    "Incoming Prometheus rules"
+  validate_regular_non_symlink_file "$source_prometheus_manifest" \
+    "Incoming Prometheus image manifest"
+  validate_regular_non_symlink_file "$source_alertmanager_config" \
+    "Incoming Alertmanager configuration"
+  validate_regular_non_symlink_file "$source_alertmanager_ignore" \
+    "Incoming Alertmanager Trivy exception"
+  validate_regular_non_symlink_file "$source_postgres_manifest" \
+    "Incoming PostgreSQL image manifest"
+
+  required_redeploy="$SHELL_BUNDLE_DIR/scripts/redeploy_caddy.sh"
+  if [ -L "$required_redeploy" ] || [ ! -f "$required_redeploy" ]; then
+    echo "❌ SHELL_BUNDLE_DIR is missing scripts/redeploy_caddy.sh: $required_redeploy" >&2
+    exit 1
+  fi
+  validate_regular_non_symlink_file "$required_backup_helper" \
+    "Incoming PostgreSQL backup helper"
+
+  optional_diagnose="$SHELL_BUNDLE_DIR/scripts/diagnose_web.sh"
+  if [ -L "$optional_diagnose" ]; then
+    echo "❌ Optional diagnose helper must not be a symlink" >&2
+    exit 1
+  fi
+  if [ ! -f "$optional_diagnose" ]; then
+    optional_diagnose=""
+  fi
+
+  validate_prometheus_contract_identity "$source_prometheus_manifest" "$source_compose"
+  validate_alertmanager_contract "$source_compose" "$source_prometheus_config" \
+    "$source_prometheus_rules" "$source_alertmanager_config" "$source_alertmanager_ignore"
+  if [ "$PRODUCTION_DB_TOPOLOGY" = "self-hosted" ]; then
+    validate_postgres_contract_identity "$source_postgres_manifest" "$source_compose"
+  fi
+  validate_full_bundle_safely \
+    "$source_frontend" \
+    "$source_caddyfile" \
+    "$optional_diagnose" \
+    "$required_redeploy" \
+    "$required_backup_helper"
+}
+
+run_preflight() {
+  echo "Validating production secret and database contracts..."
+  validate_metrics_secret_metadata
+  validate_contract_destinations_safely
+  validate_shell_bundle_archive
+  if [ -n "$SHELL_BUNDLE_DIR" ]; then
+    validate_shell_bundle_contract
+  elif [ -z "$SHELL_BUNDLE_ARCHIVE" ]; then
+    contract_destination_transaction validate-checkpoint-installed
+    validate_prometheus_contract_files
+    validate_alertmanager_contract_files
+    validate_prometheus_contract_identity \
+      "$PROMETHEUS_IMAGE_MANIFEST" \
+      "$COMPOSE_CONTRACT_PATH"
+    validate_alertmanager_contract "$COMPOSE_CONTRACT_PATH" "$PROMETHEUS_CONFIG" \
+      "$PROMETHEUS_RULES" "$ALERTMANAGER_CONFIG" "$ALERTMANAGER_TRIVY_IGNORE"
+    if [ "$PRODUCTION_DB_TOPOLOGY" = "self-hosted" ]; then
+      validate_postgres_contract_files
+      validate_postgres_contract_identity \
+        "$POSTGRES_IMAGE_MANIFEST" \
+        "$COMPOSE_CONTRACT_PATH"
+    fi
+  fi
+  validate_alertmanager_secret_if_selected
+  validate_production_database_contract
+  validate_scheduler_mode_contract
+  echo "✅ Production deploy preflight passed"
+}
+
+run_preflight
+if [ "$MODE" = "preflight-only" ]; then
+  exit 0
+fi
+
+trap cleanup_deploy_runtime EXIT
+
+if [ -n "$SHELL_BUNDLE_ARCHIVE" ]; then
+  extract_shell_bundle_archive
+  validate_shell_bundle_contract
+fi
+
+login_to_ghcr_if_configured
+
+sync_shell_bundle compose-only
+if [ "$PRODUCTION_DB_TOPOLOGY" = "self-hosted" ]; then
+  validate_published_backup_helper_binding
+fi
+contract_destination_transaction validate-checkpoint-installed
+validate_prometheus_contract_files
+validate_alertmanager_contract_files
+dc config --quiet
+PROMETHEUS_RUNTIME_REF="$(read_prometheus_runtime_ref "$PROMETHEUS_IMAGE_MANIFEST")"
+export PROMETHEUS_RUNTIME_REF
+readonly PROMETHEUS_RUNTIME_REF
+PROMETHEUS_PLATFORM_MANIFEST_DIGEST="${PROMETHEUS_RUNTIME_REF##*@}"
+readonly PROMETHEUS_PLATFORM_MANIFEST_DIGEST
+validate_prometheus_compose_identity "$COMPOSE_CONTRACT_PATH" "$PROMETHEUS_RUNTIME_REF"
+validate_alertmanager_contract "$COMPOSE_CONTRACT_PATH" "$PROMETHEUS_CONFIG" \
+  "$PROMETHEUS_RULES" "$ALERTMANAGER_CONFIG" "$ALERTMANAGER_TRIVY_IGNORE"
+validate_alertmanager_secret_if_selected
+POSTGRES_RUNTIME_REF=""
+if [ "$PRODUCTION_DB_TOPOLOGY" = "self-hosted" ]; then
+  validate_postgres_contract_files
+  POSTGRES_RUNTIME_REF="$(read_postgres_runtime_ref "$POSTGRES_IMAGE_MANIFEST")"
+  readonly POSTGRES_RUNTIME_REF
+  validate_postgres_compose_identity "$COMPOSE_CONTRACT_PATH" "$POSTGRES_RUNTIME_REF"
+  POSTGRES_VOLUME_NAME="$(read_rendered_postgres_volume_name)"
+  readonly POSTGRES_VOLUME_NAME
+fi
+
+echo "Pulling production app image..."
+dc pull app
+
+echo "Pulling production scheduler worker image..."
+dc pull worker
+
+echo "Pulling exact production Prometheus image..."
+dc pull prometheus
+if alertmanager_selected; then
+  dc --profile alerting pull alertmanager
+fi
+
+if [ "$PRODUCTION_DB_TOPOLOGY" = "self-hosted" ]; then
+  echo "Pulling exact self-hosted PostgreSQL image..."
+  dc pull postgres
+fi
+
+echo "Validating the pulled Prometheus platform manifest before product mutation..."
+validate_pulled_prometheus_image "$PROMETHEUS_RUNTIME_REF"
+if alertmanager_selected; then
+  validate_pulled_alertmanager_image
+fi
+
+if [ "$PRODUCTION_DB_TOPOLOGY" = "self-hosted" ]; then
+  echo "Validating the pulled PostgreSQL platform manifest before product mutation..."
+  validate_pulled_postgres_image "$POSTGRES_RUNTIME_REF"
+  echo "Validating the pulled PostgreSQL empty UID 70 mountpoint before product mutation..."
+  validate_pulled_postgres_mountpoint "$POSTGRES_RUNTIME_REF"
+fi
+
+if ! cleanup_ghcr_credentials; then
+  echo "❌ Failed to remove temporary GHCR credentials before runtime mutation" >&2
+  exit 1
+fi
+unset GHCR_TOKEN GHCR_USER ORIGINAL_GHCR_TOKEN ORIGINAL_GHCR_USER
+
+echo "Validating the exact Prometheus configuration before product mutation..."
+dc run --rm --no-deps --entrypoint /bin/promtool prometheus \
+  check config /etc/prometheus/prometheus.yml
+dc run --rm --no-deps --entrypoint /bin/promtool prometheus \
+  check rules /etc/prometheus/alias-alerts.yml
+
+if alertmanager_selected; then
+  "$DOCKER_BIN" run --rm --pull never --platform linux/amd64 --network none --read-only \
+    --user 65534:65534 --cap-drop ALL --security-opt no-new-privileges:true \
+    --mount "type=bind,source=$ALERTMANAGER_CONFIG,target=/etc/alertmanager/alertmanager.yml,readonly" \
+    --entrypoint /bin/amtool \
+    "$(run_alertmanager_contract --alertmanager-contract --phase selected-image --selected-case "$ALERTMANAGER_CASE" --field runtime_ref)" \
+    check-config /etc/alertmanager/alertmanager.yml
+fi
+
+echo "Invoking the canonical application production invariant before product mutation..."
+dc run --rm --no-deps app python -c \
+  'from app.main import app; from app.security.production_invariants import assert_production_runtime_invariants; assert_production_runtime_invariants(app=app)'
+
+if [ "$PRODUCTION_DB_TOPOLOGY" = "self-hosted" ]; then
+  validate_published_backup_helper_binding
+  echo "Censusing and quiescing product containers before self-hosted PostgreSQL transition..."
+  CAPTURED_WORKER_ID="$(capture_running_service_container worker)"
+  CAPTURED_CADDY_ID="$(capture_running_service_container caddy)"
+  CAPTURED_APP_ID="$(capture_running_service_container app)"
+  readonly CAPTURED_WORKER_ID CAPTURED_CADDY_ID CAPTURED_APP_ID
+
+  postgres_container_raw="$(dc ps -q postgres | tr -d '\r')"
+  if [[ "$postgres_container_raw" == *$'\n'* ]]; then
+    echo "❌ Expected at most one existing PostgreSQL container" >&2
+    exit 1
+  fi
+  postgres_transition="fresh"
+  postgres_container=""
+  postgres_image_id=""
+  postgres_configured_image=""
+  postgres_pgdata=""
+  postgres_volume=""
+  postgres_state_receipt=""
+  postgres_runtime_receipt=""
+  if [ -n "$postgres_container_raw" ]; then
+    postgres_transition="existing"
+    postgres_state_receipt="$(read_existing_postgres_state "$postgres_container_raw")"
+    IFS=$'\t' read -r postgres_container postgres_image_id postgres_configured_image \
+      postgres_pgdata postgres_volume <<< "$postgres_state_receipt"
+    validate_existing_postgres_image_identity "$postgres_image_id" "$postgres_configured_image"
+    postgres_runtime_receipt="$(read_existing_postgres_runtime_state "$postgres_container")"
+    if [ "$postgres_volume" != "$POSTGRES_VOLUME_NAME" ]; then
+      echo "❌ Existing PostgreSQL volume does not match rendered Compose identity" >&2
+      exit 1
+    fi
+  else
+    require_absent_postgres_volume
+  fi
+
+  if dc stop worker caddy app; then
+    :
+  else
+    transition_status=$?
+    restart_captured_product_containers_after_failure
+    exit "$transition_status"
+  fi
+
+  if [ "$postgres_transition" = "existing" ]; then
+    if assert_existing_postgres_unchanged "$postgres_state_receipt" "$postgres_runtime_receipt"; then
+      :
+    else
+      identity_status=$?
+      echo "❌ PostgreSQL identity revalidation failed; captured product writers remain quiesced" >&2
+      exit "$identity_status"
+    fi
+    echo "Creating a verified backup from the still-running old self-hosted PostgreSQL container..."
+    backup_output=""
+    if backup_output="$(
+        export DOCKER_BIN BACKUP_DIR POSTGRES_USER POSTGRES_DB ENV_FILE
+        PROJECT_DIR="$COMPOSE_CONTRACT_DIR"
+        COMPOSE_FILE="$COMPOSE_CONTRACT_PATH"
+        export PROJECT_DIR COMPOSE_FILE
+        "$BACKUP_HELPER"
+      )"; then
+      :
+    else
+      backup_status=$?
+      echo "❌ PostgreSQL backup execution failed ambiguously; captured product writers remain quiesced" >&2
+      exit "$backup_status"
+    fi
+    if backup_receipt="$(validate_backup_receipt "$backup_output" "$postgres_container")"; then
+      :
+    else
+      receipt_status=$?
+      echo "❌ PostgreSQL backup receipt validation failed; captured product writers remain quiesced" >&2
+      exit "$receipt_status"
+    fi
+    if assert_existing_postgres_unchanged "$postgres_state_receipt" "$postgres_runtime_receipt"; then
+      :
+    else
+      identity_status=$?
+      echo "❌ PostgreSQL identity revalidation failed; captured product writers remain quiesced" >&2
+      exit "$identity_status"
+    fi
+    echo "Verified self-hosted pre-transition backup receipt: $backup_receipt"
+    if "$DOCKER_BIN" stop "$postgres_container" >/dev/null; then
+      :
+    else
+      stop_status=$?
+      echo "❌ PostgreSQL stop failed ambiguously; captured product writers remain quiesced" >&2
+      exit "$stop_status"
+    fi
+  else
+    echo "Fresh self-hosted PostgreSQL path admitted: rendered named volume is absent"
+    if require_absent_postgres_volume; then
+      :
+    else
+      fresh_volume_status=$?
+      echo "❌ Fresh self-hosted PostgreSQL volume revalidation failed; captured product writers remain quiesced" >&2
+      exit "$fresh_volume_status"
+    fi
+  fi
+
+  echo "Starting exact self-hosted PostgreSQL image without a registry pull..."
+  dc up -d --pull never postgres
+  wait_for_postgres_ready 60
+else
+  echo "Stopping the previous scheduler worker before managed-database migrations..."
+  dc stop worker
+  echo "Managed production database backups remain provider-owned (snapshots / PITR)."
+fi
+
+echo "Running database migrations via one-shot release container..."
+if dc run --rm --no-deps app alembic upgrade head; then
+  echo "✅ Database migrations completed successfully"
+else
+  migration_exit_code=$?
+  echo "❌ Database migrations failed (exit code: $migration_exit_code)" >&2
+  exit "$migration_exit_code"
+fi
+
+sync_shell_bundle
+
+echo "Starting app before exposing traffic..."
+COMPOSE_PROFILES="${COMPOSE_PROFILES:+${COMPOSE_PROFILES},}alerting" \
+dc up -d --remove-orphans app
+wait_for_app_ready 30
+
+if [ "$FOOD_UPDATE_SCHEDULER_MODE" = "external" ]; then
+  echo "Starting scheduler worker after app readiness..."
+  dc up -d --pull never --wait --wait-timeout 30 worker
+else
+  echo "Scheduler mode is disabled; worker container remains absent"
+  dc rm -f worker
+fi
+
+echo "Starting caddy after successful migrations..."
+dc build caddy
+COMPOSE_PROFILES="${COMPOSE_PROFILES:+${COMPOSE_PROFILES},}alerting" \
+dc up -d --remove-orphans caddy
+
+# Healthcheck using --resolve to avoid DNS dependency (works even if DNS is temporarily unavailable)
+# This checks locally via 127.0.0.1 but uses the domain for Host/SNI headers (TLS works correctly)
+DOMAIN="${PRODUCTION_DOMAIN}"
+HEALTH_URL="https://${DOMAIN}/ready"
+attempt=1
+
+# Quick non-blocking HTTP smoke check (diagnostic only; expected 308 -> HTTPS redirect)
+echo "Smoke check HTTP..."
+if "$CURL_BIN" -sS -o /dev/null -w "HTTP:%{http_code}\n" \
+    "http://${DOMAIN}/ready" --resolve "${DOMAIN}:80:127.0.0.1" \
+    --max-time "${HEALTH_CURL_MAX_TIME_S}"; then
+  :
+else
+  echo "⚠️  HTTP redirect diagnostic failed; continuing to the required HTTPS check" >&2
+fi
+
+# Main healthcheck on HTTPS (does not depend on external DNS)
+echo "Healthcheck HTTPS (attempt ${attempt}/${HEALTH_MAX_ATTEMPTS})..."
+until "$CURL_BIN" -fsS --max-time "${HEALTH_CURL_MAX_TIME_S}" "$HEALTH_URL" \
+    --resolve "${DOMAIN}:443:127.0.0.1" > /dev/null; do
+  if [ "$attempt" -ge "$HEALTH_MAX_ATTEMPTS" ]; then
+    echo "❌ Healthcheck failed after ${HEALTH_MAX_ATTEMPTS} attempts: $HEALTH_URL" >&2
+    echo "Container status:"
+    if dc ps; then
+      :
+    else
+      echo "⚠️  Unable to collect container status diagnostics" >&2
+    fi
+    echo "Container logs (last 200 lines):"
+    if dc logs --tail=200; then
+      :
+    else
+      echo "⚠️  Unable to collect container log diagnostics" >&2
+    fi
+    exit 1
+  fi
+  echo "Healthcheck not ready (attempt ${attempt}/${HEALTH_MAX_ATTEMPTS}), retrying in ${HEALTH_SLEEP_S}s..."
+  attempt=$((attempt + 1))
+  sleep "${HEALTH_SLEEP_S}"
+done
+
+if [ "$FOOD_UPDATE_SCHEDULER_MODE" = "external" ]; then
+  echo "Confirming scheduler worker process is running..."
+  dc up -d --pull never --no-recreate --wait --wait-timeout 30 worker
+fi
+
+echo "✅ Product healthcheck OK"
+
+echo "Starting Prometheus after complete product health..."
+if dc up -d --pull never prometheus; then
+  :
+else
+  prometheus_start_status=$?
+  echo "❌ Prometheus failed to start; app and Caddy remain running" >&2
+  exit "$prometheus_start_status"
+fi
+
+prometheus_attempt=0
+prometheus_ready=0
+while [ "$prometheus_attempt" -lt "$HEALTH_MAX_ATTEMPTS" ]; do
+  prometheus_attempt=$((prometheus_attempt + 1))
+  if dc exec -T prometheus /bin/promtool check ready \
+      --url=http://localhost:9090 >/dev/null 2>&1 && \
+     dc exec -T prometheus /bin/promtool check healthy \
+      --url=http://localhost:9090 >/dev/null 2>&1; then
+    prometheus_ready=1
+    break
+  fi
+  echo "Waiting for Prometheus readiness... ($prometheus_attempt/$HEALTH_MAX_ATTEMPTS)"
+  if [ "$prometheus_attempt" -lt "$HEALTH_MAX_ATTEMPTS" ]; then
+    sleep "$HEALTH_SLEEP_S"
+  fi
+done
+
+if [ "$prometheus_ready" -ne 1 ]; then
+  echo "❌ Prometheus telemetry readiness failed; app and Caddy remain running and prometheus_data is preserved" >&2
+  exit 1
+fi
+
+echo "✅ Product and Prometheus healthchecks OK"
+
+"$DOCKER_BIN" ps --last 20 --format "table {{.Names}}\t{{.Image}}\t{{.Status}}"

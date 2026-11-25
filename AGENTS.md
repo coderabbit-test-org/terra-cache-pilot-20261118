@@ -1,0 +1,3032 @@
+# Agent instructions (scope: repo root and subdirectories)
+
+## 🚫 Hard Gates (Non-negotiable)
+
+**Local full-verify budget rule:** agents MUST NOT run full local `make verify`
+in this PulsePlate checkout by default. The unsharded full suite exceeds the
+operator's acceptable local machine budget. Run local `make verify` only when a
+human explicitly overrides this rule for a single invocation.
+
+**Machine-heavy PR exception compatibility label:** the former
+operator-approved exception is now the repository-wide local default: agents
+do not run `make verify` by default. Merge evidence still requires the narrow
+local bundle (`make validate-changed`, `pre-commit run --all-files`, and focused
+tests) plus canonical current-head CI parity across `lint`,
+required/current-head checks, the relevant `test-main` matrix,
+`diff-coverage` ≥97%, security/governance checks, and
+`check_merge_ready.py --require-auth`.
+
+An agent MUST NOT claim a PR is "green", "ready", or "mergeable" unless BOTH
+the local narrow bundle and GitHub current-head CI are green:
+
+Local required bundle:
+
+- `python3 scripts/orchestration/check_preflight.py`
+- `python3 scripts/orchestration/check_agent_consistency.py`
+- focused tests for the touched surface
+- `make validate-changed`
+- `pre-commit run --all-files`
+
+GitHub current-head heavy signal:
+
+- `lint` — includes flake8 and other CI lint surfaces
+- typecheck / required backend checks for the touched PR surface
+- `test-fast` / relevant `test-main` matrix jobs
+- `diff-coverage` at ≥97%
+- applicable security/governance checks
+- `check_merge_ready.py --require-auth` / CI merge-readiness equivalent
+
+This policy does not permit ignored failures, weakened coverage,
+`continue-on-error`, skipped hooks, or merge-ready claims while local narrow
+gates, review threads, canonical current-head CI, or required CI are pending.
+
+`verify-env` (the first step of `make verify`) also rejects **present** broken
+`.venv/bin` console scripts for flake8/pytest/mypy/coverage/diff-cover (stale
+absolute shebang, non-executable file, broken symlink) so local preflight
+cannot pass while PATH-activated or hook-driven invocations would still hit a
+dead interpreter. Missing scripts are OK; see
+`scripts/ci/check_local_verify_environment.py`.
+
+**Tooling behavior contract (validation helpers):**
+
+- `test-fast` is deterministic and does not use `.pytest_cache`/`--lf`.
+- `make validate-min` is the cheap deterministic local bundle: repo-policy guards + `make test-fast`.
+- The installed pre-push backend hook runs `make validate-changed` once during each dispatched single feature-branch push. Its successful terminal result satisfies this push's local Make requirement. Run the other narrow gates before pushing. Standalone `make validate-changed` remains available for diagnosis.
+- Ordinary commits select backend tests from staged paths. A clean local `pre-commit run --all-files` runs the configured static/security hooks without replaying backend branch tests. Hosted lint explicitly selects its event delta under ci-lite.
+- `scripts/quick_check.sh` delegates to `make validate-min`, then adds staged-file format/import/syntax checks.
+- Use `. .venv/bin/activate` before direct local `pytest` runs outside Make targets.
+
+**Command results and failure scope:**
+
+Classify the result before choosing the next action:
+
+| Result | Required action |
+| --- | --- |
+| Required gate fails | Preserve raw failure output, fix the cause, and rerun that gate. No readiness claim while it fails. |
+| Exploratory `rg`/`grep` returns 1 with no matches | Record the empty search result. It is not a failed gate unless the check required a match. Exit 2 or tool diagnostics still require investigation. |
+| Tool/service invocation fails | Preserve the error and diagnose its own prerequisite. A service HTTP 403 does not authorize model switching or a retry loop. |
+| Required CI is pending | Record pending and wait for current-head evidence; pending is neither pass nor failure. |
+
+**Attempt scope:** A one-attempt allowance applies to the specific agreed operation
+for the current problem, not to the lifetime of a PR. A distinct new problem,
+or a necessary invocation after correcting the observed cause, has its own
+scoped first attempt. Preserve earlier results and resource charges; they do
+not create a permanent prohibition on required follow-through. The coordinator
+uses the owner's continuing authorization, identifies the actual problem,
+material and operation, and applies the relevant per-invocation budget without
+asking again for permission already granted. Do not duplicate active or healthy
+work for context, blindly repeat an unchanged unresolved cause, or relabel an
+old invocation to reuse its exclusive claim. Source/evidence checks, workload
+limits, protected-operation ownership, and separate merge/release/deployment
+authority remain in force.
+
+For a failed required command:
+
+1. Paste raw output lines showing the failure
+2. Provide `file:line:error` pointers
+3. Do NOT write "готово", "green", "mergeable"
+4. Fix the issue first, then re-run the failed required gate. Locally this means
+   the narrow bundle above; full `make verify` remains a GitHub CI/heavy-runner
+   signal unless a human explicitly overrides the local budget rule.
+
+Run the required narrow bundle and focused checks for the admitted scope. Repeat
+or broaden them only for a new change, failure, unresolved concern, or explicit
+coordinator/owner instruction. A failure in another owned lane does not transfer
+that lane's files or recovery work to this agent. The global Next-PR Start Gate
+still applies; preserve the current lane's scope and report the dependency.
+
+**Current-PR defect handling (hard rule):**
+
+- Any actionable defect surfaced by local gates, role agents, Codex Security,
+  CodeRabbit, Sourcery, Cubic, or human review inside the current PR surface
+  MUST be fixed in the same PR before mapping, thread resolution, or
+  merge-readiness claims. Do not classify such findings as "known inherited
+  debt" or leave them for a later PR merely to preserve the original narrow
+  diff.
+- Pre-existing defects discovered while validating the active execution path,
+  touched dependency graph, or required gate surface MUST NOT be dismissed as
+  inherited debt. Fix every bounded, relevant defect in the current PR. If a
+  safe fix requires a materially different authority boundary or a broad
+  migration, stop the current readiness claim, register and open a dedicated
+  prerequisite/remediation lane with explicit evidence, and complete that lane
+  before treating the dependent work as ready. Unrelated repository-wide
+  cleanup is still forbidden inside a narrow PR.
+- Duplicate FastAPI method/path route registrations are forbidden. If a
+  duplicate route is found in the live app or touched route family, remove the
+  duplicate owner or add a fail-closed registration guard in the same PR. Do not
+  document duplicate routes as acceptable inherited debt.
+- Do not soften production invariants to satisfy stale tests, compatibility
+  placeholders, or legacy `None`/empty stubs. Production code must require real
+  configured objects, real keys, and real route owners; if an old test encodes a
+  false placeholder contract, update the test and keep runtime behavior
+  fail-closed.
+
+**PR merge readiness (hard rule):**
+
+- Green CI alone is NOT sufficient for merge.
+- PR MUST NOT be merged while any review thread is unresolved.
+- PR MUST NOT be merged while any bot comment contains actionable items.
+- Before merge, confirm CodeRabbit and Sourcery are explicitly PASS / no-actionables.
+  Inspect authenticated current-head results from other configured reviewers;
+  missing optional reviewer output is not a PASS, and every posted actionable
+  bot item still requires disposition.
+- Required checks must be PASS with no pending required jobs.
+- `gh pr checks <PR_NUMBER>` is diagnostic only: a non-zero exit can mean live
+  pending jobs, not failed checks. Use the strict merge wrapper plus targeted
+  `gh run view <RUN_ID>` inspection before calling a PR red or green.
+- Mandatory wait-window: after the latest bot/review activity, do one final check pass and wait at least one review cycle before merge (never merge on the first green tick).
+- Merge checklist is mandatory: canonical artifact
+  `docs/review/PR_<N>_FIXED_MAPPING.md` (Fixed in Commit Mapping and review-seal
+  SoT) plus one PR-body link to that artifact. Do not duplicate URL→SHA mapping
+  blocks in the PR body.
+- This gate applies to every non-draft PR before merge.
+
+**Current PR lane baseline (Tier 1 governance):**
+
+- Canonical backend/shared PR lane is `.github/workflows/ci.yml` (`CI`).
+- Overlapping backend/shared workflows such as `PR Tests (Fast)`,
+  `PR Coverage Guard`, `Security Scan`, and `trivy` are transitional until the
+  Tier 1 consolidation series removes or reclassifies them; do not treat them as
+  equal canonical merge truth by default.
+- Frontend, accessibility, iOS, Docker/image, Fastlane, and App Store lanes are
+  specialized add-on lanes. They become merge- or release-blocking only when the
+  touched surface or branch protection explicitly attaches them.
+- External bot status checks remain advisory unless GitHub marks them required.
+  Actionable bot review comments still block merge through disposition
+  governance, even when the bot status itself is not required.
+
+## Review Governance
+
+Review threads **must not be resolved without an explicit disposition**.
+Every actionable comment must be classified as one of the following:
+
+### Review guidelines
+
+For GitHub/Codex-assisted review work, prioritize these surfaces before stylistic or low-risk feedback:
+
+- P0/P1 correctness and regressions
+- security, auth, quota, and secret-handling paths
+- billing, subscriptions, paywall, and release-truth surfaces
+- App Store / Fastlane / iOS release integrity
+- orchestration invariants (`agent-coordinator`, `task_bootstrap.py`, `native_subagent_bridge`, merge-readiness governance)
+- schema drift between backend contracts, OpenAPI, and generated client types
+
+These review priorities are additive only. They do not replace the existing review-thread disposition policy, canonical review artifacts, or merge-readiness rules in this file.
+
+### FIXED
+
+The issue was corrected in code or documentation.
+
+Required:
+
+* Commit SHA
+* Evidence (`file:line`, test, or command output)
+
+Example:
+
+```
+Disposition: FIXED
+Commit: 7733589a
+Evidence: docs/orchestration/AGENT_CAPABILITY_MATRIX.md:12
+```
+
+### NOT-A-BUG
+
+The comment is valid feedback but the current implementation is correct.
+
+Required:
+
+* Explanation
+* Evidence (`file:line`, contract reference, or test)
+
+Example:
+
+```
+Disposition: NOT-A-BUG
+Evidence: docs/orchestration/AGENT_ROUTING_GRAPH.md:36
+Reason: Routing graph already enforces canonical slug usage.
+```
+
+### DEFERRED
+
+The issue is intentionally postponed.
+
+Required:
+
+* Link to backlog item (`BACKLOG_LEDGER.md` or issue)
+* Mention in PR body under **Deferred / Follow-ups**
+
+Example:
+
+```
+Disposition: DEFERRED
+Backlog: docs/roadmap/BACKLOG_LEDGER.md#agent-consistency-preflight
+```
+
+### Enforcement rules
+
+1. **Checkboxes and mapping do not substitute fixes.**
+   Phase 2 / merge-readiness checklists may be marked only **after** a disposition is recorded.
+2. **Review threads cannot be resolved without disposition evidence.**
+3. **Resolved threads must be listed under Fixed in Commit Mapping** in canonical artifact `docs/review/PR_<N>_FIXED_MAPPING.md` with Disposition + proof (Commit/Evidence/Backlog). Validator-covered canonical reply-only roots under rule 10 are the only exception: the exact reply and resolved thread are the disposition evidence, and they must not create a second artifact entry or docs commit.
+4. Every other resolved actionable must appear in **Fixed in Commit Mapping** (artifact) with disposition-specific proof: **FIXED** → Commit SHA (and mapping line `- <url> -> <sha>`); **NOT-A-BUG** → Evidence with the thread listed as `- <url>` (no commit required); **DEFERRED** → Backlog link with the thread listed as `- <url>` (no commit required). A reply-only root not covered by the rule 10 validator remains subject to this ordinary mapping requirement.
+5. If no disposition can be determined, **the thread remains open**.
+6. **Commit-after-comment:** When a thread is mapped to a commit SHA (e.g. `- <url> -> <sha>`), that commit MUST have been made **after** the comment timestamp. Merge readiness gate fails otherwise (enforced by `check_review_threads_disposition.py`). This prevents "map/resolve without fix": fix code first, then add mapping and resolve.
+7. **FIXED proof quality (trigger-only ban):** A commit SHA used as FIXED proof (`- <thread_url> -> <commit_sha>`) MUST NOT be a trigger-only commit. **Trigger-only** means: (a) **empty commit** (no changed files), or (b) commit subject containing `trigger ci`, `rerun ci`, or `rerun checks` (case-insensitive). Such SHAs are invalid FIXED proof and fail the merge readiness gate. Exceptions only via allowlist with TTL (empty by default; P2 if needed).
+8. **Review seal v1:** a FIXED proof uses a full 40-character SHA that GitHub
+   proves is in the complete live PR commit graph and reachable from the live
+   PR head. Reviewer execution SHAs are opaque until the Commit API proves
+   them repository-addressable; unavailable/API-unknown refs must never enter
+   ancestry checks.
+9. **Material identity and provider-neutral no-claim:** the v1 seal binds
+   every evidence record to one frozen material digest, exact material head, and
+   exact merge-base. When `seal` receives neither review-provider input nor
+   security-provider input, it authors one closed, exact static pair inside the
+   existing v1 seal:
+   - review: `review_claim=none`, `output_required=false`,
+     `blocking=false`, exact `material_head_sha`, and exact
+     `material_digest`;
+   - security: `scan_claim=none`, `no_findings_claim=false`,
+     `output_required=false`, `blocking=false`, and the exact
+     base/head/material digest.
+   - self-review: one repo-native `pulseplate-pr-review` advisory artifact,
+     reserved for this provider-neutral seal shape and bound to the exact
+     base/merge-base/material-head/digest plus its canonical report hash. It
+     carries no provider review, scan, approval, PASS, or no-findings claim.
+   Provider output absence is not a review, scan, approval, PASS, or no-findings
+   result. It must not invoke, start, restart, retry, poll, wait for, substitute,
+   or require an operator override for either provider. One-sided, mixed,
+   partial, open-ended, or escalating no-claim shapes fail closed.
+   Provider absence requires no retry.
+   The no-claim pair alone cannot authorize any protected authority, verifier,
+   workflow, dependency, or security-policy surface and grants no bypass or
+   self-authorization.
+   Current-head CI and the trusted security-check bundle remain hard. So do
+   actual provider findings, review dispositions, canonical mapping, unresolved
+   threads, bot actionables, commit ancestry, the mapping-only descendant rule,
+   and the mandatory review wait window. A no-claim pair grants no authority to
+   resolve or ignore any finding.
+   Historical v1 review, source-unavailability, positive-response, scan, and
+   outage receipts remain parseable for legacy artifacts only; they gain no new
+   authoring or merge authority. The historical terminal source-unavailability
+   projection remains `source_degraded=true`, `fallback_required=false`,
+   `blocking=false`, `review_claim=none`, `retry_required=false`,
+   `substitute_review_required=false`, `prior_review_required=false`,
+   `operator_override_required=false`, and `ttl_required=false`; it is a
+   no-retry record, never provider success.
+   GitHub Codex Connector review and Codex Security were separate legacy
+   providers. Their embedded receipts remain readable only as historical data;
+   provider preparation/outcome authoring commands are not registered and no
+   legacy receipt authorizes a current provider request or retry.
+   Every path is material except the exact current-PR mapping artifact. PR-body
+   edits are outside Git. Any later code, test, workflow, dependency, policy,
+   contract, or other docs change invalidates the seal and requires a new
+   exact-material validation cycle.
+10. **One closeout commit:** author dispositions and the content-bound human
+    receipt locally with `pr_review_closeout.py`, then publish mapping and seal
+    once. A validated canonical-record duplicate remains reply-only. The first
+    recordless trusted Codex unavailable-ref ancestry finding may also be
+    handled reply-only on the exact direct mapping-only successor, when its root is
+    bound to the live head and same digest and its uniquely cited reachable FIX
+    is non-empty, non-trigger-only, and already mapped from a live resolved
+    thread root by a commit pushed strictly after that root comment. A fingerprint
+    is covered only when exactly one fully eligible recordless seed is currently
+    visible; ineligible same-fingerprint comments do not affect cardinality, but
+    if more than one eligible seed is visible, none is covered and all remain
+    blocking. A legacy owner-only recordless path is available only when that
+    same thread root has no canonical fingerprint record or FIXED mapping. It may
+    coexist with unrelated canonical records and requires one resolved root on
+    the canonical current-PR mapping artifact, authored by
+    `chatgpt-codex-connector` with `originalCommit` equal to the exact live head;
+    that live head must be the sole direct mapping-only successor of the sealed
+    material, and both heads must recompute to the sealed digest. The root must
+    name an ancestry/commit-graph cause and contain exact, hex-boundary-delimited
+    occurrences of the sealed material SHA and the lowercase ref selected by the
+    OWNER reply. The validator deliberately does not infer a natural-language
+    relationship between those tokens or interpret the rest of the bot prose.
+    Before posting, the human OWNER must inspect the whole root and confirm that
+    it contains no independent actionable finding beyond the unavailable-ref
+    ancestry claim; otherwise this reply-only class is forbidden and ordinary
+    disposition/mapping remains required. After that explicit human decision,
+    exactly one later GraphQL-authenticated
+    `OWNER` reply must be this single line, with no Markdown, whitespace, newline,
+    or extra text:
+    `OWNER NOT-A-BUG: ignore unavailable reviewer ref <full-40-sha>; authenticated live PR graph is authoritative.`
+    The selected ref comes only from that reply and must resolve specifically as
+    `REVIEW_REF_UNAVAILABLE`; `API_UNKNOWN` is terminal, and any real repository
+    or PR commit is ineligible. Unavailable refs never enter ancestry. Exactly one
+    globally eligible owner-only root may be covered; two leave both blocking.
+    Global eligibility is counted across every live thread root before caller
+    URL filtering, and the case-insensitive owner/repository identity used for
+    authenticated evidence must equal the live PR snapshot repository.
+    The exact OWNER reply selects the unavailable ref and records the human
+    disposition for that one root; automation does not derive that disposition
+    from bot wording. The validator is read-only and never authors the reply. This narrow
+    NOT-A-BUG disposition is not review, approval, merge authority, or a bypass
+    of findings, CI, security, mapping, thread, ancestry, or wait-window gates.
+    This full-ref form remains valid only for compatibility with already-open
+    historical threads and is not the recommended authoring format.
+    A fourth, mutually exclusive owner-only recordless class covers unavailable
+    or synthetic provider-only evidence on the canonical mapping without
+    classifying a provider ref. It requires the same authenticated repository,
+    resolved first connector root, canonical mapping path, exact live-head
+    `originalCommit`, sole direct non-empty non-trigger mapping-only successor,
+    recomputed same material digest, and strict current provider-neutral seal.
+    REST and GraphQL must cross-bind the same repository, PR, numeric comment,
+    URL, path, unedited body, timestamp with `updated_at == created_at`, trusted
+    connector REST user id/login/type, and `originalCommit`. The same root
+    must have no canonical fingerprint or ordinary mapping disposition. After
+    the human OWNER reads the complete root and confirms that it contains no
+    independent actionable finding beyond provider-only evidence that is
+    unavailable or synthetic, exactly one later GraphQL-authenticated `OWNER`
+    reply must equal this one line byte-for-byte:
+    `OWNER NOT-A-BUG: provider-only evidence in this root is unavailable; authenticated live PR state is authoritative.`
+    Here *unavailable* means the provider evidence is not repository-addressable
+    evidence usable by the authenticated live PR validator; it does not mean
+    that a material, security, code, workflow, dependency, or runtime defect is
+    unavailable. Automation does not parse refs, lex SHAs, classify commits, or
+    interpret bot prose for this class. Each structurally eligible root is
+    evaluated independently; no global singleton limit applies. Comments on
+    any material path are ineligible. The reply is only the OWNER's human
+    NOT-A-BUG disposition for provider-only evidence. It is not review,
+    approval, provider output, a scan, PASS, a no-findings claim, merge
+    authority, or a bypass of current seal, CI, security, diff coverage,
+    mapping, unresolved threads, bot actionables, ancestry, or the wait window.
+    Any API, Git, repository, path, seal, digest, timestamp, topology, or
+    identity ambiguity fails closed. The same strict REST connector and
+    unedited-root binding also applies to the legacy full-ref class.
+    A fifth, mutually exclusive owner-only recordless class covers a historical
+    stale-seal finding as `FIXED` only when the same root has no canonical
+    fingerprint or FIXED mapping and the human OWNER has inspected the whole
+    root and confirmed that it contains no independent actionable finding
+    beyond the historical stale-seal defect that `R` corrected. The resolved
+    root must be the first comment, be authored by
+    `chatgpt-codex-connector`, target the canonical current-PR mapping artifact,
+    and have `originalCommit` equal to the selected stale head `S`. The thread
+    must contain exactly one later comment whose GraphQL `authorAssociation` is
+    `OWNER`; that sole OWNER comment must equal this single line byte-for-byte,
+    with two distinct lowercase full 40-character SHAs and no Markdown, extra
+    whitespace, newline, or explanation:
+    `OWNER FIXED: stale seal at <full-stale-head-sha> is corrected by mapping-only reseal <full-reseal-sha>; authenticated live PR graph is authoritative.`
+    For this fifth class, the authenticated current root revision must satisfy
+    `created_at <= updated_at < OWNER reply createdAt`, with matching REST/GraphQL
+    body and identity. The OWNER's inspection must cover that same complete
+    revision. Before posting, reread the root: a changed body or revision time
+    invalidates the earlier confirmation for the changed revision. Timestamp
+    ordering proves temporal eligibility, not that the human read the root.
+    The other OWNER-only classes retain their unedited-root requirement.
+    The selected reseal `R` must be a real, reachable PR commit pushed after the
+    root but no later than the OWNER reply and the sole direct child of `S` in
+    the complete live PR commit graph. It must be non-empty, non-trigger-only,
+    and change only the regular canonical mapping blob. `S` must match exactly
+    one member of the closed disjoint union `LINEAR_MATERIAL ∪ BASE_SYNC`.
+    `LINEAR_MATERIAL` has sole parent `P`, inherits `P`'s mapping byte-for-byte,
+    and contains a non-empty real material diff from `P` with no mapping
+    mutation; the valid prior seal at `P` binds its exact historical base and
+    merge-base, that base remains the base for `S` and `R` and is an ancestor
+    of the authenticated current base, `P` is a reachable live PR commit, and
+    the inherited seal is demonstrably stale at `S`. This linear form is
+    retrospective only: it is not permission to manufacture post-closeout
+    material. `BASE_SYNC` is the exact two-parent form: the synchronized-base
+    second parent must advance the prior sealed base and must not already be an
+    ancestor of the first parent. A failed `BASE_SYNC` never falls through to
+    `LINEAR_MATERIAL`; any other parent count is rejected. In either form the
+    inherited seal, including a valid legacy v1 provider shape, must recompute
+    for the repository-addressable prior material/base through its unique direct
+    mapping-only closeout but be stale at `S`, while the seal in `R` must bind
+    material head `S`, the form-selected unchanged or synchronized base, the
+    exact merge-base, and the recomputed material digest. The
+    `S` and `R` material projections must be identical after excluding only the
+    canonical mapping. Later ordinary base syncs and reseals may place `R` below
+    the live head, but the current live seal must independently pass the normal
+    current-base, material-head, digest, and sole mapping-only successor checks.
+    Unrelated canonical records may coexist; exactly one root may be globally
+    eligible before caller URL filtering, while two leave all blocking. Every
+    REST pagination link must remain on `api.github.com` at the same repository
+    endpoint and path with immutable non-pagination query fields; repeated,
+    cross-repository, or cross-endpoint pages fail closed. Local Git evidence is
+    evaluated with replacement objects disabled. A shallow boundary that hides
+    any selected commit parent or lies in selected ancestry is terminal; an
+    unrelated legacy shallow boundary is not evidence for or against that graph.
+    Any repository, REST/GraphQL,
+    Git graph, regular-path, seal, digest, timestamp, pagination,
+    shallow-boundary, replacement-object, or cardinality uncertainty fails closed. The validator
+    never interprets bot prose or authors the reply. This historical class is
+    `FIXED`, because `R`
+    corrected a real defect at `S`; it is not review, provider output,
+    approval, scan, PASS, merge authority, or a bypass of current CI, security,
+    mapping, unresolved
+    threads, bot actionables, ancestry, or the wait window.
+    A closed inspection/publication phase extends only that historical stale-seal
+    class when real intervening material or advancing base synchronizations
+    separate `S` from the current frozen material `M`. It preserves the five
+    existing classes. The root has no ordinary mapping or canonical fingerprint
+    record, is the first trusted connector comment on the canonical mapping,
+    and has `originalCommit=S`. Before posting, the human OWNER must read the
+    complete authenticated current root revision and exact frozen candidate
+    `C`, confirm no independent actionable beyond this historical stale seal,
+    and explicitly permit one correcting publication. Scope approval, account
+    association, hashes and auto-authored content receipts do not supply that act.
+    Exactly one immutable GraphQL-authenticated OWNER comment `I` must fullmatch
+    this ASCII line, substituting positive numeric root ID, exact UTC revision,
+    lowercase full SHAs and SHA-256 digests, without extra fields or whitespace:
+    `OWNER INSPECTED: historical stale-seal root <id> revision <UTC-updated-at> body sha256:<raw-body-hash> at <S> has no independent actionable; permit one mapping-only publication from material <M> base <B> merge-base <MB> digest sha256:<D> candidate sha256:<C> inventory sha256:<H>; no disposition or merge authority.`
+    REST and GraphQL cross-bind every selected root and phase comment's native
+    identity, repository/PR/path, raw UTF-8 body and actual revision. Both `I`
+    and the later existing OWNER FIXED line `F(S,R)` require valid chronology
+    `createdAt <= updatedAt` and present native `lastEditedAt=null`; missing
+    fields are unknown. Native update metadata alone is not edit evidence; exact
+    REST/GraphQL revision binding and rereads remain mandatory. This correction
+    does not change the separate legacy OWNER-only unedited-root classes. Root
+    revision must precede `I` and remain identical to its inspected binding.
+    The nearest genuine valid prior material-to-mapping closeout anchors the
+    mechanically derived finite first-parent interval to `M`. Every later edge
+    inherits its regular mapping byte-for-byte and is non-empty material-only
+    or a genuine advancing two-parent base sync. `S` lies in that interval with
+    a demonstrably stale seal. Invalid merges never fall through to linear;
+    missing parents, objects, pagination or API/Git certainty fail closed.
+    Local pre-closeout accepts only the `I`-only phase with exact live head `M`,
+    current base/merge-base/digest and bounded regular raw candidate bytes `C`.
+    It binds two complete current observations of the existing actionable bot
+    issue/inline/top-review inventory and validated non-GHAS unresolved first
+    roots to `I.H`. Membership stays with the existing collector/root predicate;
+    the shared recognizer binds exact raw native body/revision evidence, with
+    creation, submission and edit times distinct. The digest does not hash `I`
+    itself or infer actionability. Missing `I` may emit that current diagnostic
+    digest only while failing admission. Record the actual registered PASS,
+    command and output before publication; it is procedural evidence only.
+    Publication admission never means FIXED, resolution or readiness and does
+    not cover an independent top-level review or false No-actionables claim.
+    Final recognition requires exactly the ordered immutable OWNER pair `I,F`,
+    an actual reachable non-empty non-trigger regular mapping-only `R` as the
+    sole direct PR child of inspected `M`, its exact inspected `C` blob, and
+    same-repository/ref server publication strictly after `I` and no later than
+    `F`. The existing FIXED line selects real `S,R` only after publication; no
+    future SHA or false direct `S->R` edge is allowed. Current seal and final
+    activity/disposition/unresolved/CI/security/wait gates pass independently.
+    Supported post-publication resolution and later ordinary reviews change
+    current inventories normally; final validation does not compare them to
+    the old `H`, reconstruct erased members, or prove historical gate execution
+    from a scalar/timestamp. Missing procedure remains unknown and observed
+    bypass is not achieved. Two observations do not promise atomic/continuous
+    history or cryptographic/human execution. Any observable frozen-publication
+    drift after `I` stops for coordinator rescope: no second `I`, edit/deletion,
+    implicit retry or manufactured material/reseal is a recovery transition.
+    Global historical eligibility is counted before caller URL filtering;
+    exactly one eligible root across the legacy and inspected forms is required.
+    At publication `M` is the exact live head, so legacy current-closeout
+    eligibility would require an impossible direct `M->M` mapping edge. The
+    registered consumer still runs the full shared legacy producer first;
+    recognizable legacy API/Git uncertainty remains blocking. Final coverage
+    counts both actually eligible historical forms together.
+    This extension adds no v1 receipt/schema, store, CLI, DTO, disposition
+    adapter, mapping carrier, prose classifier or authority for merge.
+    None of the reply-only paths creates another docs commit or restarts
+    review/security scans.
+    Complete canonical proof inventory belongs to
+    `scripts/orchestration/review_mapping_artifact.py`: its existing finite
+    lexical grammar must account for the whole input before selecting one
+    nonempty supported Fixed section. Missing, empty or duplicate sections and
+    recognized proof or No-actionables markers outside that span fail closed
+    for complete consumers. This does not claim arbitrary Markdown or
+    human-proof completeness.
+    Freeze the actual final material `M`, record ordinary `FIXED` proof against
+    its genuine reachable correcting ancestor `Q_fix`, and generate the sole
+    normal mapping-only direct successor `R` of `M` with `seal`. A required
+    later `docs(agents)` commit is material; self-review, digest and seal bind
+    final `M`, while `Q_fix` proves its actual correction rather than a future
+    regenerated seal. A historical correcting transition remains historical
+    evidence, not a current command or permission to repeat it. The root stays
+    open until actual `R` and supported validation. Historical unused inspection
+    grants no authority for changed material. This adds no receipt, store,
+    retry grammar, trusted-policy switch or exemption from current
+    CI/security/review/wait/merge gates.
+
+11. **Pre-closeout ordering gate:** after `seal` writes the local canonical
+    mapping and after the live PR body contains its canonical link, but before
+    the sole mapping commit, run
+    `python scripts/orchestration/check_merge_ready.py --pr-number <PR_NUMBER>
+    --repo Katsiarynakavaleuskaya/PulsePlate --pre-closeout --require-auth`
+    with both `GH_TOKEN` and `GITHUB_TOKEN` exported. This fail-closed pass must explicitly cover
+    every live actionable bot issue comment, bot inline comment, and top-level
+    bot review in the local artifact, except the one independently validated
+    publication-only historical root above, and require exactly one real same-repository
+    Markdown link through
+    `blob/<exact-live-head-ref>/docs/review/PR_<N>_FIXED_MAPPING.md` in the live
+    PR body. The ref path must exactly match the PR's authenticated `head.ref`;
+    the link must occupy its own bullet line, the decoded canonical URL must
+    occur exactly once, and repo-relative or non-rendered HTML/code examples are
+    invalid in PR-body context.
+    Also require the first comment URL of every unresolved conversation review
+    thread in the authenticated validated inventory to appear in the canonical
+    mapping, except the one independently validated publication-only historical
+    root above, preserving the existing GHAS exclusion. Its two exact native
+    inventory/candidate/root/phase checks authorize only that one correction.
+    This structural coverage
+    check is independent of author and prose; a mapped reply cannot substitute
+    for its root. It neither classifies a finding nor permits thread resolution.
+    Mapped unresolved threads still block final merge readiness.
+    The canonical mapping artifact must be the only dirty path both before and
+    after the live validation calls. Child inline mappings do not substitute
+    for an actionable top-level review in this pre-commit pass. A PASS
+    authorizes only the one closeout commit: it does not
+    require thread resolution, current-head CI, or the review wait window, and
+    it must never be presented as merge-readiness evidence. After push, the
+    unchanged full strict wrapper remains mandatory.
+
+**Purpose:** This policy prevents "checkbox-only" resolutions and ensures that every review comment results in a concrete action, justification, or backlog entry.
+
+**Canonical orchestration governance reference:** For PR governance contracts (Phase 2 body contract, merge readiness, FIXED / NOT-A-BUG / DEFERRED semantics, required-check truth, hard/soft/external CI classes), see:
+
+- `docs/orchestration/PR_ORCHESTRATION_CONTRACT_MATRIX.md`
+
+This document is the canonical governance reference and must stay aligned with:
+
+- `scripts/ci/check_pr_body_phase2_gates.py`
+- `scripts/ci/check_pr_merge_readiness.py`
+- `scripts/orchestration/check_review_threads_disposition.py`
+
+**CI / gh-based gates (canonical contract):** Any step that runs `gh api` or GraphQL **MUST** run with a token exported. The `gh` CLI accepts both `GH_TOKEN` and `GITHUB_TOKEN` (GH_TOKEN takes precedence). For this repo, auth semantics are mode-specific:
+- **Local default / advisory:** disposition guard may `SKIP` (exit 0) when no usable `gh` auth is available; this keeps local exploration non-blocking.
+- **Local strict parity:** when you pass `--require-auth`, export `GH_TOKEN` and require `gh auth status` to succeed before any GraphQL.
+- **CI strict:** when `CI=true`, disposition preflight requires `GH_TOKEN` (for example `GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}`) and `gh auth status` before any GraphQL.
+
+**GitHub token handling:** Never assume fixed GitHub token length. Treat `GITHUB_TOKEN`, `GH_TOKEN`, GitHub App installation tokens, and `ghs_*` values as opaque secrets. Validators must accept stateless GitHub App installation tokens, including `ghs_` JWT-format tokens of approximately 520 characters with dots. Do not decode, introspect, split, log, or persist installation-token internals. Workflow command emissions that mask or print untrusted `workflow_dispatch` values must escape `%`, CR, and LF before writing `::add-mask::` or related workflow commands.
+Deterministic test and mock harnesses that construct, assert, or snapshot
+authentication headers must isolate every credential-source environment variable
+and inject synthetic credentials, even when transport is mocked, so assertion
+diagnostics cannot expose host credentials.
+
+The merge-readiness gate remains separate and still requires `GITHUB_TOKEN` for PR API access. Before any GraphQL call, the disposition guard runs a mandatory preflight: if `--require-auth` or `CI=true`, it requires `GH_TOKEN` and runs `gh auth status`; if either is missing or fails, the script exits 1 with env diagnostic and fix commands (no GraphQL, no mapping/resolve). This prevents agents from wasting iterations on mapping when auth is invalid.
+
+**Bandit / nosec policy (no blind suppressions):** Adding `# nosec` to silence Bandit is **forbidden** when a simple fix exists (e.g. B607 → use `shutil.which()` for full path). `# nosec` is allowed **only** with: (1) rule code (e.g. B607), (2) one-line justification, (3) `(remove-by: YYYY-MM-DD, ref: issue/PR)` on the same comment line, and (4) only when there is no safe code fix. **remove-by and ref MUST NOT be 'N/A'** (policy enforcement). Any subprocess call to external tools (`gh`, `git`, `curl`, `wget`, `ssh`) MUST use an absolute path via `shutil.which()` or config. Direct Python subprocess calls MUST NOT use bare `python` or `python3`; use `sys.executable` for current-interpreter subprocesses or an explicitly resolved repo-approved interpreter path such as `VENV_PYTHON`, `DEV_PYTHON`, repo `.venv/bin/python`, or the Experiment Runner resolver pattern. Enforced by `tests/guards/test_nosec_policy_guard.py` and `tests/guards/test_subprocess_uses_absolute_binaries.py`. Legacy suppressions are allowlisted in `tests/guards/fixtures/nosec_policy_allowlist.txt` (Phase 1); migrate to full format and remove from allowlist over time. **Allowlist entries MUST include remove-by/ref and MUST expire** (format: `path:line remove-by=YYYY-MM-DD ref=PR-XXX`; past date → guard FAIL). **Adding allowlist entries is treated as tech-debt and requires a ledger item.**
+
+**Fix before mapping:** When security/linter checks fail (Bandit, Ruff, MyPy, tests), it is **forbidden** to touch artifact mapping or resolve review threads first. Fix the root cause (code/docs) first; only then update `docs/review/PR_<N>_FIXED_MAPPING.md` or resolve threads. Tasks that affect Bandit/Trivy/security gates MUST NOT be done in auto/weak modes.
+
+**Pre-commit hook policy (mandatory before push):**
+
+- **Always run `pre-commit run --all-files` locally before pushing any PR.**
+- **If hooks modify files:**
+  1. Run `pre-commit run --all-files`
+  2. Check `git status` for modified files (e.g., `.secrets.baseline`, whitespace fixes, formatting)
+  3. **Commit hook modifications as a separate commit:** `chore(pre-commit): apply hook fixes`
+  4. **Important:** If `detect-secrets` updated `.secrets.baseline`, this must be committed (it's a legitimate baseline update, not a secret leak)
+- **Policy note:** `.secrets.baseline` is a generated `detect-secrets` artifact with hashed fingerprints; it is excluded from Sourcery scans (false-positive “Generic API Key”).
+- **Carryover rule:** If a PR intentionally carries over missed changes from a prior PR, the PR description MUST include a short **Carryover** note and the work MUST be tracked in `docs/roadmap/BACKLOG_LEDGER.md` (entry updated to point to that PR).
+- CI runs `pre-commit run --all-files` and will fail if hooks would modify files that aren't committed.
+- This is not optional: uncommitted hook modifications guarantee CI failure.
+- **One-time setup:** Run `pre-commit install --hook-type pre-commit --hook-type pre-push` locally to install both stages.
+- **Async test marker rule for pre-commit-selected tests:** CI lint runs
+  `pre-commit run --all-files`, and its `backend-tests` hook can execute changed
+  tests in an environment where `pytest-asyncio` is not loaded even if the local
+  venv has it. For tests selected by `scripts/run-backend-tests-pre-commit.sh`
+  (especially diff-coverage/changed-file tests), do not add `pytest.mark.asyncio`
+  or `async def` test functions unless the hook environment is explicitly proven
+  to load the async plugin. Prefer sync tests that call simple coroutines with
+  `asyncio.run(...)` or exercise routes through `TestClient`, and validate with
+  `VENV_PYTHON="$(. scripts/hooks/repo_python.sh; resolve_repo_python "$PWD")" BRANCH_DIFF_MODE=1 bash scripts/run-backend-tests-pre-commit.sh`
+  plus `pre-commit run --all-files`. See `docs/ENGINEERING_LESSONS.md` lesson 25.
+
+**Pre-commit and "expected red" PRs (guard policy):**
+
+- **`--no-verify` is allowed ONLY for "expected-red PR" (guards-first approach)** and **only** with explicit explanation in commit message and PR description.
+- **Rationale:** Guard tests intentionally fail to document architectural violations. Pre-commit hook runs pytest and blocks commits when guards fail (expected behavior).
+- **Process:**
+  1. Guard Policy PR: Use `--no-verify` with explanation: "Pre-commit hook fails because guards intentionally document violations. This is expected behavior — guards will pass after remediation."
+  2. Remediation PR: **Must pass pre-commit** (guards turn green, no `--no-verify` needed).
+  3. **Future improvement:** Consider moving pytest from pre-commit to CI-only (or make it optional via `SKIP_TESTS=1` env var) to avoid blocking commits for expected-red PRs.
+- **Note:** Pre-commit currently runs `backend-tests` hook (pytest) via `.pre-commit-config.yaml`. This is intentional for normal PRs, but creates friction for guard policy PRs. This is acceptable for now; process improvement can be done in separate PR.
+
+**❌ Forbidden:**
+
+- Saying "all checks pass" without showing command outputs
+- Using `|| true`, `continue-on-error`, or ignoring failures
+- Adding `# type: ignore` without explicit user approval
+- Testing dead code instead of deleting it
+- Pushing PRs without running `pre-commit run --all-files` first
+- Using `SKIP=...` or disabling hooks without explicit justification (default: "fix it, don't skip it"; if skip is needed, document why in PR description/comment)
+
+## Local-only artifacts (hard rule)
+
+**Hard rule:** local/dev artifacts must never be tracked in git.
+
+**Forbidden to commit:**
+- `artifacts/agent_runs/`
+- `artifacts/orchestration/`
+- `artifacts/security_lab/`
+- `worktrees/`
+- `.venv/`
+- `.pytest_cache/`
+- `.mypy_cache/`
+- `.ruff_cache/`
+- `node_modules/`
+- `.DS_Store`
+- `coverage.*`
+- `.coverage`
+- `dist/`
+- `build/`
+
+**Enforcement:**
+- Any appearance of these paths in `git status` is a **P0 stop** condition. Remove/ignore them before continuing any task.
+- Any PR with tracked `worktrees/` paths is **No-Go** and must not be merged.
+
+**Worktree isolation (hard):**
+
+- Do not edit files inside `worktrees/...` while an agent is working there.
+- Integration only via PR: agent promotes changes → human reviews → merge. No in-place edits.
+- If human must intervene: create a new branch from the agent branch; do NOT edit in-place inside the worktree directory.
+- See: `docs/orchestration/AGENT_KNOWLEDGE_LIBRARY_WORKTREE_RUNBOOK.md` (Worktree isolation policy).
+
+**SKIPPED policy (Bad skip vs Intentional skip):**
+
+- **Intentional skip:** Documented, scoped (e.g. known missing module, expected-red guard),
+  and either temporary or tracked. Allowed when justified in test/PR.
+- **Bad skip:** Skipping a check or test to get green without fixing the root cause,
+  or without documenting why and where it is tracked.
+- **Hard rule:** Any **bad skip** MUST be recorded in `docs/roadmap/BACKLOG_LEDGER.md`
+  as **P0/P1** (technical debt priority; see Backlog Ledger Policy — not release
+  P0-A/P0-B), with Owner, DoD, Target PR. Do not leave skipped checks untracked;
+  "fix it or ledger it."
+- **sys.modules policy guard must never be skipped:** `tests/test_repo_policy_guards.py`
+  must run on-by-default; do not add `skip`/`xfail` wrappers to silence violations.
+- **If a temporary disable is unavoidable:** create a `docs/roadmap/BACKLOG_LEDGER.md`
+  entry (P0/P1) in the same PR with rationale, owner, and target PR to re-enable.
+- **Two-layer policy:** keep runtime guard enforcement in
+  `tests/test_repo_policy_guards.py`; keep incremental tests-cleanup tracking in
+  `tests/test_repo_policy_sys_modules.py`.
+- **Skip reason protocol:** Any skip caused by missing module/function/data MUST use
+  `require_feature(...)` and emit `feature_disabled:<key>` (no ad-hoc skip strings).
+  Applies to high-noise runtime coverage suites and similar optional-feature tests.
+
+**Dead code policy:**
+If diff-cover shows uncovered helpers that have zero call sites → **delete them**, don't write tests for unused code.
+
+**Local env required vars (hard rule):**
+
+- If a new env var becomes required at startup, update `.env.example` + root `docker-compose.yaml` in the same PR.
+
+## App Store release readiness gates
+
+Any iOS release or App Store metadata PR MUST verify:
+
+1. `ios/PulsePlate/PrivacyInfo.xcprivacy` exists and covers required-reason APIs.
+2. `ios/fastlane/app_privacy_details.json` matches actual network data flows.
+3. Release `BASE_URL` is explicit HTTPS; no silent production fallback.
+4. App Store screenshot scenarios are not submitted unless the feature is release-enabled and smoke-tested.
+5. App Store assets are preserved as repo assets, but submission status must be classified as `SUBMIT_READY`, `IMPLEMENTATION_REQUIRED`, or `INTERNAL_REVIEW_ONLY`.
+6. Unused sensitive permission strings are forbidden in release localization files.
+7. AI/CBT/user free-text features require explicit consent and wellness-only disclosure before release.
+8. HealthKit must remain read-only unless a separate reviewed PR changes entitlement posture.
+
+**Rate Limiting Policy:**
+
+**Hard rule:** Expensive endpoints (LLM, exports) MUST be rate-limited AND MUST have deterministic 429 tests.
+PRs that add expensive endpoints MUST include deterministic 429 tests (no smoke-only substitutes).
+If adding rate-limit to endpoints, use thin **route wrappers**; do not change callable function signatures used by coverage tests.
+
+**Enforcement:**
+
+- All LLM endpoints (`/api/v1/insight`, `/insight`) MUST use `@limit_if_available(RATE_LIMIT_INSIGHT)`.
+- All export endpoints (CSV/PDF) MUST use `@limit_if_available(RATE_LIMIT_EXPORTS)`.
+- OpenAPI MUST document 429 responses for rate-limited endpoints: `responses=RATE_LIMIT_429_RESPONSES` (from `app/security/rate_limit.py`).
+- Tests MUST verify 200 → 429 transitions with low limits (2/minute in tests).
+- Rate-limited endpoints MUST accept `request: Request` in the handler signature (SlowAPI requirement).
+- Runtime behavior is env-gated: in tests (`TESTING=true`) rate limiting is disabled unless `RATE_LIMITING_IN_TESTS=true`.
+- Client identification uses proxy-aware key_func with CIDR support (`app/security/rate_limit.py`).
+
+**LLM Monthly Quota Policy (Hard rule):**
+
+- All LLM endpoints MUST enforce a **server-side monthly hard quota** **before** any provider call.
+- Minimal baseline quota unit is **`requests/month`** (budget/cost-based quotas may be added later).
+- Quota MUST be deterministic (no soft-limit-only behavior) and have tests that prove enforcement.
+- Feature flags MUST be checked **before** quota consumption (no charging when a feature is disabled).
+- CI container smoke-start MUST set `SERVER_SALT` (dummy value allowed) so app startup can pass fail-fast requirements.
+
+**AI agent input guard policy (Hard rule):**
+
+- AI-facing insight and MCP entrypoints MUST screen text with shared helpers in `app/security/agent_input_guard.py` before quota, RAG, provider calls, or tool execution.
+- Legacy compatibility routes MUST stay thin: use shared helpers such as `prepare_safe_ai_prompt_input(...)` instead of inlining guard enforcement inside `legacy_app.py`.
+- MCP tool-level blocking MUST preserve JSON-RPC contract: reject unsafe or malformed guarded fields with `-32602 Invalid params` from `_call_tool`.
+- Direct helper paths that bypass `_call_tool` MUST still fail closed before the provider call and return the stable local error shape already covered by tests.
+- Broad fallback regexes are intentionally scoped to AI-agent control surfaces; do not reuse them for general educational/free-form developer text without a separate contract review.
+- See: `app/security/agent_input_guard.py` (`prepare_safe_ai_prompt_input`, `scan_ai_agent_input`), `mcp_pulseplate_server.py` (`_call_tool`, `_find_blocked_tool_argument`), `legacy_app.py` (`/insight`, `/api/v1/insight`), `tests/test_agent_input_guard.py`, `tests/test_mcp_pulseplate_server_coverage.py`, `tests/test_insight_error_hygiene.py`.
+
+**Rationale:**
+
+- LLM endpoints: $72k/month abuse risk (documented in `BACKLOG_LEDGER.md`).
+- Export endpoints: Resource-intensive (PDF generation, CSV streaming) → DoS risk.
+- Deterministic tests prevent time-window flakiness.
+
+**See:**
+
+- Audit: `docs/audit/PR_628_RATE_LIMIT_LLM_EXPORTS_AUDIT.md`
+- Implementation: `app/security/rate_limit.py`
+- Tests: `tests/test_rate_limit_llm_and_exports_api.py`, `tests/test_rate_limit_client_key_api.py`
+
+**WebSocket foundation policy (hard rule):**
+
+- Canonical websocket surface is foundation-only endpoint `/ws`, registered in `app/main.py`.
+- WebSocket authentication is mandatory and fail-closed (missing/invalid token -> policy close `1008`).
+- Runtime guardrails are mandatory: message-size limit, sliding-window burst limit, and event allowlist.
+- Feature flagging must be request-time (`FEATURE_WEBSOCKET_ENABLED`) to keep tests deterministic and avoid import-time freeze.
+- Any websocket behavior expansion (new event types, rooms, fan-out) must be tracked in `docs/roadmap/BACKLOG_LEDGER.md` before implementation.
+
+**Rationale:** WebSocket transport is long-lived and stateful; strict baseline rules prevent auth bypass and uncontrolled scope creep.
+
+**Knowledge promotion invariant (hard rule):**
+
+- RAG chunks are evidence artifacts, not canonical facts.
+- Knowledge promotion is allowed only from validated RAG evidence.
+- Knowledge writes require a passed canonical verification bundle.
+- Future semantic-cache admission and side-effectful cache/action execution must reuse the same canonical verification-bundle contract when their dedicated gates open.
+- `prepare_insight_runtime(...)` is the canonical seam for runtime knowledge policy.
+- Recursive retrieval verification and philosophical runtime verification must converge into one canonical registry/bundle path.
+- Route layer and `legacy_app.py` must never write or mutate knowledge records.
+- Route layer, service adapters, and `legacy_app.py` must never author verification truth.
+- Request-local recursive caches are optimization helpers only and must never be treated as persistent knowledge.
+- Promotion must fail closed on degraded retrieval/orchestration reasons.
+- Failed verification must degrade safely and must not break the response path.
+- Semantic cache must not be widened or implied by knowledge-promotion work unless the dedicated semantic-cache gate explicitly opens.
+
+**Evidence Graph Runtime invariant (hard rule):**
+
+- Product AI runtime, advisory wiki / compiled memory, and plugin/control-plane artifacts must stay on separate rails.
+- Product runtime is canonical only when backed by repo contracts, DB/runtime truth, verification bundles, deterministic tests, and merge gates.
+- Advisory wiki and local support/control-plane outputs are non-canonical unless promoted through a dedicated repo-reviewed contract.
+- Semantic cache is forbidden until evidence asset lineage, replay-safe promotion, and metadata admission gates exist and the dedicated semantic-cache gate (`docs/roadmap/PulsePlate_Semantic_Cache_Gate_and_Plan.md`) explicitly opens.
+- Any new evidence-bearing artifact must define asset type, upstream assets, fingerprint, policy version, idempotency key, and replay/admission behavior.
+
+**Experiment Runner attribution invariant (hard rule):**
+
+- When the Experiment Runner materially contributes to a commit, use exactly this co-author trailer:
+  `Co-authored-by: PulsePlate Experiment Runner <pulseplate@pm.me>`.
+- Material contribution can be oracle-only review, experiment design, admission/fixed-mapping
+  review, review-disposition input, or commit-decision input; `mutated_paths: []`
+  does not cancel attribution when the artifact shaped the engineering decision.
+- Do not add the trailer when the runner only launched, its artifact was rejected or unused,
+  or the PR records an explicit `Not applicable: <reason>`.
+- Do not use placeholder attribution such as `runner@example.com` for new Experiment Runner work.
+- This trailer is public Git attribution text only; it is not an email delivery channel, a cryptographic signature, review-thread authority, or merge-readiness authority.
+
+---
+
+## REQUIRED READING (before any change)
+
+1) `docs/ENGINEERING_LESSONS.md` (project-level lessons and hard-won invariants)
+2) `RUNBOOK_AGENT.md` (CI/debug playbook)
+3) The nearest scoped `AGENTS.md` for the files you touch (e.g. `tests/AGENTS.md`, `scripts/AGENTS.md`)
+
+If your change conflicts with these docs, you must explain why and how risks are mitigated.
+
+## Agent Coordination (Coordinator-First Rule)
+
+**Hard rule:** Any new task MUST start with `agent-coordinator` for task analysis and agent routing.
+
+**Start gate clarification:** If launcher/runtime auto-capture is unavailable, manual
+`agent-coordinator` invocation is still mandatory before any non-trivial execution.
+Coordinator-first is a start gate, not advisory wording.
+
+### Definition of a Task (Canonical)
+
+A **task** is any unit of work that:
+- Affects code, documentation, architecture, security, or process; or
+- Requires a decision, trade-off, or coordination between domains; or
+- May impact quality gates, invariants, or downstream systems.
+
+**Non-tasks (explicitly excluded):**
+- Trivial typo fixes
+- Formatting-only edits (whitespace, line breaks)
+- Local experiments with no intent to commit
+
+**Rule of thumb:** If unsure, treat it as a task and start with coordinator.
+
+### Workflow
+
+**Pre-flight MUST run:** `python3 scripts/orchestration/check_preflight.py` — failure = stop execution.
+
+Optional local bridge (operator-invoked; not host auto-start): see [`scripts/AGENTS.md`](scripts/AGENTS.md) (first-class wrappers) and [`docs/orchestration/AUTOMATION_READINESS_MATRIX.md`](docs/orchestration/AUTOMATION_READINESS_MATRIX.md).
+
+1. **Task Analysis** → Coordinator analyzes task, identifies domains, assigns priority
+2. **Agent Assignment** → Coordinator routes to appropriate agent(s) based on capabilities
+3. **Work Review** → Coordinator reviews agent outputs, verifies quality gates
+4. **Synthesis** → Coordinator synthesizes multi-agent work into coherent solution
+5. **DoD** → Coordinator verifies Definition of Done before PR merge
+
+### Role-Agent Order Contract
+
+For coordinator-owned PR lanes, the coordinator defines the executable role order and that
+order becomes mandatory for the lane packet/runbook.
+
+Rules:
+- Every role agent assigned by coordinator MUST be used in the declared order.
+- No assigned role agent may be skipped without an explicit coordinator update to the
+  packet/runbook.
+- No parallel or ad-hoc internal role stack may replace the declared coordinator order.
+- `task_bootstrap.py` packet generation is routing/provenance only and does not execute
+  role agents. After files exist, agents MUST explicitly run the declared role-agent
+  passes and attach the bootstrap packet context to each pass because local
+  `artifacts/` packets are gitignored and are not available in the branch by default.
+  Role bindings in the packet's legacy `advisory` collection remain mandatory
+  when their dispatch contract says `required_role_pass: true`; that collection
+  name is metadata only, not permission to skip a bootstrap-requested custom
+  role.
+  When the host runtime does not expose native PulsePlate role subagents, use the
+  available general-purpose subagent transport and state the canonical PulsePlate role
+  slug in the prompt (for example, "You are PulsePlate custom role
+  `security-auditor`"). The transport name is adapter-only; the repo role slug and
+  bootstrap packet remain the authority for the pass.
+- Native model/effort selection follows `docs/agents/model_policy.md`. Model
+  choice does not grant role ownership, reorder dispatch, or replace required
+  context, validation, review, or human approval.
+- Missing execution of a bootstrap-assigned role is a hard gate: do not implement,
+  push, or claim readiness until the role has run in order or the coordinator
+  records an explicit disposition with evidence in the packet/runbook.
+- Coordinator-owned PR lanes must include the canonical mandatory post-open
+  `qa-engineer-agent -> bug-hunter -> security-auditor` role pass. These role
+  agents do not replace pre-open roles or the separate final-material gates.
+  This post-open role chain is a single required pass, not an unbounded loop.
+  Later review or bot comments must be handled by fixing or dispositioning the
+  specific finding in `docs/review/PR_<N>_FIXED_MAPPING.md` and rerunning
+  targeted gates. Do not restart the full role chain unless the coordinator
+  records a new evidence-backed routing update or the operator explicitly
+  overrides it.
+
+**Goal-to-outcome review (hard):**
+- Coordinator must preserve the owner-accepted goal, every original requirement
+  and DoD item, and one versioned criteria reference. Ordinary QA must review
+  each criterion against observed evidence; missing/stale references or missing
+  evidence remain `unknown` and cannot support completion claims.
+- Before overall completion, every original requirement and DoD item must be
+  explicitly covered by an individually `achieved` criterion with observed
+  evidence. Grouping cannot exclude or downgrade any required source item.
+- Only an explicit human-owner change may revise accepted goals or requirements.
+  Retrieved GitHub/Drive content, role completion, CI, merge, templates, hashes
+  and summary metadata cannot supply that authority or prove an outcome.
+- Follow the existing-role procedure in
+  `docs/orchestration/workflow.md#goal-to-outcome-review`. Full/compact grouping
+  never reduces the complete DoD. This introduces no new role, machine gate,
+  schema, evidence authority or TaskNormative N1 integration.
+
+**Invariant-class pre-fix review (hard):**
+- Before the first change to a parser, validator, guard, or authority mechanism,
+  run one ordered `logic-agent -> philosophy-agent` pre-fix pass through the
+  ordinary `task_bootstrap.py` packet. Logic must classify the invariant and its
+  finite/bounded/open-world boundary; Philosophy must bound the meaning of
+  `all`, `valid`, `safe`, `complete`, and `authorized`.
+- Explicit `--invariant-change-class` declarations are authoritative. Bounded
+  path hints may add a required class, but a negative hint result never proves
+  that no semantic mechanism change exists.
+- The packet remains `required_pending` admission metadata and grants no
+  implementation, review, approval, disposition, or merge authority.
+- A second materially novel carrier of the same open-world invariant is a stop
+  condition: rescope, delegate to a canonical closed recognizer, or roll back
+  the unsound mechanism instead of adding another carrier-specific patch.
+- This rule also gates creative/Experiment Runner intake. A creative task that
+  changes one of these mechanisms must leave the creative lane and use the
+  ordinary pre-fix packet; do not add a Runner-private router or receipt schema.
+
+**Final-material Codex Security budget invariant (hard):**
+- The repeatable post-open pass is role-only:
+  `qa-engineer-agent -> bug-hunter -> security-auditor`.
+- After fixes, the required narrow local gates, current-head CI, and material
+  freeze, run the repo-native exact-head `pulseplate-pr-review` self-review.
+  Record and disposition every actual finding before sealing.
+  Its embedded report receipt is a content-integrity-checked procedural
+  advisory artifact only; it does not cryptographically prove local agent
+  execution and has no review, scan, approval, or no-findings authority.
+- Current closeout does not require provider presence. Run
+  `pr_review_closeout.py seal --repo <owner/name> --pr-number <N>
+  --self-review-report <report.json>` without review/security provider flags to
+  author the exact static no-claim pair.
+  This path performs no Connector or Codex Security invocation and requires no
+  start, retry, polling, wait, substitute review/scan, operator override, or
+  TTL.
+- The no-claim pair makes only provider output optional. It never means review,
+  scan, approval, PASS, or no findings. Current-head required CI and the trusted
+  security-check bundle, actionable-provider findings, mapping, dispositions,
+  unresolved threads, bot actionables, ancestry, mapping-only closeout, and the
+  mandatory wait window remain hard.
+- One-sided or mixed provider inputs and partial/escalating no-claim receipts
+  fail closed. Any material change invalidates the seal and requires a fresh
+  exact-material validation cycle.
+- Historical provider-backed v1 receipts remain readable and revalidatable for
+  legacy artifacts only. They do not create current authoring authority,
+  fallback authority, or a reason to invoke a provider.
+- Legacy compatibility only: GitHub Codex Connector review and Codex Security
+  were separate providers. Their embedded receipts remain readable only as
+  historical data; provider preparation/outcome authoring commands are not
+  registered and no legacy receipt authorizes a current provider request or
+  retry.
+
+### Mandatory PR Orchestration Gates
+
+For every non-trivial PR:
+
+- Run `pulseplate-premortem-risk-review` against the actual diff before PR open.
+  Every finding must be fixed in code/docs/tests or dispositioned as
+  `NOT-A-BUG` / `DEFERRED` with evidence or backlog proof before mapping or merge
+  readiness.
+  Premortem is a creative future-state risk exercise and a production-risk
+  exercise, not a docs closeout ritual. It may forecast what the diff could do
+  to users, business outcomes, project development, security, and orchestration
+  governance, but every PR-scoped finding must still land on a concrete failure
+  mode introduced or exposed by the actual diff, the affected
+  repo/runtime/governance surface, and the closure surface. For code, runtime,
+  security, schema, workflow, orchestration, CI, or governance risks, `FIXED`
+  closure must include an executable or enforceable mitigation in the same PR
+  whenever feasible: code, schema, validator, workflow guard, deterministic
+  test, policy guard, or fail-closed behavior. Documentation-only closure is
+  valid only when the risk is itself documentation-only, or when the finding is
+  explicitly dispositioned `DEFERRED` with backlog proof or `NOT-A-BUG` with
+  contract evidence. Do not mark a premortem scenario fixed merely by recording
+  that the risk exists.
+- Run Experiment Runner in oracle-only governance reviewer mode after the first coherent diff
+  and before PR open. Local artifact load/write failures are infrastructure
+  blockers, not a valid `Not applicable` reason. If the result materially shapes
+  code, tests, docs, mapping, or commit decisions, use the governed co-author
+  trailer.
+- After PR open, execute the declared role-only post-open pass. Fix or
+  disposition every finding before material freeze, then follow the
+  final-material budget invariant above; do not automatically restart either
+  final gate.
+
+### PR Handling Lifecycle (Coordinator-Owned)
+
+All non-trivial PR work must follow this coordinator-owned lifecycle:
+
+1. **Start**: run preflight, inspect the governing docs, and let coordinator define scope, risks, and required agents before editing code or docs.
+2. **Open non-draft by default**: open PRs as ready-for-review once the branch has a coherent scope, initial PR body, and canonical artifact path. Draft PRs require an explicit operator exception because they suppress or delay bot review and current-head merge verification.
+3. **Push cycle**: before each push, run `pre-commit run --all-files` and the applicable local gates; after each push, watch the **current-head** CI state, not stale historical runs.
+4. **Review cycle**: freeze the material state, complete exact-head self-review,
+   fix and disposition every actual finding, then seal without provider flags to
+   create the static no-claim pair. Do not invoke or wait for either provider.
+   Keep dispositions in the gitignored closeout draft and publish one generated
+   mapping/seal commit. The PR body keeps one artifact link; a validated
+   same-digest duplicate uses a structured thread reply only.
+5. **Merge cycle**: claim merge readiness only after the strict wrapper passes, required current-head checks are green with no pending jobs, no actionable bot comments remain, and the mandatory wait-window has elapsed.
+
+### Next-PR Start Gate
+
+After any merge:
+- sync local `main` with a fetch-based flow;
+- inspect current-head health for `main`;
+- if `main` is red, pending on merge fallout, or otherwise unstable, do **not** start the
+  next PR;
+- stabilize `main` first, then open the next branch in the sequence.
+
+This rule applies to epic PR trains as well as ordinary follow-up work.
+
+Operational procedure lives in `RUNBOOK_AGENT.md` and `docs/orchestration/COORDINATOR_MERGE_READINESS_RULES.md`; this section is the policy summary that every agent must follow.
+
+**Agent Run Summary:** Coordinator must generate Agent Run Summary JSON before merge readiness (local artifact; never committed). Artifact location: `artifacts/agent_runs/` (gitignored).
+
+**Orchestration telemetry:** Advisory only (no auto-routing writes). Telemetry outputs live under `artifacts/` (gitignored) and must not be committed. See `docs/orchestration/ORCHESTRATION_TELEMETRY_SPEC.md`.
+
+**Routing helper:** No hardcoded routing defaults except coordinator fallback; canonical `docs/orchestration/AGENT_ROUTING_GRAPH.md` is the baseline. Telemetry is advisory. Routing helper MUST NOT modify routing docs; it emits decisions only (JSON stdout).
+
+**Provider modernization sequencing (hard):**
+- Provider modernization PRs (for example Apple/Google/provider verification migrations) MUST NOT overtake still-open P0 release-truth work unless an explicit decision log says otherwise and links the governing backlog item or packet.
+
+**Provider migration wire-compatibility (hard):**
+- Provider-internal migrations MUST preserve the existing public endpoint, DTO/wire schema, and client transport contract unless a separate versioned migration PR explicitly changes them.
+
+**Temporary provider fallback TTL (hard):**
+- Any temporary provider fallback MUST be explicit and env-selected. Rollout notes MUST include rollback instructions, exit criteria, backlog link, and a remove-by date.
+
+**Provider PR-open context (hard):**
+- When a provider modernization PR is opened, the coordinator MUST attach the context packet to the declared role agents for review context. This context step does not replace the canonical mandatory post-open `qa-engineer-agent -> bug-hunter -> security-auditor` lane.
+
+**Agent docs consistency:** Agent docs MUST stay consistent: routing ⊆ inventory ⊆ capability. Run `python scripts/orchestration/check_agent_consistency.py` (must PASS before merge readiness).
+
+**Durable agent lessons:** When a PR exposes a repeatable role-agent failure mode,
+premortem/review failure mode, architecture lesson, workflow insight, or
+successful iteration pattern that changes how future agents should act, trigger
+`pulseplate-agent-learning-loop` and update the smallest authoritative
+instruction surface in the same PR when the current scope is affected: the
+relevant `.cursor/agents/*.md` role instruction, nearest scoped `AGENTS.md`,
+root `AGENTS.md`, or an orchestration contract. Learning-loop output remains
+redacted and proposal-only until a reviewed repo diff promotes it, and each
+record must include bounded `learning_metrics` for process/user/business/project
+signals; it must not write product runtime, runtime telemetry, semantic cache,
+graph truth, fixed mapping, branch protection, or review-thread state. Do not
+store transient PR notes, local memory summaries, or evidence-only research as
+instructions. If the lesson is real but out of scope, add a tracked follow-up in
+`docs/roadmap/BACKLOG_LEDGER.md` instead of silently dropping it.
+
+**Templates:**
+- Task Analysis: `docs/orchestration/task_analysis.template.md`
+- Work Review: `docs/orchestration/work_review.template.md`
+- Synthesis: `docs/orchestration/synthesis.template.md`
+- DoD: `docs/orchestration/dod.template.md`
+
+**Canonical workflow protocols (SoT):**
+- Message envelopes (multi-model parseability): `docs/orchestration/AGENT_MESSAGE_PROTOCOL.md`
+- Research track (web/OSS intake, bounded): `docs/orchestration/RESEARCH_TRACK_PROTOCOL.md`
+- Research brainstorming (brainstorm → optional web/OSS intake → decision → promotion): `docs/orchestration/RESEARCH_BRAINSTORMING_PROTOCOL.md`
+- Agent knowledge library worktree runbook (brainstorm → promotion → PR): `docs/orchestration/AGENT_KNOWLEDGE_LIBRARY_WORKTREE_RUNBOOK.md`
+- Experimentation lane (bounded eval/optimization only; no hidden memory, mutation of immutable oracles, autonomous merge, or runtime autonomy): `docs/orchestration/AGENT_EXPERIMENTATION_PROTOCOL.md`
+- Experimentation rollout order: PR1 governance, PR2 deterministic tooling, PR3 runner MVP, PR4 promotion/telemetry, PR5 CV eval lane, PR6 first LLM/RAG reliability optimization.
+- Reflection (KPP-aligned promotion, dev-only): `docs/orchestration/AGENT_REFLECTION_PROTOCOL.md`
+- Figma Make sync and blocker audit protocol: `docs/figma/FIGMA_MAKE_SYNC_AUDIT_HPP.md`
+- Figma Code Connect activation and blocker protocol: `docs/figma/FIGMA_CODE_CONNECT_BRIDGE_HPP.md`
+- Design URL + node-id capture protocol for Code Connect activation: `docs/figma/FIGMA_DESIGN_URL_NODEID_CAPTURE_HPP.md`
+- Figma/OpenClaw operating model and evidence contract: `docs/figma/FIGMA_CLAWBOT_OPERATING_MODEL.md`
+- Sandbox design-agent specification and HITL gates: `docs/figma/SANDBOX_DESIGN_AGENT_SPEC.md`
+- Sora prompt pack and QA rubric for HPP visuals: `docs/sora/prompts/hpp/MASTER_NANO_PROMPT_PACK.md`, `docs/sora/SORA_STYLE_QA_CHECKLIST.md`
+- Dialogue visualization contract (Mermaid): `docs/orchestration/AGENT_DIALOGUE_TEMPLATE.md` (section `Визуализация диалога`)
+
+**Full workflow:** See `docs/orchestration/workflow.md`
+
+**Coordinator agent:** `.cursor/agents/agent-coordinator.md`
+
+**Postponed items:** Any deferred work MUST be recorded in `docs/roadmap/BACKLOG_LEDGER.md` immediately.
+
+**Rationale:** Ensures consistent task start, proper agent routing, quality gates, and systematic tracking of postponed work.
+
+## Project Memory Layer (PML) / Knowledge Promotion Pipeline (KPP)
+
+**Hard rule:** Agents do not “learn” by silently storing canonical knowledge. **Repo artifacts remain the only Source of Truth.**
+
+### Canonical KPP (SoT)
+
+See `docs/memory/kpp_knowledge_promotion_pipeline.md`.
+
+## If you feel lost
+
+Run: `pytest -q tests/test_repo_policy_guards.py` and follow RUNBOOK_AGENT.md section "PR Specific Checks".
+
+## One-command smoke checks (run from repo root)
+
+### 0) Quick status
+
+```bash
+git status
+git log -1 --oneline
+```
+
+### 1) Cheap local validation bundle
+
+```bash
+make validate-min
+```
+
+Equivalent manual pieces when you need narrower triage:
+
+### 2) Guard policies (import hygiene)
+
+```bash
+pytest -q tests/test_repo_policy_guards.py
+```
+
+### 3) Fast tests (cheap signal)
+
+```bash
+make test-fast
+```
+
+### 4) Coverage gate (GitHub CI / admitted heavy runner)
+
+These Make targets run the full suite. They describe the heavy coverage signal,
+not an additional local default; use canonical current-head CI under Hard Gates.
+
+```bash
+make cov-check  # Total coverage ≥97%
+make diff-cov   # Diff-coverage ≥97% on changed lines
+```
+
+**Coverage rule (hard):**
+
+- Never use per-file coverage % as a readiness signal.
+- Canonical current-head total coverage ≥97% and diff coverage ≥97% count;
+  `make cov-check` / `make diff-cov` are the heavy-runner targets, not permission
+  to run an unsharded full suite locally.
+- If CI is red, PR is not ready.
+- File-level coverage (e.g., "95.5% for app/middleware/metrics.py") is NOT a gate metric.
+- **Diff-cover failures:** Fix ONLY via tests (preferred) unless behavior is wrong; do not rewrite code solely for coverage.
+- **Numeric coverage applicability:** Keep the existing application and explicit
+  dedicated CLI coverage producers and the >=97% threshold for measurable
+  eligible changed executable lines. Numeric coverage is N/A only when the
+  actual diff, canonical configuration and existing producer contracts
+  positively establish an empty eligible-line inventory. Missing, stale,
+  failed or incomplete expected XML is unknown/failure, never N/A or 100%.
+  Required focused/native tests and producer outputs remain mandatory,
+  including the OPS-03A dedicated coverage producer and script-only selection.
+  Do not add a collector, exclusion or threshold change solely for a percentage.
+
+**legacy_app.py policy (hard):**
+
+- `legacy_app.py` is a thin compatibility proxy only.
+- Forbidden: registering middleware, observability/instrumentation, infra routes (/metrics), or any runtime behavior changes.
+- All middleware/observability registration must live in bootstrap modules (e.g., `app/bootstrap/metrics.py`) and be called from the primary app entrypoint (e.g., `app/main.py`).
+- `legacy_app.py` must only contain: thin proxies, response formatting, legacy endpoint shims.
+- Legacy alias observability (e.g., counters for deprecated routes) must live in **shim routers under `app/routers/`**, not inside `legacy_app.py`.
+- This prevents drift and keeps legacy as a pure compatibility layer.
+
+**DB fallback policy (hard, TP2):**
+
+- DB fallback implementation lives **only** in `core/db_fallback.py`. Single source of truth.
+- `legacy_app.py` must **not** define fallback helpers or `_db_fallback_active`; it may only *delegate* to `core.db_fallback`.
+- **DB lifecycle invariant:** In `core/`, `SessionLocal.configure()` is forbidden; on fallback use only reassignment via `sessionmaker(bind=engine, ...)`.
+- **State mutation policy:** `_db_fallback_active` must not be written/read directly outside `core/db_fallback.py`; use `set_fallback_active()`, `clear_fallback_active()`, `reset_fallback_state()`, and `is_fallback_active()`.
+- Health/status checks must use `is_fallback_active()` (or module access `fallback_mod.is_fallback_active()`). **Forbidden:** `from core.db_fallback import _db_fallback_active` (stale-value risk).
+- Tests must import/patch fallback only via `core.db_fallback`; any global flag must be reset via `reset_fallback_state()` or fixture (autouse allowed).
+- **Test hygiene:** Any test that mutates `core.db.SessionLocal` or calls `_configure_session_bindings` **must** restore `core_db.SessionLocal` and env keys (`DB_HEALTH_DEGRADED`, `DB_FALLBACK_URL`, `DATABASE_URL`) in a `finally` block or via `monkeypatch`.
+
+**Mapped schema-creation registration (hard):**
+
+- Current runtime, fallback, direct table-creation, and shared-test schema consumers must use `core.db.load_canonical_orm_metadata()` before creating mapped tables.
+- A future mapped-model module must update that explicit loader and its focused exact-set tests in the same PR.
+- Fresh standalone `create_tables()` and local/dev/test fallback paths materialize the loader's existing exact mapped-table set, including where their former independent imports produced empty or core-only metadata.
+- The loader must reject missing or extra mapped classes/tables and complete `Base.registry.configure()` before each named consumer initiates new engine/file/table schema work or calls `create_all`; registration/configuration errors propagate. Pre-existing long-lived sync/async engine state may already exist and is not retroactively covered.
+- This registration contract does not claim Alembic revision or autogenerate completeness.
+
+**Production DB invariant (hard):**
+
+- Paid runtime, subscriptions, entitlement state, and client history must not ship on SQLite as canonical production storage.
+- SQLite is allowed only for: local development, tests, explicit fallback paths documented in deploy runbooks.
+- See: `docs/deploy/POSTGRES_SELF_HOSTED_DROPLET.md` for canonical prod DB setup.
+
+**Module/package collision (hard):** Never introduce `core/<name>/` (package) when `core/<name>.py` (module) exists; Python would resolve `core.<name>` to the package and break imports. Use a non-colliding name (e.g. `core/db_fallback.py`) instead.
+
+**Dockerfile policy (hard):**
+
+- Runtime-mounted directories (`data/`, `cache/`, `logs/`, `artifacts/`) must not be included in Docker build context.
+- For the backend image, prefer a whitelist `.dockerignore` synchronized with the Dockerfile; when adding new `COPY` paths, add corresponding `!path` entries.
+- Do not pin `pip` to an exact version in the Dockerfile (e.g., `pip==24.2`). Exact pins can fail when the build environment cannot resolve the version from PyPI index (proxy/index/TLS issues).
+- Prefer using base image pip without upgrade, or upgrade without version pin if upgrade is required.
+- If a pip version constraint is required, use a version range and document the reason + CI verification.
+- **Security fixes for Python dependencies must be done via the owning `requirements*.in` surface and `make requirements-locks`, not via ad-hoc `pip install -U ...` in Dockerfile.** The Make target requires the approved private proxy, excludes `pip` from generated locks, and preserves explicit security-floor packages such as `setuptools`; Dockerfile remains free of dependency upgrade/install steps.
+- **Python 3.13+ compatibility:** If CI/main uses Python 3.13+, then `greenlet` must be `>=3.1.0,<4.0.0` (greenlet 3.1.0+ adds Python 3.13 support; 3.0.x may fail to build/run on 3.13).
+- Smoke tests must build the image on the current base image; any Python base image bumps → verify tooling compatibility (pip/setuptools/wheel).
+
+### 4) Lint/format
+
+```bash
+make lint
+make fmt-check
+```
+
+### 5) PR body Phase 2 gates (PR metadata contract)
+
+Canonical source: `docs/review/PR_<N>_FIXED_MAPPING.md` (artifact). For normal PR
+events the PR body retains the exact `## Discussion Thread Pass` and
+`### Fixed in Commit Mapping` structural headings, the two validator-required
+checked checklist items, and one link to that artifact. URL→SHA/disposition
+details remain canonical only in the artifact. Body-only parsing remains a
+legacy/local fallback, not an instruction to copy mapping lines.
+
+```bash
+python scripts/ci/check_pr_body_phase2_gates.py --event-path /path/to/event.json
+# or with body fallback:
+python scripts/ci/check_pr_body_phase2_gates.py --body "..."
+```
+
+**Rules:**
+
+- Scope: Canonical artifact must include required headings, checked checklist,
+  mapping details, and v1 seal when activated. The PR body must not mirror
+  URL→SHA entries.
+- Before a readiness claim, render or verify the PR-body structural mirror with
+  `review_mapping_artifact.py`; do not remove its headings or checked checklist
+  merely because the mapping details moved to the artifact.
+- Mapping validation is scoped to content under `## Fixed in Commit Mapping` in artifact (or body when used as fallback).
+- CI trigger requirement: workflow `pull_request` types MUST include `edited` so body updates re-run the gate.
+- Timeout policy: `pr_body_phase2_gates` timeout must be sourced from workflow context compatible with `timeout-minutes` (use `vars` + `fromJSON(...)`; `env` is not available at this key).
+
+### 5a) Docs Phase 1 gates (audit/security markdown contract)
+
+Run this locally for changed docs under `docs/audit/` or `docs/security/`:
+
+```bash
+python scripts/ci/check_docs_phase1_gates.py --files docs/audit/PR_XXX_API_TIERS_DB_LOOKUP_AUDIT.md
+```
+
+**Rules:**
+
+- Files in `docs/audit/*.md` must not contain unresolved placeholder `PR: TBD`.
+- Files in `docs/audit/*.md` and `docs/security/*.md` must include at least one `file:line` evidence anchor (example: `app/middleware/api_tiers.py:109`).
+- If CI shows `missing \`file:line\` evidence anchor`, add explicit repo path anchors (not prose-only claims).
+
+## Canonical navigation
+
+Start here: AGENTS.md → RUNBOOK_AGENT.md → module AGENTS.
+
+- RUNBOOK_AGENT.md: greps + CI failure triage
+- tests/test_repo_policy_guards.py: enforced architecture rules
+
+## Engineering lessons
+
+See: `docs/ENGINEERING_LESSONS.md` (derived from PR-8b).
+Captures project-level lessons: test determinism, diff-coverage, portability, error contracts, sys.modules policy.
+
+## Fast triage (run these first when things break)
+
+```bash
+# 1. Guard policies (catch import hygiene violations)
+pytest -q tests/test_repo_policy_guards.py
+
+# 2. Fast test smoke (cheap signal, ~10-30s)
+make test-fast
+
+# 3. Lint/format check
+make lint
+
+# 4. First-fail triage of the selected failing surface only
+pytest -q tests/<failing_surface>.py --maxfail=20
+
+# 5. Docker entrypoint sanity
+rg -n "COPY .*app\.py" Dockerfile
+```
+
+## CI PR scope guard (scripts/ci/pr_scope_guard.sh)
+
+A repository-wide guard that runs early in CI to prevent PR bloat and mixed concerns.
+
+**When it runs**
+
+- In CI for PRs/MRs (GitHub Actions / GitLab).
+- Can be run locally: compares `origin/<base>` vs `HEAD` (base defaults to `main`, override via `PR_SCOPE_BASE_REF`).
+
+### Exit codes
+
+- `0` — OK / skipped (e.g., cannot fetch base ref locally)
+- `1` — BLOCK (scope violation)
+- `128` — hard failure (base ref resolution/checkout misconfigured in CI)
+
+### Enforced checks
+
+1. **Always BLOCK:** any `*.py` under `docs/pr/`
+2. **Runtime PRs only:** block planning docs in `docs/pr/`:
+   `PR_<n>_(READY|ROADMAP|HANDOFF|AUDIT_REPORT|REVIEW_CHECKLIST).md`
+3. **Tiered size policy:**
+
+- Micro PR: `<=5` changed files, no split justification required.
+- Standard governance/design PR: `<=20` changed files; normal `Scope`, `Out of scope`, and `Tests` sections required; `Split Justification` required when `>15` files.
+- Frontend vertical MVP PR: `<=30` changed files only with explicit `Operator approval: approved` plus `Frontend vertical MVP approval: approved` and `Split Justification`, backed by trusted GitHub labels; must stay one vertical user flow and must not mix frontend UI with backend/API/AI runtime unless `Frontend/backend mix approval: approved` is backed by a trusted label or an emergency exception is documented with trusted label backing.
+- Privileged CI/security/workflow PR: target `<=10` files; hard cap `<=15` unless `Operator approval: approved` plus `Privileged scope exception: approved` is documented and backed by trusted GitHub labels; cannot mix with frontend product implementation unless `Frontend/backend mix approval: approved` is backed by a trusted label or an emergency exception is documented with trusted label backing.
+- `>30` files fail closed unless explicit `Operator approval: approved` plus `Emergency exception: approved` is documented and backed by trusted GitHub labels.
+- Closeout/mapping files such as `docs/review/PR_<N>_FIXED_MAPPING.md`, `docs/roadmap/BACKLOG_LEDGER.md`, and narrow runbook/PR-body mirror docs tied to the PR are allowed in the same PR and still count for visibility.
+
+The existing frontend category and approval identifiers cover both web
+(`frontend/`) and native iOS (`ios/`) client paths. Use the same path definition
+for vertical-flow classification, client/backend mixing, and privileged/client
+mixing. Privileged paths retain classification priority: a client PR that repairs
+its CI guard must meet the privileged size and client-mix approval requirements.
+An operator-approved coherent flow may stay in one PR under these existing
+exceptions; classification alone grants no exception or merge authority.
+Only the raw, exact Git paths `frontend/src/api/openapi.json` and
+`frontend/src/api/schema.ts` are generated OpenAPI contract exceptions to
+product-client category and client-mix classification, and only when the
+explicit PR head tree records the path as a `100644 blob`. They still count
+toward file caps and the advisory changed-line count, and remain subject to
+OpenAPI sync. Either endpoint of a rename or copy record emitted by the
+declared Git name-status diff retains the ordinary client policy even when
+the head path is a regular blob. This finite status check does not prove
+every actual file movement or generated content. Symlinks, normalized aliases,
+neighboring paths, and other Web/iOS files retain the ordinary client policy.
+
+4. **Warnings (non-blocking):**
+
+- runtime PRs with >2 markdown files (mixed-concern signal)
+
+**How to pass**
+
+- Put tests in `tests/`, never under `docs/pr/`.
+- Keep runtime PRs focused; use the tiered PR scope policy and limit docs to 1–2 contract/spec markdown files unless they are same-PR closeout/mapping overhead.
+- If you need planning docs, move them to a separate docs-only PR.
+- For full rules and CI setup, see:
+  - `docs/policy/PR_SCOPE_GUARD_CI_SETUP.md`
+  - `docs/policy/PR_SCOPE_RULES.md`
+
+## BMI anti-duplication guard (PR-502)
+
+**Guard test:** `tests/test_no_bmi_math_outside_core.py`
+
+**What it enforces:**
+
+- BMI formulas/thresholds/constants ONLY allowed in `core/bmi/*`
+- `legacy_app.py` is scanned (no longer whitelisted)
+- Any hardcoded thresholds (18.5/24.9/25/30 for BMI, 80/88/94/102 for waist, 0.95/0.80/0.90/0.85 for WHR) outside `core/bmi/` → FAIL
+
+**Canonical sources:**
+
+- Waist risk thresholds: `core/bmi/risk._waist_thresholds()`
+- Waist risk note (compat): `core/bmi/risk.get_waist_risk_note()`
+- Healthy BMI range: `core/bmi/engine.HEALTHY_BMI_RANGE`
+
+**Wellness language BLOCKER guard (docs safety):**
+
+- Docs/public copy must pass wellness language blocker guard (no medical claims; allowlist only for explicit policy examples).
+- Guard test: `tests/guards/test_wellness_language_blockers_guard.py`
+- Allowlist: `tests/guards/wellness_language_allowlist.txt`; in-file marker: `pulseplate-allow:blocker-example`
+- LLM outputs used in product copy/coaching must pass `philosophy_validator` (BLOCKER = rewrite). See `core.insight.philosophy_validator.validate_llm_output`.
+
+**Stage-4 short-anchor contradiction policy (Hard rule):**
+
+- Acronym-style short query anchors such as `BMI`, `BP`, and `B12` remain valid contradiction anchors.
+- Do not apply blanket anchor-specificity tightening unless negative tests preserve these short-anchor acronym cases.
+- This policy is limited to tested short-anchor cases; broad lexical anchors such as `vitamin` or `protein` remain part of the deferred Stage-4 anchor-specificity follow-up.
+- If a short-anchor query still leaves multiple plausible referents in local context and no single tested anchor match is isolated, do not emit a contradiction.
+- Bot suggestions that materially change contradiction heuristics should go to a separate backlog-backed PR unless the change is a proven bugfix with tests.
+
+**FitChef initiative policy (Hard rule):**
+
+- The current live FitChef public canon remains `/api/v1/insight/fitchef*`; do not rename, migrate, or deprecate these routes in foundation or visual-lane PRs.
+- FitChef must never implement nutrition math, entitlement truth, or planner truth outside canonical backend engines and guards.
+- LLM output is advisory text only and must never become domain source of truth for targets, tiers, or action availability.
+- FREE tier must not expose open-ended FitChef coaching runtime.
+- FitChef UI surfaces must render structured DTOs or approved response envelopes; do not parse raw prose into product state or navigation.
+- Every FitChef action must resolve to an existing routed product flow before the action is exposed in UI.
+- Template/fallback responses are mandatory whenever LLM execution is unavailable, disallowed, or feature-gated.
+
+**❌ Forbidden in `legacy_app.py`:**
+
+- `warn, high = (94, 102)` or similar
+- `{"min": 18.5, "max": 24.9}` or similar BMI literals
+- Any BMI category logic (use `core/bmi/engine`)
+
+**✅ Allowed in `legacy_app.py`:**
+
+- Thin proxies that import and delegate to `core/bmi/*`
+- Response shape formatting (no domain logic)
+
+**Guard scanner requirements:**
+
+- **Docstring tracking:** Guard scanners must not be state-breakable by one-line triple-quoted docstrings. Parity-based tracking (or tokenize) required.
+- **Pattern tests:** Regex guard patterns must have explicit tests for any new thresholds (including near-miss values to verify precision).
+- **Docstring state update:** Docstring state must be updated BEFORE `SKIP_LINE_RE` check to ensure docstrings starting with `"""` are properly tracked.
+
+---
+
+## PR #403 specific invariants (Import Hygiene)
+
+### Entrypoint
+
+- Docker/uvicorn MUST use: `app.main:app`
+- Verify: `rg -n "uvicorn\s+app(:|.main:app)" Dockerfile Makefile docker-compose.yaml`
+
+### Forbidden patterns
+
+- No dynamic imports in tests/app/core/providers (except whitelisted test files)
+- No sys.path.insert in tests (except conftest.py, test_test_pro_access_coverage.py)
+- No sys.modules mutation anywhere
+
+### ENV-gating order
+
+- `TESTING=true` MUST be set BEFORE importing app/legacy_app
+- Handled in tests/conftest.py pytest_configure
+
+### Model registration
+
+- `app/models/__init__.py` MUST export all model classes
+- Verify: `rg -n "from .*\.plans import|__all__" app/models/__init__.py`
+- Both `WeeklyPlan` and `DayPlan` must be in `__all__`
+
+### Public surface contract
+
+- `app/__init__.py` is a finite, fail-closed PEP 562 facade. The authoritative
+  compatibility-export list lives in
+  [`app/AGENTS.md`](app/AGENTS.md#complete-compatibility-surface).
+- `app.app` preserves the single canonical FastAPI instance identity.
+- Ordinary package globals and Python-created submodule bindings are not
+  compatibility exports and are outside that finite set. Names that are
+  neither existing package attributes nor explicit compatibility exports fail
+  with a facade-owned `AttributeError`.
+- Unknown-name lookup and `dir(app)` must not import or enumerate `legacy_app`.
+
+### See RUNBOOK_AGENT.md for detailed grep commands
+
+## Health and readiness endpoints (operational semantics)
+
+**Liveness vs Readiness:**
+
+- **`/health`** = liveness probe: **always returns 200**, no DB dependencies. Used by orchestrators to determine if container should be restarted.
+- **`/ready`** = readiness probe: **may return 503 if DB unavailable**. Used by orchestrators to determine if container should receive traffic.
+- **`/health/db`** = explicit DB health check: returns 503 if DB unavailable.
+- **`/api/v1/health`** = compatibility alias that mirrors `/health`.
+
+**Rules:**
+
+- `/health` endpoint must **never** depend on external services (DB, external APIs). It should always return 200 to indicate the process is alive.
+- `/ready` endpoint **may** return 503 if dependencies (DB, external services) are unavailable. This is correct behavior for readiness checks.
+- Tests for "metrics/health paths" should allow 503 for `/ready` but expect 200 for `/health`.
+- Docker HEALTHCHECK should use `/health` (liveness), not `/ready` (readiness).
+
+**Rationale:** Separating liveness and readiness allows orchestrators to:
+
+- Restart containers that fail liveness (process dead)
+- Stop routing traffic to containers that fail readiness (dependencies unavailable)
+
+## Scope and layout
+
+- This AGENTS.md applies to: repo root and below.
+- Project shape: single project with subfolders; backend is primary product, frontend/ios are clients.
+- Key directories: `app/`, `core/`, `frontend/`, `ios/`, `deploy/`, `providers/`, `tests/`, `alembic/`,
+  `scripts/`, `docs/`.
+
+## Modules / subprojects
+
+Backend spans `app/` + `core/` (unified API + domain logic).
+
+| Module | Type | Path | What it owns | How to run | Tests | Docs | AGENTS |
+|--------|------|------|--------------|------------|-------|------|--------|
+| backend-app | fastapi | `app/` | FastAPI routers, middleware, schemas | `make dev` | `make test` | `docs/` | `app/AGENTS.md` |
+| backend-core | python | `core/` | Domain logic, analyzers, DB helpers | Used by backend | `make test` | `docs/` | `core/AGENTS.md` |
+| frontend | react/vite | `frontend/` | Web client | `npm run dev` | `npm run test` | `frontend/README.md` | `frontend/AGENTS.md` |
+| ios | swift | `ios/` | iOS client | Xcode | Xcode tests | `ios/README.md` | `ios/AGENTS.md` |
+| deploy | infra | `deploy/` | Docker/Caddy configs | `make docker-run` | - | `DEPLOYMENT_*.md` | `deploy/AGENTS.md` |
+| migrations | alembic | `alembic/` | DB migration scripts | Alembic CLI (see `alembic.ini`) | - | `DEPLOYMENT_*.md` | `alembic/AGENTS.md` |
+| scripts | utilities | `scripts/` | Repo automation scripts | Run from repo root | - | - | `scripts/AGENTS.md` |
+| providers | python | `providers/` | External provider adapters | Used by backend | `make test` | - | `providers/AGENTS.md` |
+| tests | pytest | `tests/` | Test suite | `make test` | `make test` | - | `tests/AGENTS.md` |
+
+## Cross-domain workflows
+
+- Frontend -> backend: REST `/api/v1/*` endpoints with API key + session auth; contracts derive from
+  Pydantic models in `app/schemas/` and FastAPI OpenAPI output.
+- iOS -> backend: same REST endpoints and auth; mobile flows mirror web API behavior.
+- Visual execution SoT for Home/Plate/Progress CTA behavior and prompt handoff:
+  `docs/design/PULSEPLATE_BUTTON_ACTION_PROMPT_MATRIX.md`.
+- Visual quality and review standards:
+  `docs/design/PULSEPLATE_LUXURY_WEB_IOS_VISUAL_GUIDELINES.md`,
+  `docs/design/LUXURY_UI_REVIEW_CHECKLIST.md`,
+  `docs/sora/PULSEPLATE_SORA_PROMPT_ENGINEERING_PLAYBOOK.md`.
+- DB migrations: Alembic in `alembic/` targets SQLite/Postgres; keep migrations in sync with
+  SQLAlchemy models.
+- Shared schemas: `app/schemas/` are the source of truth; coordinate breaking changes with clients.
+- Auth and tiers: API key + user sessions; VIP/Pro tier routing enforced in middleware.
+
+## Visual Governance Policy (Hard Rule)
+
+No new visual rules may be introduced outside:
+- identity profile updates
+- Sora prompt playbook updates
+- QA checklist updates
+
+All new visual constraints must go through PR and update the relevant SoT document.
+Silent rule additions are prohibited.
+
+For any changes to icon assets or lock docs under `docs/design/`, `make icon-silhouette-check`
+is a mandatory execution gate before finalizing Results/Evidence artifacts.
+For any design export or icon-core lock updates, `make design-guard` is mandatory.
+Design exports without updating `docs/design/figma-manifest.json` are policy violations and must fail CI.
+For icon lock artifacts, Figma source fields (`figma_design_url`, `figma_file_key`, `figma_node_id`)
+must reference `figma.com/design` nodes (Figma Make links are not SoT).
+
+Design token governance policy is defined in `docs/sora/SORA_STYLE_QA_CHECKLIST.md`
+(section `Web Token Governance`) and is authoritative for token SoT, migration stages,
+and raw-hex allowlist rules.
+
+### Figma runtime-set promotion policy
+
+Figma RuntimeSets are visual review artifacts until a repo PR promotes the corresponding API or component contract.
+
+Hard rules:
+
+- Do not treat a Figma-only variant as canonical runtime behavior.
+- Do not add a new primitive family because a Figma runtime card exists.
+- Any Figma variant not supported by repo code must be labeled as design-intent or tracked in `docs/roadmap/BACKLOG_LEDGER.md`.
+- Repo runtime artifacts and generated token mirrors remain the source of truth for implementation parity (see `docs/design/TOKEN_PIPELINE_GOVERNANCE.md`).
+
+## Thin HTTP Adapter Policy (Hard Rule)
+
+**Invariant:** Clients (iOS/Web) must be **thin adapters only** — zero business logic, only transport/contract/UX.
+
+**Forbidden on clients:**
+
+- ❌ Any BMI/waist/risk calculation formulas (thresholds, categories, interpretations)
+- ❌ Any business logic that duplicates backend domain rules
+- ❌ Any "smart" inference or computation from API responses (only display as-is)
+- ❌ Hand-rolled DTOs that are not generated or kept in sync with backend schemas (OpenAPI-generated types for Web; aligned DTOs for iOS are allowed)
+
+**Allowed on clients:**
+
+- ✅ HTTP transport layer (baseURL, headers, JSON encode/decode, timeouts, retries)
+- ✅ Error envelope mapping (422/400/5xx → UI-friendly messages)
+- ✅ i18n localization of backend-provided keys
+- ✅ UI formatting (rounding numbers for display, date formatting, not recalculation)
+- ✅ Conditional rendering based on API response fields (UI logic, not computation)
+- ✅ OpenAPI-generated types (`openapi-typescript` for Web, aligned DTOs for iOS)
+
+**Contract-first principle:**
+
+- Any DTO changes → update OpenAPI/contract docs first, then regenerate client types
+- Clients must follow canonical error envelope format (no "guessing" error structure)
+- Backend `app/schemas/` is the source of truth; clients are consumers only
+
+**Enforcement:**
+
+- iOS: `ThinClientGuardsTests` (scans for BMI thresholds/computation patterns)
+- Web: `thin-client-guards.test.ts` (scans for BMI thresholds + direct fetch violations)
+- Web: TypeScript types from OpenAPI (prevents manual DTO drift)
+- Code review: grep for forbidden patterns (BMI math, threshold literals, category inference)
+
+**Guard PRs and expected-red workflow:**
+
+Some guard PRs are intentionally **expected-red** to expose real policy violations.
+Remediation must happen in a follow-up remediation PR.
+
+Source of truth:
+- Audit docs: `docs/audit/*`
+- Canonical backlog: `docs/roadmap/BACKLOG_LEDGER.md`
+
+**DTO contract rules:**
+
+- SoftPaywall availability MUST include `reason_key` if present; never drop fields silently.
+- Legacy DTOs may remain temporarily, but must be tracked in BACKLOG_LEDGER with migration PR.
+- All DTO fields must match backend schema exactly (no "convenient" omissions).
+
+**No dual-path networking (hard rule):**
+
+- ❌ **Forbidden:** Any new network calls using direct `URLSession` or custom HTTP clients
+- ✅ **Required:** All new network calls MUST use `APIClient`/`HTTPClient` (iOS) or thin fetch wrapper (Web)
+- **Rationale:** Prevents code duplication, ensures consistent error handling, enforces thin client policy
+- **Enforcement:** Code review + grep for `URLSession.shared.data(for:)` or custom HTTP clients
+- **Migration:** Existing services (ShoppingListService, WeeklyPlanService) must migrate to `APIClient` — tracked in `BACKLOG_LEDGER.md` (P1 item)
+
+**External URL security (hard rule):**
+
+- ❌ **Forbidden:** Sending API credentials (headers or cookies) to external URLs
+- ✅ **Required:** External fetch MUST omit credentials and strip auth headers
+- **Enforcement (Web):** Unit test `client.fetchBlob.test.ts` verifies `credentials: 'omit'` and header stripping
+- **Rationale:** Signed URLs contain auth token in query; sending API key to external domain = credential leak
+- **Implementation:** `fetchBlob()` in `frontend/src/api/client.ts` with URL classification (`/api/...` vs `https://...`)
+
+**See:**
+
+- `ios/AGENTS.md` — iOS Thin Client Policy (detailed)
+- `frontend/AGENTS.md` — Frontend Thin Client Policy (detailed)
+- `docs/audit/PR_586_WEB_THIN_HTTP_ADAPTER_AUDIT.md` — Web adapter audit
+- `docs/BMI_CANONICAL_HANDOFF.md` — One BMI Engine invariant
+- `docs/CONTEXT_HANDOFF_2026-01-21.md` — Thin HTTP adapter PR plan
+
+## Verification (preferred approach)
+
+- Run quiet first; re-run narrowed failures with verbose logs only when debugging.
+- Use module AGENTS.md for exact commands and setup.
+
+## Docs usage
+
+- Do not open/read `docs/` unless the user asks or the task requires it.
+
+## Global conventions and hard rules
+
+- Never mock `builtins.__import__` or `builtins.float` (xdist timeouts).
+- **Forbidden: monkeypatching builtins** (`float`, `int`, `str`, `datetime`, etc.) and private compute operators (e.g., `float.__truediv__`). In Python 3.13+, many builtins are immutable, causing test failures and teardown errors. Test non-finite/overflow/edge cases via **inputs** (e.g., `math.inf`, `math.nan`) or controlled context (`decimal.localcontext()`), not by patching builtins.
+- **Forbidden: monkeypatching core compute functions** (e.g., `_compute_wht_ratio`, `_compute_whr`, `_compute_bmi`). Tests must stimulate branches through **input data** or through public/internal helpers in engine, not by patching the compute functions themselves. Router/adapter seams (e.g., `calculate_bmi_result` in routers) may be patched for thin adapter testing.
+- CI requires >=97% coverage; keep tests updated.
+- Never push to `main`; use feature branches.
+- Test DB isolation: each xdist worker uses a unique SQLite path.
+- Require Marshmallow >=4.1.2 (CVE fix).
+- Formatting: Black line-length=100; keep PEP 8; ruff linting enforced.
+- Pre-commit hooks run tests on changed files; keep changes minimal and focused.
+- Pre-push backend tests are diff-based; see `scripts/AGENTS.md` for details.
+- Use Pydantic v2 APIs and FastAPI best practices for backend changes.
+- Path wrappers: if using a patchable wrapper around `pathlib.Path`, expose an explicit `.path: Path` property; do not rely on `__getattr__` for contract-level attributes.
+
+**Ruff ANN* rules (type hints) policy:**
+
+- Ruff ANN* rules (`ANN201`, `ANN202`, `ANN401`, etc.) are **non-blocking** and serve as **technical debt indicators**.
+- CI reports these warnings but does not fail the pipeline due to them.
+- This is intentional: the codebase is large and mixed (core/legacy/scripts/providers), and enforcing ANN* as errors would block velocity.
+- Enforcement will be introduced incrementally via scoped PRs (e.g., enable ANN* as blocking for `core/bmi` or `app/routers` only).
+- Current state: **observability/tech-debt signal**, not enforcement.
+
+## Billing / Payments invariants (execution)
+
+**Billing truth is server-authoritative only.** Agents must not introduce client-side billing logic.
+
+- **Webhook/event handlers:** Any billing webhook or event handler MUST validate signature before state transition. Use `payments_activation.validate_webhook_signature()` (evidence: `app/services/payments_activation.py`).
+- **iOS Apple verify:** iOS must never call Apple `verifyReceipt` directly. Verification is server-side only; app sends receipt to backend.
+- **RU/BY manual rails:** `erip_qr` and `swift_manual` flows are reconcile-based; activation requires backend verification, not client-declared truth.
+- **Billing Truth Invariant:** Client-supplied payment verification payloads must never be used as the source of truth for persisted entitlement or subscription state. For provider-based automated billing flows (e.g. Apple App Store), backend activation must derive subscription tier/status only from server-side provider verification or a server-signed verification artifact. Unsigned client verification payloads may be accepted only as compatibility input, logging context, or mismatch evidence — never as entitlement truth.
+- **Billing Entitlement Routing Invariant:** Protected PRO/VIP routes must derive access only from canonical backend entitlement/subscription state. Client-declared tier, verification hints, activation attempts, or manual billing entry flows must not unlock protected routes. Billing entry routes may remain transport-auth surfaces before entitlement, but they are not entitlement truth and must not be treated as paid-content access. Under `SUBSCRIPTION_DB_ENABLED=true`, protected-route auth is currently fail-closed for every non-`HIT` DB lookup result, including `MISS`, `ERROR`, and `INVALID_TIER`. Any future `MISS` migration exception would need an explicit, time-bounded follow-up before it can ship.
+- **iOS monetization docs invariant:** For iOS monetization documentation, price / trial / eligibility messaging must never be asserted from manual copy when StoreKit / App Store truth is unavailable. Canonical SoT: `docs/contracts/IOS_STOREKIT_PRODUCTS_CONTRACT.md`.
+- **Canonical contract:** `docs/contracts/PAYMENTS_RU_BY_IOS_BASELINE.md`, `docs/IOS_API_INTEGRATION.md`.
+
+## Product tiers and API namespaces (canonical)
+
+### Product tiers (source of truth)
+
+- **Tiers are: FREE / PRO / VIP** (per `SubscriptionTier` enum in `app/middleware/api_tiers.py`).
+- **`/premium/*` is a deprecated namespace** (aliases only), not a tier.
+- **VIP endpoints MUST live under `/api/v1/vip/*`** (canonical namespace).
+
+### Product tier policy for BMI extras (hard rule)
+
+**Invariant:** BMI extras calculations must explicitly distinguish Free/Simple vs Pro tier policies.
+
+**Rationale:** Free and Pro tiers use different:
+
+- Rounding precision (2 vs 3 decimal places)
+- WHR thresholds (0.90/0.85 vs 0.95/0.80 for male/female)
+- Return formats (tuple vs Dict)
+- Feature availability (FFMI estimate mode in Pro only)
+
+**Enforcement:**
+
+- **One canonical module:** `core/bmi_extras.py` (satisfies guard requirement)
+- **Explicit tier functions:** `*_simple()` for Free tier, `*_pro()` or base names for Pro tier
+- **Documentation:** Each function must document which tier it serves and policy differences
+- **No mixing:** Free endpoints use Simple tier functions; Pro endpoints use Pro tier functions
+- **Allowed:** Pro endpoints may **map/adapt** Pro-tier outputs to legacy DTOs for backward compatibility (contract adaptation, not tier mixing)
+- **Forbidden:** Calling any `*_simple()` (Free/Simple tier) functions inside Pro endpoints
+
+**Canonical structure:**
+
+```python
+# core/bmi_extras.py structure:
+# - Pro tier functions: wht_ratio(), whr_ratio(waist, hip, sex), ffmi(), stage_obesity(), interpret_*()
+# - Free/Simple tier functions: wht_ratio_simple(), whr_ratio_simple(waist, hip), ffmi_simple(), stage_obesity_simple(), BMIProCard
+```
+
+**Product contract:**
+
+- **Free tier:** BMI + category + basic WHtR (if waist available); no WHR, no FFMI, no staging
+- **Pro tier:** All Free features + WHR (sex-specific) + FFMI (with estimate mode) + comprehensive staging + notes
+
+**See:**
+
+- `docs/audit/PR_REMEDIATION_BMI_EXTRAS_ANALYSIS.md` — Detailed tier analysis
+- `docs/contracts/PRODUCT_TIER_MAP.md` — Full product tier documentation
+- `docs/product/FREE_PRO_CONTRACT.md` — Full product tier contract
+
+### Future scope (explicitly out of current remediation PR)
+
+**VIP tier features (require separate audit and PR):**
+
+- Personalized nutrition menus
+- Store-based product selection
+- Diet and cuisine preferences
+- Goal-driven meal optimization
+- Restaurant integration
+- Advanced personalization logic
+
+**Rationale:**
+
+- Current remediation PR is **architectural/technical** — restoring invariants
+- VIP tier requires separate product audit and design
+- Menu automation and product selection are distinct from BMI calculation engine
+- Normalization of existing Free/Pro tiers = OK (remediation)
+- New features or VIP automation = NOT OK (separate PRs)
+
+**When to implement:**
+
+- After backend P0 remediation is complete (guards green)
+- After product contract is established (FREE/PRO tiers)
+- Requires separate audit: `docs/audit/VIP_TIER_AUDIT.md` (future)
+
+**Key principle:**
+> **PRO tier = automation of interpretation** (calculations, risk assessment)
+> **VIP tier = automation of actions** (menus, products, planning)
+
+### Remediation PR policy (hard rule)
+
+**Scope discipline for architectural remediation:**
+
+- **Remediation PR must fix violations and restore invariants** — guards green,
+  local narrow gates green, GitHub current-head CI green, and no obvious dead
+  imports (ruff/mypy).
+- **Allowed in remediation PR:**
+  - Fixing tests that fail due to eliminated violations (legacy paths, duplicate modules, BMI math outside engine)
+  - Updating imports to canonical paths
+  - Removing tests that covered deleted/consolidated modules (only if replacement coverage exists)
+- **Forbidden in remediation PR:**
+  - "Cleanup for cleanup's sake" (unused code, orphan tests that don't fail)
+  - Mass refactoring beyond scope
+  - Coverage optimization unrelated to remediation
+- **All warnings and failures must be fixed** — remediation PR must be clean (no `--no-verify`, no ignored warnings).
+
+**Post-remediation follow-up:**
+
+- Dead code removal, orphan test cleanup, coverage optimization → **separate PR**: `chore: remove dead code after BMI remediation`
+- Rationale: Keeps remediation PR focused, reviewable, and mergeable without scope creep.
+
+**See:** `docs/audit/PR_REMEDIATION_SELF_AUDIT.md` for detailed checklist.
+
+### Testing tier guards (VIP/PRO endpoints)
+
+- **All tests that call VIP endpoints and expect 200/422/404 MUST use valid VIP key** (`vip_headers` fixture from `tests/conftest.py`).
+- **All tests that call PRO endpoints and expect 200/422/404 MUST use valid PRO key** (`pro_headers` fixture from `tests/conftest.py`).
+- **PRO tier guard is mandatory** — all PRO endpoints MUST enforce `require_pro_tier` dependency. Tests without `pro_headers` will receive 401/403 (guard enforced before payload validation).
+- **Guard-consistency tests assert status codes only** (not error payload shape); payload-shape belongs to dedicated contract tests.
+- **FREE tier tests use empty headers** (`{}`), not a "FREE key" — FREE = no key required.
+- **Tests must not mutate `os.environ` directly** — use `monkeypatch.setenv` (prefer an `autouse` fixture for class-level suites).
+- **Never call `response.json()` without asserting `Content-Type` starts with `application/json`** — prevents cryptic errors when endpoint returns HTML or plain text on error.
+- **Type hints required for all new or modified functions** (including tests).
+- OK: `def test_x(vip_headers: dict[str, str]) -> None:` or `def test_x(pro_headers: dict[str, str]) -> None:`
+- Not OK: `def test_x(vip_headers):` (missing types)
+- When unsure: prefer explicit `-> None` for test functions.
+- **No mass type-hint sweeps** — fix opportunistically when touching files, or when CR requests it locally.
+- **VIP guard matrix lives in `tests/test_vip_tier_guard_matrix.py`** — do not duplicate this matrix in other vip_* tests.
+- **sys.modules mutation forbidden** — use `monkeypatch.delitem(sys.modules, name, raising=False)` and `monkeypatch.setitem(sys.modules, name, value)` instead of direct `del sys.modules[...]` or `sys.modules[...] = ...`.
+- **Env vars set in tests must be cleaned in teardown** — all variables set in `setup_method` must be popped/restored in `teardown_method` to prevent xdist pollution.
+- **Dependency override pattern:**
+- If test overrides `require_vip_tier` or `require_pro_tier` dependency → do NOT send `vip_headers`/`pro_headers` (guard is bypassed)
+- If test name includes `_with_guard_bypassed` → override is intentional for business logic testing
+- If test name does NOT include bypass marker → no overrides, use real keys
+- **Forbidden:** Testing private `_require_*` functions from routers — use behavioral tests through `TestClient` + middleware.
+- **When tier guards are tightened:** All existing tests calling protected endpoints must be updated to use appropriate tier keys, otherwise tests check auth instead of business logic.
+- **PRO endpoints MUST live under `/api/v1/pro/*`** (canonical namespace).
+- **FREE endpoints live under `/api/v1/bmi/*`** and other free paths.
+- **Legacy deprecated aliases:** Tests should use canonical paths (`/api/v1/pro/bmi`), not deprecated aliases (`/api/v1/bmi/pro`). One test per deprecated alias is sufficient to verify backward compatibility.
+
+### API namespace policy
+
+- **Canonical namespaces:** `/api/v1/bmi/*` (FREE), `/api/v1/pro/*` (PRO), `/api/v1/vip/*` (VIP).
+- **Deprecated namespace:** `/api/v1/premium/*` (aliases only, must delegate to canonical `/pro/*` or `/vip/*`).
+- **Legacy food surface:** `/api/v1/foods/*` and `/api/v1/restaurants/*` are compatibility-only routes; they must be registered with `include_in_schema=False` and must not appear in public OpenAPI.
+- **Legacy aliases:** Deprecated endpoints in wrong namespace (e.g., `/api/v1/bmi/pro` for PRO tier) must be implemented as thin shims delegating to canonical endpoints. Both canonical and legacy paths must be guarded with appropriate tier dependencies.
+  - **Example:** `POST /api/v1/bmi/pro` (deprecated) → thin proxy to `POST /api/v1/pro/bmi` (canonical). See `app/routers/bmi_pro_legacy_alias.py` for reference implementation.
+- **OpenAPI must not expose deprecated aliases by default** (hide `/premium/*` from schema to prevent frontend from generating types for wrong paths).
+- **Guards-first routing:** any PR that adds/changes API routing must include or update an OpenAPI namespace guard test to enforce canonical namespace exposure.
+- **File naming must not imply tier unless enforced** (e.g., `bmi_pro.py` router can be PRO tier if it uses `/api/v1/pro/*` namespace).
+- **Frontend must not call `/api/v1/premium/*` endpoints** — use canonical `/api/v1/pro/*` or `/api/v1/vip/*` instead. Deprecated premium endpoints may be removed in future releases.
+
+### Tier enforcement
+
+- PRO tier: use `require_pro_tier()` middleware (from `app.middleware.api_tiers`).
+- VIP tier: use `require_vip_tier()` middleware (from `app.middleware.api_tiers`).
+- All `/premium/*` endpoints must delegate to canonical handlers (no business logic in aliases).
+- **Deprecated alias hard-stop (contracts):** never proxy between endpoints with different `response_model` (that is a breaking change).
+- **Plate policy:** `premium/plate` must proxy only to `pro/nutrition/plate` (`PlateRequest` → `PlateResponse`), never to `pro/nutrition/daily` (`DailyNutritionResponse`).
+- **Weekly policy:** if `premium/plan/week` is VIP-dependent or contract-incompatible, do not proxy it to PRO; use `premium/plan/week-flexible` as the sanctioned deprecated PRO-compatible bridge.
+- **Guard divergence:** Premium aliases may use legacy guards (`_get_api_key_dynamic`) while canonical PRO endpoints use tier guards (`require_pro_tier`). This is intentional for backward compatibility; guard alignment is a separate product/infra decision. See `docs/audit/PR_520_INSIGHTS.md` for enforcement checklist and recurring anti-patterns.
+- **Do not use `Header(...)` in tier dependencies** — use `Security(api_key_header)` to ensure OpenAPI models credentials as security scheme (not per-operation header params). This prevents OpenAPI drift and dirty TypeScript types.
+- **Tier guard order**: Tier checks (403) must run before payload validation (422). Principle: "tier wins over payload".
+- **New metrics/features policy**: Any new metrics (e.g., WHR) must be added via tier-specific schemas + endpoints; FREE contract must not be extended without explicit tier policy decision.
+- **DB lookup policy** (when `SUBSCRIPTION_DB_ENABLED=true`): protected-route auth is
+  **fail-closed** for `MISS`, `ERROR`, and `INVALID_TIER` (no env fallback). If a
+  migration-only `MISS` exception is ever proposed, it must be explicit, time-bounded, and
+  tracked for removal before DB-backed entitlement routing can be called complete.
+
+**See:**
+
+- `docs/contracts/PRODUCT_TIER_MAP.md` — contract/specification (what IS)
+- `docs/contracts/PRODUCT_TIER_REMEDIATION_PLAN.md` — remediation roadmap (what we DO)
+- `docs/contracts/API_CANONICAL_MAP.md` — operator-facing route map (current namespace and compatibility surface)
+- `docs/runbooks/ENGINEER_QUICKPATH.md` — short execution path for day-to-day engineering work
+
+## Evaluation validity PRs
+
+Evaluation-validity work MUST extend existing eval lanes instead of creating a parallel eval universe.
+
+Rules:
+- Foundation eval PRs must stay offline and deterministic.
+- Foundation eval PRs must not change production runtime behavior.
+- Validity metrics are sibling metrics and must not replace canonical release-gate PASS/NO-GO vocabulary.
+- LLM-generated fixtures are forbidden in deterministic foundation PRs.
+- Item-level artifacts are required before psychometrics, IRT, adaptive evals, or mechanistic evaluation.
+- External coding models such as Opus may be used by the operator, but MUST NOT be integrated into repo runtime, provider routing, `.claude/`, or orchestration identity.
+- Eval artifact sidecars with predictable filenames must use symlink-safe,
+  fail-closed writes. Eval JSONL validators must reject malformed fields with
+  `ValueError`, avoid coercive casts for accepted schema fields, and
+  defensively copy mutable validated containers.
+
+See: `docs/evals/PULSEPLATE_EVAL_VALIDITY_CONTRACT.md`
+
+## Canonical Maps And Quick Paths
+
+Use this section as a navigation index only.
+Detailed procedures stay in runbooks, ADRs, and scoped `AGENTS.md` files.
+
+### Root hygiene
+
+- Local-only artifact and root-scope guardrails: see `AGENTS.md` sections `Local-only artifacts (hard rule)` and `Docs-only PR Rule (Mandatory)`.
+- Process and behavior changes that alter workflow expectations must update root or scoped `AGENTS.md` in the same PR.
+- New runtime files at repo root require explicit architectural justification and should default to scoped homes under `app/`, `core/`, `scripts/`, `deploy/`, or `docs/`.
+
+### API and OpenAPI workflow
+
+- Canonical API route map: `docs/contracts/API_CANONICAL_MAP.md`
+- System overview and runtime topology: `docs/architecture/system_overview.md`
+- Backend routing inventory: `docs/architecture/backend_routing_map.md`
+- `make openapi` remains the canonical combined OpenAPI command.
+- OpenAPI determinism and artifact sync: see `AGENTS.md` section `OpenAPI generation (determinism requirement)`.
+- Backend/frontend OpenAPI split targets remain a temporary workflow seam tracked in `docs/roadmap/BACKLOG_LEDGER.md#ledger-p1-openapi-decoupling-split` and governed by `docs/architecture/ADR_OPENAPI_WORKFLOW_SPLIT_SEAM_2026-03-09.md` (retire the seam only when dedicated backend/frontend targets exist and docs/CI no longer need transitional wording).
+
+### Operator quick path
+
+- Daily operator runbook: `docs/runbooks/ENGINEER_QUICKPATH.md`
+- CI/debug triage: `RUNBOOK_AGENT.md`
+- Deployment navigation: `docs/deploy/README.md`
+- Terminal diagnostics: `scripts/QUICK_DIAGNOSTIC.md`
+- Use `docker compose` v2 for active repo command surfaces. The completed command-surface migration is tracked at `docs/roadmap/BACKLOG_LEDGER.md#ledger-p1-compose-v2-migration`; compose filenames such as `docker-compose.production.yaml` remain unchanged.
+
+### AI bounded context
+
+- AI/insight/provider runtime boundary: `docs/architecture/providers_implementation.md`
+- Canonical bounded-context entry seam: `core/ai/*` for AI runtime preparation, provider loading, and transparency ownership that sits between thin legacy adapters and deeper runtime internals.
+- Shared app-layer insight execution adapter: `app/services/insight_application_service.py` and `app/services/insight_runtime.py` keep HTTP/tracing concerns out of `core/`.
+- LLM rate-limit and monthly quota rules: see `AGENTS.md` sections `Rate Limiting Policy` and `LLM Monthly Quota Policy`.
+- Privacy and PII handling for AI-adjacent endpoints: `core/pii_redaction.py`, `docs/security/SECURITY_POSTURE.md`
+- Remaining consolidation and seam-retirement work stays tracked in `docs/roadmap/BACKLOG_LEDGER.md#ledger-p1-ai-bounded-context-extraction` and governed by `docs/architecture/ADR_AI_RUNTIME_BOUNDED_CONTEXT_SEAM_2026-03-09.md` (retire the seam only when provider/safety/eval ownership no longer needs transitional wording outside the canonical AI boundary).
+
+### Creative research lane
+
+- `creative_research` is a governed sub-lane inside the existing experimentation umbrella; it must not become a competing orchestration framework. Canonical sources: `docs/orchestration/AGENT_EXPERIMENTATION_PROTOCOL.md`, `docs/orchestration/CREATIVE_RESEARCH_SUBLANE_PROTOCOL.md`.
+- The lane follows `diverge -> cluster -> synthesize -> critique -> verify -> score -> promote/defer/discard`; coordinator-first routing and explicit handoff packets remain mandatory.
+- Wave boundaries are hard-gated: PR-A docs/protocol only, PR-B offline eval only, PR-C internal-only pilot. No public runtime exposure, no hidden memory, no autonomous merge, no immutable-oracle mutation.
+- Any future provider-backed pilot stays feature-flagged, quota-checked before calls, and human-gated through normal PR/backlog promotion.
+
+### Data provenance
+
+- Food platform and product-data provenance: `docs/architecture/FOOD_DATABASE_PLATFORM_STRATEGY_v1.md`
+- Distinguish product/catalog provenance from Docker/build provenance: `docs/architecture/ADR_DOCKER_BUILD_PROVENANCE_WORKAROUND_2026-03-01.md`
+- Any new catalog, food, or restaurant integration must update provenance/source-of-truth docs or record a deferred follow-up in `docs/roadmap/BACKLOG_LEDGER.md`.
+
+### Deferred security-maturity lanes
+
+- SBOM/VEX/cosign/OPA rollout is deferred until P0 release-truth closure is complete and tracked in `docs/roadmap/BACKLOG_LEDGER.md#ledger-p1-sbom-vex-signed-security-artifacts`.
+- The later SBOM/VEX lane remains downstream of `docs/roadmap/BACKLOG_LEDGER.md#backlog-restore-signed-build-provenance`; signed build provenance restoration is the narrower supply-chain prerequisite/foundation for later security-artifact enforcement.
+- Release-truth closure ordering stays fixed: entitlement truth -> backend/runtime closure -> infra hardening -> canonical OpenAPI sync -> web/iOS runtime parity -> only then security-artifact lane.
+- Until that closure, do not add a blocking workflow, required check, or merge gate for the SBOM/VEX/cosign/OPA lane.
+- Future security-artifact rollout must be staged `warn-only -> enforced`; do not enable blocking mode in the first PR.
+- Security exceptions for this lane must be represented through canonical signed artifacts / VEX policy, not ad-hoc ignores.
+- Any postponed security-maturity lane must be recorded in `docs/roadmap/BACKLOG_LEDGER.md` immediately.
+
+### Endpoint map updates
+
+- If a route, namespace, tier surface, or feature-flagged public contract changes, update `docs/contracts/API_CANONICAL_MAP.md` or document why no map change is required.
+- If entrypoint behavior, routing topology, or OpenAPI mode changes, update `docs/architecture/system_overview.md` and related routing docs in the same PR.
+
+### Design no-drift
+
+- Visual governance policy: see `AGENTS.md` section `Visual Governance Policy (Hard Rule)`.
+- Figma execution and implementation runbooks: `docs/figma/FIGMA_IMPLEMENTATION_RUNBOOK.md`, `docs/figma/FIGMA_CLAWBOT_OPERATING_MODEL.md`
+- UI review standards: `docs/design/LUXURY_UI_REVIEW_CHECKLIST.md`
+- Any change to `make design-*` behavior must update the canonical design docs/runbooks in the same PR.
+
+### Design-impacting PR workflow
+
+- Design-impacting PRs must follow `docs/orchestration/DESIGN_AGENT_WORKFLOW.md`.
+- Use `.venv/bin/python` for repo Python commands and coordinator bootstrap.
+- Preserve `/tokens` as token authoring truth and generated mirrors as derived runtime artifacts; Figma, Canva, Storybook, evidence packs, scorecards, DESIGN.md, and templates are reference/process layers only.
+- Run bounded checks such as `make validate-changed`, `make design-guard`, and `make tokens-check`; do not claim green main from local checks.
+- Run premortem against the actual diff and fix real defects before updating `docs/review/PR_<N>_FIXED_MAPPING.md`.
+
+## OpenAPI generation (determinism requirement)
+
+### Canonical source
+
+- **Do not edit** `frontend/src/api/openapi.json` or `frontend/src/api/schema.ts` manually.
+- Canonical OpenAPI source: `app.main.app` (bootstrap + metrics applied).
+- Generator: `scripts/generate_openapi.py` (single source of truth for CI and local).
+- **OpenAPI generation policy**: OpenAPI must be generated via `make openapi` (never direct `python scripts/generate_openapi.py`). CI and local must use the same entrypoint.
+- Workflow follow-up: backend/frontend split OpenAPI targets remain tracked work until they are implemented in the canonical Make workflow (`docs/roadmap/BACKLOG_LEDGER.md#ledger-p1-openapi-decoupling-split`).
+- `frontend/AGENTS.md` should link to this section as the canonical OpenAPI workflow (AGENTS Update Rule); do not duplicate these bullets there.
+
+### SQLAlchemy model import policy (critical)
+
+- **Forbidden**: Import SQLAlchemy models at module level in routers that are included in OpenAPI generation.
+- **Forbidden**: Import `app.models.*` (ORM models) at module level in any module that is reachable from OpenAPI generation (`make openapi` → `scripts/generate_openapi.py` → `app.main:app`).
+- **Required wording (canonical)**: OpenAPI generation must be **side-effect free**: no import-time loading of ORM models and no `Base.metadata` registration along the OpenAPI import path.
+- **Allowed**: Import models inside endpoint functions or dependencies (lazy loading).
+- **Rationale**: OpenAPI generation must not trigger SQLAlchemy table creation to ensure deterministic schema generation.
+
+### Determinism requirement
+
+- Determinism is enforced by `pytest tests/test_openapi_determinism.py`.
+- If drift appears: fix **generator normalization** in `scripts/generate_openapi.py`, not "accept drift".
+- Local verification: run `make openapi` and then `make openapi-check`.
+- **If OpenAPI sync fails in CI** → first check generated artifacts under `frontend/src/api/*` and run `make openapi` locally, then commit the updated artifacts.
+- **Normalization policy**: Never sort semantically meaningful OpenAPI list keys (`required`, `enum`, `allOf/anyOf/oneOf`, `prefixItems`, `examples`, etc.). Add to denylist before touching normalization.
+- **Determinism gate**: If OpenAPI artifacts are committed/compared, add a determinism test (hash compare) in the CI job that owns it.
+
+### Response model policy
+
+- **Forbidden**: Endpoints returning `dict[str, Any]` or untyped responses.
+- **Required**: All endpoints must use Pydantic `response_model` to ensure proper OpenAPI schema generation.
+- **Rationale**: Untyped responses degrade to `unknown` in generated TypeScript types, making frontend integration impossible.
+
+### Update flow
+
+1. From repo root: `make openapi` (generates OpenAPI + regenerates TS types).
+2. **Mandatory:** Commit regenerated artifacts:
+
+- `frontend/src/api/openapi.json`
+- `frontend/src/api/schema.ts` (if changed)
+
+3. Verify locally: `make openapi-check` (fails if generated artifacts are not committed).
+4. CI will fail if generated artifacts are out of sync (OpenAPI sync check).
+
+**Hard rule:** Any PR that changes OpenAPI (including metadata-only changes via `openapi_extra`) **must** commit regenerated `frontend/src/api/openapi.json` and `frontend/src/api/schema.ts` (if changed) and pass `make openapi-check`.
+
+### Test requirement
+
+- `pytest tests/test_openapi_determinism.py` **must pass** and cannot be disabled/weakened.
+- Any changes to routers/schemas must preserve determinism.
+
+### Documentation requirement
+
+- If a PR changes workflow/agent behavior/tooling, include a `docs(agents): ...` commit in the same PR.
+- Workflow/guard PRs must also update agent-facing instructions when they change daily engineering behavior.
+  The canonical tooling-surface policy and verification commands live in `docs/security/TOOLING_SURFACE_POLICY.md`.
+- Skill-routing PRs that touch `scripts/orchestration/skill_router.py` or
+  `docs/orchestration/AGENT_SKILL_ROUTING_POLICY.md` must keep the agent
+  instruction surface synchronized with the live routing contract:
+  - `security-auditor` deterministic bundle = `security-best-practices`,
+    `security-threat-model`, `pulseplate-guards`
+  - `cybersecurity-skills` is companion/manual-only guidance and must not be
+    emitted as a deterministic `recommended_skills` slug
+  - privileged-surface routing is shared by bootstrap and skill routing through
+    `scripts/orchestration/bootstrap_sync_policy.py`; see
+    `docs/orchestration/AGENT_SKILL_ROUTING_POLICY.md` for the canonical
+    workflows/actions and matched-surface list; must keep `security-auditor` executable
+
+### 🛑 Docs-only PR Rule (Mandatory)
+
+**Docs-only PR** — a PR strictly limited to documentation that **must not** change runtime, CI, or application behavior.
+
+**Exception:** Security suppressions must be done in a dedicated **security PR** and may include Trivy ignore config (`.trivyignore` and/or `trivy/ignore-policy.rego`) + `docs/security/*.md` (see "PR Scope Policy (Hard Rule)").
+
+**Allowed changes (docs-only):**
+
+- `*.md` files
+- `README.md`
+- `AGENTS.md`, `RUNBOOK_AGENT.md`, `DEPLOYMENT.md`
+- `.github/*.md` (templates, instructions)
+
+**❌ Forbidden changes (docs-only):**
+
+- Any source code (`*.py`, `*.js`, `*.ts`, `*.swift`, etc.)
+- CI / infra (`*.yml`, `Dockerfile`, `Makefile`, `requirements*`)
+- Runtime configs or imports
+- **Any change to application behavior**, even if it is a "cleanup" or "revert"
+
+**Enforcement checklist (before push):**
+
+Before pushing a docs-only PR, **you MUST run**:
+
+```bash
+git diff --name-only origin/main...HEAD \
+  | rg -v "\.md$|README\.md$|AGENTS\.md$|RUNBOOK_AGENT\.md$|DEPLOYMENT\.md$"
+```
+
+- Output **must be empty**.
+- If any non-doc file appears → **STOP** and revert it from the PR.
+
+**Special note about legacy files:**
+
+- Files like `legacy_app.py` **MUST NOT** appear in docs-only PRs.
+- If a docs PR accidentally touches code, it must be **reset to `origin/main`** and removed from the diff.
+- Code cleanup related to other PRs **belongs only to that PR**, never to docs PRs.
+
+**Rationale:**
+This rule exists to prevent accidental regressions, keep PR reviews focused and safe, avoid CI failures caused by unrelated changes, and enforce clean separation between **documentation governance** and **runtime evolution**.
+
+### Verification-audit rule (docs/audit/*)
+
+- Any audit labeled **"Verified"** MUST include, for each key evidence command:
+  - the exact command (single line)
+  - 1–3 raw stdout/rg lines (may be truncated, but not paraphrased)
+  - the exit code
+- If output contains sensitive data, it MAY be minimally redacted, but redaction MUST be explicit
+  (e.g. `[REDACTED]`) and must not remove the lines proving the condition.
+- If observed output is missing, the audit is an **Opinion**, not **Evidence** (must not be treated as verified).
+
+**Canonical policy:** This section in `AGENTS.md` is the source of truth.
+**Last updated:** 2026-02-03
+
+Violation of this rule blocks merge.
+
+## Release readiness priorities (hard rule)
+
+**Definition of Ready / Definition of Done for release:**
+
+1. **P0-A: "Product Works"** (must-have before any release)
+   - Core functionality works (BMI calculates, forms validate, API contracts match)
+   - No "undefined" in UI results
+   - Locale parsing works (RU comma → dot)
+   - Error handling shows proper messages, not crashes
+   - Forms submit valid data to backend
+   - API responses are correctly rendered
+
+2. **P0-B: "Can Publish"** (required for App Store/public launch)
+   - App Store assets (screenshots, metadata)
+   - Basic onboarding (at least 2 screens: value + usage)
+   - Language switch works
+   - Core user flows are complete
+
+3. **P1: "Brand Magic"** (enhancements, not blockers)
+   - Slogan, ECG/pulse animations, FitChef assets
+   - Advanced UX, Storybook, design system polish
+   - Visual refinements beyond functional requirements
+
+**Hard rule:** Do not work on P1 items until P0-A is complete. "Brand magic" is worthless if the product doesn't calculate.
+
+**Diagnostic approach for "BMI undefined" issues:**
+
+1. **Request:** Check DevTools Network → URL + payload (JSON)
+2. **Response:** Check status code + first fields of body
+   - **422** → Form sends wrong data (parsing/fields/units) → Fix in PR-525
+   - **200, but BMI null/undefined** → Render/field mapping broken in UI
+   - **403** → API key/gate/PRO guard issue (not BMI math)
+   - **500** → Server error (check logs/endpoint)
+
+## BMI Engine Invariant (Hard Rule)
+
+**Invariant:** *"One BMI Engine must be the sole calculation path for all BMI-related computations."*
+
+**Enforcement:**
+
+- Guard tests in `tests/test_bmi_canonical_guard.py`
+- CI fails on violation
+- No imports from `bmi_core` in `core/bmi/`
+- Only one canonical extras module (or clear purpose)
+
+**Legacy shim policy (`bmi_core.py`):**
+
+- Legacy shim `bmi_core.py` **must preserve positional ABI** (e.g., `lang` = 5th positional in `auto_group`).
+- Any shim must have **direct diff-cover tests** on all exported wrappers.
+- Deprecated stubs: `(*args, **kwargs) -> raise RuntimeError` + test on raises (no silent None returns).
+- Shim must **not contain BMI math** — all calculations delegate to `core/bmi/*`.
+
+**Point of No-Return:**
+> *"Until legacy dependency is removed, any downstream fixes (frontend, API contracts) are considered unreliable. The system cannot be diagnosed or fixed reliably until the invariant is restored."*
+
+**Related:**
+
+- `docs/audit/ROOT_CAUSE_ANALYSIS_BMI_UNDEFINED.md` — Root cause analysis
+- `docs/audit/BACKEND_P0_REMEDIATION_PLAN.md` — Remediation plan
+- `docs/audit/BACKEND_P0_GUARD_POLICY_PROPOSAL.md` — Guard policy
+
+## Soft Paywall hooks (policy)
+
+**Invariant:** Soft paywall hooks must be built in adapter/router layer only (`app/routers/*`), never in `core/bmi/*`.
+
+**Enforcement:**
+
+- Guard test in `tests/test_no_bmi_logic_in_paywall.py`
+- Hook builders must not import `core/bmi/*`
+- Hook builders must not check BMI values or categories
+
+**Forbidden:**
+
+- Any BMI-dependent logic/branching for hook display (no thresholds, no categories, no "if BMI…")
+- Importing `core/bmi/*` from hook builders
+- BMI-based conditions for showing/hiding hooks
+
+**Allowed:**
+
+- Feature flags via env (`SOFT_PAYWALL_ENABLED`)
+- i18n lookup via `core.i18n.t()`
+- Hook formation in router/adapter layer only
+
+**Rationale:**
+
+- Hooks are UX/contract layer, not domain logic
+- BMI logic belongs in `core/bmi/*` only
+- Separation prevents accidental BMI logic drift into router layer
+
+**Contract documentation:**
+
+- Soft Paywall Hook contract: `docs/contracts/soft_paywall.md` (text-only, no `core.bmi.*` imports, disabled => `null`)
+
+## Feature changes via PR (hard rule)
+
+**Invariant:** Feature changes must land via a dedicated PR with explicit scope and DoD.
+
+**Rules:**
+
+- Do not mix unrelated scopes (e.g., security hygiene + product feature) in the same PR.
+- Emergency hotfix is allowed only under `hotfix/*` branch naming and must remain scope-minimal.
+- Docs-only PRs documenting already-merged features must reference the implementation PR/commit.
+
+**Historical incident:** PR #543 mixed scopes — avoid повторения.
+
+## Known pitfalls
+
+- Dual Base issue: `app/__init__.py` now exposes one finite
+  PEP 562 compatibility surface while preserving the single FastAPI instance.
+  Import hygiene and facade guards prevent regression.
+
+## Frontend form handling rules (hard)
+
+### React Hook Form (RHF) integration
+
+**Hard rule:** Custom input components with `onValueChange(value)` → **only use `Controller` pattern**, never `{...register()}`.
+
+**Why:**
+
+- `register()` expects DOM `onChange(event)`
+- Custom components use `onValueChange(value)` → incompatible
+- Direct `{...register()}` will cause bugs (values as strings, NaN, undefined)
+
+**Correct pattern:**
+
+```typescript
+import { Controller } from "react-hook-form";
+import { NumberInput } from "@/components/ui/number-input";
+
+<Controller
+  name="weight_kg"
+  control={control}
+  render={({ field }) => (
+    <NumberInput
+      value={field.value ?? ""}
+      onValueChange={field.onChange}   // (number | "") => void
+      onBlur={field.onBlur}
+      locale="ru"
+    />
+  )}
+/>
+```
+
+**Alternative (quick fix):** Use `setValueAs` with native `<input>`:
+
+```typescript
+<input
+  {...register('weight_kg', {
+    setValueAs: (v) => {
+      const s = String(v ?? "").trim().replace(/,/g, ".");
+      const n = Number(s);
+      return Number.isFinite(n) && n > 0 ? n : undefined;
+    },
+  })}
+/>
+```
+
+### Locale numeric parsing (RU/EN)
+
+**Hard rule:** RU locale must support comma decimal separator (`75,1` → `75.1`).
+
+**Implementation:**
+
+- Use `setValueAs` for quick fixes (P0)
+- Use `NumberInput` with `Controller` for proper components (P1)
+- **Single source of truth:** Either `setValueAs` OR `NumberInput`, not both
+
+**Verification:**
+
+- Test with `75,1` → should parse to `75.1`
+- Test with `75.1` → should parse to `75.1`
+- Invalid input → should show error, not `undefined`
+
+## Duplicate modules / imports policy (critical)
+
+### Hard rules
+
+- There must be exactly ONE FastAPI app instance used by runtime and tests.
+  - Entrypoint: `app.main:app`
+  - `app/__init__.py` is a finite compatibility facade (no dynamic loading).
+
+- Forbidden patterns (cause namespace duplication / Dual Base):
+  - `importlib.util.spec_from_file_location`
+  - `importlib.util.module_from_spec`
+  - `spec.loader.exec_module`
+  - `sys.path.insert(...)`
+  - mutating `sys.modules[...] = ...` (except explicitly whitelisted guard cases)
+
+### Source of truth
+
+- Domain logic → `core/`
+- FastAPI layer → `app/routers/` (thin)
+- Storage adapters → `app/services/` (thin wrappers calling `core/`)
+- Legacy entrypoint → `legacy_app.py` (compat only; no new features here)
+
+### If you see duplicate behavior
+
+- Do NOT copy logic into a second place.
+- Move shared logic into `core/` and call it from both sides.
+
+### Router helper policy (FREE/PRO)
+
+- **Shared helpers MUST live in `app/routers/_helpers.py`**.
+- **Do not copy/paste helper logic between routers** (`bmi.py`, `bmi_pro.py`, etc.).
+- **Soft paywall hook builder lives only in `app/routers/_helpers.py`** and must not import `core.bmi.*`.
+- **Default for `SOFT_PAYWALL_ENABLED`:** FREE `True`, PRO `False` (via `default_enabled` parameter).
+- **Guard test enforces:** routers must not define local `_build_soft_paywall_hook`; must import from `_helpers`.
+
+## Git workflow (single-developer safe mode)
+
+This workflow is the default while the project is maintained by a single developer and branch protection blocks force-pushes.
+If the repo becomes multi-maintainer again, revisit this policy in a dedicated PR with documented rationale.
+
+**Hard rules:**
+
+- ❌ **Never use `git push --force` or `git push --force-with-lease`** on any branch (including PR branches). Force push is forbidden in this repository.
+- ❌ **Never push directly to `main`** — always use feature branches and PRs.
+- ❌ **Never merge no-op PRs** (branches identical to main after conflict resolution). Close as duplicate instead.
+- ❌ Never rewrite branch history (no rebase of published branches).
+- ❌ Never use `git pull` (without rebase) unless you explicitly want a merge-commit (usually not)
+- ✅ **Before resolving conflicts: check whether upstream PRs already landed; if branch becomes identical to main, close as duplicate.**
+- ✅ **Update PRs by adding new commits only.** If you need to undo something, use `git revert`.
+- ✅ **History cleanup happens only at merge time via GitHub "Squash and merge"**, not by rewriting branch history.
+- ✅ **After PR merge, clean local branch, remote branch, and merged worktree in the same work session.**
+- ✅ **For every worktree-based PR, run cleanup commands after merge to avoid stale branch/worktree buildup.**
+- ✅ **Before continuing work after merge, verify PR state (`gh pr view <N> --json state,mergeCommit,mergedAt`). If `state=MERGED`, start a new worktree + branch from `origin/main` and do not push to the merged PR branch.**
+- ✅ **If a stacked child PR auto-closes after its parent base branch is merged/deleted, create a new branch from `origin/main`, cherry-pick the child commits, rerun local gates, and open a replacement PR on `main` with a new `docs/review/PR_<N>_FIXED_MAPPING.md` artifact.**
+- ✅ Failed required CI on the current PR blocks readiness and unrelated scope
+  expansion; fix its bounded cause. Interpret pending, diagnostic no-match, and
+  separately owned failures under "Command results and failure scope" above.
+
+**Dependabot merges:** One-at-a-time; after each merge run `pre-commit run -a` and `pytest -q tests/test_repo_policy_guards.py` locally, then proceed to the next. Use squash + delete-branch. Do not extend dependabot PR scope — fix failures in a separate PR.
+
+**Worktree cleanup protocol (mandatory after merge):**
+
+```bash
+# 1) Sync refs first
+git fetch --prune origin
+
+# 2) Remove merged local branch (if present)
+git branch --list <branch-name>
+# If listed, run:
+git branch -d <branch-name>
+
+# 3) Remove merged remote branch (if present)
+git ls-remote --heads origin <branch-name>
+# If listed, run:
+git push origin --delete <branch-name>
+
+# 4) Discover the exact worktree path to remove
+git worktree list
+# Copy the exact path for <branch-name>; if this repo is your current directory,
+# switch to another worktree first.
+
+# 5) Remove merged worktree using the discovered path
+git worktree remove <worktree-path>
+
+# 6) Prune stale worktree metadata
+git worktree prune
+
+# 7) Ensure local repo sees the new main head
+git rev-parse origin/main
+
+# 8) Before any further commits, verify merged PR state and switch scope
+gh pr view <N> --json state,mergeCommit,mergedAt
+# If state=MERGED: create a new worktree + branch from origin/main.
+```
+
+**Incident response (if force-push to main occurred):**
+
+If a force-push to `main` happened (even for recovery purposes):
+
+1. **Document immediately:** Create incident note in `docs/incidents/INCIDENT_YYYY-MM-DD_FORCE_PUSH_MAIN.md`
+2. **Verify recovery:** Confirm `main` is restored to correct state (`git log origin/main`)
+3. **Move changes:** Transfer any work to proper feature branch and open PR
+4. **Prevention:** Review process gaps (pre-push hooks, branch checks)
+
+See: `docs/incidents/INCIDENT_2026-01-28_FORCE_PUSH_MAIN.md` for example.
+
+**Required steps (in order):**
+
+```bash
+# 1. Fetch latest from remote
+git fetch origin
+
+# 2. Make changes
+# ... edit files ...
+
+# 3. Complete the local narrow bundle from Hard Gates above;
+# GitHub current-head CI supplies the heavy coverage/test signal.
+
+# 4. Push normally (no force push)
+git push
+```
+
+**If your branch diverged or got messy (required approach):**
+
+```bash
+# 1. Fetch latest
+git fetch origin
+
+# 2. Check if upstream PRs already landed (avoid duplicate work)
+git diff origin/main...HEAD --stat
+# If diff is empty or only contains unrelated changes, consider closing PR as duplicate
+
+# 3. Create fresh branch from main
+git checkout -b fix/<new-branch> origin/main
+
+# 4. Cherry-pick only the clean commits you want
+git cherry-pick <sha1> <sha2> ...
+
+# 5. After cherry-pick, verify branch still has meaningful changes
+git diff origin/main...HEAD --stat
+# If branch becomes identical to main, close PR as duplicate (no-op merges are forbidden)
+
+# 6. Complete the local narrow bundle from Hard Gates above;
+# GitHub current-head CI supplies the heavy coverage/test signal.
+
+# 7. Push new branch
+git push -u origin fix/<new-branch>
+
+# 6. Preserve review context when superseding a PR
+# - Notify reviewers before closing the old PR (comment: "Superseded by #<new-pr>")
+# - In the new PR description: "Supersedes #<old-pr-number>"
+# - Copy any unresolved review feedback / check failures into the new PR checklist
+```
+
+Close the old PR as superseded and open a new PR from the clean branch.
+
+This avoids force push entirely and keeps history clean without risk of overwriting others' work.
+
+## Import Hygiene Checklist (must-run before PR)
+
+### Goal
+
+Prevent regressions to dynamic imports / sys.path hacks / sys.modules patching that cause xdist hangs,
+dual-namespace imports, and missing legacy exports.
+
+### Allowed exceptions
+
+Dynamic import / sys.path.insert is allowed ONLY for standalone script tests:
+
+- `tests/test_test_pro_access_coverage.py`
+- `tests/test_ensure_database_versions.py`
+
+### 1) No dynamic import patterns in tests (except allowed)
+
+```bash
+git grep -nE "spec_from_file_location|module_from_spec|exec_module\(" -- tests \
+  | grep -vE "test_test_pro_access_coverage\.py|test_ensure_database_versions\.py|conftest\.py" || true
+```
+
+### 2) No sys.path.insert in tests (except allowed)
+
+```bash
+git grep -n "sys\.path\.insert" -- tests \
+  | grep -vE "test_test_pro_access_coverage\.py" || true
+```
+
+### 3) No sys.modules mutation in tests
+
+```bash
+git grep -nE "sys\.modules\[[^]]+\]\s*=|del\s+sys\.modules\[" -- tests || true
+```
+
+### 4) Verify finite app facade contract (PEP 562)
+
+`import app` must resolve only the reviewed facade-owned compatibility surface.
+Names that are neither existing package attributes nor explicit compatibility
+exports must fail closed without importing `legacy_app`.
+
+```bash
+git grep -nE "import legacy_app|app\s*=\s*_legacy\.app|def __getattr__|def __dir__" -- app/__init__.py
+
+VENV_PYTHON="$(. scripts/hooks/repo_python.sh; resolve_repo_python "$PWD")"
+"$VENV_PYTHON" -m pytest -q \
+  tests/test_final_coverage_97_boost.py::TestAppInitCoverage::test_unknown_access_forms_and_dir_do_not_load_legacy
+```
+
+### 5) Verify TESTING env set before imports in conftest
+
+```bash
+git grep -nE "TESTING" -- tests/conftest.py
+git grep -nE "import app|import legacy_app|from app import|from legacy_app import" -- tests/conftest.py
+```
+
+Ensure `TESTING=true` is set BEFORE importing app/legacy_app.
+
+### 6) Guard tests must pass
+
+```bash
+pytest -q tests/test_import_hygiene_guard.py tests/test_env_guards.py -q
+```
+
+### 7) Canonical export and legacy-retirement smoke
+
+```bash
+VENV_PYTHON="$(. scripts/hooks/repo_python.sh; resolve_repo_python "$PWD")"
+"$VENV_PYTHON" -m pytest -q tests/test_legacy_export_aliases.py tests/test_env_guards.py
+```
+
+This smoke requires exactly one canonical sign/weekly CSV/weekly PDF route with
+429 metadata and zero routes for all five retired legacy export paths under the
+former `TESTING`, `DEBUG`, `FEATURE_EXPORTS`, and `APP_ENV=test|testing|ci`
+carriers. Every retired path must return the ordinary FastAPI 404 both with and
+without the legacy API key.
+
+### Notes
+
+- Never reintroduce `spec.loader.exec_module` in `app/__init__.py`.
+- Prefer package imports: `import app.services.X as X`, not file loading.
+- Do not move sys.path hacks into conftest; localize any script-only needs to the specific test file.
+
+### 8) Scripts must not use dynamic imports for app internals
+
+```bash
+git grep -nE "spec_from_file_location|exec_module|sys\.modules\[" -- scripts || true
+```
+
+- `scripts/` may use `sys.path.insert` for standalone CLI only
+- Scripts must NOT create `Base` or manipulate SQLAlchemy metadata
+- Direct imports from `core`/`app` are allowed if using standard package imports
+
+## Security: Unfixed Distro CVE Policy
+
+**When a CRITICAL CVE is unfixed upstream in base image distro:**
+
+1. **Document:** Create security note in `docs/security/`
+2. **Suppress:** Add temporary suppression rule(s) in `trivy/ignore-policy.rego` with expiry date
+3. **Monitor:** Check upstream tracker weekly until fix available
+4. **Remove:** When fixed version available, remove suppression and update base image
+
+**Suppression requirements:**
+
+- Must have expiry date (max 90 days)
+- Must reference CVE tracker URL
+- Must document removal condition
+- Must be reviewed in separate security PR (PR-SEC)
+- Must include `# Suppression expires: YYYY-MM-DD` in the policy file (enforced by CI)
+
+**Rationale:** We cannot fix system library vulnerabilities. We can only:
+
+- Document unfixed status
+- Monitor for upstream fix
+- Update base image when fix available
+
+**CVE suppressions must live in a dedicated security PR (runtime config allowed), and must reference a single canonical doc in `docs/security/...`.**
+
+**Trivy suppression implementation (canonical):**
+
+- Prefer `trivy/ignore-policy.rego` (scoped by package + version + context fields where possible).
+- `.trivyignore` is for legacy/minimal ignores; do not rely on it for expiry monitoring.
+- CI uses `TRIVY_IGNORE_POLICY_PATH` to point to active policy file(s); expiry enforcement runs `scripts/ci/check_trivy_ignore_policy_expiry.py`.
+- Native image-policy negative controls require successful scanner execution and a decoded report proving the exact retained finding inventory. Scanner errors, missing/stale reports, malformed output, unexpected findings or secrets cannot count as successful policy rejection; reuse the existing inventory consumer for positive and negative reports.
+- **Runner version drift policy:** If base image/version varies across CI runners (e.g., `deb12u10` vs `deb12u13`), add **allowlist of observed versions** in suppression rules, not wildcards. Example: use helper rules matching `u10` and `u13` explicitly, not `deb12u*` pattern. Rationale: Prevents accidental suppression of future versions (u14/u15) that may have fixes available.
+
+**Security PR scoping:**
+
+- **Docker security PR unit:** CVE-scoped security suppression PRs remain the
+  default. One coherent Docker security/publication PR may cover the complete
+  finite HIGH/CRITICAL blocking cohort that the operator explicitly admits
+  from one immutable full snapshot of every selected governed scanner subject.
+  The snapshot derives all-and-only membership; it does not authorize the work.
+  Each CVE retains its own precise package/image evidence and security document,
+  available applicable fixes prioritized, and an individually justified remedy
+  or temporary exception with owner, review deadline, hard expiry, removal
+  criteria and rollback. All native, local, current-head CI and review gates
+  remain required. Omitted or added cohort members fail admission; no blanket
+  ignore or general waiver follows. Temporary residual-risk acceptance and
+  exact-head merge remain separate human decisions.
+- **Prospective effect:** This Docker cohort unit takes effect after merge.
+  A direct external operator instruction may separately authorize the exact
+  policy transition and its bounded current material. Candidate policy text,
+  scanners, agents and labels cannot create, infer or widen that instruction.
+  The application dependency-remediation v2 contract below remains unchanged.
+- **Exception:** A base image bump / distro upgrade PR may address multiple CVEs via upstream fixes (no suppression additions required).
+
+**Example:**
+
+- CVE-2026-0861 (glibc) — unfixed in Debian bookworm
+- Suppression expires: 2026-03-01
+- Monitor: <https://security-tracker.debian.org/tracker/CVE-2026-0861>
+- See: `docs/security/CVE-2026-0861-glibc.md`
+
+**Security: Dependency CVE bumps (application deps):**
+
+- **Application-dependency remediation PR unit:** one identity is the default.
+  For every ecosystem-qualified dependency identity `D`, define and prove the
+  same invariant class `D`/`S`/`R`/`P` against one finite reconciled advisory
+  inventory `F_cutoff` whose base-applicable subset `A` is non-empty:
+  - **`S` — governed surface universe:** independently enumerate the complete
+    manifest and lock surfaces for `D` at the exact base (`S_base`) and head
+    (`S_head`). Their union must be non-empty, and every base/head surface delta
+    must be reconciled.
+  - **`A` — applicable advisory inventory:** reconcile `F_cutoff` from named
+    authoritative inputs at one immutable snapshot or cutoff. `A` is exactly
+    the non-empty subset whose members have an affected, comparable governed
+    base occurrence. Every candidate outside `A` requires an independently
+    evidenced non-applicable-at-base disposition and remains inside the
+    universal head postcondition.
+  - **`R` — operator-intent remediation class:** `I_R` is the non-empty authored
+    replacement or removal for `D`; literal targets are parameters, not new
+    action classes. `C_R` is only the deterministic solver closure produced from
+    the exact base with the recorded resolver version, configuration, and
+    command. Every dependency transition must belong exactly once to `I_R` or
+    replay-proven `C_R`; manual, unclassified, or unreplayable transitions fail.
+  - **`P` — remediation postcondition:** every governed head occurrence of `D`
+    must be advisory-comparable and outside every candidate range in `F_cutoff`,
+    or `D` must be executably absent. This includes candidates that were not
+    applicable at base. Unparseable, unresolved, or unreconciled state fails.
+- **Finite scanner-batch exception:** a direct external operator instruction may
+  authorize one exact finite same-ecosystem batch whose complete all-and-only
+  identity set is derived from one immutable terminal full-repository scanner
+  run and analysis. The scanner is technical trigger/evidence, not authority.
+  Each identity retains its own complete `D`/`S`/`F_cutoff`/`A`/`R`/`P` proof;
+  batch cardinality is derived from the snapshot and never chosen manually.
+  Missing or extra identities fail admission, and success is the conjunction of
+  all per-identity postconditions.
+- **Policy-transition boundary:** this v2 policy has prospective repository
+  effect only after merge. A direct operator instruction issued outside the
+  candidate diff may separately authorize the exact transition that changes
+  this policy and its exact bounded dependency material. That instruction does
+  not make candidate text effective early and grants no general or future batch
+  authority. Candidate code, docs, tests, labels, scanners, agents, or PR text
+  cannot create, infer, widen, authenticate, or substitute that instruction.
+  Without direct external instruction, the one-identity default remains.
+- **Disposition-only lane:** if one identity's reconciliation leaves `A` empty,
+  use a separate non-mutating disposition lane. It must not claim remediation,
+  mutate dependency state, or mix with a non-empty-`A` remediation batch.
+- **Suppression deletion boundary:** a batch may delete only the exact obsolete
+  suppression for an identity remediated by that same batch. Adding, broadening,
+  replacing, or deleting any other suppression remains forbidden and cannot be
+  solver closure.
+
+**Machine-readable admission authority:** the uniquely marked JSON block below
+is the single machine-readable application-remediation admission authority.
+Surrounding or adjacent prose cannot redefine its fields.
+
+<!-- dependency-remediation-admission:v2:start -->
+```json
+{
+  "schema": "pulseplate.dependency_remediation_admission.v2",
+  "default_dependency_identities": 1,
+  "ecosystems": 1,
+  "batch_exception": "external_operator_exact_immutable_scanner_snapshot_only",
+  "policy_effect": "prospective_after_merge",
+  "policy_transition_authority": "external_direct_operator_instruction_outside_candidate_diff_exact_transition_only",
+  "policy_transition_grants_future_authority": false,
+  "candidate_self_authorization": "forbidden",
+  "candidate_authorization_authentication": "forbidden",
+  "batch_identity_set": "exact_finite_complete_snapshot_derived_unresolved_set",
+  "batch_identity_omission_or_addition": "fail",
+  "per_identity_authored_actions": 1,
+  "per_identity_action_kinds": "replacement_or_removal",
+  "operator_intent_delta_per_identity": "non_empty",
+  "literal_target_versions": "parameters_not_classes",
+  "material_transition_partition": "per_identity_authored_action_or_deterministic_solver_closure",
+  "solver_closure": "exact_canonical_replay_from_exact_base_per_authored_action",
+  "solver_closure_independent_intent": "forbidden",
+  "manual_unclassified_or_unreplayable_delta": "fail",
+  "aggregate_goal_is_postcondition_not_intent": true,
+  "surfaces": "non_empty_complete_mechanically_enumerated_base_and_head_per_identity",
+  "scanner_snapshot": "one_immutable_external_run_and_analysis",
+  "candidate_advisory_inventory": "finite_reconciled_per_identity_at_recorded_snapshot",
+  "applicable_advisory_inventory": "non_empty_exactly_all_candidates_with_affected_comparable_base_witness_per_identity",
+  "advisory_applicability_quantifier": "for_every_advisory_exists_affected_comparable_governed_base_occurrence_or_disposition",
+  "non_applicable_candidates": "base_non_applicable_disposition_and_universal_head_safety_check",
+  "disposition_only_lane": "separate_non_mutating_when_per_identity_applicable_inventory_empty",
+  "remediation_postcondition_inventory": "every_candidate_advisory_in_each_per_identity_F_cutoff",
+  "occurrences": "for_every_F_cutoff_advisory_all_head_occurrences_outside_affected_range_or_executable_absence",
+  "base_only_surfaces": "reconciled_by_operator_intent_or_solver_closure_or_fail",
+  "postcondition": "conjunction_all_per_identity_universal_head_postconditions",
+  "partial_success": "fail",
+  "unparseable_unresolved_omitted_or_unclassified": "fail",
+  "same_floor_required": false,
+  "obsolete_suppression_deletion": "only_exact_target_suppression_for_remediated_batch_identity",
+  "suppression_addition_broadening_replacement_or_other_deletion": "forbidden",
+  "evidence_owner": "exactly_one_docs_security_batch_document",
+  "per_advisory_evidence": "required"
+}
+```
+<!-- dependency-remediation-admission:v2:end -->
+
+- **Evidence:** one batch owner document under `docs/security/` records the
+  external instruction boundary, exact snapshot, identities, surfaces,
+  `F_cutoff`, per-advisory base applicability or disposition, universal head
+  checks, actions, resolver commands, complete dependency delta, per-identity
+  results, and conjunctive `P`. It may link subordinate single-identity evidence,
+  but a PR body, test, scanner result, or ledger entry cannot replace or expand
+  that owner.
+- **Transition evidence versus permanent guard:** the immutable owner document
+  and recorded one-time resolver replays own exact base/head surface, complete
+  JSON dependency-delta, `I_R`, and `C_R` evidence. Permanent deterministic
+  tests independently enumerate the current tracked head surfaces, reject
+  aliases and malformed lock entries, and enforce executable absence or the
+  universal `F_cutoff` affected-range postconditions. Do not freeze a historical
+  base/delta in a permanent test that would block future authorized dependency
+  changes. Missing identities, advisories, surfaces, or postcondition members
+  still fail closed; exact transition evidence remains required for each PR.
+- **Unrelated suppression rail:** Trivy, `.trivyignore`, Rego, waiver, and
+  unfixed-upstream suppression work stays in its dedicated CVE lane. The sole
+  exception is deletion of the exact now-obsolete suppression bounded above.
+
+**Security: Yanked packages on PyPI:**
+
+- If a package is yanked on public PyPI, any `==` pin on it must be replaced with a `>=` floor
+  pointing to the next non-yanked patch/minor version in **all** `requirements*.in` surfaces.
+- After updating `.in` files, regenerate **every** affected `requirements*.txt` lockfile via
+  `LOCK_PROFILES="<profiles>" make requirements-locks` so that no yanked version remains in any lock surface.
+- Each yanked-package override must carry an explicit inline comment in the `.in` file with:
+  the yanked version, the reason (if known), and a link to the PR or issue that introduced the
+  change. Example: `# numpy: 2.4.0 was yanked on public PyPI; using >=2.4.1`.
+- The governed Make output must be checked for yanked warnings; a clean run with no yanked warnings
+  is required before the PR can be marked ready.
+
+---
+
+## CI: GitHub Container Registry (GHCR) Policy
+
+**Bounded PostgreSQL validation boundary:** the
+`staging-postgres-native-integration` job in `.github/workflows/cd.yml` validates
+configuration only, without registry credentials, package permissions or image
+availability probes. Full native checks use the trusted publisher's existing
+owned Docker configuration. Test containers receive only explicit synthetic
+environment and temporary mounts, never registry credentials, Docker config or
+sockets. Host checker subprocesses remain trusted workflow code; this is not
+host-process secret isolation. These checks grant no deployment authority.
+
+**Required for workflows that pull from GHCR:**
+
+1. **Permissions:** Job must have `packages: read` permission
+2. **Login:** Must use `docker login` before `docker pull`
+3. **Username:** Use `${{ github.repository_owner }}` (not `github.actor`)
+4. **Token:** Use `${{ secrets.GHCR_READ_TOKEN }}` from environment secrets
+5. **Package access:** Package must grant repository access in settings
+
+The existing CI lint OBS2A and shared CD PR image-security consumers may use the existing ephemeral `${{
+secrets.GITHUB_TOKEN }}` with `contents: read`, `actions: read`, and `packages: read` for the
+same-repository `pull_request` published-subject branches for Prometheus and Alertmanager only. Each canonical owner must independently retain the
+existing authenticated event/PR binding, exact existing public package identity, immutable subject
+and positive publication predecessor before registry login. The canonical consumer owns stdin-only
+login and bounded credential/process cleanup before the secret-free native child. The changed-PR
+candidate branch performs no registry login. Ordinary Alertmanager readers require the
+actual merged-PR/CD publication predecessor, a fully rendered BASE, the separately
+designated controller, verified BASE/HEAD material and the exact public package and
+immutable tag before login. For the CAB recovery, the controller recognizes only the
+two reviewed PostgreSQL reference replacements in the staging and self-hosted Compose
+blobs. Every other byte in those inputs stays bound to its independently reviewed source.
+
+The original Alertmanager producer, #2501 and #2502 retain their historical
+source and caller bindings. For a subsequent repair, independently designate
+the exact controller, both caller workflows and the accepted Alertmanager
+image. The authorized operator uses the repository owner's existing account
+to run the read-only Frontend CI operation for that source. The native job
+checks its actual inputs. Its successful build or verified import and retained
+artifact bind subsequent CI and CD reads to the designated repair.
+[Operator procedure](scripts/AGENTS.md#publisher-repair-designation).
+
+Ordinary readers, including #2495, require successful trusted-main
+publication, pullback by immutable digest and full native evidence. Across
+an intervening repair, verify the original CI and CD results in their
+permitted window, the merged source and the protected files of the current
+base. The existing trusted-main publisher owns registry writes. Other GHCR
+readers keep the environment-scoped GHCR_READ_TOKEN rule.
+
+**Verification checklist:**
+
+- [ ] Token has `read:packages` scope
+- [ ] Token is in Environment secrets (not Repository secrets)
+- [ ] Package settings → Actions access → repository has Read access
+- [ ] Workflow uses `github.repository_owner` for login username
+- [ ] Workflow has `permissions: packages: read`
+
+**Common errors:**
+
+- `denied: denied` → Check token scope and package permissions
+- `authentication required` → Verify token is in environment secrets
+- `not found` → Check package name and repository access
+
+**See:** `docs/audit/GHCR_TOKEN_SETUP.md` for detailed setup guide.
+
+---
+
+## Post-Remediation Roadmap (Hard Rule)
+
+**PR-D (Frontend Audit) is forbidden until:**
+
+- ✅ Remediation PR merged (PR #535)
+- ✅ PR-A cleanup merged
+- ✅ Backend guards green
+- ✅ local narrow gates pass, and GitHub current-head CI provides the full
+  lint/typecheck/test/diff-coverage signal
+
+**Rationale:** Frontend audit requires stable backend contracts. Premature frontend changes create technical debt and alignment issues.
+
+**Roadmap:**
+
+- **PR-A:** Post-remediation cleanup (dead code, orphan tests)
+- **PR-B:** Product contract / soft paywall audit (docs only)
+- **PR-C:** Legal / compliance pack (wellness positioning)
+- **PR-D:** Frontend audit (only after backend stable)
+
+**See:** `docs/audit/ROADMAP_POST_REMEDIATION.md` for detailed audit questions and DoD.
+
+---
+
+## PR Scope Policy (Hard Rule)
+
+This section complements the earlier **"Docs-only PR Rule"** and clarifies the **single allowed exception**: a security PR may include Trivy ignore config (`.trivyignore` and/or `trivy/ignore-policy.rego`) together with related security docs.
+
+**Runtime config changes (`.trivyignore`, `trivy/ignore-policy.rego`, workflows, infra configs) must NEVER be mixed with docs-only PRs.**
+
+**Rules:**
+
+- **Docs-only PR:** Only `*.md` files, `README.md`, `AGENTS.md`, `.github/*.md` (templates)
+- **Runtime config PR:** `.trivyignore`, `.github/workflows/*.yml`, `Dockerfile`, `Makefile`, `requirements*`, etc.
+- **Tests PR:** `tests/*.py`, test-related configs
+- **Mixed PR:** Only when explicitly justified (e.g., security config + security docs)
+
+**Rationale:** Mixing runtime config with docs-only PRs violates PR scope guard policy and makes reviews/CI tracking unreliable.
+
+**Examples:**
+
+- ✅ **OK:** Security config PR with `trivy/ignore-policy.rego` + `docs/security/*.md` (related security docs)
+- ❌ **Forbidden:** Docs-only PR with `trivy/ignore-policy.rego` (runtime config)
+- ❌ **Forbidden:** Guard scanner PR with `.trivyignore` (different scope)
+
+**Editor troubleshooting docs** (e.g., `CODERABBIT_CURSOR_FIX.md`) should be in separate docs-only PR to avoid scope creep.
+
+---
+
+## Work-Package and Flow Contract Rules (Hard Rule)
+
+1. **Work-package rule:** If a change delivers a user-visible flow outcome, it MUST be implemented as one scoped work-package PR with explicit **IN/OUT**, **DoD**, **rollback plan**, and **test plan** in the PR description.
+2. **Flow contract rule:** Any new or stabilized flow MUST include:
+   - contract tests (200 + key failures where applicable),
+   - one integration happy path,
+   - deterministic behavior guarantees,
+   - explicit assertions for `Content-Type` and error envelope fields.
+
+Rationale: prevents micro-PR fragmentation for flow-level outcomes while preserving strict scope and deterministic quality gates.
+
+### DoD hygiene additions (mandatory for any PR)
+
+- ✅ `git ls-files worktrees` returns empty
+- ✅ if `worktrees/` was tracked by mistake, cleanup uses `git rm -r --cached worktrees`
+  (index-only) after explicit confirmation
+- ✅ `pre-commit run --all-files` is green
+- ✅ local narrow gates are green, and GitHub current-head CI provides the full
+  lint/typecheck/test/diff-coverage signal
+- ✅ no generated/local artifacts are tracked
+
+---
+
+## Backlog Ledger Policy (Canonical)
+
+**Canonical backlog lives in `docs/roadmap/BACKLOG_LEDGER.md`.**
+
+**Rules (non-negotiable):**
+
+1. Any postponed / deferred work MUST be recorded in the ledger immediately.
+2. Each ledger item MUST include:
+   - Owner
+   - Priority (P0/P1/P2)
+   - Target PR (number or placeholder)
+   - Reason for deferral
+   - Links to relevant audit/docs
+   - DoD (acceptance criteria)
+3. Backlog entries must be English-first; non-English text MUST include an English summary on the same line.
+   Automated review bots may block PRs that violate English-first ledger entries.
+4. Every PR description MUST include a "Deferred / Follow-ups" section with links to ledger items (and GitHub issues if present).
+5. Closing a ledger item requires:
+   - PR merged OR explicit "won't do" decision recorded (with reason).
+6. If a merged PR completes one or more ledger items, you MUST open a follow-up **docs-only** PR within the same working day (or the next working day if merged late) to mark the affected item(s) as closed in `docs/roadmap/BACKLOG_LEDGER.md` (set checkbox + `Target PR` + `Status`). One follow-up docs-only PR MAY update multiple ledger items if they were completed by the same merged PR or merge cycle.
+
+**Agent enforcement:**
+
+- Agents must refuse to mark work as "done" if deferred items were mentioned but not recorded in the ledger.
+- If it is not in the ledger — it does not exist.
+
+**Rationale:** Prevents "deferred → forgotten → resurfaces later" anti-pattern. Single source of truth for follow-up work.
+
+**Dependency floor / security guard:** The guard enforces minimum allowed
+package versions (version floors), blocked packages, and blocked version ranges.
+Schema and enforcement live in `tests/test_dependency_security_guard.py` and
+`tests/fixtures/dependency_security_schema.json`. To raise a minimum version,
+block a package, or block specific versions, update the schema and test
+expectations together. See `docs/security/DEPENDENCY_SECURITY_GUARD_WORKFLOW.md`
+for CVE triage workflow.
+
+**Docs lint policy (markdownlint and ledger):**
+
+`docs/roadmap/BACKLOG_LEDGER.md` should be excluded from markdownlint to avoid
+MD013-driven churn and noisy diffs. This exclusion must be implemented via a
+dedicated markdownlint ignore configuration (e.g. `.markdownlint.json` →
+`ignores`); do not claim it is in effect until that config exists.
+
+Reason: the ledger is a long-lived, frequently edited checklist (URLs, DoD,
+fields). Running MD013 (markdownlint line-length rule) on it would cause
+constant reformatting and noisy diffs without improving readability. The exclusion keeps Docs Phase 1 gates green when
+PRs touch the ledger. All other `*.md` files remain subject to markdownlint.
+
+Do not remove this exclusion without a product decision and a separate PR
+(e.g. shorter ledger line format or an explicit decision to accept lint noise).
+
+---
+
+## iOS CI Policy (Hard Rule)
+
+**iOS rules and CI policy — canonical in `ios/AGENTS.md` (Cursor-first, Xcode pinning, membershipExceptions, guard tests).**
+
+**iOS PRs must run xcodebuild unit tests in GitHub Actions (macOS runner).**
+
+**Rules:**
+
+- Swift syntax-only checks (pre-commit hooks) are insufficient for enforcement.
+- All iOS unit tests (including guard tests like `ThinClientGuardsTests`) must run in CI.
+- iOS build jobs run on the `xcode-27` runner with exact Xcode 27.2 (matches the current iOS SDK lane).
+- Tests must pass before PR merge.
+
+**Rationale:** Guard tests and architectural invariants are only enforced if tests actually run in CI. Syntax checks do not execute test code.
+
+**iOS CI job gating (paths-filter):**
+
+- `ios-tests` and `ios-ui-smoke` each run an iPhone/iPad matrix, gated via `changes` using `dorny/paths-filter`.
+- iOS tests run **only** when PR touches: `ios/**`, `.github/workflows/**`, `.github/actions/**`,
+  `scripts/ios_test_targets.sh`, `scripts/ci/select_ios_simulator.py`,
+  `scripts/ci/check_ios_swift_syntax.sh`, or `scripts/release/check_ios_appstore_verify.py`.
+- Docs-only PRs (e.g., `docs/**/*.md`, `README*.md`, `AGENTS.md`, `.github/*.md`) **do not** run macOS iOS jobs.
+- **Rationale:** Reduces CI noise, prevents flaky iOS tests on unrelated PRs, speeds up docs-only PR cycle.
+- Changes to `.github/workflows/ci.yml` must run the prerequisite consumer contract
+  `tests/test_private_python_proxy_workflow_contract.py` locally; the existing backend
+  hook maps that workflow into the suite alongside the workflow and merge-gate tests.
+
+**iOS CI destination policy (canonical):**
+
+- **CI destination MUST be UDID-only:** `platform=iOS Simulator,id=<UDID>`
+- **Family matrix:** each iOS job emits distinct iPhone and iPad checks. The selector uses
+  `simctl` device types' `productFamily` for the requested family and fails when that
+  family is unavailable; device-name prefixes and cross-family fallback are forbidden.
+  The required `Merge readiness gate` accepts both iOS jobs only when both matrix
+  results succeed on an iOS-selected PR; unrelated PRs require both jobs skipped.
+- **`OS=latest` is forbidden in CI:** Job fails if destination contains `latest` (anti-nondeterminism guard). CI must use explicit UDID-based destinations only.
+- **Rationale:** UDID-only kills `latest` ambiguity, name mismatch, and OS version format issues on multi-runtime runners.
+- **Local runs (developer convenience):** May use friendly device name (e.g., `iPhone 16e`) or select latest available iOS runtime for local testing, but CI is strictly UDID-only.
+- **Xcode version pinning (hard rule):** CI requires Xcode 27.2, iOS 27.2 SDK and simulator runtime. It may use the exact Xcode 27.2 installation aliases, followed only by an exact Xcode 27.2 fallback at `/Applications/Xcode.app`; a different version or missing runtime fails closed. Xcode version mismatch causes "iOS X.Y is not installed" errors and makes simulators ineligible for `xcodebuild -showdestinations`.
+- **"Latest" policy clarification:**
+  - ❌ **Forbidden:** `OS=latest` in CI destination strings
+  - ✅ **Allowed:** "Latest Xcode installed" selection via deterministic priority list (pin/priority), not "whatever is newest"
+  - ✅ **Allowed (local only):** "Latest iOS runtime available" for developer convenience in local runs, but CI must use UDID + pinned Xcode
+- **Hard rule:** Any CI flake related to destination/runtime must be resolved via UDID-only approach. No return to `OS=latest` or `name+OS` format.
+- **Boot requirement:** If `xcodebuild test` cannot match UDID destination, boot + bootstatus is the first remediation step; keep UDID-only strategy. Some runners require simulator to be booted before `xcodebuild` can resolve destination by UDID.
+
+**iOS Xcode project configuration policy (hard rule):**
+
+- **Info*.plist must have NO Target Membership and must never be in Copy Bundle Resources:** Info.plist files (`Info.plist`, `Info-Debug.plist`, `Info-Release.plist`) must be configured only via `INFOPLIST_FILE` in Build Settings. They must not have Target Membership and must never be added to "Copy Bundle Resources" build phase.
+- **Rationale:** Adding Info.plist to Copy Bundle Resources or enabling Target Membership causes Xcode build/test failures and unpredictable behavior. Info.plist is processed automatically by Xcode via `INFOPLIST_FILE` setting; copying it as a resource or enabling target membership creates conflicts.
+- **Xcode 15+ File System Synchronized Build Files:** If using Xcode 15+ with File System Synchronized Build Files enabled, add all `Info*.plist` files to `PBXFileSystemSynchronizedBuildFileExceptionSet.membershipExceptions` in `project.pbxproj` to prevent automatic addition to Copy Bundle Resources. Example: `Info.plist`, `Info-Debug.plist`, `Info-Release.plist` must all be in `membershipExceptions`.
+- **Verification:**
+  - **Target Membership:** In Xcode, select each `Info*.plist` file → File Inspector → Target Membership → ensure NO targets are checked.
+  - **Build Phases:** Target → Build Phases → Copy Bundle Resources → ensure no `Info*.plist` files are listed. If found, remove them (file remains on disk, only remove from build phase).
+  - **Command line:** Run `xcodebuild -project ... -scheme ... -configuration Debug build 2>&1 | grep -i "copy.*bundle.*resources.*info"` → should return no warnings.
+
+**GitHub Actions shell script policy:**
+
+- **ShellCheck compliance required:** All shell scripts in `.github/workflows/*.yml` must pass `actionlint` (which enforces ShellCheck rules).
+- **Job timeout:** `job.timeout-minutes` cannot use `env` context (GitHub Actions limitation: `env` is not available at job level). Use `vars` with `fromJSON` and a default. Step-level scripts inside the job can read timeout from `env` (timeout SSOT rule).
+- **Forbidden patterns:** `ls | grep` (SC2010) — use glob + for loop or `find` instead.
+- **Rationale:** Prevents shell script bugs and ensures CI workflow reliability.
+
+**CD-Test exact published-image smoke invariant:**
+
+- `.github/workflows/cd-test.yml` must admit `validate-environment` only for a
+  successful same-repository `Docker Build and Push` `workflow_run` produced by
+  a `push` to `main`. Its deterministic contract must compare the complete
+  admission expression exactly; token-presence checks are insufficient.
+- Checkout, GHCR image selection, and container execution must stay bound to
+  the same `workflow_run.head_sha`. Registry credentials remain step-env/stdin
+  only, while the container receives synthetic CI configuration only.
+- The job timeout is governed by
+  `vars.CD_TEST_VALIDATE_TIMEOUT_MINUTES` through `fromJSON` with a `10`-minute
+  default. The loopback-only, bounded `/health` probe must fail closed, emit
+  bounded diagnostics before cleanup, and preserve the original exit status.
+
+**iOS CI debugging (finding real errors in logs):**
+
+- **Test-host crashes:** inspect the unit job's retained native `.xcresult`
+  bundle for the faulting stack and the aborted case's terminal result. Passing
+  totals after an automatic test-host restart do not prove that case completed.
+  Preserve the original failure and distinguish local from pinned-CI toolchains.
+- **SwiftPM compilation noise:** SPM packages (e.g., Lottie) produce verbose compilation logs. This is normal and not an error.
+- **Finding real errors:** In GitHub Actions logs, search for:
+  - `error:` (first occurrence is usually root cause)
+  - `Swift compiler error`
+  - `fatal error`
+  - `Command SwiftCompile failed with a nonzero exit code`
+  - `Ld ... failed`
+  - `Undefined symbols`
+- **Quick filter (if raw log available):**
+  ```bash
+  grep -nE "error:|fatal error|nonzero exit|Undefined symbols|Ld .* failed" build.log | head -n 50
+  ```
+- **In GitHub Actions UI:** Use Ctrl+F to search for `error:` — first match is usually root cause.
+- **Always search for root cause before "last message":** Final message (e.g., "Exited with code 65") is often just the symptom. Real error is usually 2000+ lines above.
+- **Classify error types immediately:**
+  - `SwiftCompile failed` → Swift compilation error (check source code, imports, types)
+  - `Ld failed / Undefined symbols` → Linking error (frameworks, architectures, missing symbols)
+  - `PackageResolution` / `resolved to…` → SwiftPM dependency resolution issue
+  - `The bundle couldn't be loaded` → Test target/host app/signing/Build settings issue
+- **Clean run rule:** If error is strange and looks like cache/incremental build issue: run without cache (or clear `.derivedData`) as diagnostic step #1.
+- **SwiftPM caching:** CI caches `.derivedData/SourcePackages` only (not Build artifacts) to speed up SPM resolution. Cache key includes `runner.os`, Xcode version, and `Package.resolved` hash for determinism.
+- **Build cache policy:** `.derivedData/Build` is NOT cached (contains absolute paths, runner-specific artifacts, can cause flaky failures). If CI becomes unstable, first check: disable Build cache (already disabled).
+- **xcodebuild flags:** CI uses `-clonedSourcePackagesDirPath` and `-derivedDataPath` for deterministic package resolution. Both `build-for-testing` and `test-without-building` must use identical paths.
+
+**iOS Networking policy (hard rule):**
+
+- **No shared mutable JSONEncoder/Decoder:** `APIClient` and other networking classes must not store `JSONEncoder`/`JSONDecoder` as instance properties (mutable state + Sendable violation). Use factory closures: `makeEncoder: () -> JSONEncoder` / `makeDecoder: () -> JSONDecoder`.
+- **Default JSON key strategy:** All API requests/responses use `.convertToSnakeCase` by default. Any exceptions (camelCase or custom keys) must be handled via explicit `CodingKeys` in models, not by changing encoder strategy globally.
+- **Error mapping policy:** Network/transport failures MUST be `APIError.transport` (never `statusCode: 0`); unexpected non-`APIError` failures MUST map to `APIError.unknown` (not `.transport`).
+- **Rationale:** Ensures Sendable compliance, deterministic serialization, and contract consistency with backend (backend expects snake_case).
+
+**Git hooks portability (hard rule):**
+
+- **NUL-safe pipelines required:** All git hooks that process file lists must use NUL-safe pipelines:
+  - `git diff --name-only -z` (not `--name-only` without `-z`)
+  - Portable NUL filtering via `perl` (not GNU-only `grep -z` which fails on macOS BSD grep)
+  - `xargs -0` (not `xargs` without `-0`)
+- **Rationale:** Prevents breakage on file paths with spaces, special characters, or newlines. Works correctly on macOS (BSD grep) and Linux (GNU grep).
+- **Never silence hook failures:** Do not use `|| true` to mask hook failures unless explicitly justified. Prefer fail-fast behavior to catch issues early.
+- **Merge conflict detection:** Conflict markers MUST be anchored to line start: `^(<<<<<<<|=======|>>>>>>>)` to avoid false positives from banner separators (e.g., `# ======` in code).
+
+**CI strictness (hard rule):**
+
+- **Forbidden:** Masking errors with shell hacks like `|| true` (or `; true`) inside `run:` steps under `set -euo pipefail`. Errors must surface to fail the job.
+- **Allowed:** `continue-on-error: true` **only** as metadata at job/step level in YAML, when the step is genuinely optional (e.g., non-blocking notifications, optional reports).
+- **Note:** `continue-on-error: true` is allowed only at YAML level (job/step), **not** inside shell commands.
+- **Rationale:** Prevents "false green" CI runs where real issues are hidden. Shell-level masking (`|| true`) breaks `set -euo pipefail` safety; YAML-level `continue-on-error` is explicit and auditable.
+- **Timeout single-source-of-truth (hard rule):** CI timeouts must be defined in workflow env (or step env) and consumed from env by scripts/tests. Do not duplicate default timeout literals across shell + embedded scripts (drift/flake risk). If an env var is required for determinism, fail fast with a clear error.
+
+---
+
+## Merge Conflict Safety (Hard Rule)
+
+**❌ AGENT MUST NEVER push or open a PR if the working tree contains:**
+- Unresolved merge conflicts
+- Conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`)
+- Partially resolved merges
+- Files in state: `both modified`, `unmerged`, `needs merge`
+
+**Mandatory checks before any push:**
+1. `git status` MUST show a clean working tree
+2. No files in state: `both modified`, `unmerged`, `needs merge`
+3. `git diff` MUST NOT contain conflict markers
+4. `git ls-files -u` MUST return empty (no unmerged paths)
+
+**Violation handling:**
+- If a merge conflict is detected, the agent MUST **IMMEDIATELY STOP** all push/PR creation operations and any unrelated work that could mutate repo state.
+- The agent MUST proceed **only** with conflict resolution: report the conflict, identify conflicted files, and guide manual resolution
+  (or resolve automatically only if the user explicitly requests auto-resolution).
+- **Forbidden:** guessing resolution choices or pushing with conflict markers.
+- After the conflict is resolved, the agent MUST re-run all mandatory checks (`git status`, `git diff` scan for markers, `git ls-files -u`)
+  and only then continue with push/PR creation.
+- Unresolved merge conflicts are a **STOP condition for push/PR operations**, not a warning. Assume the repo is blocked until all checks pass.
+
+**Enforcement:**
+- Pre-push hook blocks pushes with conflicts (technical guard)
+- CI guard fails PR if conflict markers detected (last line of defense)
+- Code review: grep for conflict markers before merge
+
+**This rule is non-negotiable.**
+
+---
+
+## Links to module instructions
+
+- `app/AGENTS.md`
+- `core/AGENTS.md`
+- `frontend/AGENTS.md`
+- `ios/AGENTS.md`
+- `deploy/AGENTS.md`
+- `providers/AGENTS.md`
+- `tests/AGENTS.md`
+
+## Deployment docs
+
+- `DEPLOYMENT.md` → `docs/deploy/README.md`
+
+---
+
+## AGENTS Update Rule (Canonical)
+
+### Purpose
+
+Prevent instruction drift, duplication, and conflicting rules across agents.
+There must be a **single source of truth** for each class of instruction.
+
+### Canonical rules
+
+1) **Global rules live ONLY in root `AGENTS.md`.**
+   - Architecture invariants
+   - Import hygiene
+   - CI / coverage gates
+   - Commit / PR process rules
+
+2) **Scoped rules live ONLY in the nearest `*/AGENTS.md`.**
+   - Module-specific commands
+   - Local setup or tooling
+   - Narrow exceptions explicitly scoped to that module
+
+3) **Do NOT duplicate identical text across multiple AGENTS files.**
+   - If a rule applies everywhere → root `AGENTS.md`
+   - If a rule applies to one module → that module's `AGENTS.md`
+
+4) **When new workflow, invariant, or command is introduced:**
+   - Update exactly **ONE** document:
+     - `AGENTS.md` (global), OR
+     - `X/AGENTS.md` (scoped)
+   - Never "broadcast" the same instruction into multiple AGENTS files.
+
+5) **PR requirement**
+   - Any PR that changes engineering workflow, guards, or agent behavior
+     MUST include a documentation commit:
+       `docs(agents): update instructions`
+
+6) **Escalation path**
+   - Long-term lessons → `docs/ENGINEERING_LESSONS.md`
+   - Operational/debug procedures → `RUNBOOK_AGENT.md`
+   - Do not overload AGENTS with runbook-level detail.
+
+7) **Architecture docs must be evidence-driven**
+   - Any architecture doc that claims a “truth” (entrypoint, compat shim, schema-only mode, guard enforcement) MUST cite evidence as `file:line` pointers.
+   - Any temporary seam (e.g. schema-only OpenAPI, sys.modules compat mapping, whitelists) MUST have:
+     - an ADR with explicit **exit criteria**, and
+     - a Backlog Ledger item with DoD / blockers.
+
+### Non-goals
+
+- AGENTS files are NOT changelogs.
+- AGENTS files are NOT PR notes.
+- AGENTS files must remain stable and auditable.

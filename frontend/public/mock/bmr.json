@@ -1,0 +1,18 @@
+{
+  "bmr": {
+    "mifflin": 1470,
+    "harris": 1490
+  },
+  "tdee": {
+    "mifflin": 2278,
+    "harris": 2309
+  },
+  "activity_level": "moderate",
+  "recommended_intake": {
+    "maintenance": 2278,
+    "weight_loss": 1822.4,
+    "weight_gain": 2733.6
+  },
+  "formulas_used": ["mifflin", "harris"],
+  "notes": ["Deterministic canonical PRO BMR fixture"]
+}

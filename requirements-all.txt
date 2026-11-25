@@ -1,0 +1,16 @@
+# Production dependencies (canonical source: requirements.txt)
+-r requirements.txt
+
+# Development & Testing tools (use constraints.txt for exact versions)
+pytest>=9.1.1
+pytest-cov>=6.0
+pytest-asyncio>=1.4.0
+coverage>=7.15.4
+black>=26.10.1
+flake8>=7.0
+pre-commit>=4.6.0
+mypy>=2.3.1
+bandit>=1.9.4
+pip-audit>=2.10.1
+ruff>=0.16.4
+sourcery>=2.0

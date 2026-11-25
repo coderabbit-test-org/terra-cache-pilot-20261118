@@ -1,0 +1,123 @@
+#
+# Managed by the PulsePlate private-proxy lock workflow.
+# Profile: rag-vector-cpu
+# Sources: requirements-rag-vector-cpu.in
+# Regenerate with:
+#
+#    LOCK_PROFILES="rag-vector-cpu" make requirements-locks
+#
+annotated-doc==0.0.4
+    # via
+    #   -c requirements.txt
+    #   typer
+anyio==4.14.2
+    # via
+    #   -c requirements.txt
+    #   httpx
+certifi==2026.10.19
+    # via
+    #   -c requirements.txt
+    #   httpcore
+    #   httpx
+    #   requests
+charset-normalizer==3.4.4
+    # via
+    #   -c requirements.txt
+    #   requests
+fastembed==0.8.0+pulseplate.1
+    # via -r requirements-rag-vector-cpu.in
+filelock==4.2.1
+    # via
+    #   -r requirements-rag-vector-cpu.in
+    #   huggingface-hub
+flatbuffers==25.12.19
+    # via onnxruntime
+fsspec==2026.6.0
+    # via huggingface-hub
+h11==0.16.0
+    # via
+    #   -c requirements.txt
+    #   httpcore
+hf-xet==1.5.1
+    # via huggingface-hub
+httpcore==1.0.9
+    # via
+    #   -c requirements.txt
+    #   httpx
+httpx==0.28.1
+    # via
+    #   -c requirements.txt
+    #   huggingface-hub
+huggingface-hub==1.16.1
+    # via
+    #   fastembed
+    #   tokenizers
+idna==3.18
+    # via
+    #   -c requirements.txt
+    #   anyio
+    #   httpx
+    #   requests
+loguru==0.7.3
+    # via fastembed
+markdown-it-py==4.2.0
+    # via rich
+mdurl==0.1.2
+    # via markdown-it-py
+mmh3==5.2.1
+    # via fastembed
+numpy==2.4.6
+    # via
+    #   -c requirements.txt
+    #   fastembed
+    #   onnxruntime
+onnxruntime==1.27.0
+    # via fastembed
+packaging==26.3
+    # via
+    #   -c requirements.txt
+    #   huggingface-hub
+    #   onnxruntime
+pgvector==0.5.0
+    # via -r requirements-rag-vector-cpu.in
+pillow==13.0.0
+    # via
+    #   -c requirements.txt
+    #   fastembed
+protobuf==6.33.5
+    # via
+    #   -c requirements.txt
+    #   onnxruntime
+py-rust-stemmers==0.1.8
+    # via fastembed
+pygments==2.20.0
+    # via
+    #   -c requirements.txt
+    #   rich
+pyyaml==6.0.3
+    # via huggingface-hub
+requests==2.33.0
+    # via
+    #   -c requirements.txt
+    #   fastembed
+rich==15.0.0
+    # via typer
+shellingham==1.5.4
+    # via typer
+tokenizers==0.23.1
+    # via fastembed
+tqdm==4.67.1
+    # via
+    #   -c requirements.txt
+    #   fastembed
+    #   huggingface-hub
+typer==0.26.8
+    # via huggingface-hub
+typing-extensions==4.15.0
+    # via
+    #   -c requirements.txt
+    #   huggingface-hub
+urllib3==2.8.0
+    # via
+    #   -c requirements.txt
+    #   requests

@@ -1,0 +1,126 @@
+{
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+  "python.analysis.typeCheckingMode": "basic",
+  "python.analysis.autoImportCompletions": true,
+  "python.analysis.diagnosticMode": "openFilesOnly",
+  "python.analysis.indexing": false,
+  "python.analysis.packageIndexDepths": [
+    {
+      "name": "",
+      "depth": 2
+    }
+  ],
+  "python.formatting.provider": "black",
+  "python.formatting.blackArgs": [
+    "--line-length=100"
+  ],
+  "python.linting.enabled": true,
+  "python.linting.pylintEnabled": false,
+  "python.linting.flake8Enabled": true,
+  "python.linting.flake8Args": [
+    "--max-line-length=100"
+  ],
+  "python.testing.pytestEnabled": true,
+  "python.testing.unittestEnabled": false,
+  "python.testing.pytestArgs": [
+    "-q",
+    "--asyncio-mode=auto"
+  ],
+  "editor.formatOnSave": true,
+  "editor.codeActionsOnSave": {
+    "source.organizeImports": "never"
+  },
+  "cursor.rpcFileLogger.enabled": false,
+  "editor.rulers": [
+    100
+  ],
+  "editor.tabSize": 4,
+  "editor.insertSpaces": true,
+  "editor.trimAutoWhitespace": true,
+  "files.trimTrailingWhitespace": true,
+  "files.insertFinalNewline": true,
+  "files.exclude": {
+    "**/__pycache__": true,
+    "**/*.pyc": true,
+    "**/.derivedData": true,
+    "**/.mypy_cache": true,
+    "**/.pytest_cache": true,
+    "**/.ruff_cache": true,
+    "**/.venv": true,
+    "**/.venv-ci": true,
+    "**/htmlcov": true,
+    "**/.coverage": true,
+    "**/artifacts/agent_runs": true,
+    "**/artifacts/orchestration": true,
+    "**/cache": true,
+    "**/coverage*": true,
+    "**/ios/.build": true,
+    "**/junit.xml": true,
+    "**/node_modules": true,
+    "**/tmp_security_*": true,
+    "**/worktrees": true,
+    "**/dist": true,
+    "**/build": true
+  },
+  "files.watcherExclude": {
+    "**/__pycache__/**": true,
+    "**/.derivedData/**": true,
+    "**/.mypy_cache/**": true,
+    "**/.pytest_cache/**": true,
+    "**/.ruff_cache/**": true,
+    "**/.venv/**": true,
+    "**/.venv-ci/**": true,
+    "**/htmlcov/**": true,
+    "**/artifacts/agent_runs/**": true,
+    "**/artifacts/orchestration/**": true,
+    "**/cache/**": true,
+    "**/dist/**": true,
+    "**/build/**": true,
+    "**/ios/.build/**": true,
+    "**/node_modules/**": true,
+    "**/tmp_security_*/**": true,
+    "**/worktrees/**": true
+  },
+  "search.exclude": {
+    "**/__pycache__": true,
+    "**/.derivedData": true,
+    "**/.mypy_cache": true,
+    "**/.pytest_cache": true,
+    "**/.ruff_cache": true,
+    "**/.venv": true,
+    "**/.venv-ci": true,
+    "**/htmlcov": true,
+    "**/.coverage": true,
+    "**/artifacts/agent_runs": true,
+    "**/artifacts/orchestration": true,
+    "**/cache": true,
+    "**/coverage*": true,
+    "**/ios/.build": true,
+    "**/junit.xml": true,
+    "**/node_modules": true,
+    "**/*.pyc": true,
+    "**/*.log": true,
+    "**/tmp_security_*": true,
+    "**/worktrees": true,
+    "**/dist": true,
+    "**/build": true
+  },
+  "[python]": {
+    "editor.defaultFormatter": "ms-python.black-formatter",
+    "editor.formatOnSave": true,
+    "editor.rulers": [
+      100
+    ],
+    "editor.tabSize": 4
+  },
+  "[json]": {
+    "editor.defaultFormatter": "vscode.json-language-features"
+  },
+  "[yaml]": {
+    "editor.tabSize": 2,
+    "editor.insertSpaces": true
+  },
+  "[markdown]": {
+    "files.trimTrailingWhitespace": false
+  }
+}

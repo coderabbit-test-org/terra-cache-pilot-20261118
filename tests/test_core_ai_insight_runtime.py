@@ -1,0 +1,765 @@
+"""Unit tests for the canonical core.ai insight runtime facade."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from types import SimpleNamespace
+from typing import Any, Callable
+
+import pytest
+
+from core.ai.insight_runtime import (
+    DirectInsightProviderStub,
+    InsightProviderLoadError,
+    KnowledgePolicy,
+    RecursiveRolloutPolicy,
+    RecursiveOptimizationHints,
+    InsightTransparencyNotice,
+    InsightTransparencyUnavailableError,
+    load_insight_provider,
+    prepare_insight_runtime,
+    require_ai_generated_insight_notice,
+)
+from core.insight.philosophical_runtime import PhilosophyRolloutPolicy
+from core.rag.contracts import (
+    OptimizationStopReason,
+    RAGChunk,
+    RAGContext,
+    RAGDegradedReason,
+    RecursiveOptimizationHints as RagRecursiveOptimizationHints,
+)
+
+
+class _FakeProvider:
+    name: str = "fake-provider"
+
+    async def generate(self, text: str) -> str:
+        return text
+
+
+def test_load_insight_provider_uses_lazy_loader(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Facade must stay lazy and return the resolved provider instance."""
+
+    monkeypatch.setattr(
+        "core.ai.insight_runtime.load_llm_get_provider",
+        lambda: (lambda: _FakeProvider()),
+        raising=True,
+    )
+
+    provider = load_insight_provider()
+
+    assert provider.name == "fake-provider"
+
+
+def test_load_insight_provider_raises_on_import_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Import failures must map to the bounded-context provider error."""
+
+    def _raise_import_failure() -> object:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(
+        "core.ai.insight_runtime.load_llm_get_provider",
+        _raise_import_failure,
+        raising=True,
+    )
+
+    with pytest.raises(InsightProviderLoadError, match="LLM module is not available"):
+        load_insight_provider()
+
+
+def test_load_insight_provider_raises_when_provider_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Missing provider must stay a deterministic bounded-context failure."""
+
+    monkeypatch.setattr(
+        "core.ai.insight_runtime.load_llm_get_provider",
+        lambda: (lambda: None),
+        raising=True,
+    )
+
+    with pytest.raises(InsightProviderLoadError, match="No LLM provider configured"):
+        load_insight_provider()
+
+
+def test_load_insight_provider_raises_when_provider_factory_call_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Provider factory invocation must map to the bounded-context error contract."""
+
+    def _raise_provider_init_failure() -> _FakeProvider:
+        raise RuntimeError("provider init boom")
+
+    monkeypatch.setattr(
+        "core.ai.insight_runtime.load_llm_get_provider",
+        lambda: _raise_provider_init_failure,
+        raising=True,
+    )
+
+    with pytest.raises(InsightProviderLoadError, match="LLM provider initialization failed"):
+        load_insight_provider()
+
+
+def test_require_ai_generated_insight_notice_returns_notice() -> None:
+    """Valid transparency metadata must become the canonical notice object."""
+
+    notice = require_ai_generated_insight_notice(
+        registry_loader=lambda: {
+            "ai_generated_insight": {
+                "surface_id": "ai_generated_insight",
+                "boundary": "Wellness only.",
+            }
+        }
+    )
+
+    assert notice == InsightTransparencyNotice(
+        surface_id="ai_generated_insight",
+        wellness_boundary="Wellness only.",
+    )
+
+
+@pytest.mark.parametrize(
+    "registry_loader",
+    [
+        lambda: {},
+        lambda: {"ai_generated_insight": {"surface_id": None, "boundary": ""}},
+    ],
+)
+def test_require_ai_generated_insight_notice_fails_closed(
+    registry_loader: Callable[[], dict[str, Any]],
+) -> None:
+    """Malformed transparency metadata must fail closed."""
+
+    with pytest.raises(
+        InsightTransparencyUnavailableError,
+        match="transparency_registry_unavailable",
+    ):
+        require_ai_generated_insight_notice(registry_loader=registry_loader)
+
+
+def test_prepare_insight_runtime_uses_direct_stub_for_local_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Local-direct routes must not touch provider loading."""
+
+    class _FakeRuntime:
+        def preview_route(
+            self, *, text: str, lang: str | None, router_enabled: bool, use_rag: bool
+        ) -> SimpleNamespace:
+            del text, lang, router_enabled, use_rag
+            return SimpleNamespace(
+                needs_generation=False, route_type=SimpleNamespace(value="direct")
+            )
+
+    monkeypatch.setattr("core.ai.insight_runtime.PhilosophicalRuntime", _FakeRuntime, raising=True)
+
+    prepared = prepare_insight_runtime(
+        text="hello",
+        use_rag=False,
+        philosophy_router_enabled=False,
+        philosophy_linguistic_enabled=False,
+        provider_loader=lambda: pytest.fail("provider loader must not run"),
+        transparency_loader=lambda: ("ai_generated_insight", "Wellness only."),
+        direct_provider_factory=DirectInsightProviderStub,
+    )
+
+    assert isinstance(prepared.provider, DirectInsightProviderStub)
+    assert prepared.transparency_notice.surface_id == "ai_generated_insight"
+    assert prepared.knowledge_policy.allow_promotion is False
+    assert prepared.knowledge_policy.allow_reads is False
+    assert prepared.rollout_policy == PhilosophyRolloutPolicy()
+    assert prepared.recursive_rollout_policy == RecursiveRolloutPolicy(
+        use_rag=False,
+        recursive_rag_enabled=False,
+        recursive_rag_optimization_enabled=False,
+    )
+
+
+def test_prepare_insight_runtime_uses_provider_loader_for_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Generation routes must resolve provider and keep the preview decision."""
+
+    @dataclass
+    class _FakeDecision:
+        needs_generation: bool
+        route_type: object
+
+    class _FakeRuntime:
+        def preview_route(
+            self, *, text: str, lang: str | None, router_enabled: bool, use_rag: bool
+        ) -> _FakeDecision:
+            assert text == "hello"
+            assert lang is None
+            assert router_enabled is True
+            assert use_rag is True
+            return _FakeDecision(
+                needs_generation=True,
+                route_type=SimpleNamespace(value="deep_reasoning"),
+            )
+
+    provider = _FakeProvider()
+    monkeypatch.setattr("core.ai.insight_runtime.PhilosophicalRuntime", _FakeRuntime, raising=True)
+
+    prepared = prepare_insight_runtime(
+        text="hello",
+        use_rag=True,
+        philosophy_router_enabled=True,
+        philosophy_linguistic_enabled=False,
+        provider_loader=lambda: provider,
+        transparency_loader=lambda: ("ai_generated_insight", "Wellness only."),
+    )
+
+    assert prepared.provider is provider
+    assert prepared.decision.route_type.value == "deep_reasoning"
+    assert prepared.transparency_notice.wellness_boundary == "Wellness only."
+    assert prepared.rollout_policy == PhilosophyRolloutPolicy(
+        router_enabled=True,
+        phase12_enabled=False,
+        linguistic_enabled=False,
+        pragmatic_enabled=False,
+    )
+    assert prepared.recursive_rollout_policy == RecursiveRolloutPolicy(
+        use_rag=True,
+        recursive_rag_enabled=False,
+        recursive_rag_optimization_enabled=False,
+        optimization_hints=None,
+    )
+    assert prepared.knowledge_policy == KnowledgePolicy(
+        enabled=False,
+        allow_reads=False,
+        allow_promotion=False,
+        min_confidence=0.7,
+        require_rag_factual_route=True,
+        deny_degraded_reasons=tuple(reason.value for reason in RAGDegradedReason),
+        subject_scope_required=True,
+        rail="product_ai_runtime",
+    )
+
+
+def test_prepare_insight_runtime_enables_knowledge_promotion_for_rag_factual_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RAG factual route must enable bounded knowledge reads and promotion."""
+
+    @dataclass
+    class _FakeDecision:
+        needs_generation: bool
+        route_type: object
+
+    class _FakeRuntime:
+        def preview_route(
+            self, *, text: str, lang: str | None, router_enabled: bool, use_rag: bool
+        ) -> _FakeDecision:
+            del text, lang, router_enabled, use_rag
+            return _FakeDecision(
+                needs_generation=True,
+                route_type=SimpleNamespace(value="RAG_FACTUAL"),
+            )
+
+    monkeypatch.setattr("core.ai.insight_runtime.PhilosophicalRuntime", _FakeRuntime, raising=True)
+
+    prepared = prepare_insight_runtime(
+        text="hello",
+        use_rag=True,
+        philosophy_router_enabled=True,
+        philosophy_linguistic_enabled=False,
+        provider_loader=lambda: _FakeProvider(),
+        transparency_loader=lambda: ("ai_generated_insight", "Wellness only."),
+    )
+
+    assert prepared.knowledge_policy.enabled is True
+    assert prepared.knowledge_policy.allow_reads is True
+    assert prepared.knowledge_policy.allow_promotion is True
+
+
+def test_prepare_insight_runtime_returns_rollout_policy_and_preserves_router_linguistic_parity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prepared runtime must own rollout truth and preserve router-or-linguistic preview routing."""
+
+    @dataclass
+    class _FakeDecision:
+        needs_generation: bool
+        route_type: object
+
+    class _FakeRuntime:
+        def preview_route(
+            self, *, text: str, lang: str | None, router_enabled: bool, use_rag: bool
+        ) -> _FakeDecision:
+            assert text == "hello"
+            assert lang is None
+            assert router_enabled is True
+            assert use_rag is False
+            return _FakeDecision(
+                needs_generation=True,
+                route_type=SimpleNamespace(value="deep_reasoning"),
+            )
+
+    monkeypatch.setattr("core.ai.insight_runtime.PhilosophicalRuntime", _FakeRuntime, raising=True)
+
+    prepared = prepare_insight_runtime(
+        text="hello",
+        use_rag=False,
+        philosophy_router_enabled=False,
+        philosophy_linguistic_enabled=True,
+        philosophy_phase12_enabled=True,
+        philosophy_pragmatic_enabled=True,
+        provider_loader=lambda: _FakeProvider(),
+        transparency_loader=lambda: ("ai_generated_insight", "Wellness only."),
+    )
+
+    assert prepared.rollout_policy == PhilosophyRolloutPolicy(
+        router_enabled=False,
+        phase12_enabled=True,
+        linguistic_enabled=True,
+        pragmatic_enabled=True,
+    )
+    assert prepared.recursive_rollout_policy == RecursiveRolloutPolicy(
+        use_rag=False,
+        recursive_rag_enabled=False,
+        recursive_rag_optimization_enabled=False,
+    )
+
+
+def test_prepare_insight_runtime_returns_recursive_rollout_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prepared runtime must freeze recursive rollout truth for the request."""
+
+    class _FakeRuntime:
+        def preview_route(
+            self, *, text: str, lang: str | None, router_enabled: bool, use_rag: bool
+        ) -> SimpleNamespace:
+            del text, lang, router_enabled, use_rag
+            return SimpleNamespace(
+                needs_generation=True,
+                route_type=SimpleNamespace(value="deep_reasoning"),
+            )
+
+    monkeypatch.setattr("core.ai.insight_runtime.PhilosophicalRuntime", _FakeRuntime, raising=True)
+
+    prepared = prepare_insight_runtime(
+        text="hello",
+        use_rag=True,
+        philosophy_router_enabled=False,
+        philosophy_linguistic_enabled=False,
+        recursive_rag_enabled=True,
+        recursive_rag_optimization_enabled=True,
+        provider_loader=lambda: _FakeProvider(),
+        transparency_loader=lambda: ("ai_generated_insight", "Wellness only."),
+    )
+
+    assert prepared.recursive_rollout_policy == RecursiveRolloutPolicy(
+        use_rag=True,
+        recursive_rag_enabled=True,
+        recursive_rag_optimization_enabled=True,
+        optimization_hints=RecursiveOptimizationHints(target_depth_cap=3),
+    )
+    assert prepared.recursive_rollout_policy.recursive_path_enabled is True
+    assert prepared.recursive_rollout_policy.optimization_path_enabled is True
+
+
+def test_prepare_insight_runtime_derives_recursive_speed_hints_from_route_truth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prepared recursive hints must come from the existing route decision only."""
+
+    class _FakeRuntime:
+        def preview_route(
+            self, *, text: str, lang: str | None, router_enabled: bool, use_rag: bool
+        ) -> SimpleNamespace:
+            del text, lang, router_enabled, use_rag
+            return SimpleNamespace(
+                needs_generation=True,
+                needs_rag=True,
+                target_depth=2,
+                optimization_applied=True,
+                route_type=SimpleNamespace(value="RAG_FACTUAL"),
+            )
+
+    monkeypatch.setattr("core.ai.insight_runtime.PhilosophicalRuntime", _FakeRuntime, raising=True)
+
+    prepared = prepare_insight_runtime(
+        text="hello",
+        use_rag=True,
+        philosophy_router_enabled=True,
+        philosophy_linguistic_enabled=True,
+        recursive_rag_enabled=True,
+        recursive_rag_optimization_enabled=True,
+        provider_loader=lambda: _FakeProvider(),
+        transparency_loader=lambda: ("ai_generated_insight", "Wellness only."),
+    )
+
+    assert prepared.recursive_rollout_policy.optimization_hints == RecursiveOptimizationHints(
+        target_depth_cap=2,
+        aggressive_short_circuit_allowed=True,
+        pragmatic_early_stop_allowed=True,
+    )
+
+
+def test_prepare_insight_runtime_preserves_linguistic_speed_hint_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recursive speed hints must carry cheap route context from the prepared seam."""
+
+    class _FakeRuntime:
+        def preview_route(
+            self, *, text: str, lang: str | None, router_enabled: bool, use_rag: bool
+        ) -> SimpleNamespace:
+            del text, lang, router_enabled, use_rag
+            return SimpleNamespace(
+                needs_generation=True,
+                needs_rag=True,
+                target_depth=2,
+                optimization_applied=True,
+                route_type=SimpleNamespace(value="RAG_FACTUAL"),
+                speech_act=SimpleNamespace(value="question"),
+                language_game=SimpleNamespace(value="nutrition"),
+            )
+
+    monkeypatch.setattr("core.ai.insight_runtime.PhilosophicalRuntime", _FakeRuntime, raising=True)
+
+    prepared = prepare_insight_runtime(
+        text="How much protein should I eat?",
+        use_rag=True,
+        philosophy_router_enabled=True,
+        philosophy_linguistic_enabled=True,
+        recursive_rag_enabled=True,
+        recursive_rag_optimization_enabled=True,
+        provider_loader=lambda: _FakeProvider(),
+        transparency_loader=lambda: ("ai_generated_insight", "Wellness only."),
+    )
+
+    assert prepared.recursive_rollout_policy.optimization_hints == RecursiveOptimizationHints(
+        target_depth_cap=2,
+        aggressive_short_circuit_allowed=True,
+        pragmatic_early_stop_allowed=True,
+        speech_act="question",
+        language_game="nutrition",
+    )
+
+
+def test_prepare_insight_runtime_defaults_null_linguistic_speed_hint_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Null-valued route context must fall back before string coercion."""
+
+    class _FakeRuntime:
+        def preview_route(
+            self, *, text: str, lang: str | None, router_enabled: bool, use_rag: bool
+        ) -> SimpleNamespace:
+            del text, lang, router_enabled, use_rag
+            return SimpleNamespace(
+                needs_generation=True,
+                needs_rag=True,
+                target_depth=2,
+                optimization_applied=True,
+                route_type=SimpleNamespace(value="RAG_FACTUAL"),
+                speech_act=SimpleNamespace(value=None),
+                language_game=SimpleNamespace(value=None),
+            )
+
+    monkeypatch.setattr("core.ai.insight_runtime.PhilosophicalRuntime", _FakeRuntime, raising=True)
+
+    prepared = prepare_insight_runtime(
+        text="How much protein should I eat?",
+        use_rag=True,
+        philosophy_router_enabled=True,
+        philosophy_linguistic_enabled=True,
+        recursive_rag_enabled=True,
+        recursive_rag_optimization_enabled=True,
+        provider_loader=lambda: _FakeProvider(),
+        transparency_loader=lambda: ("ai_generated_insight", "Wellness only."),
+    )
+
+    assert prepared.recursive_rollout_policy.optimization_hints == RecursiveOptimizationHints(
+        target_depth_cap=2,
+        aggressive_short_circuit_allowed=True,
+        pragmatic_early_stop_allowed=True,
+        speech_act="unknown",
+        language_game="general",
+    )
+
+
+def test_prepare_insight_runtime_skips_recursive_speed_hints_for_non_rag_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Plain-string non-RAG route decisions must not create recursive hints."""
+
+    class _FakeRuntime:
+        def preview_route(
+            self, *, text: str, lang: str | None, router_enabled: bool, use_rag: bool
+        ) -> SimpleNamespace:
+            del text, lang, router_enabled, use_rag
+            return SimpleNamespace(
+                needs_generation=False,
+                route_type="local_direct",
+            )
+
+    monkeypatch.setattr("core.ai.insight_runtime.PhilosophicalRuntime", _FakeRuntime, raising=True)
+
+    prepared = prepare_insight_runtime(
+        text="hello",
+        use_rag=True,
+        philosophy_router_enabled=True,
+        philosophy_linguistic_enabled=True,
+        recursive_rag_enabled=True,
+        recursive_rag_optimization_enabled=True,
+        provider_loader=lambda: _FakeProvider(),
+        transparency_loader=lambda: ("ai_generated_insight", "Wellness only."),
+    )
+
+    assert prepared.recursive_rollout_policy.optimization_hints is None
+
+
+def test_prepare_insight_runtime_uses_direct_transparency_notice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Direct notice payloads must stay valid without tuple coercion."""
+
+    class _FakeRuntime:
+        def preview_route(
+            self, *, text: str, lang: str | None, router_enabled: bool, use_rag: bool
+        ) -> SimpleNamespace:
+            del text, lang, router_enabled, use_rag
+            return SimpleNamespace(
+                needs_generation=False, route_type=SimpleNamespace(value="direct")
+            )
+
+    notice = InsightTransparencyNotice(
+        surface_id="ai_generated_insight",
+        wellness_boundary="Wellness only.",
+    )
+    monkeypatch.setattr("core.ai.insight_runtime.PhilosophicalRuntime", _FakeRuntime, raising=True)
+
+    prepared = prepare_insight_runtime(
+        text="hello",
+        use_rag=False,
+        philosophy_router_enabled=False,
+        philosophy_linguistic_enabled=False,
+        transparency_loader=lambda: notice,
+        direct_provider_factory=DirectInsightProviderStub,
+    )
+
+    assert prepared.transparency_notice is notice
+
+
+def test_prepare_insight_runtime_rejects_invalid_custom_transparency_tuple(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Custom tuple-based transparency loaders must fail closed on invalid payloads."""
+
+    class _FakeRuntime:
+        def preview_route(
+            self, *, text: str, lang: str | None, router_enabled: bool, use_rag: bool
+        ) -> SimpleNamespace:
+            del text, lang, router_enabled, use_rag
+            return SimpleNamespace(
+                needs_generation=False, route_type=SimpleNamespace(value="direct")
+            )
+
+    monkeypatch.setattr("core.ai.insight_runtime.PhilosophicalRuntime", _FakeRuntime, raising=True)
+
+    with pytest.raises(
+        InsightTransparencyUnavailableError,
+        match="transparency_registry_unavailable",
+    ):
+        prepare_insight_runtime(
+            text="hello",
+            use_rag=False,
+            philosophy_router_enabled=False,
+            philosophy_linguistic_enabled=False,
+            transparency_loader=lambda: ("", "Wellness only."),
+            direct_provider_factory=DirectInsightProviderStub,
+        )
+
+
+def test_prepare_insight_runtime_raises_when_custom_provider_loader_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Custom generation provider loaders must not leak `None` downstream."""
+
+    @dataclass
+    class _FakeDecision:
+        needs_generation: bool
+        route_type: object
+
+    class _FakeRuntime:
+        def preview_route(
+            self, *, text: str, lang: str | None, router_enabled: bool, use_rag: bool
+        ) -> _FakeDecision:
+            del text, lang, router_enabled, use_rag
+            return _FakeDecision(
+                needs_generation=True,
+                route_type=SimpleNamespace(value="deep_reasoning"),
+            )
+
+    monkeypatch.setattr("core.ai.insight_runtime.PhilosophicalRuntime", _FakeRuntime, raising=True)
+
+    with pytest.raises(InsightProviderLoadError, match="No LLM provider configured"):
+        prepare_insight_runtime(
+            text="hello",
+            use_rag=False,
+            philosophy_router_enabled=False,
+            philosophy_linguistic_enabled=False,
+            provider_loader=lambda: None,
+            transparency_loader=lambda: ("ai_generated_insight", "Wellness only."),
+        )
+
+
+def test_recursive_speed_helper_uses_pragmatic_language_game_hint() -> None:
+    """CI-selected insight suite covers recursive pragmatic early-stop helpers."""
+
+    import core.rag.recursive_retrieval as recursive
+
+    chunks = [
+        RAGChunk(
+            chunk_id="meal",
+            file="nutrition.md",
+            content="First, use protein at each meal.",
+            score=0.75,
+        )
+    ]
+
+    assert recursive._should_short_circuit_from_hints(
+        query="protein meal",
+        chunks=chunks,
+        confidence=0.75,
+        hop=2,
+        hints=RagRecursiveOptimizationHints(
+            target_depth_cap=3,
+            pragmatic_early_stop_allowed=True,
+            language_game="unknown-game",
+        ),
+    ) == (OptimizationStopReason.COMPLETED, "early_stop_pragmatic_usefulness")
+
+    assert recursive._should_short_circuit_from_hints(
+        query="protein meal",
+        chunks=chunks,
+        confidence=0.75,
+        hop=2,
+        hints=None,
+    ) == (None, None)
+
+    assert (
+        recursive._pragmatic_evidence_is_sufficient(
+            query="protein meal",
+            chunks=chunks,
+            hints=RagRecursiveOptimizationHints(
+                target_depth_cap=3,
+                pragmatic_early_stop_allowed=False,
+            ),
+        )
+        is False
+    )
+    assert recursive._should_short_circuit_from_hints(
+        query="protein meal",
+        chunks=chunks,
+        confidence=0.2,
+        hop=2,
+        hints=RagRecursiveOptimizationHints(target_depth_cap=3),
+    ) == (None, None)
+
+
+def test_recursive_speed_hint_short_circuits_full_retrieval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CI-selected insight suite covers loop break on prepared speed hints."""
+
+    import core.rag.recursive_retrieval as recursive
+
+    monkeypatch.setattr(recursive, "MAX_RAG_HOPS", 4)
+    monkeypatch.setattr(recursive, "MAX_REFINEMENT_PASSES", 4)
+    monkeypatch.setattr(recursive, "MAX_VERIFICATION_QUERIES", 0)
+    monkeypatch.setattr(recursive, "MIN_CONFIDENCE_GAIN_PER_HOP", -1.0)
+
+    calls: list[str] = []
+
+    def _fake_retrieve(query: str, **_: Any) -> RAGContext:
+        calls.append(query)
+        return RAGContext(
+            query=query,
+            refined_queries=[query],
+            chunks=[
+                RAGChunk(
+                    chunk_id=f"chunk-{len(calls)}",
+                    file="nutrition.md",
+                    content="Balanced meal evidence with protein and fiber.",
+                    score=0.9,
+                )
+            ],
+            confidence=0.9,
+            hops=1,
+            latency_ms=5,
+        )
+
+    monkeypatch.setattr("core.rag.vector_rag.retrieve_context_structured", _fake_retrieve)
+
+    result = recursive.retrieve_recursive_context_structured(
+        "balanced meal",
+        optimization_enabled=True,
+        optimization_hints=RagRecursiveOptimizationHints(
+            target_depth_cap=3,
+            aggressive_short_circuit_allowed=True,
+        ),
+    )
+
+    assert len(calls) == 1
+    assert result.optimization_stats["stop_reason"] == "aggressive_short_circuit"
+    assert result.optimization_stats["early_stop_aggressive_short_circuit"] is True
+
+
+def test_recursive_speed_hint_uses_current_hop_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Later-hop pragmatic checks must use the refined hop-local query."""
+
+    import core.rag.recursive_retrieval as recursive
+
+    monkeypatch.setattr(recursive, "MAX_RAG_HOPS", 2)
+    monkeypatch.setattr(recursive, "MAX_REFINEMENT_PASSES", 2)
+    monkeypatch.setattr(recursive, "MAX_VERIFICATION_QUERIES", 0)
+    monkeypatch.setattr(recursive, "MIN_CONFIDENCE_GAIN_PER_HOP", -1.0)
+    monkeypatch.setattr(recursive, "_refine_query", lambda _current, *_args, **_kwargs: "refined")
+
+    calls = {"n": 0}
+    queries_seen: list[str] = []
+
+    def _fake_retrieve(query: str, **_: Any) -> RAGContext:
+        calls["n"] += 1
+        return RAGContext(
+            query=query,
+            refined_queries=[query],
+            chunks=[
+                RAGChunk(
+                    chunk_id=f"chunk-{calls['n']}",
+                    file="nutrition.md",
+                    content=f"evidence for {query}",
+                    score=0.6,
+                )
+            ],
+            confidence=0.6,
+            hops=1,
+            latency_ms=5,
+        )
+
+    def _record_query(**kwargs: Any) -> tuple[None, None]:
+        queries_seen.append(str(kwargs["query"]))
+        return None, None
+
+    monkeypatch.setattr("core.rag.vector_rag.retrieve_context_structured", _fake_retrieve)
+    monkeypatch.setattr(recursive, "_should_short_circuit_from_hints", _record_query)
+
+    recursive.retrieve_recursive_context_structured(
+        "base",
+        optimization_enabled=True,
+        optimization_hints=RagRecursiveOptimizationHints(
+            target_depth_cap=2,
+            pragmatic_early_stop_allowed=True,
+        ),
+    )
+
+    assert queries_seen == ["base", "refined"]

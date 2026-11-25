@@ -1,0 +1,1001 @@
+"""
+Unified Food Database Interface
+
+RU: Единый интерфейс для работы с различными API продуктов питания.
+EN: Unified interface for working with different food nutrition APIs.
+
+This module provides a single interface to access multiple food databases
+(USDA, Open Food Facts, etc.) and cache results for better performance.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Mapping
+from copy import deepcopy
+import importlib
+import inspect
+import json
+import logging
+import math
+import os
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+import tempfile
+import threading
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, TypedDict
+
+from core.off_nutrition.bridge import (
+    merge_wire_nutrition_sources,
+    nutrition_inputs_from_unified_wire,
+)
+
+from .usda_client import USDAClient, USDAFoodItem
+from .unified_language import normalize_unified_db_language
+
+UNIFIED_FOOD_CLEANUP_ERROR_MESSAGE = "Unified-food client cleanup failed"
+UNIFIED_FOOD_CLEANUP_CANCELLED_MESSAGE = "Unified-food client cleanup cancelled"
+UNIFIED_FOOD_INITIALIZATION_ERROR_MESSAGE = "Unified-food database initialization failed"
+
+
+class UnifiedFoodClientCleanupError(RuntimeError):
+    """Sanitized ordinary failure while closing unified-food clients."""
+
+
+class _UnifiedFoodSignalAccumulator:
+    """Accumulate sanitized P > K > O cleanup signals without retaining raw errors."""
+
+    def __init__(self) -> None:
+        self._process_signal: tuple[str, int | None] | None = None
+        self._cancelled = False
+        self._ordinary_kind: str | None = None
+
+    @property
+    def has_signal(self) -> bool:
+        return (
+            self._process_signal is not None or self._cancelled or self._ordinary_kind is not None
+        )
+
+    def add_exception(self, error: BaseException, *, ordinary_kind: str) -> None:
+        current: BaseException | None = error
+        seen: set[int] = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            self._add_single_exception(current, ordinary_kind=ordinary_kind)
+            current = current.__cause__
+
+    def _add_single_exception(self, error: BaseException, *, ordinary_kind: str) -> None:
+        if isinstance(error, KeyboardInterrupt):
+            if self._process_signal is None:
+                self._process_signal = ("keyboard", None)
+            return
+        if isinstance(error, SystemExit):
+            if self._process_signal is None:
+                code = error.code if error.code is None or type(error.code) is int else 1
+                self._process_signal = ("system_exit", code)
+            return
+        if isinstance(error, GeneratorExit):
+            if self._process_signal is None:
+                self._process_signal = ("generator_exit", None)
+            return
+        if isinstance(error, asyncio.CancelledError):
+            if not self._cancelled:
+                self._cancelled = True
+            return
+        if self._ordinary_kind is None:
+            self._ordinary_kind = ordinary_kind
+
+    def add_ordinary(self, kind: str) -> None:
+        if self._ordinary_kind is None:
+            self._ordinary_kind = kind
+
+    def _ordinary_exception(self) -> Exception | None:
+        if self._ordinary_kind is None:
+            return None
+        if self._ordinary_kind == "initialization":
+            return RuntimeError(UNIFIED_FOOD_INITIALIZATION_ERROR_MESSAGE)
+        if self._ordinary_kind == "acquisition_changed":
+            return RuntimeError("Unified-food singleton changed during acquisition")
+        if self._ordinary_kind == "acquisition_foreign":
+            return RuntimeError("Unified-food singleton is not lifecycle-managed")
+        return UnifiedFoodClientCleanupError(UNIFIED_FOOD_CLEANUP_ERROR_MESSAGE)
+
+    def _process_exception(self) -> BaseException | None:
+        if self._process_signal is None:
+            return None
+        signal_name, code = self._process_signal
+        if signal_name == "keyboard":
+            return KeyboardInterrupt()
+        if signal_name == "generator_exit":
+            return GeneratorExit()
+        return SystemExit(code)
+
+    def raise_if_any(self) -> None:
+        ordinary = self._ordinary_exception()
+        cancelled: asyncio.CancelledError | None = None
+        if self._cancelled:
+            cancelled = asyncio.CancelledError(UNIFIED_FOOD_CLEANUP_CANCELLED_MESSAGE)
+            if ordinary is not None:
+                cancelled.__cause__ = ordinary
+                cancelled.__suppress_context__ = True
+
+        process_signal = self._process_exception()
+        if process_signal is not None:
+            lower = cancelled if cancelled is not None else ordinary
+            if lower is not None:
+                raise process_signal from lower
+            raise process_signal from None
+        if cancelled is not None:
+            if ordinary is not None:
+                raise cancelled from ordinary
+            raise cancelled from None
+        if ordinary is not None:
+            raise ordinary from None
+
+
+# Type-only imports for Open Food Facts
+if TYPE_CHECKING:
+    from .openfoodfacts_client import OFFClient as OFFClientType
+    from .openfoodfacts_client import OFFFoodItem as OFFFoodItemType
+else:
+    OFFClientType = Any
+    OFFFoodItemType = Any
+
+
+def _resolve_off_client() -> Tuple[Any, bool]:
+    """Resolve OFFClient class and availability safely (import-time or runtime).
+
+    Returns (OFFClient_class_or_None, available_flag)
+    """
+    try:
+        _off_module = importlib.import_module(f"{__package__}.openfoodfacts_client")
+        _cls = getattr(_off_module, "OFFClient", None)
+        return _cls, _cls is not None
+    except Exception:
+        return None, False
+
+
+# Ensure OFFClient symbol exists in module scope for tests to patch and direct calls
+OFFClient, OFF_AVAILABLE = _resolve_off_client()
+
+logger = logging.getLogger(__name__)
+
+
+def _publish_common_foods_cache(
+    cache_file: Path,
+    cache_data: dict[str, object],
+) -> bool:
+    """Publish one complete common-food cache with same-directory atomic replace."""
+
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=cache_file.parent,
+            prefix=".common_foods.",
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            temp_path = Path(temp_file.name)
+            json.dump(cache_data, temp_file, indent=2, ensure_ascii=False)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+        os.replace(temp_path, cache_file)
+    except Exception:
+        logger.error("Failed to publish common-food cache")
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                logger.error("Failed to clean incomplete common-food cache temp file")
+        return False
+    return True
+
+
+def _load_time_module() -> Any:
+    """RU: Изолирует import time для deterministic tests.
+    EN: Isolates the `time` import for deterministic tests.
+    """
+    return importlib.import_module("time")
+
+
+class UnifiedFoodResult(TypedDict):
+    """Payload contract used by menu-engine compatible unified search helpers."""
+
+    name: str
+    nutrients_per_100g: Dict[str, float]
+    cost_per_100g: float
+    tags: List[str]
+    availability_regions: List[str]
+    source: str
+    source_id: str
+    category: Optional[str]
+
+
+@dataclass
+class UnifiedFoodItem:
+    """
+    RU: Унифицированный элемент продукта из различных источников.
+    EN: Unified food item from different sources.
+    """
+
+    name: str
+    nutrients_per_100g: Dict[str, float]
+    cost_per_100g: float
+    tags: List[str]
+    availability_regions: List[str]
+    source: str
+    source_id: str
+    category: Optional[str] = None
+    nutrition_inputs: list[dict[str, object]] = field(default_factory=list)
+    nutrition_provenance: dict[str, str] = field(default_factory=dict)
+    nutrition_nutrient_confidence: dict[str, float] = field(default_factory=dict)
+    nutrition_confidence: float = 0.0
+
+    @classmethod
+    def from_usda_item(
+        cls, usda_item: USDAFoodItem, estimated_cost: float = 1.0
+    ) -> "UnifiedFoodItem":
+        """Convert one USDA item through the canonical nutrition resolver."""
+
+        raw_nutrients = dict(usda_item.nutrients_per_100g)
+        nutrition_inputs = nutrition_inputs_from_unified_wire(
+            nutrition_inputs_wire=[
+                {
+                    "source": "usda",
+                    "record_id": str(usda_item.fdc_id),
+                    "version_ref": usda_item.publication_date,
+                    "nutrients": raw_nutrients,
+                    "raw_payload": {},
+                }
+            ],
+            nutrients_per_100g=raw_nutrients,
+            fallback_source="usda",
+            record_id=str(usda_item.fdc_id),
+            version_ref=usda_item.publication_date,
+        )
+        resolved = merge_wire_nutrition_sources(
+            primary_inputs=nutrition_inputs,
+            secondary_inputs=[],
+            nutrient_keys=sorted(raw_nutrients) if raw_nutrients else None,
+        )
+
+        return cls(
+            name=usda_item.description,
+            nutrients_per_100g=dict(resolved.nutrients),
+            cost_per_100g=estimated_cost,
+            tags=usda_item._generate_tags(),
+            availability_regions=["US", "BY", "RU"],  # Assume global availability
+            source="USDA FoodData Central",
+            source_id=str(usda_item.fdc_id),
+            category=usda_item.food_category,
+            nutrition_inputs=[entry.to_dict() for entry in resolved.raw_inputs],
+            nutrition_provenance=dict(resolved.provenance),
+            nutrition_nutrient_confidence=dict(resolved.nutrient_confidence),
+            nutrition_confidence=resolved.confidence,
+        )
+
+    @classmethod
+    def from_off_item(
+        cls, off_item: "OFFFoodItemType", estimated_cost: float = 1.5
+    ) -> "UnifiedFoodItem":
+        """Convert one OFF item through explicit or legacy-estimate resolver inputs."""
+
+        flat_nutrients = dict(off_item.nutrients_per_100g)
+        raw_wire_inputs = getattr(off_item, "nutrition_inputs", [])
+        wire_inputs = (
+            [dict(row) for row in raw_wire_inputs if isinstance(row, Mapping)]
+            if isinstance(raw_wire_inputs, list)
+            else []
+        )
+        nutrition_inputs = nutrition_inputs_from_unified_wire(
+            nutrition_inputs_wire=wire_inputs,
+            nutrients_per_100g=flat_nutrients,
+            fallback_source="estimate",
+            record_id=str(off_item.code),
+        )
+        resolved = merge_wire_nutrition_sources(
+            primary_inputs=nutrition_inputs,
+            secondary_inputs=[],
+            nutrient_keys=sorted(flat_nutrients) if flat_nutrients else None,
+        )
+
+        return cls(
+            name=off_item.product_name,
+            nutrients_per_100g=dict(resolved.nutrients),
+            cost_per_100g=estimated_cost,
+            tags=off_item._generate_tags(),
+            availability_regions=off_item.countries,
+            source="Open Food Facts",
+            source_id=off_item.code,
+            category=off_item.categories[0] if off_item.categories else None,
+            nutrition_inputs=[entry.to_dict() for entry in resolved.raw_inputs],
+            nutrition_provenance=dict(resolved.provenance),
+            nutrition_nutrient_confidence=dict(resolved.nutrient_confidence),
+            nutrition_confidence=resolved.confidence,
+        )
+
+    @classmethod
+    def from_usda_and_off_merge(
+        cls,
+        usda_unified: "UnifiedFoodItem",
+        off_unified: "UnifiedFoodItem",
+    ) -> "UnifiedFoodItem":
+        """Merge USDA primary hit with Open Food Facts via shared nutrition resolver.
+
+        RU: Слияние первичной строки USDA с OFF через общий nutrition resolver.
+        EN: Merge USDA primary row with OFF using the shared resolver priority order.
+        """
+
+        usda_inputs = nutrition_inputs_from_unified_wire(
+            nutrition_inputs_wire=usda_unified.nutrition_inputs,
+            nutrients_per_100g=usda_unified.nutrients_per_100g,
+            fallback_source="usda",
+            record_id=usda_unified.source_id,
+        )
+        off_inputs = nutrition_inputs_from_unified_wire(
+            nutrition_inputs_wire=off_unified.nutrition_inputs,
+            nutrients_per_100g=off_unified.nutrients_per_100g,
+            fallback_source="estimate",
+            record_id=off_unified.source_id,
+        )
+        key_union = set(usda_unified.nutrients_per_100g) | set(off_unified.nutrients_per_100g)
+        nutrient_keys = sorted(key_union) if key_union else None
+        resolved = merge_wire_nutrition_sources(
+            primary_inputs=usda_inputs,
+            secondary_inputs=off_inputs,
+            nutrient_keys=nutrient_keys,
+        )
+        nutrients = dict(resolved.nutrients)
+        tags = list(dict.fromkeys([*usda_unified.tags, *off_unified.tags]))
+        regions = list(
+            dict.fromkeys([*usda_unified.availability_regions, *off_unified.availability_regions])
+        )
+        return cls(
+            name=usda_unified.name,
+            nutrients_per_100g=nutrients,
+            cost_per_100g=usda_unified.cost_per_100g,
+            tags=tags,
+            availability_regions=regions,
+            source="USDA FoodData Central + Open Food Facts (merged)",
+            source_id=usda_unified.source_id,
+            category=usda_unified.category or off_unified.category,
+            nutrition_inputs=[entry.to_dict() for entry in resolved.raw_inputs],
+            nutrition_provenance=dict(resolved.provenance),
+            nutrition_nutrient_confidence=dict(resolved.nutrient_confidence),
+            nutrition_confidence=resolved.confidence,
+        )
+
+    def to_menu_engine_format(self) -> UnifiedFoodResult:
+        """Convert to format expected by menu_engine.py"""
+        return {
+            "name": self.name,
+            "nutrients_per_100g": self.nutrients_per_100g,
+            "cost_per_100g": self.cost_per_100g,
+            "tags": self.tags,
+            "availability_regions": self.availability_regions,
+            "source": self.source,
+            "source_id": self.source_id,
+            "category": self.category,
+        }
+
+
+class UnifiedFoodDatabase:
+    """
+    RU: Единая база данных продуктов с кэшированием и поддержкой нескольких источников.
+    EN: Unified food database with caching and multiple source support.
+    """
+
+    def __init__(
+        self,
+        cache_dir: Optional[str] = None,
+        *,
+        create_cache_dir: bool = True,
+    ) -> None:
+        self.usda_client = USDAClient()
+        # Resolve OFF client at runtime (allows tests to patch resolution)
+        # Treat OFFClient==None as unavailable without mutating module-level flags
+        runtime_off = (
+            OFFClient()
+            if (OFFClient is not None and OFF_AVAILABLE and callable(OFFClient))
+            else None
+        )
+        self.off_client: Optional[Any] = runtime_off
+        self.cache_dir = Path(cache_dir or "cache/food_db")
+        if create_cache_dir:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+        # In-memory cache for this session
+        self._memory_cache: Dict[str, UnifiedFoodItem] = {}
+
+        # Load persistent cache
+        self._load_cache()
+        # Throttle state for disk saves
+        self._last_save_ts: float | None = None
+        try:
+            self._last_save_ts = _load_time_module().monotonic()
+        except Exception:
+            self._last_save_ts = None
+
+    def _get_cache_file(self) -> Path:
+        """Get path to cache file."""
+        return self.cache_dir / "unified_food_cache.json"
+
+    def _load_cache(self):
+        """Load cached food items from disk."""
+        cache_file = self._get_cache_file()
+        if cache_file.exists():
+            try:
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    cache_data = json.load(f)
+
+                for key, item_data in cache_data.items():
+                    self._memory_cache[key] = UnifiedFoodItem(**item_data)
+
+                logger.info(f"Loaded {len(self._memory_cache)} items from cache")
+            except Exception as e:
+                logger.error(f"Error loading cache: {e}")
+
+    def _save_cache(self):
+        """Save cached food items to disk."""
+        try:
+            # Optional throttle via env (milliseconds)
+            import os as _os
+
+            ms = int(_os.getenv("UNIFIED_DB_SAVE_THROTTLE_MS", "0"))
+            if ms > 0:
+                last_save_ts = getattr(self, "_last_save_ts", None)
+                if last_save_ts is not None:
+                    now = _load_time_module().monotonic()
+                    if (now - last_save_ts) * 1000.0 < ms:
+                        return
+                    self._last_save_ts = now
+            cache_data = {key: asdict(item) for key, item in self._memory_cache.items()}
+
+            with open(self._get_cache_file(), "w", encoding="utf-8") as f:
+                json.dump(cache_data, f, indent=2, ensure_ascii=False)
+
+            logger.info(f"Saved {len(cache_data)} items to cache")
+        except Exception as e:
+            logger.error(f"Error saving cache: {e}")
+
+    async def search_food(
+        self, query: str, prefer_source: str = "usda", save_cache: bool = True
+    ) -> List[UnifiedFoodItem]:
+        """
+        RU: Поиск продуктов по названию.
+        EN: Search for foods by name.
+
+        Args:
+            query: Search query (e.g., "chicken breast")
+            prefer_source: Preferred data source ("usda", "openfoodfacts")
+            save_cache: Whether to save cache after search (default: True)
+
+        Returns:
+            List of unified food items
+        """
+        # Check cache first
+        cache_key = f"search_{query.lower().strip()}"
+        if cache_key in self._memory_cache:
+            return [self._memory_cache[cache_key]]
+
+        results = []
+
+        if prefer_source == "usda":
+            # Search USDA first
+            try:
+                usda_results = await self.usda_client.search_foods(query, page_size=5)
+                for usda_item in usda_results:
+                    unified_item = UnifiedFoodItem.from_usda_item(usda_item)
+                    results.append(unified_item)
+
+                    # Cache the best result
+                    if not self._memory_cache.get(cache_key):
+                        self._memory_cache[cache_key] = unified_item
+            except Exception:
+                logger.exception("Error searching USDA")
+
+        # When USDA is preferred and returned hits, enrich the top result with OFF using
+        # the shared resolver (USDA ranks above OFF per DEFAULT_SOURCE_PRIORITY).
+        if prefer_source == "usda" and results and self.off_client:
+            try:
+                off_results = await self.off_client.search_products(query, page_size=1)
+                if off_results:
+                    off_unified = UnifiedFoodItem.from_off_item(off_results[0])
+                    merged = UnifiedFoodItem.from_usda_and_off_merge(results[0], off_unified)
+                    results[0] = merged
+                    if cache_key in self._memory_cache:
+                        self._memory_cache[cache_key] = merged
+            except Exception as exc:
+                logger.debug(
+                    "Unified DB: skipping USDA+OFF nutrition merge for query %r: %s",
+                    query,
+                    exc,
+                )
+                # Drop stale search_* cache so a transient OFF failure can retry merge.
+                self._memory_cache.pop(cache_key, None)
+
+        # Search Open Food Facts if USDA results are empty or if preferred
+        if (prefer_source == "openfoodfacts" or not results) and self.off_client:
+            try:
+                off_results = await self.off_client.search_products(query, page_size=5)
+                for off_item in off_results:
+                    unified_item = UnifiedFoodItem.from_off_item(off_item)
+                    results.append(unified_item)
+
+                    # Cache the best result
+                    if not self._memory_cache.get(cache_key):
+                        self._memory_cache[cache_key] = unified_item
+            except Exception as e:
+                logger.error(f"Error searching Open Food Facts: {e}")
+
+        if results and save_cache:
+            self._save_cache()
+
+        return results
+
+    async def get_food_by_id(self, source: str, food_id: str) -> Optional[UnifiedFoodItem]:
+        """
+        RU: Получить продукт по ID источника.
+        EN: Get food by source ID.
+        """
+        cache_key = f"{source}_{food_id}"
+        if cache_key in self._memory_cache:
+            return self._memory_cache[cache_key]
+
+        if source == "usda":
+            try:
+                fdc_id = int(food_id)
+                usda_item = await self.usda_client.get_food_details(fdc_id)
+                if usda_item:
+                    unified_item = UnifiedFoodItem.from_usda_item(usda_item)
+                    self._memory_cache[cache_key] = unified_item
+                    self._save_cache()
+                    return unified_item
+            except ValueError:
+                logger.error(f"Invalid USDA FDC ID: {food_id}")
+
+        elif source == "openfoodfacts" and self.off_client:
+            try:
+                off_item = await self.off_client.get_product_details(food_id)
+                if off_item:
+                    unified_item = UnifiedFoodItem.from_off_item(off_item)
+                    self._memory_cache[cache_key] = unified_item
+                    self._save_cache()
+                    return unified_item
+            except Exception as e:
+                logger.error(f"Error fetching Open Food Facts item {food_id}: {e}")
+
+        return None
+
+    async def get_common_foods_database(self) -> Dict[str, UnifiedFoodItem]:
+        """
+        RU: Получает базу часто используемых продуктов.
+        EN: Gets database of commonly used foods.
+
+        Returns a dictionary of common foods with standardized names.
+        """
+        # Check if we have cached common foods
+        cache_file = self.cache_dir / "common_foods.json"
+
+        if cache_file.exists():
+            try:
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    cache_data = json.load(f)
+
+                foods_db = {}
+                for key, item_data in cache_data.items():
+                    foods_db[key] = UnifiedFoodItem(**item_data)
+
+                logger.info(f"Loaded {len(foods_db)} common foods from cache")
+                return foods_db
+            except Exception as e:
+                logger.error(f"Error loading common foods cache: {e}")
+
+        # Build common foods database from USDA
+        common_searches = {
+            "chicken_breast": "chicken breast meat only cooked roasted",
+            "salmon": "salmon atlantic farmed cooked dry heat",
+            "lentils": "lentils mature seeds cooked boiled",
+            "spinach": "spinach raw",
+            "oats": "cereals oats regular and quick unenriched dry",
+            "broccoli": "broccoli raw",
+            "brown_rice": "rice brown long-grain cooked",
+            "quinoa": "quinoa cooked",
+            "almonds": "nuts almonds",
+            "greek_yogurt": "yogurt greek plain nonfat",
+            "eggs": "egg whole raw fresh",
+            "sweet_potato": "sweet potato raw unprepared",
+            "avocado": "avocados raw all commercial varieties",
+            "banana": "bananas raw",
+            "black_beans": "beans black mature seeds cooked boiled",
+            "tofu": "tofu raw firm prepared with calcium sulfate",
+            "olive_oil": "oil olive salad or cooking",
+            "milk": "milk reduced fat fluid 2% milkfat",
+            "carrots": "carrots raw",
+            "tomatoes": "tomatoes red ripe raw year round average",
+        }
+
+        foods_db = {}
+
+        # Optional sleep override for faster tests
+        import os as _os
+
+        _sleep_ms = int(_os.getenv("UNIFIED_DB_COMMON_SLEEP_MS", "100"))
+
+        for standard_name, search_query in common_searches.items():
+            try:
+                results = await self.search_food(search_query, save_cache=False)
+                if results:
+                    # Take the first result (usually most relevant)
+                    foods_db[standard_name] = results[0]
+                    logger.info(f"Found food for {standard_name}: {results[0].name}")
+
+                # Small delay to be respectful to the API (adjustable)
+                await asyncio.sleep(max(0.0, _sleep_ms / 1000.0))
+
+            except Exception as e:
+                logger.error(f"Error fetching {standard_name}: {e}")
+                continue
+
+        # Save common foods cache
+        serialized_cache: dict[str, object] = {key: asdict(item) for key, item in foods_db.items()}
+        if _publish_common_foods_cache(cache_file, serialized_cache):
+            logger.info("Saved %d common foods to cache", len(foods_db))
+
+        return foods_db
+
+    async def close(self) -> None:
+        """Close all API clients."""
+        await close_unified_food_clients(self)
+
+
+# Global instance for easy access
+_unified_db_instance: Optional[UnifiedFoodDatabase] = None
+_unified_db_instance_lock = threading.Lock()
+
+
+async def close_unified_food_clients(instance: object) -> None:
+    """Close every unique bounded client once and raise one sanitized signal chain."""
+
+    signals = _UnifiedFoodSignalAccumulator()
+    closed_client_ids: set[int] = set()
+    for attribute_name in ("usda_client", "off_client"):
+        try:
+            client = getattr(instance, attribute_name, None)
+        except BaseException as error:
+            signals.add_exception(error, ordinary_kind="cleanup")
+            continue
+        if client is None or id(client) in closed_client_ids:
+            continue
+        closed_client_ids.add(id(client))
+        try:
+            close = getattr(client, "close", None)
+        except BaseException as error:
+            signals.add_exception(error, ordinary_kind="cleanup")
+            continue
+        if not callable(close):
+            continue
+        try:
+            result = close()
+            if inspect.isawaitable(result):
+                await result
+        except BaseException as error:
+            signals.add_exception(error, ordinary_kind="cleanup")
+    signals.raise_if_any()
+
+
+def _read_unified_db_instance() -> UnifiedFoodDatabase | None:
+    """Return one identity snapshot under the private non-reentrant register lock."""
+
+    with _unified_db_instance_lock:
+        return _unified_db_instance
+
+
+def _compare_exchange_unified_db_instance(
+    expected: UnifiedFoodDatabase | None,
+    replacement: UnifiedFoodDatabase | None,
+) -> tuple[bool, UnifiedFoodDatabase | None]:
+    """Replace the process singleton only when the observed identity is expected."""
+
+    global _unified_db_instance
+
+    with _unified_db_instance_lock:
+        observed = _unified_db_instance
+        if observed is not expected:
+            return False, observed
+        _unified_db_instance = replacement
+        return True, replacement
+
+
+def _reject_cached_common_foods(reason_code: str) -> Dict[str, UnifiedFoodItem]:
+    """Return an empty snapshot with one stable, non-sensitive diagnostic reason."""
+
+    logger.warning("Cached common-food snapshot rejected: reason=%s", reason_code)
+    return {}
+
+
+def get_cached_common_foods_snapshot() -> Dict[str, UnifiedFoodItem]:
+    """Read a validated common-food cache from the already configured instance only."""
+    instance = _read_unified_db_instance()
+    if instance is None:
+        return _reject_cached_common_foods("instance_unconfigured")
+    cache_file = instance.cache_dir / "common_foods.json"
+    if not cache_file.is_file():
+        return _reject_cached_common_foods("cache_file_missing")
+    try:
+        raw_payload = json.loads(cache_file.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return _reject_cached_common_foods("cache_unreadable_or_invalid_json")
+    if not isinstance(raw_payload, dict):
+        return _reject_cached_common_foods("payload_not_object")
+
+    validated: Dict[str, UnifiedFoodItem] = {}
+    try:
+        for key, raw_item in raw_payload.items():
+            if not isinstance(key, str) or not key or not isinstance(raw_item, dict):
+                return _reject_cached_common_foods("entry_identity_or_shape_invalid")
+            raw_name = raw_item.get("name")
+            if type(raw_name) is not str or len(raw_name) > 500 or not raw_name.strip():
+                return _reject_cached_common_foods("item_name_invalid")
+            item = UnifiedFoodItem(**deepcopy(raw_item))
+            if any(
+                not isinstance(value, str) or not value.strip()
+                for value in (item.source, item.source_id)
+            ):
+                return _reject_cached_common_foods("item_identity_invalid")
+            if not isinstance(item.nutrients_per_100g, dict) or not item.nutrients_per_100g:
+                return _reject_cached_common_foods("nutrients_shape_invalid")
+            for nutrient, raw_value in item.nutrients_per_100g.items():
+                if not isinstance(nutrient, str) or not nutrient:
+                    return _reject_cached_common_foods("nutrient_identity_invalid")
+                if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
+                    return _reject_cached_common_foods("nutrient_value_type_invalid")
+                value = float(raw_value)
+                if not math.isfinite(value) or value < 0:
+                    return _reject_cached_common_foods("nutrient_value_range_invalid")
+            if (
+                isinstance(item.cost_per_100g, bool)
+                or not isinstance(item.cost_per_100g, (int, float))
+                or not math.isfinite(float(item.cost_per_100g))
+                or float(item.cost_per_100g) < 0
+            ):
+                return _reject_cached_common_foods("cost_invalid")
+            if not isinstance(item.tags, list) or not all(
+                isinstance(tag, str) for tag in item.tags
+            ):
+                return _reject_cached_common_foods("tags_invalid")
+            if not isinstance(item.availability_regions, list) or not all(
+                isinstance(region, str) for region in item.availability_regions
+            ):
+                return _reject_cached_common_foods("availability_regions_invalid")
+            if item.category is not None and not isinstance(item.category, str):
+                return _reject_cached_common_foods("category_invalid")
+            if (
+                not isinstance(item.nutrition_inputs, list)
+                or not item.nutrition_inputs
+                or not all(
+                    isinstance(value, dict) and bool(value) for value in item.nutrition_inputs
+                )
+            ):
+                return _reject_cached_common_foods("nutrition_inputs_missing_or_invalid")
+            nutrient_names = set(item.nutrients_per_100g)
+            validated_input_rows: list[dict[str, object]] = []
+            raw_nutrient_union: set[str] = set()
+            for raw_input in item.nutrition_inputs:
+                raw_source = raw_input.get("source")
+                if not isinstance(raw_source, str) or not raw_source.strip():
+                    return _reject_cached_common_foods("nutrition_input_source_invalid")
+                raw_nutrients = raw_input.get("nutrients")
+                if not isinstance(raw_nutrients, Mapping) or not raw_nutrients:
+                    return _reject_cached_common_foods(
+                        "nutrition_input_nutrients_missing_or_invalid"
+                    )
+                validated_raw_nutrients: dict[str, float] = {}
+                for raw_nutrient, raw_value in raw_nutrients.items():
+                    if not isinstance(raw_nutrient, str) or not raw_nutrient.strip():
+                        return _reject_cached_common_foods(
+                            "nutrition_input_nutrient_identity_invalid"
+                        )
+                    if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
+                        return _reject_cached_common_foods(
+                            "nutrition_input_nutrient_value_type_invalid"
+                        )
+                    numeric_value = float(raw_value)
+                    if not math.isfinite(numeric_value) or numeric_value < 0:
+                        return _reject_cached_common_foods(
+                            "nutrition_input_nutrient_value_range_invalid"
+                        )
+                    validated_raw_nutrients[raw_nutrient] = numeric_value
+                raw_nutrient_union.update(validated_raw_nutrients)
+                validated_input = deepcopy(raw_input)
+                validated_input["source"] = raw_source
+                validated_input["nutrients"] = validated_raw_nutrients
+                validated_input_rows.append(validated_input)
+            if not nutrient_names <= raw_nutrient_union:
+                return _reject_cached_common_foods("nutrition_input_coverage_invalid")
+            if (
+                not isinstance(item.nutrition_provenance, dict)
+                or set(item.nutrition_provenance) != nutrient_names
+                or not all(
+                    isinstance(name, str) and isinstance(value, str) and bool(value.strip())
+                    for name, value in item.nutrition_provenance.items()
+                )
+            ):
+                return _reject_cached_common_foods("nutrition_provenance_coverage_invalid")
+            if (
+                not isinstance(item.nutrition_nutrient_confidence, dict)
+                or set(item.nutrition_nutrient_confidence) != nutrient_names
+            ):
+                return _reject_cached_common_foods("nutrient_confidence_coverage_invalid")
+            for name, raw_confidence in item.nutrition_nutrient_confidence.items():
+                if not isinstance(name, str) or isinstance(raw_confidence, bool):
+                    return _reject_cached_common_foods("nutrient_confidence_identity_invalid")
+                if not isinstance(raw_confidence, (int, float)):
+                    return _reject_cached_common_foods("nutrient_confidence_type_invalid")
+                confidence = float(raw_confidence)
+                if not math.isfinite(confidence) or not 0 < confidence <= 1:
+                    return _reject_cached_common_foods("nutrient_confidence_range_invalid")
+            if (
+                isinstance(item.nutrition_confidence, bool)
+                or not isinstance(item.nutrition_confidence, (int, float))
+                or not math.isfinite(float(item.nutrition_confidence))
+                or not 0 < float(item.nutrition_confidence) <= 1
+            ):
+                return _reject_cached_common_foods("overall_confidence_invalid")
+            rebuilt_inputs = nutrition_inputs_from_unified_wire(
+                nutrition_inputs_wire=validated_input_rows,
+                nutrients_per_100g={},
+                fallback_source="estimate",
+                record_id=item.source_id,
+            )
+            resolved = merge_wire_nutrition_sources(
+                primary_inputs=rebuilt_inputs,
+                secondary_inputs=[],
+                nutrient_keys=sorted(nutrient_names),
+            )
+            published_nutrients = {
+                nutrient: float(value) for nutrient, value in item.nutrients_per_100g.items()
+            }
+            if dict(resolved.nutrients) != published_nutrients:
+                return _reject_cached_common_foods("resolved_nutrients_mismatch")
+            if dict(resolved.provenance) != item.nutrition_provenance:
+                return _reject_cached_common_foods("resolved_provenance_mismatch")
+            if dict(resolved.nutrient_confidence) != item.nutrition_nutrient_confidence:
+                return _reject_cached_common_foods("resolved_nutrient_confidence_mismatch")
+            if resolved.confidence != float(item.nutrition_confidence):
+                return _reject_cached_common_foods("resolved_overall_confidence_mismatch")
+            validated[key] = deepcopy(item)
+    except (TypeError, ValueError, OverflowError):
+        return _reject_cached_common_foods("entry_model_invalid")
+    return validated
+
+
+async def get_unified_food_db() -> UnifiedFoodDatabase:
+    """
+    RU: Получить глобальный экземпляр унифицированной базы данных продуктов.
+    EN: Get global instance of unified food database.
+    """
+    existing = _read_unified_db_instance()
+    if existing is not None:
+        return existing
+
+    candidate = UnifiedFoodDatabase.__new__(UnifiedFoodDatabase)
+    initialization_signals = _UnifiedFoodSignalAccumulator()
+    try:
+        UnifiedFoodDatabase.__init__(candidate)
+    except BaseException as error:
+        initialization_signals.add_exception(error, ordinary_kind="initialization")
+    if initialization_signals.has_signal:
+        try:
+            await close_unified_food_clients(candidate)
+        except BaseException as error:
+            initialization_signals.add_exception(error, ordinary_kind="cleanup")
+        initialization_signals.raise_if_any()
+        raise RuntimeError(UNIFIED_FOOD_INITIALIZATION_ERROR_MESSAGE)
+
+    published, observed = _compare_exchange_unified_db_instance(None, candidate)
+    if published:
+        return candidate
+
+    await close_unified_food_clients(candidate)
+
+    if observed is None:
+        raise RuntimeError("Unified-food singleton publication lost without a winner")
+    return observed
+
+
+async def search_foods_unified(query: str, max_results: int = 5) -> List[UnifiedFoodResult]:
+    """
+    RU: Упрощенная функция поиска продуктов для использования в menu_engine.
+    EN: Simplified food search function for use in menu_engine.
+
+    Returns results in the format expected by menu_engine.py
+    """
+    db = await get_unified_food_db()
+    results = await db.search_food(query)
+
+    return [item.to_menu_engine_format() for item in results[:max_results]]
+
+
+async def search_unified_food(
+    query: str, language: str | None = None, max_results: int = 5
+) -> List[UnifiedFoodResult]:
+    """Backward-compatible unified search with language contract.
+
+    RU: Поддерживает language-параметр без изменения runtime поведения поиска.
+    EN: Supports language parameter without changing search runtime behavior.
+    """
+    normalized_language = normalize_unified_db_language(language)
+    # NOTE: normalized_language is intentionally computed as a SoT extension point.
+    # Today it does not change unified search behavior; future routing may use it.
+    _ = normalized_language
+    return await search_foods_unified(query, max_results=max_results)
+
+
+# ---------------------------------------------------------------------------
+# Thin facades (satisfy test imports; see tests/feature_manifest.py unified_db)
+# ---------------------------------------------------------------------------
+
+
+class UnifiedFoodDB:
+    """Thin facade providing sync interface for tests.
+
+    Wraps UnifiedFoodDatabase with synchronous search_foods method.
+    """
+
+    def search_foods(self, query: str | None) -> list[dict[str, object]]:
+        """Synchronous search returning empty list (facade only)."""
+        return []
+
+
+class FoodSource:
+    """Simple enum-like container for food source identifiers."""
+
+    USDA = "usda"
+    OPENFOODFACTS = "openfoodfacts"
+
+
+def merge_food_sources(
+    sources1: list[dict[str, object]],
+    sources2: list[dict[str, object]],
+    **kwargs: object,
+) -> list[dict[str, object]]:
+    """Merge two food-source lists by concatenation."""
+    return list(sources1) + list(sources2)
+
+
+def update_unified_db(**kwargs: object) -> None:
+    """No-op synchronous update facade."""
+
+
+if __name__ == "__main__":  # pragma: no cover
+    # Test the unified database
+    async def test_unified_db():
+        db = UnifiedFoodDatabase()
+
+        try:
+            print("Testing unified food database...")
+
+            # Test search
+            results = await db.search_food("chicken breast")
+            if results:
+                food = results[0]
+                print(f"✓ Found: {food.name}")
+                print(f"✓ Source: {food.source}")
+                print(f"✓ Nutrients: {len(food.nutrients_per_100g)} found")
+                print(f"✓ Tags: {food.tags}")
+
+            # Test common foods database
+            print("\nBuilding common foods database...")
+            common_foods = await db.get_common_foods_database()
+            print(f"✓ Built database with {len(common_foods)} common foods:")
+            for name, food in list(common_foods.items())[:5]:
+                print(f"  {name}: {food.name}")
+
+        finally:
+            await db.close()
+
+    # Run test
+    asyncio.run(test_unified_db())

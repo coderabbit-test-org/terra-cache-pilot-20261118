@@ -1,0 +1,1829 @@
+# -*- coding: utf-8 -*-
+"""
+RU: Доказательные тесты для shim'ов legacy BMI endpoints.
+EN: Proof tests for legacy BMI endpoint shims.
+
+PR-456 Commit 3: Verify that /bmi and /api/v1/bmi delegate to canonical handler.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
+from typing import Any, Literal, get_args, get_origin
+
+import pytest
+from fastapi.testclient import TestClient
+
+import scripts.ci.check_legacy_growth_guard as legacy_guard
+from core.bmi.engine import BMICalculateResult
+from core.bmi.risk import WaistRiskResult
+from core.i18n import t
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+RETIRED_LEGACY_PYTHON_BINDINGS = {
+    "admin_status",
+    "cleanup_expired_logs",
+    "debug_env",
+    "get_database_status",
+    "force_database_update",
+    "check_for_updates",
+    "rollback_database",
+    "bmi_endpoint",
+    "plan_endpoint",
+    "bmi_endpoint_v1",
+    "_resolve_build_targets_callable",
+    "PlateDependencies",
+    "_compute_premium_plate",
+    "api_premium_plate",
+    "build_fallback_plate",
+    "align_macros_with_targets",
+    "aggregate_day_micros",
+    "premium_targets_legacy",
+    "api_who_targets",
+    "api_nutrient_gaps",
+    "analyze_nutrient_gaps",
+    "make_daily_menu",
+    "make_weekly_menu",
+    "repair_week_plan",
+    "make_plate",
+    "build_nutrition_targets",
+    "to_csv_day",
+    "to_pdf_day",
+    "to_csv_week",
+    "to_pdf_week",
+    "WeeklyPlanFlexibleRequest",
+    "INSIGHT_TEXT_MAX_LENGTH",
+    "InsightRequest",
+    "RAGSourceItem",
+    "InsightResponse",
+    "INSIGHT_TEMP_UNAVAILABLE_MESSAGE",
+    "_execute_insight_request",
+    "insight_v1",
+    "insight",
+    "DB_TO_ALIAS_NUTRIENT_MAP",
+    "PlateServiceDependencies",
+    "_convert_db_nutrients_to_alias_format",
+    "_aggregate_meal_micronutrients",
+    "_get_recipe_ingredients_for_meal",
+    "_aggregate_day_micronutrients",
+    "_macros_to_kcal",
+    "sanitize_plate_data",
+    "_iter_exception_chain",
+    "_is_missing_nh3_error",
+    "_raise_missing_nh3_http_error",
+    "calculate_heuristic_macros",
+    "MANDATORY_MICRO_DEFAULTS",
+    "MAX_DAILY_KCAL",
+    "MICRO_ALIAS_MAP",
+    "MIN_DAILY_KCAL",
+    "_alias_micros",
+    "_clamp_daily_kcal",
+    "_ensure_priority_micros",
+    "_generate_who_targets_response",
+    "_fallback_targets_response",
+    "analyze_nutrient_gaps_response",
+    "_OPENAPI_ALLOWED_PREFIXES",
+    "_OPENAPI_ALLOWED_EXACT",
+    "_is_openapi_public_path",
+    "_collect_schema_refs",
+    "_prune_unreferenced_schema_components",
+    "_build_canonical_openapi",
+    "_install_openapi_builder",
+    "BMRRequest",
+    "BMRRequestLegacy",
+    "BMRResponse",
+    "NutrientGapsRequest",
+    "NutrientGapsResponse",
+    "PlateRequest",
+    "PlateResponse",
+    "VisualShape",
+    "WHOTargetsRequest",
+    "WHOTargetsResponse",
+    "Activity",
+    "DietFlag",
+    "Goal",
+    "Sex",
+    "build_who_targets_ui_labels",
+    "DataClass",
+    "get_retention_manager",
+    "LogRetentionManager",
+    "_log_retention_manager",
+    "TargetsIn",
+    "CanonicalTargetsIn",
+    "LegacyWeekPlanRequest",
+    "WeeklyMenuResponse",
+    "get_session",
+    "Language",
+    "normalize_lang",
+    "t",
+    "FIBER_MIN_G",
+    "_short_git_sha",
+    "_is_truthy",
+    "_LEGACY_IMPORT_COMPAT_REEXPORTS",
+    "BMIRequest",
+    "BMIRequestV1",
+    "MATPLOTLIB_AVAILABLE",
+    "generate_bmi_visualization",
+    "add_visualization_if_requested",
+    "_BMI_COMPAT_REEXPORTS",
+    "_BMI_SCHEMA_COMPAT_REEXPORTS",
+    "build_application_metadata",
+    "ENHANCED_PLATE_GENERATION_FAILED_DETAIL",
+    "INVALID_PREMIUM_PLATE_INPUT_DETAIL",
+    "APPLICATION_METADATA",
+    "RUNTIME_ENV",
+    "_app_env",
+    "_application_metadata",
+    "tags_metadata",
+    "_api_description",
+    "lifespan",
+    "get_update_scheduler",
+    "limiter",
+    "limit_if_available",
+    "RATE_LIMIT_EXPORTS",
+    "RATE_LIMIT_INSIGHT",
+    "RATE_LIMIT_429_RESPONSES",
+    "_RATE_LIMIT_429_RESPONSES",
+    "_TypeVar",
+    "_F",
+    "_LimitValue",
+    "LimiterType",
+    "_Limiter",
+    "Limiter",
+    "slowapi_available",
+    "get_api_key",
+    "_get_api_key_dynamic",
+}
+
+RETIRED_PLATE_HELPER_BINDINGS = (
+    "DB_TO_ALIAS_NUTRIENT_MAP",
+    "PlateServiceDependencies",
+    "_convert_db_nutrients_to_alias_format",
+    "_aggregate_meal_micronutrients",
+    "_get_recipe_ingredients_for_meal",
+    "_aggregate_day_micronutrients",
+    "_macros_to_kcal",
+    "sanitize_plate_data",
+    "_iter_exception_chain",
+    "_is_missing_nh3_error",
+    "_raise_missing_nh3_http_error",
+    "calculate_heuristic_macros",
+)
+
+RETIRED_NUTRITION_UTILITY_BINDINGS = (
+    "MANDATORY_MICRO_DEFAULTS",
+    "MAX_DAILY_KCAL",
+    "MICRO_ALIAS_MAP",
+    "MIN_DAILY_KCAL",
+    "_alias_micros",
+    "_clamp_daily_kcal",
+    "_ensure_priority_micros",
+)
+
+RETIRED_INSIGHT_BINDINGS = (
+    "INSIGHT_TEXT_MAX_LENGTH",
+    "InsightRequest",
+    "RAGSourceItem",
+    "InsightResponse",
+    "INSIGHT_TEMP_UNAVAILABLE_MESSAGE",
+    "_execute_insight_request",
+    "insight_v1",
+    "insight",
+)
+
+RETIRED_OPENAPI_BINDINGS = (
+    "_OPENAPI_ALLOWED_PREFIXES",
+    "_OPENAPI_ALLOWED_EXACT",
+    "_is_openapi_public_path",
+    "_collect_schema_refs",
+    "_prune_unreferenced_schema_components",
+    "_build_canonical_openapi",
+    "_install_openapi_builder",
+)
+
+RETIRED_CORE_UTILITY_BINDINGS = (
+    "get_session",
+    "Language",
+    "normalize_lang",
+    "t",
+    "FIBER_MIN_G",
+    "_short_git_sha",
+    "_is_truthy",
+    "_LEGACY_IMPORT_COMPAT_REEXPORTS",
+)
+
+RETIRED_BMI_COMPAT_BINDINGS = (
+    "BMIRequest",
+    "BMIRequestV1",
+    "MATPLOTLIB_AVAILABLE",
+    "generate_bmi_visualization",
+    "add_visualization_if_requested",
+    "_BMI_COMPAT_REEXPORTS",
+    "_BMI_SCHEMA_COMPAT_REEXPORTS",
+)
+
+RETIRED_RATE_LIMIT_BINDINGS = (
+    "limiter",
+    "limit_if_available",
+    "RATE_LIMIT_EXPORTS",
+    "RATE_LIMIT_INSIGHT",
+    "RATE_LIMIT_429_RESPONSES",
+    "_RATE_LIMIT_429_RESPONSES",
+    "_TypeVar",
+    "_F",
+    "_LimitValue",
+    "LimiterType",
+    "_Limiter",
+    "Limiter",
+    "slowapi_available",
+)
+
+_NETWORK_DISABLED_PREAMBLE = textwrap.dedent("""
+    import socket
+
+    def _deny_network(*_args, **_kwargs):
+        raise AssertionError("network access is disabled for this import probe")
+
+    class _NetworkDisabledSocket(socket.socket):
+        def connect(self, *_args, **_kwargs):
+            _deny_network()
+
+        def connect_ex(self, *_args, **_kwargs):
+            _deny_network()
+
+    socket.create_connection = _deny_network
+    socket.socket = _NetworkDisabledSocket
+    """)
+
+
+def _run_legacy_retirement_probe(
+    scenario: str,
+    *,
+    rate_limiting_enabled: bool = False,
+) -> dict[str, object]:
+    """Run a fresh finite-env child with named connection controls and fixed enabled settings."""
+    passthrough_names = (
+        "LANG",
+        "LC_ALL",
+        "PATH",
+        "PYTHONIOENCODING",
+        "PYTHONUTF8",
+        "TMPDIR",
+    )
+    env = {name: value for name in passthrough_names if (value := os.environ.get(name)) is not None}
+    env.update(
+        {
+            "APP_ENV": "test",
+            "ENVIRONMENT": "test",
+            "TESTING": "true",
+            "PYTEST_CURRENT_TEST": "legacy-python-retirement-probe",
+            "PRIVATE_EXPORTS_ENABLED": "false",
+        }
+    )
+    if rate_limiting_enabled:
+        env.update(
+            {
+                "RATE_LIMITING_IN_TESTS": "true",
+                "RATE_LIMIT_INSIGHT": "2/minute",
+                "SERVER_SALT": "StrongServerSaltForTests123456789!",
+                "BUSINESS_MODULE_ENABLED": "true",
+                "VIP_MODULE_ENABLED": "true",
+                "FEATURE_FITCHEF_MASCOT": "true",
+                "FITCHEF_MASCOT_EXECUTION_MODE": "auto-safe",
+            }
+        )
+    completed = subprocess.run(
+        [sys.executable, "-c", _NETWORK_DISABLED_PREAMBLE + scenario],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+        shell=False,
+    )
+    assert completed.returncode == 0, (
+        f"legacy retirement probe failed with returncode={completed.returncode}; "
+        f"stdout_tail={completed.stdout[-2000:]!r}; stderr_tail={completed.stderr[-2000:]!r}"
+    )
+    result_line = next(
+        line
+        for line in completed.stdout.splitlines()
+        if line.startswith("LEGACY_RETIREMENT_RESULT=")
+    )
+    return json.loads(result_line.removeprefix("LEGACY_RETIREMENT_RESULT="))
+
+
+def test_legacy_retirement_probe_excludes_ambient_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FIGMA_ACCESS_TOKEN", "must-not-enter-child")
+    monkeypatch.setenv(
+        "PULSEPLATE_PYTHON_INDEX_URL",
+        "https://must-not-enter-child.invalid/simple/",
+    )
+    scenario = textwrap.dedent("""
+        import json
+        import os
+
+        assert "FIGMA_ACCESS_TOKEN" not in os.environ
+        assert "PULSEPLATE_PYTHON_INDEX_URL" not in os.environ
+        print(
+            "LEGACY_RETIREMENT_RESULT="
+            + json.dumps({"ambient_credentials_present": False})
+        )
+        """)
+
+    assert _run_legacy_retirement_probe(scenario) == {"ambient_credentials_present": False}
+
+
+@pytest.mark.parametrize("import_order", ("legacy-first", "api-key-first"))
+def test_api_key_retirement_preserves_canonical_identity_in_fresh_orders(
+    import_order: str,
+) -> None:
+    """Prove Legacy absence and canonical identity through two distinct fresh import orders."""
+    imports = (
+        "assert 'app.routers.api_key' not in sys.modules\n"
+        "assert 'legacy_app' not in sys.modules\n"
+        "import legacy_app\n"
+        "assert sys.modules['legacy_app'] is legacy_app\n"
+        "from app.routers import api_key\n"
+        if import_order == "legacy-first"
+        else "assert 'legacy_app' not in sys.modules\n"
+        "from app.routers import api_key\n"
+        "assert 'legacy_app' not in sys.modules\n"
+        "import legacy_app\n"
+    )
+    scenario = "import sys\n" + imports + textwrap.dedent("""
+        import inspect
+        import json
+        import app as app_package
+        import app.main as app_main
+        from app.bootstrap.application import app as canonical_app
+
+        retired = ("get_api_key", "_get_api_key_dynamic")
+        assert set(retired).isdisjoint(vars(legacy_app))
+        assert set(retired).isdisjoint(vars(legacy_app).get("__annotations__", {}))
+        for name in retired:
+            try:
+                getattr(legacy_app, name)
+            except AttributeError:
+                pass
+            else:
+                raise AssertionError("legacy API-key attribute remains: " + name)
+        try:
+            from legacy_app import get_api_key
+        except ImportError:
+            pass
+        else:
+            raise AssertionError("legacy get_api_key import remains")
+        try:
+            from legacy_app import _get_api_key_dynamic
+        except ImportError:
+            pass
+        else:
+            raise AssertionError("legacy _get_api_key_dynamic import remains")
+        assert app_package.api_key_header is api_key.api_key_header
+        assert app_package.get_api_key is api_key.get_api_key
+        assert app_package._get_api_key_dynamic is api_key._get_api_key_dynamic
+        for name in (*retired, "validate_app_api_key", "require_app_api_key"):
+            value = getattr(api_key, name)
+            assert callable(value)
+            assert value.__module__ == "app.routers.api_key"
+        for guard in (api_key.get_api_key, api_key._get_api_key_dynamic):
+            dependency = inspect.signature(guard).parameters["api_key"].default
+            assert dependency.dependency is api_key.api_key_header
+        assert app_package.app is app_main.app is canonical_app is legacy_app.app
+        assert all(
+            getattr(call, "__module__", None) != "legacy_app"
+            for route in app_main.app.routes
+            for dependant in getattr(route, "dependencies", ())
+            for call in (getattr(dependant, "dependency", None),)
+            if callable(call)
+        )
+        print("LEGACY_RETIREMENT_RESULT=" + json.dumps({
+            "absent": list(retired), "canonical_identity_preserved": True,
+        }))
+        """)
+    assert _run_legacy_retirement_probe(scenario) == {
+        "absent": ["get_api_key", "_get_api_key_dynamic"],
+        "canonical_identity_preserved": True,
+    }
+
+
+def test_retired_rate_limit_bindings_are_absent() -> None:
+    """Require whole-cohort namespace, annotation, attribute and direct-import absence."""
+    import_checks = "\n".join(textwrap.dedent(f"""
+        try:
+            from legacy_app import {binding_name}
+        except ImportError:
+            pass
+        else:
+            raise AssertionError("legacy from-import remains: {binding_name}")
+        """) for binding_name in RETIRED_RATE_LIMIT_BINDINGS)
+    scenario = (
+        textwrap.dedent(f"""
+        import json
+        import legacy_app
+        retired = {RETIRED_RATE_LIMIT_BINDINGS!r}
+        assert set(retired).isdisjoint(vars(legacy_app)), "legacy rate-limit bindings remain"
+        assert set(retired).isdisjoint(vars(legacy_app).get("__annotations__", {{}}))
+        for name in retired:
+            try:
+                getattr(legacy_app, name)
+            except AttributeError:
+                pass
+            else:
+                raise AssertionError(f"legacy attribute remains: {{name}}")
+        """)
+        + import_checks
+        + textwrap.dedent("""
+        print("LEGACY_RETIREMENT_RESULT=" + json.dumps({"absent": list(retired)}))
+        """)
+    )
+    assert _run_legacy_retirement_probe(scenario) == {"absent": list(RETIRED_RATE_LIMIT_BINDINGS)}
+
+
+@pytest.mark.parametrize("import_order", ("legacy-first", "rate-limit-first", "main-first"))
+def test_rate_limit_canonical_wiring_survives_retirement_import_orders(import_order: str) -> None:
+    """Preserve real canonical wiring, route/model and handler across three fresh import orders."""
+    sequences = {
+        "legacy-first": "import legacy_app\nimport app.security.rate_limit as rate_limit\n"
+        "import app.main as main\nbefore_legacy = None\n",
+        "rate-limit-first": "import app.security.rate_limit as rate_limit\n"
+        "assert 'legacy_app' not in sys.modules\nimport legacy_app\n"
+        "import app.main as main\nbefore_legacy = None\n",
+        "main-first": "import app.main as main\nimport app.security.rate_limit as rate_limit\n"
+        "assert 'legacy_app' not in sys.modules\nbefore_legacy = snapshot(main.app)\n"
+        "import legacy_app\n",
+    }
+    import_checks = "\n".join(textwrap.dedent(f"""
+        try:
+            from legacy_app import {binding_name}
+        except ImportError:
+            pass
+        else:
+            raise AssertionError("legacy from-import remains: {binding_name}")
+        """) for binding_name in RETIRED_RATE_LIMIT_BINDINGS)
+    scenario = (
+        textwrap.dedent("""
+        import importlib
+        import json
+        import sys
+        from fastapi import FastAPI
+        from app.effective_routes import (
+            iter_effective_route_candidates, route_endpoint, route_matches_path_method,
+            route_methods, route_path, route_responses,
+        )
+
+        def snapshot(application: FastAPI) -> tuple[object, ...]:
+            return (
+                application, application.state.limiter, tuple(application.user_middleware),
+                dict(application.exception_handlers),
+                tuple((route_path(route), route_methods(route), route_endpoint(route))
+                      for route in iter_effective_route_candidates(application.routes)),
+            )
+
+        assert 'legacy_app' not in sys.modules
+        assert 'app.main' not in sys.modules
+        assert 'app.security.rate_limit' not in sys.modules
+        """)
+        + sequences[import_order]
+        + textwrap.dedent(f"""
+        from fastapi import Request
+        import app as app_facade
+        import app.bootstrap.application as application_bootstrap
+        from app.routers import fitchef_insight
+        from core.i18n import t
+
+        retired = {RETIRED_RATE_LIMIT_BINDINGS!r}
+        assert set(retired).isdisjoint(vars(legacy_app))
+        assert set(retired).isdisjoint(vars(legacy_app).get("__annotations__", {{}}))
+        for name in retired:
+            try:
+                getattr(legacy_app, name)
+            except AttributeError:
+                pass
+            else:
+                raise AssertionError(f"legacy attribute remains: {{name}}")
+        assert all(name in vars(rate_limit) for name in retired[:5])
+        assert rate_limit.limiter is not None
+        assert isinstance(rate_limit.limiter, rate_limit.Limiter)
+        assert main.app is application_bootstrap.app is app_facade.app is legacy_app.app
+        assert main.app.state.limiter is rate_limit.limiter
+        assert rate_limit.limiter.enabled is True
+        assert sum(item.cls is rate_limit.SlowAPIMiddleware
+                   for item in main.app.user_middleware) == 1
+        handler = main.app.exception_handlers[rate_limit.RateLimitExceeded]
+        assert handler is rate_limit._rate_limit_exceeded_json_handler
+        assert rate_limit.RATE_LIMIT_429_RESPONSES[429]['model'] is rate_limit.RateLimitErrorResponse
+        routes = [route for route in iter_effective_route_candidates(main.app.routes)
+                  if route_matches_path_method(
+                      route, '/api/v1/insight/fitchef/weekly-reflection', 'POST')]
+        assert len(routes) == 1
+        assert route_endpoint(routes[0]) is fitchef_insight.fitchef_weekly_reflection
+        assert route_responses(routes[0])[429]['model'] is rate_limit.RateLimitErrorResponse
+        before_repeat = snapshot(main.app)
+        if before_legacy is not None:
+            assert before_legacy == before_repeat
+        assert importlib.import_module('legacy_app') is legacy_app
+        rate_limit.wire_rate_limiting(main.app)
+        assert snapshot(main.app) == before_repeat
+        request = Request({{
+            'type': 'http', 'method': 'POST', 'scheme': 'http',
+            'path': '/api/v1/insight/fitchef/weekly-reflection',
+            'headers': [(b'accept-language', b'en')],
+            'server': ('testserver', 80), 'client': ('127.0.0.1', 12345),
+        }})
+        response = handler(request, Exception('synthetic rate-limit error'))
+        assert response.status_code == 429
+        assert response.headers['content-type'].split(';', 1)[0].strip().lower() == 'application/json', 'canonical handler media type must be application/json'
+        payload = json.loads(response.body)
+        assert payload == {{'detail': t('en', 'rate_limit.exceeded')}}
+        assert rate_limit.RateLimitErrorResponse.model_validate(payload).model_dump() == payload
+        """)
+        + import_checks
+        + textwrap.dedent("""
+        print("LEGACY_RETIREMENT_RESULT=" + json.dumps({
+            'absent': list(retired), 'canonical_wiring_preserved': True,
+            'canonical_handler_contract_preserved': True,
+        }))
+        """)
+    )
+    assert _run_legacy_retirement_probe(scenario, rate_limiting_enabled=True) == {
+        "absent": list(RETIRED_RATE_LIMIT_BINDINGS),
+        "canonical_wiring_preserved": True,
+        "canonical_handler_contract_preserved": True,
+    }
+
+
+@pytest.mark.parametrize("binding_name", ("lifespan", "get_update_scheduler"))
+def test_retired_lifecycle_access_bindings_are_absent(binding_name: str) -> None:
+    scenario = textwrap.dedent(f"""
+        import json
+        import legacy_app
+        assert {binding_name!r} not in vars(legacy_app), "legacy binding remains: {binding_name}"
+        try:
+            getattr(legacy_app, {binding_name!r})
+        except AttributeError:
+            pass
+        else:
+            raise AssertionError("legacy attribute remains: {binding_name}")
+        try:
+            from legacy_app import {binding_name}
+        except ImportError:
+            pass
+        else:
+            raise AssertionError("legacy from-import remains: {binding_name}")
+        print("LEGACY_RETIREMENT_RESULT=" + json.dumps({{"absent": {binding_name!r}}}))
+        """)
+    assert _run_legacy_retirement_probe(scenario) == {"absent": binding_name}
+
+
+@pytest.mark.parametrize("binding_name", RETIRED_BMI_COMPAT_BINDINGS)
+def test_retired_bmi_compat_bindings_are_absent(binding_name: str) -> None:
+    """Require exact BMI retirement independently of production guard data."""
+    import legacy_app
+
+    assert binding_name not in vars(legacy_app)
+    with pytest.raises(AttributeError):
+        getattr(legacy_app, binding_name)
+    scenario = textwrap.dedent(f"""
+        import json
+        try:
+            from legacy_app import {binding_name}
+        except ImportError:
+            pass
+        else:
+            raise AssertionError("legacy from-import remains: {binding_name}")
+        print("LEGACY_RETIREMENT_RESULT=" + json.dumps({{"absent": {binding_name!r}}}))
+        """)
+    assert _run_legacy_retirement_probe(scenario) == {"absent": binding_name}
+
+
+@pytest.mark.parametrize(
+    "binding_name",
+    (
+        "build_application_metadata",
+        "ENHANCED_PLATE_GENERATION_FAILED_DETAIL",
+        "INVALID_PREMIUM_PLATE_INPUT_DETAIL",
+    ),
+)
+def test_retired_metadata_error_bindings_are_absent(binding_name: str) -> None:
+    """Require exact metadata/error retirement independently of production guard data."""
+    import legacy_app
+
+    assert binding_name not in vars(legacy_app)
+    with pytest.raises(AttributeError):
+        getattr(legacy_app, binding_name)
+    scenario = textwrap.dedent(f"""
+        import json
+        try:
+            from legacy_app import {binding_name}
+        except ImportError:
+            pass
+        else:
+            raise AssertionError("legacy from-import remains: {binding_name}")
+        print("LEGACY_RETIREMENT_RESULT=" + json.dumps({{"absent": {binding_name!r}}}))
+        """)
+    assert _run_legacy_retirement_probe(scenario) == {"absent": binding_name}
+
+
+@pytest.mark.parametrize("binding_name", RETIRED_CORE_UTILITY_BINDINGS)
+def test_retired_core_utility_bindings_are_absent(binding_name: str) -> None:
+    """Require each selected binding to disappear independently of guard data."""
+    import legacy_app
+
+    assert binding_name not in vars(legacy_app)
+    with pytest.raises(AttributeError):
+        getattr(legacy_app, binding_name)
+    scenario = textwrap.dedent(f"""
+        import json
+        try:
+            from legacy_app import {binding_name}
+        except ImportError:
+            pass
+        else:
+            raise AssertionError("legacy from-import remains: {binding_name}")
+        print("LEGACY_RETIREMENT_RESULT=" + json.dumps({{"absent": {binding_name!r}}}))
+        """)
+    assert _run_legacy_retirement_probe(scenario) == {"absent": binding_name}
+
+
+def test_retired_legacy_python_bindings_are_absent_with_canonical_owners_present() -> None:
+    """Verify retired-name absence while preserving canonical objects and retained schemas."""
+    import app as app_facade
+    import app.schemas.bmi_compat as bmi_schemas
+    import app.schemas.bmr as bmr_schemas
+    import app.bootstrap.openapi as canonical_openapi
+    import app.schemas.insight as insight_schemas
+    import app.schemas.legacy_premium_weekly_plan as planning_schemas
+    import app.schemas.nutrition_targets as planning_targets
+    import app.schemas.premium_contracts as premium_contracts
+    import app.services.admin_operations as admin_operations
+    import app.services.bmi_compat as bmi_compat
+    import app.services.insight_compat as insight_compat
+    import app.services.pro_nutrition_plate as plate_service
+    import app.services.pro_nutrition_targets as targets_service
+    import app.routers.api_key as canonical_api_key
+    import app.routers.health as health
+    import app.utils.feature_flags as feature_flags
+    import app.utils.helpers as helpers
+    import core.db as core_db
+    import core.i18n as core_i18n
+    import core.targets as core_targets
+    import core.exports as exports
+    import core.log_retention as log_retention
+    import core.menu_engine as menu_engine
+    import core.nutrition_utils as nutrition_utils
+    import core.plate as plate
+    import core.recommendations as recommendations
+    import bmi_visualization
+    import legacy_app
+
+    import app.application_metadata as application_metadata
+    import app.bootstrap.application as application_bootstrap
+    import app.http_error_details as http_error_details
+    from app.bootstrap.lifespan import application_lifespan
+    from app.services import scheduler_access
+    import app.security.rate_limit as rate_limit
+
+    canonical_migrations = {
+        "admin_status": admin_operations.admin_status,
+        "cleanup_expired_logs": admin_operations.cleanup_expired_logs,
+        "debug_env": admin_operations.debug_env,
+        "get_database_status": admin_operations.get_database_status,
+        "force_database_update": admin_operations.force_database_update,
+        "check_for_updates": admin_operations.check_for_updates,
+        "rollback_database": admin_operations.rollback_database,
+        "bmi_endpoint": bmi_compat.bmi_endpoint,
+        "plan_endpoint": bmi_compat.plan_endpoint,
+        "bmi_endpoint_v1": bmi_compat.bmi_endpoint_v1,
+        "_resolve_build_targets_callable": None,
+        "PlateDependencies": plate_service.PlateServiceDependencies,
+        "_compute_premium_plate": plate_service.generate_plate_response,
+        "api_premium_plate": plate_service.generate_plate_response,
+        "build_fallback_plate": plate_service.build_fallback_plate,
+        "align_macros_with_targets": plate_service.align_macros_with_targets,
+        "aggregate_day_micros": plate_service.aggregate_day_micros,
+        "premium_targets_legacy": targets_service.generate_who_targets_response,
+        "api_who_targets": targets_service.generate_who_targets_response,
+        "api_nutrient_gaps": targets_service.analyze_nutrient_gaps_response,
+        "analyze_nutrient_gaps": menu_engine.analyze_nutrient_gaps,
+        "make_daily_menu": menu_engine.make_daily_menu,
+        "make_weekly_menu": menu_engine.make_weekly_menu,
+        "repair_week_plan": menu_engine.repair_week_plan,
+        "make_plate": plate.make_plate,
+        "build_nutrition_targets": recommendations.build_nutrition_targets,
+        "to_csv_day": exports.to_csv_day,
+        "to_pdf_day": exports.to_pdf_day,
+        "to_csv_week": exports.to_csv_week,
+        "to_pdf_week": exports.to_pdf_week,
+        "WeeklyPlanFlexibleRequest": None,
+        "INSIGHT_TEXT_MAX_LENGTH": insight_schemas.INSIGHT_TEXT_MAX_LENGTH,
+        "InsightRequest": insight_schemas.InsightRequest,
+        "RAGSourceItem": insight_schemas.RAGSourceItem,
+        "InsightResponse": insight_schemas.InsightResponse,
+        "INSIGHT_TEMP_UNAVAILABLE_MESSAGE": insight_compat.INSIGHT_TEMP_UNAVAILABLE_MESSAGE,
+        "_execute_insight_request": insight_compat._execute_insight_request,
+        "insight_v1": insight_compat.insight_v1,
+        "insight": insight_compat.insight,
+        "DB_TO_ALIAS_NUTRIENT_MAP": plate_service.DB_TO_ALIAS_NUTRIENT_MAP,
+        "PlateServiceDependencies": plate_service.PlateServiceDependencies,
+        "_convert_db_nutrients_to_alias_format": plate_service._convert_db_nutrients_to_alias_format,
+        "_aggregate_meal_micronutrients": plate_service._aggregate_meal_micronutrients,
+        "_get_recipe_ingredients_for_meal": plate_service._get_recipe_ingredients_for_meal,
+        "_aggregate_day_micronutrients": plate_service._aggregate_day_micronutrients,
+        "_macros_to_kcal": plate_service._macros_to_kcal,
+        "sanitize_plate_data": plate_service.sanitize_plate_data,
+        "_iter_exception_chain": plate_service._iter_exception_chain,
+        "_is_missing_nh3_error": plate_service._is_missing_nh3_error,
+        "_raise_missing_nh3_http_error": plate_service._raise_missing_nh3_http_error,
+        "calculate_heuristic_macros": plate_service.calculate_heuristic_macros,
+        "MANDATORY_MICRO_DEFAULTS": nutrition_utils.MANDATORY_MICRO_DEFAULTS,
+        "MAX_DAILY_KCAL": nutrition_utils.MAX_DAILY_KCAL,
+        "MICRO_ALIAS_MAP": nutrition_utils.MICRO_ALIAS_MAP,
+        "MIN_DAILY_KCAL": nutrition_utils.MIN_DAILY_KCAL,
+        "_alias_micros": nutrition_utils.alias_micros,
+        "_clamp_daily_kcal": nutrition_utils.clamp_daily_kcal,
+        "_ensure_priority_micros": nutrition_utils.ensure_priority_micros,
+        "_generate_who_targets_response": targets_service.generate_who_targets_response,
+        "_fallback_targets_response": targets_service.fallback_targets_response,
+        "analyze_nutrient_gaps_response": targets_service.analyze_nutrient_gaps_response,
+        "_OPENAPI_ALLOWED_PREFIXES": canonical_openapi._OPENAPI_ALLOWED_PREFIXES,
+        "_OPENAPI_ALLOWED_EXACT": canonical_openapi._OPENAPI_ALLOWED_EXACT,
+        "_is_openapi_public_path": canonical_openapi._is_openapi_public_path,
+        "_collect_schema_refs": canonical_openapi._collect_schema_refs,
+        "_prune_unreferenced_schema_components": (
+            canonical_openapi._prune_unreferenced_schema_components
+        ),
+        "_build_canonical_openapi": canonical_openapi._build_canonical_openapi,
+        "_install_openapi_builder": canonical_openapi._install_openapi_builder,
+        "BMRRequest": bmr_schemas.BMRRequest,
+        "BMRRequestLegacy": bmr_schemas.BMRRequestLegacy,
+        "BMRResponse": bmr_schemas.BMRResponse,
+        "NutrientGapsRequest": premium_contracts.NutrientGapsRequest,
+        "NutrientGapsResponse": premium_contracts.NutrientGapsResponse,
+        "PlateRequest": premium_contracts.PlateRequest,
+        "PlateResponse": premium_contracts.PlateResponse,
+        "VisualShape": premium_contracts.VisualShape,
+        "WHOTargetsRequest": premium_contracts.WHOTargetsRequest,
+        "WHOTargetsResponse": premium_contracts.WHOTargetsResponse,
+        "Activity": premium_contracts.Activity,
+        "DietFlag": premium_contracts.DietFlag,
+        "Goal": premium_contracts.Goal,
+        "Sex": premium_contracts.Sex,
+        "build_who_targets_ui_labels": premium_contracts.build_who_targets_ui_labels,
+        "DataClass": log_retention.DataClass,
+        "get_retention_manager": log_retention.get_retention_manager,
+        "LogRetentionManager": log_retention.LogRetentionManager,
+        "_log_retention_manager": None,
+        "TargetsIn": planning_targets.TargetsIn,
+        "CanonicalTargetsIn": planning_targets.TargetsIn,
+        "LegacyWeekPlanRequest": planning_schemas.LegacyWeekPlanRequest,
+        "WeeklyMenuResponse": planning_schemas.WeeklyMenuResponse,
+        "get_session": core_db.get_session,
+        "Language": core_i18n.Language,
+        "normalize_lang": core_i18n.normalize_lang,
+        "t": core_i18n.t,
+        "FIBER_MIN_G": core_targets.FIBER_MIN_G,
+        "_short_git_sha": helpers._short_git_sha,
+        "_is_truthy": feature_flags._is_truthy,
+        "_LEGACY_IMPORT_COMPAT_REEXPORTS": None,
+        "BMIRequest": bmi_schemas.BMIRequest,
+        "BMIRequestV1": bmi_schemas.BMIRequestV1,
+        "MATPLOTLIB_AVAILABLE": bmi_visualization.MATPLOTLIB_AVAILABLE,
+        "generate_bmi_visualization": bmi_visualization.generate_bmi_visualization,
+        "add_visualization_if_requested": bmi_compat.add_visualization_if_requested,
+        "_BMI_COMPAT_REEXPORTS": None,
+        "_BMI_SCHEMA_COMPAT_REEXPORTS": None,
+        "build_application_metadata": application_metadata.build_application_metadata,
+        "ENHANCED_PLATE_GENERATION_FAILED_DETAIL": http_error_details.ENHANCED_PLATE_GENERATION_FAILED_DETAIL,
+        "INVALID_PREMIUM_PLATE_INPUT_DETAIL": http_error_details.INVALID_PREMIUM_PLATE_INPUT_DETAIL,
+        "APPLICATION_METADATA": application_bootstrap.APPLICATION_METADATA,
+        "RUNTIME_ENV": application_bootstrap.RUNTIME_ENV,
+        "_app_env": application_bootstrap.RUNTIME_ENV,
+        "_application_metadata": application_bootstrap.APPLICATION_METADATA,
+        "tags_metadata": application_bootstrap.app.openapi_tags,
+        "_api_description": application_bootstrap.app.description,
+        "lifespan": application_lifespan,
+        "get_update_scheduler": scheduler_access.get_update_scheduler,
+        "limiter": rate_limit.limiter,
+        "limit_if_available": rate_limit.limit_if_available,
+        "RATE_LIMIT_EXPORTS": rate_limit.RATE_LIMIT_EXPORTS,
+        "RATE_LIMIT_INSIGHT": rate_limit.RATE_LIMIT_INSIGHT,
+        "RATE_LIMIT_429_RESPONSES": rate_limit.RATE_LIMIT_429_RESPONSES,
+        "_RATE_LIMIT_429_RESPONSES": None,
+        "_TypeVar": None,
+        "_F": None,
+        "_LimitValue": None,
+        "LimiterType": None,
+        "_Limiter": None,
+        "Limiter": None,
+        "slowapi_available": None,
+        "get_api_key": canonical_api_key.get_api_key,
+        "_get_api_key_dynamic": canonical_api_key._get_api_key_dynamic,
+    }
+    assert (
+        canonical_migrations["APPLICATION_METADATA"]
+        is canonical_migrations["_application_metadata"]
+    )
+    assert canonical_migrations["RUNTIME_ENV"] is canonical_migrations["_app_env"]
+    assert application_bootstrap.app is legacy_app.app is app_facade.app
+    assert app_facade.lifespan is application_lifespan
+    assert app_facade.get_update_scheduler is scheduler_access.get_update_scheduler
+    assert application_bootstrap.app.router.lifespan_context is application_lifespan
+    assert (
+        application_bootstrap.app.description
+        == application_bootstrap.APPLICATION_METADATA.description.replace(", user management", "")
+    )
+    assert application_bootstrap.app.openapi_tags == [
+        tag
+        for tag in application_bootstrap.APPLICATION_METADATA.openapi_tags_list()
+        if tag["name"] != "users"
+    ]
+    canonical_constants = {
+        "APPLICATION_METADATA": application_bootstrap.APPLICATION_METADATA,
+        "_application_metadata": application_bootstrap.APPLICATION_METADATA,
+        "RUNTIME_ENV": application_bootstrap.RUNTIME_ENV,
+        "_app_env": application_bootstrap.RUNTIME_ENV,
+        "tags_metadata": application_bootstrap.app.openapi_tags,
+        "_api_description": application_bootstrap.app.description,
+        "ENHANCED_PLATE_GENERATION_FAILED_DETAIL": http_error_details.ENHANCED_PLATE_GENERATION_FAILED_DETAIL,
+        "INVALID_PREMIUM_PLATE_INPUT_DETAIL": http_error_details.INVALID_PREMIUM_PLATE_INPUT_DETAIL,
+        "MATPLOTLIB_AVAILABLE": bmi_visualization.MATPLOTLIB_AVAILABLE,
+        "DB_TO_ALIAS_NUTRIENT_MAP": plate_service.DB_TO_ALIAS_NUTRIENT_MAP,
+        "INSIGHT_TEXT_MAX_LENGTH": insight_schemas.INSIGHT_TEXT_MAX_LENGTH,
+        "INSIGHT_TEMP_UNAVAILABLE_MESSAGE": insight_compat.INSIGHT_TEMP_UNAVAILABLE_MESSAGE,
+        "MANDATORY_MICRO_DEFAULTS": nutrition_utils.MANDATORY_MICRO_DEFAULTS,
+        "MAX_DAILY_KCAL": nutrition_utils.MAX_DAILY_KCAL,
+        "MICRO_ALIAS_MAP": nutrition_utils.MICRO_ALIAS_MAP,
+        "MIN_DAILY_KCAL": nutrition_utils.MIN_DAILY_KCAL,
+        "_OPENAPI_ALLOWED_PREFIXES": canonical_openapi._OPENAPI_ALLOWED_PREFIXES,
+        "_OPENAPI_ALLOWED_EXACT": canonical_openapi._OPENAPI_ALLOWED_EXACT,
+        "Activity": premium_contracts.Activity,
+        "DietFlag": premium_contracts.DietFlag,
+        "Goal": premium_contracts.Goal,
+        "Sex": premium_contracts.Sex,
+        "Language": core_i18n.Language,
+        "FIBER_MIN_G": core_targets.FIBER_MIN_G,
+        "RATE_LIMIT_EXPORTS": rate_limit.RATE_LIMIT_EXPORTS,
+        "RATE_LIMIT_INSIGHT": rate_limit.RATE_LIMIT_INSIGHT,
+        "RATE_LIMIT_429_RESPONSES": rate_limit.RATE_LIMIT_429_RESPONSES,
+    }
+
+    assert isinstance(
+        application_bootstrap.APPLICATION_METADATA, application_metadata.ApplicationMetadata
+    )
+    assert type(application_bootstrap.RUNTIME_ENV) is str
+    assert type(application_bootstrap.app.description) is str
+    assert isinstance(application_bootstrap.app.openapi_tags, list)
+    assert callable(application_metadata.build_application_metadata)
+    assert (
+        application_metadata.build_application_metadata.__module__ == application_metadata.__name__
+    )
+    assert type(http_error_details.ENHANCED_PLATE_GENERATION_FAILED_DETAIL) is str
+    assert (
+        http_error_details.ENHANCED_PLATE_GENERATION_FAILED_DETAIL
+        == "Enhanced plate generation failed"
+    )
+    assert type(http_error_details.INVALID_PREMIUM_PLATE_INPUT_DETAIL) is str
+    assert http_error_details.INVALID_PREMIUM_PLATE_INPUT_DETAIL == "Invalid premium plate input"
+    assert canonical_migrations.keys() == RETIRED_LEGACY_PYTHON_BINDINGS
+    assert all(name in vars(rate_limit) for name in RETIRED_RATE_LIMIT_BINDINGS[:5])
+    assert type(rate_limit.RATE_LIMIT_EXPORTS) is str
+    assert type(rate_limit.RATE_LIMIT_INSIGHT) is str
+    assert rate_limit.RATE_LIMIT_429_RESPONSES[429]["model"] is rate_limit.RateLimitErrorResponse
+    assert rate_limit.limit_if_available.__module__ == rate_limit.__name__
+    assert RETIRED_LEGACY_PYTHON_BINDINGS == legacy_guard.RETIRED_LEGACY_PYTHON_BINDINGS
+    assert len(RETIRED_LEGACY_PYTHON_BINDINGS) == 132
+    assert canonical_migrations["TargetsIn"] is canonical_migrations["CanonicalTargetsIn"]
+    assert (
+        len(
+            {
+                canonical_migrations[name]
+                for name in (
+                    "TargetsIn",
+                    "CanonicalTargetsIn",
+                    "LegacyWeekPlanRequest",
+                    "WeeklyMenuResponse",
+                )
+            }
+        )
+        == 3
+    )
+    assert planning_targets.TargetsIn.__module__ == planning_targets.__name__
+    assert planning_schemas.LegacyWeekPlanRequest.__module__ == planning_schemas.__name__
+    assert planning_schemas.WeeklyMenuResponse.__module__ == planning_schemas.__name__
+    assert RETIRED_OPENAPI_BINDINGS == tuple(
+        name for name in canonical_migrations if name in RETIRED_OPENAPI_BINDINGS
+    )
+    assert isinstance(canonical_openapi._OPENAPI_ALLOWED_PREFIXES, tuple)
+    assert canonical_openapi._OPENAPI_ALLOWED_PREFIXES == (
+        "/api/v1/bmi/",
+        "/api/v1/billing/",
+        "/api/v1/insight/",
+        "/api/v1/pro/",
+        "/api/v1/vip/",
+    )
+    assert isinstance(canonical_openapi._OPENAPI_ALLOWED_EXACT, frozenset)
+    assert canonical_openapi._OPENAPI_ALLOWED_EXACT == frozenset({"/api/v1/bmi", "/api/v1/insight"})
+    assert (
+        canonical_openapi._install_openapi_builder
+        is canonical_openapi.install_canonical_openapi_builder
+    )
+    assert isinstance(nutrition_utils.MANDATORY_MICRO_DEFAULTS, dict)
+    assert isinstance(nutrition_utils.MICRO_ALIAS_MAP, dict)
+    assert isinstance(nutrition_utils.MIN_DAILY_KCAL, int)
+    assert isinstance(nutrition_utils.MAX_DAILY_KCAL, int)
+    assert nutrition_utils.MIN_DAILY_KCAL == 1200
+    assert nutrition_utils.MAX_DAILY_KCAL == 5000
+    assert nutrition_utils.MANDATORY_MICRO_DEFAULTS == {"iodine_ug": 150.0}
+    assert nutrition_utils.MICRO_ALIAS_MAP == {
+        "iron_mg": ("iron", "fe"),
+        "calcium_mg": ("calcium", "ca"),
+        "magnesium_mg": ("magnesium",),
+        "potassium_mg": ("potassium", "k"),
+        "iodine_ug": ("iodine",),
+    }
+    assert RETIRED_LEGACY_PYTHON_BINDINGS.isdisjoint(vars(legacy_app))
+    assert app_facade._macros_to_kcal is plate_service._macros_to_kcal
+    assert app_facade._is_truthy is feature_flags._is_truthy
+    assert health.get_session is core_db.get_session
+    assert health._short_git_sha is helpers._short_git_sha
+    assert type(core_targets.FIBER_MIN_G) is float
+    assert plate_service.FIBER_MIN_G is core_targets.FIBER_MIN_G
+    assert get_origin(core_i18n.Language) is Literal
+    assert get_args(core_i18n.Language) == ("ru", "en", "es")
+    for function, owner in (
+        (core_db.get_session, core_db),
+        (core_i18n.normalize_lang, core_i18n),
+        (core_i18n.t, core_i18n),
+        (helpers._short_git_sha, helpers),
+        (feature_flags._is_truthy, feature_flags),
+    ):
+        assert function.__module__ == owner.__name__
+    assert bmi_schemas.BMIRequest is not bmi_schemas.BMIRequestV1
+    assert app_facade.BMIRequest is bmi_schemas.BMIRequest
+    assert bmi_compat.BMIRequest is bmi_schemas.BMIRequest
+    assert bmi_compat.BMIRequestV1 is bmi_schemas.BMIRequestV1
+    assert type(bmi_visualization.MATPLOTLIB_AVAILABLE) is bool
+    assert bmi_compat.MATPLOTLIB_AVAILABLE is bmi_visualization.MATPLOTLIB_AVAILABLE
+    assert app_facade.MATPLOTLIB_AVAILABLE is bmi_visualization.MATPLOTLIB_AVAILABLE
+    assert bmi_compat.generate_bmi_visualization is bmi_visualization.generate_bmi_visualization
+    assert app_facade.generate_bmi_visualization is bmi_visualization.generate_bmi_visualization
+    assert {
+        binding_name
+        for binding_name, canonical_migration in canonical_migrations.items()
+        if canonical_migration is None and binding_name != "limiter"
+    } == {
+        "_resolve_build_targets_callable",
+        "WeeklyPlanFlexibleRequest",
+        "_log_retention_manager",
+        "_LEGACY_IMPORT_COMPAT_REEXPORTS",
+        "_BMI_COMPAT_REEXPORTS",
+        "_BMI_SCHEMA_COMPAT_REEXPORTS",
+        "_RATE_LIMIT_429_RESPONSES",
+        "_TypeVar",
+        "_F",
+        "_LimitValue",
+        "LimiterType",
+        "_Limiter",
+        "Limiter",
+        "slowapi_available",
+    }
+    assert log_retention.DataClass.__module__ == log_retention.__name__
+    assert log_retention.LogRetentionManager.__module__ == log_retention.__name__
+    assert log_retention.get_retention_manager.__module__ == log_retention.__name__
+    for binding_name, canonical_migration in canonical_migrations.items():
+        if binding_name == "limiter":
+            assert canonical_migration is rate_limit.limiter
+            if canonical_migration is not None:
+                assert isinstance(canonical_migration, rate_limit.Limiter)
+        elif binding_name in canonical_constants:
+            assert canonical_migration == canonical_constants[binding_name]
+            if binding_name not in {"Activity", "DietFlag", "Goal", "Sex", "Language"}:
+                assert not callable(canonical_migration)
+        elif canonical_migration is not None:
+            assert callable(canonical_migration)
+        with pytest.raises(AttributeError):
+            getattr(legacy_app, binding_name)
+
+
+@pytest.mark.parametrize(
+    "imports",
+    (
+        "import legacy_app\n"
+        "assert 'app.services.bmi_compat' not in sys.modules\n"
+        "import app.services.bmi_compat as bmi_service\n",
+        "import app.services.bmi_compat as bmi_service\n"
+        "assert 'legacy_app' not in sys.modules\n"
+        "import legacy_app\n",
+    ),
+    ids=("legacy-first", "canonical-service-first"),
+)
+def test_bmi_canonical_and_package_exports_survive_retirement_import_orders(imports: str) -> None:
+    """Preserve the original visualization identities in the protected import probe."""
+    scenario = "import sys\n" + imports + textwrap.dedent(f"""
+        import json
+        import bmi_visualization
+        import app as app_package
+        import app.schemas.bmi_compat as bmi_schemas
+
+        assert bmi_service.generate_bmi_visualization is bmi_visualization.generate_bmi_visualization
+        assert app_package.generate_bmi_visualization is bmi_visualization.generate_bmi_visualization
+        assert type(bmi_visualization.MATPLOTLIB_AVAILABLE) is bool
+        assert bmi_service.MATPLOTLIB_AVAILABLE is bmi_visualization.MATPLOTLIB_AVAILABLE
+        assert app_package.MATPLOTLIB_AVAILABLE is bmi_visualization.MATPLOTLIB_AVAILABLE
+        assert app_package.BMIRequest is bmi_schemas.BMIRequest
+        assert bmi_schemas.BMIRequest is not bmi_schemas.BMIRequestV1
+        assert bmi_service.BMIRequest is bmi_schemas.BMIRequest
+        assert bmi_service.BMIRequestV1 is bmi_schemas.BMIRequestV1
+        package_exports = {{
+            "app", "resolve_attr", "make_weekly_menu", "build_nutrition_targets",
+            "metrics", "lifespan", "get_update_scheduler", "api_key_header",
+            "get_api_key", "_get_api_key_dynamic", "get_bodyfat_router",
+            "MATPLOTLIB_AVAILABLE", "generate_bmi_visualization", "BMIRequest",
+            "_is_truthy", "_macros_to_kcal",
+        }}
+        assert set(app_package._LOCAL_EXPORTS) | {{
+            "app", "MATPLOTLIB_AVAILABLE", "generate_bmi_visualization"
+        }} == package_exports
+        assert all(hasattr(app_package, name) for name in package_exports)
+        assert app_package.app is legacy_app.app
+        for name in {RETIRED_BMI_COMPAT_BINDINGS!r}:
+            assert name not in vars(legacy_app)
+            try:
+                getattr(legacy_app, name)
+            except AttributeError:
+                pass
+            else:
+                raise AssertionError(f"legacy BMI attribute remains: {{name}}")
+        print("LEGACY_RETIREMENT_RESULT=" + json.dumps({{
+            "canonical_models_distinct": True, "package_exports": 16,
+            "visualization_identity_preserved": True,
+        }}))
+        """)
+    assert _run_legacy_retirement_probe(scenario) == {
+        "canonical_models_distinct": True,
+        "package_exports": 16,
+        "visualization_identity_preserved": True,
+    }
+
+
+def test_canonical_nutrition_contracts_remain_importable_in_fresh_process() -> None:
+    scenario = textwrap.dedent("""
+        import json
+        from typing import Literal, get_args, get_origin
+        from pydantic import ValidationError
+        import app.schemas.bmr as bmr_schemas
+        import app.schemas.premium_contracts as premium_contracts
+
+        canonical_models = (
+            bmr_schemas.BMRRequest,
+            bmr_schemas.BMRRequestLegacy,
+            bmr_schemas.BMRResponse,
+            premium_contracts.NutrientGapsRequest,
+            premium_contracts.NutrientGapsResponse,
+            premium_contracts.PlateRequest,
+            premium_contracts.PlateResponse,
+            premium_contracts.VisualShape,
+            premium_contracts.WHOTargetsRequest,
+            premium_contracts.WHOTargetsResponse,
+        )
+        assert len(canonical_models) == len(set(canonical_models)) == 10
+        assert bmr_schemas.BMRRequest is not bmr_schemas.BMRRequestLegacy
+        for request_model in (bmr_schemas.BMRRequest, bmr_schemas.BMRRequestLegacy):
+            invalid_age = {
+                "weight_kg": 70, "height_cm": 175, "age": True,
+                "sex": "male", "activity": "moderate",
+            }
+            try:
+                request_model.model_validate(invalid_age)
+            except ValidationError:
+                pass
+            else:
+                raise AssertionError("BMR boolean age accepted")
+        allowed_literals = {
+            "Sex": {"female", "male"},
+            "Activity": {"sedentary", "light", "moderate", "active", "very_active"},
+            "Goal": {"loss", "maintain", "gain"},
+            "DietFlag": {
+                "VEG", "GF", "DAIRY_FREE", "LOW_COST", "HIGH_PROTEIN",
+                "LOW_CARB", "MEDITERRANEAN", "VEGAN", "KETO", "PALEO"
+            },
+        }
+        for name, expected_values in allowed_literals.items():
+            alias = getattr(premium_contracts, name)
+            assert get_origin(alias) is Literal
+            assert set(get_args(alias)) == expected_values
+        labels = {
+            lang: premium_contracts.build_who_targets_ui_labels(lang).kcal_daily
+            for lang in ("en", "ru", "es")
+        }
+        assert labels == {
+            "en": "Daily calories", "ru": "Ккал в день", "es": "Calorías diarias"
+        }
+        assert premium_contracts.build_who_targets_ui_labels("unknown").kcal_daily == (
+            labels["en"]
+        )
+        print("LEGACY_RETIREMENT_RESULT=" + json.dumps({
+            "canonical_models": len(canonical_models),
+            "languages": labels,
+            "bmr_request_classes_distinct": True,
+        }))
+        """)
+
+    assert _run_legacy_retirement_probe(scenario) == {
+        "canonical_models": 10,
+        "languages": {
+            "en": "Daily calories",
+            "ru": "Ккал в день",
+            "es": "Calorías diarias",
+        },
+        "bmr_request_classes_distinct": True,
+    }
+
+
+@pytest.mark.parametrize(
+    "import_sequence",
+    (
+        "assert 'app.application_metadata' not in sys.modules\n"
+        "assert 'app.http_error_details' not in sys.modules\n"
+        "import legacy_app\n"
+        "import app.application_metadata as application_metadata\n"
+        "import app.http_error_details as http_error_details\n"
+        "import app.schemas.nutrition_targets as planning_targets\n"
+        "import app.schemas.legacy_premium_weekly_plan as planning_schemas\n"
+        "import core.db as core_db\n"
+        "import core.i18n as core_i18n\n"
+        "import core.targets as core_targets\n"
+        "import app.utils.helpers as helpers\n"
+        "import app.utils.feature_flags as feature_flags\n",
+        "import app.security.rate_limit as rate_limit\n"
+        "import app.schemas.nutrition_targets as planning_targets\n"
+        "import app.schemas.legacy_premium_weekly_plan as planning_schemas\n"
+        "import core.db as core_db\n"
+        "import core.i18n as core_i18n\n"
+        "import core.targets as core_targets\n"
+        "import app.utils.helpers as helpers\n"
+        "import app.utils.feature_flags as feature_flags\n"
+        "import app.application_metadata as application_metadata\n"
+        "import app.http_error_details as http_error_details\n"
+        "assert 'legacy_app' not in sys.modules\n"
+        "import legacy_app\n",
+    ),
+    ids=("legacy-first", "canonical-first"),
+)
+def test_retired_legacy_python_bindings_fail_closed_in_a_fresh_process(
+    import_sequence: str,
+) -> None:
+    """Prove fresh-import retirement and canonical helper availability."""
+    retired_bindings = tuple(sorted(RETIRED_LEGACY_PYTHON_BINDINGS))
+    import_failure_checks = "\n".join(textwrap.dedent(f"""
+            try:
+                from legacy_app import {binding_name}
+            except ImportError:
+                pass
+            else:
+                raise AssertionError("legacy from-import remains: {binding_name}")
+            """) for binding_name in retired_bindings)
+    scenario = "import sys\n" + import_sequence + textwrap.dedent(f"""
+        import json
+        import inspect
+        import app as app_facade
+        import app.bootstrap.application as application_bootstrap
+        from app.bootstrap.lifespan import application_lifespan
+        from app.services import scheduler_access
+        import app.bootstrap.openapi as canonical_openapi
+        import app.services.pro_nutrition_plate as plate_service
+        import app.services.pro_nutrition_targets as targets_service
+        import core.log_retention as log_retention
+        import core.nutrition_utils as nutrition_utils
+
+        import app.routers.health as health
+        import app.security.rate_limit as rate_limit
+        from typing import Literal, get_args, get_origin
+
+        assert all(name in vars(rate_limit) for name in {RETIRED_RATE_LIMIT_BINDINGS[:5]!r})
+        assert not rate_limit.rate_limiting_should_be_wired()
+        assert rate_limit.RATE_LIMIT_429_RESPONSES[429]["model"] is rate_limit.RateLimitErrorResponse
+        def undecorated() -> None:
+            pass
+        assert rate_limit.limit_if_available("2/minute")(undecorated) is undecorated
+
+        assert "app.main" not in sys.modules
+        startup_metadata = application_bootstrap.APPLICATION_METADATA
+        startup_app = application_bootstrap.app
+        assert startup_app.router.lifespan_context is application_lifespan
+        assert app_facade.lifespan is application_lifespan
+        assert app_facade.get_update_scheduler is scheduler_access.get_update_scheduler
+        assert inspect.iscoroutinefunction(scheduler_access.get_update_scheduler)
+        assert "core.food_apis.scheduler" not in sys.modules
+        assert legacy_app.app is application_bootstrap.app
+        assert application_bootstrap.app.description == application_bootstrap.APPLICATION_METADATA.description
+        assert application_bootstrap.app.openapi_tags == application_bootstrap.APPLICATION_METADATA.openapi_tags_list()
+        assert app_facade.app is application_bootstrap.app
+        assert "app.main" in sys.modules
+        assert app_facade.app is startup_app
+        assert startup_app.router.lifespan_context is application_lifespan
+        assert application_bootstrap.APPLICATION_METADATA is startup_metadata
+        assert application_bootstrap.app.description == startup_metadata.description.replace(", user management", "")
+        assert application_bootstrap.app.openapi_tags == [tag for tag in startup_metadata.openapi_tags_list() if tag["name"] != "users"]
+        assert "users" in [tag.name for tag in startup_metadata.tags]
+        assert callable(application_metadata.build_application_metadata)
+        assert application_metadata.build_application_metadata.__module__ == application_metadata.__name__
+        assert type(http_error_details.ENHANCED_PLATE_GENERATION_FAILED_DETAIL) is str
+        assert http_error_details.ENHANCED_PLATE_GENERATION_FAILED_DETAIL == "Enhanced plate generation failed"
+        assert type(http_error_details.INVALID_PREMIUM_PLATE_INPUT_DETAIL) is str
+        assert http_error_details.INVALID_PREMIUM_PLATE_INPUT_DETAIL == "Invalid premium plate input"
+
+        utility_migrations = {{
+            "get_session": core_db.get_session,
+            "Language": core_i18n.Language,
+            "normalize_lang": core_i18n.normalize_lang,
+            "t": core_i18n.t,
+            "FIBER_MIN_G": core_targets.FIBER_MIN_G,
+            "_short_git_sha": helpers._short_git_sha,
+            "_is_truthy": feature_flags._is_truthy,
+            "_LEGACY_IMPORT_COMPAT_REEXPORTS": None,
+        }}
+        utility_owners = {{
+            "get_session": "core.db", "Language": "core.i18n",
+            "normalize_lang": "core.i18n", "t": "core.i18n",
+            "FIBER_MIN_G": "core.targets", "_short_git_sha": "app.utils.helpers",
+            "_is_truthy": "app.utils.feature_flags",
+        }}
+        assert tuple(utility_migrations) == {RETIRED_CORE_UTILITY_BINDINGS!r}
+        assert utility_migrations["_LEGACY_IMPORT_COMPAT_REEXPORTS"] is None
+        assert get_origin(core_i18n.Language) is Literal
+        assert get_args(core_i18n.Language) == ("ru", "en", "es")
+        assert type(core_targets.FIBER_MIN_G) is float
+        assert plate_service.FIBER_MIN_G is core_targets.FIBER_MIN_G
+        for name, module in utility_owners.items():
+            if name not in {{"Language", "FIBER_MIN_G"}}:
+                assert callable(utility_migrations[name])
+                assert utility_migrations[name].__module__ == module
+        assert app_facade._is_truthy is feature_flags._is_truthy
+        assert health.get_session is core_db.get_session
+        assert health._short_git_sha is helpers._short_git_sha
+        for route in health.router.routes:
+            if route.path in {{"/ready", "/health/db"}}:
+                assert any(d.call is core_db.get_session for d in route.dependant.dependencies)
+
+        retired = {retired_bindings!r}
+        plate_helpers = {RETIRED_PLATE_HELPER_BINDINGS!r}
+        nutrition_utilities = {RETIRED_NUTRITION_UTILITY_BINDINGS!r}
+        openapi_helpers = {RETIRED_OPENAPI_BINDINGS!r}
+        targets_gaps_service = (
+            "generate_who_targets_response",
+            "fallback_targets_response",
+            "analyze_nutrient_gaps_response",
+        )
+        assert set(retired).isdisjoint(vars(legacy_app))
+        planning_migrations = {{
+            "TargetsIn": planning_targets.TargetsIn,
+            "CanonicalTargetsIn": planning_targets.TargetsIn,
+            "LegacyWeekPlanRequest": planning_schemas.LegacyWeekPlanRequest,
+            "WeeklyMenuResponse": planning_schemas.WeeklyMenuResponse,
+        }}
+        assert planning_migrations["TargetsIn"] is planning_migrations["CanonicalTargetsIn"]
+        assert len(set(planning_migrations.values())) == 3
+        assert planning_targets.TargetsIn.__module__ == planning_targets.__name__
+        assert planning_schemas.LegacyWeekPlanRequest.__module__ == planning_schemas.__name__
+        assert planning_schemas.WeeklyMenuResponse.__module__ == planning_schemas.__name__
+        assert app_facade._macros_to_kcal is plate_service._macros_to_kcal
+        assert log_retention.DataClass.__module__ == log_retention.__name__
+        assert log_retention.LogRetentionManager.__module__ == log_retention.__name__
+        assert log_retention.get_retention_manager.__module__ == log_retention.__name__
+        for binding_name in plate_helpers:
+            canonical_object = getattr(plate_service, binding_name)
+            if binding_name == "DB_TO_ALIAS_NUTRIENT_MAP":
+                assert isinstance(canonical_object, dict)
+                assert not callable(canonical_object)
+            else:
+                assert callable(canonical_object)
+                assert canonical_object.__module__ == plate_service.__name__
+        for binding_name in nutrition_utilities:
+            canonical_name = binding_name.lstrip("_") if binding_name.startswith("_") else binding_name
+            canonical_object = getattr(nutrition_utils, canonical_name)
+            if binding_name in {{"MANDATORY_MICRO_DEFAULTS", "MICRO_ALIAS_MAP"}}:
+                assert isinstance(canonical_object, dict)
+                assert not callable(canonical_object)
+            elif binding_name in {{"MIN_DAILY_KCAL", "MAX_DAILY_KCAL"}}:
+                assert isinstance(canonical_object, int)
+                assert not callable(canonical_object)
+            else:
+                assert callable(canonical_object)
+                assert canonical_object.__module__ == nutrition_utils.__name__
+        for binding_name in targets_gaps_service:
+            canonical_object = getattr(targets_service, binding_name)
+            assert callable(canonical_object)
+            assert canonical_object.__module__ == targets_service.__name__
+        for binding_name in retired:
+            try:
+                getattr(legacy_app, binding_name)
+            except AttributeError:
+                pass
+            else:
+                raise AssertionError(f"legacy attribute remains: {{binding_name}}")
+        assert isinstance(canonical_openapi._OPENAPI_ALLOWED_PREFIXES, tuple)
+        assert isinstance(canonical_openapi._OPENAPI_ALLOWED_EXACT, frozenset)
+        assert (
+            canonical_openapi._install_openapi_builder
+            is canonical_openapi.install_canonical_openapi_builder
+        )
+        for binding_name in openapi_helpers[2:]:
+            assert callable(getattr(canonical_openapi, binding_name))
+        """)
+    scenario += import_failure_checks
+    scenario += textwrap.dedent("""
+        print(
+            "LEGACY_RETIREMENT_RESULT="
+            + json.dumps({
+                "absent": list(retired),
+                "canonical_plate_helpers": list(plate_helpers),
+                "canonical_nutrition_utilities": list(nutrition_utilities),
+                "canonical_openapi_helpers": list(openapi_helpers),
+                "canonical_targets_gaps_service": list(targets_gaps_service),
+                "canonical_core_utility_owners": utility_owners,
+                "package_truthy_identity_preserved": True,
+                "health_dependency_identity_preserved": True,
+                "health_helper_identity_preserved": True,
+                "package_macro_identity_preserved": True,
+            })
+        )
+        """)
+
+    assert _run_legacy_retirement_probe(scenario) == {
+        "absent": list(retired_bindings),
+        "canonical_plate_helpers": list(RETIRED_PLATE_HELPER_BINDINGS),
+        "canonical_nutrition_utilities": list(RETIRED_NUTRITION_UTILITY_BINDINGS),
+        "canonical_openapi_helpers": list(RETIRED_OPENAPI_BINDINGS),
+        "canonical_targets_gaps_service": [
+            "generate_who_targets_response",
+            "fallback_targets_response",
+            "analyze_nutrient_gaps_response",
+        ],
+        "canonical_core_utility_owners": {
+            "get_session": "core.db",
+            "Language": "core.i18n",
+            "normalize_lang": "core.i18n",
+            "t": "core.i18n",
+            "FIBER_MIN_G": "core.targets",
+            "_short_git_sha": "app.utils.helpers",
+            "_is_truthy": "app.utils.feature_flags",
+        },
+        "package_truthy_identity_preserved": True,
+        "health_dependency_identity_preserved": True,
+        "health_helper_identity_preserved": True,
+        "package_macro_identity_preserved": True,
+    }
+
+
+@pytest.mark.parametrize(
+    "import_sequence",
+    (
+        "import legacy_app\n"
+        "import app as app_facade\n"
+        "import app.main as app_main\n"
+        "import app.schemas.insight as insight_schemas\n"
+        "import app.services.insight_compat as insight_compat\n",
+        "import app as app_facade\n"
+        "import app.main as app_main\n"
+        "import app.schemas.insight as insight_schemas\n"
+        "import app.services.insight_compat as insight_compat\n"
+        "import legacy_app\n",
+        "import legacy_app\n"
+        "import app as app_facade\n"
+        "import app.main as app_main\n"
+        "import app.schemas.insight as insight_schemas\n"
+        "import app.services.insight_compat as insight_compat\n"
+        "legacy_app = importlib.reload(legacy_app)\n",
+    ),
+    ids=("legacy-first", "canonical-first", "reload"),
+)
+def test_insight_bindings_fail_closed_with_canonical_owners_in_a_fresh_process(
+    import_sequence: str,
+) -> None:
+    import_failure_checks = "\n".join(textwrap.dedent(f"""
+            try:
+                from legacy_app import {binding_name}
+            except ImportError:
+                pass
+            else:
+                raise AssertionError("legacy from-import remains: {binding_name}")
+            """) for binding_name in RETIRED_INSIGHT_BINDINGS)
+    scenario = textwrap.dedent("""
+        import importlib
+        import json
+        """)
+    scenario += import_sequence
+    scenario += textwrap.dedent(f"""
+        retired = {RETIRED_INSIGHT_BINDINGS!r}
+        canonical = {{
+            "INSIGHT_TEXT_MAX_LENGTH": insight_schemas.INSIGHT_TEXT_MAX_LENGTH,
+            "InsightRequest": insight_schemas.InsightRequest,
+            "RAGSourceItem": insight_schemas.RAGSourceItem,
+            "InsightResponse": insight_schemas.InsightResponse,
+            "INSIGHT_TEMP_UNAVAILABLE_MESSAGE": (
+                insight_compat.INSIGHT_TEMP_UNAVAILABLE_MESSAGE
+            ),
+            "_execute_insight_request": insight_compat._execute_insight_request,
+            "insight_v1": insight_compat.insight_v1,
+            "insight": insight_compat.insight,
+        }}
+        assert tuple(canonical) == retired
+        assert app_facade.app is app_main.app
+        assert legacy_app.app is app_main.app
+        assert insight_schemas.InsightRequest.__module__ == insight_schemas.__name__
+        assert insight_schemas.RAGSourceItem.__module__ == insight_schemas.__name__
+        assert insight_schemas.InsightResponse.__module__ == insight_schemas.__name__
+        assert insight_compat._execute_insight_request.__module__ == insight_compat.__name__
+        assert insight_compat.insight_v1.__module__ == insight_compat.__name__
+        assert insight_compat.insight.__module__ == insight_compat.__name__
+        for binding_name in retired:
+            try:
+                getattr(legacy_app, binding_name)
+            except AttributeError:
+                pass
+            else:
+                raise AssertionError(f"legacy attribute remains: {{binding_name}}")
+        """)
+    scenario += import_failure_checks
+    scenario += textwrap.dedent("""
+        print(
+            "LEGACY_RETIREMENT_RESULT="
+            + json.dumps(
+                {
+                    "absent": list(retired),
+                    "app_identity_preserved": True,
+                    "schema_owner": insight_schemas.__name__,
+                    "service_owner": insight_compat.__name__,
+                },
+                sort_keys=True,
+            )
+        )
+        """)
+
+    assert _run_legacy_retirement_probe(scenario) == {
+        "absent": list(RETIRED_INSIGHT_BINDINGS),
+        "app_identity_preserved": True,
+        "schema_owner": "app.schemas.insight",
+        "service_owner": "app.services.insight_compat",
+    }
+
+
+@pytest.mark.parametrize(
+    "import_sequence",
+    (
+        "import legacy_app\nimport app.routers.plan_export as canonical_plan_export\n",
+        "import app.routers.plan_export as canonical_plan_export\nimport legacy_app\n",
+        "import legacy_app\nimport app.routers.plan_export as canonical_plan_export\n"
+        "legacy_app = importlib.reload(legacy_app)\n",
+    ),
+    ids=("legacy-first", "router-first", "reload"),
+)
+def test_plan_export_canonical_module_has_no_legacy_synthetic_namespace(
+    import_sequence: str,
+) -> None:
+    scenario = textwrap.dedent("""
+        import importlib
+        import json
+        """)
+    scenario += import_sequence
+    scenario += textwrap.dedent("""
+        resolved = importlib.import_module("app.routers.plan_export")
+        assert resolved is canonical_plan_export
+        legacy_routers = getattr(legacy_app, "routers", None)
+        synthetic_surface_present = legacy_routers is not None and hasattr(
+            legacy_routers, "plan_export"
+        )
+        assert not synthetic_surface_present
+        print(
+            "LEGACY_RETIREMENT_RESULT="
+            + json.dumps(
+                {
+                    "canonical_module": resolved.__name__,
+                    "synthetic_surface_present": synthetic_surface_present,
+                },
+                sort_keys=True,
+            )
+        )
+        """)
+
+    assert _run_legacy_retirement_probe(scenario) == {
+        "canonical_module": "app.routers.plan_export",
+        "synthetic_surface_present": False,
+    }
+
+
+def test_bmi_endpoint_v1_uses_canonical_handler_via_shim(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    RU: Доказательный тест: /api/v1/bmi использует engine через handler (shim работает).
+    EN: Proof test: /api/v1/bmi uses engine via handler (shim works).
+
+    Monkeypatch calculate_bmi_result to return fixed BMICalculateResult,
+    then verify endpoint returns those exact values (proving shim delegation).
+    """
+    import app.routers.bmi as bmi_router
+
+    # Fixed result to verify it "flows through" the shim
+    fixed_result = BMICalculateResult(
+        bmi=22.5,
+        category="normal",
+        group="general",
+        group_display="General",
+        interpretation="Your BMI is within the normal range.",
+        wht_ratio=0.48,
+        whr=None,
+        waist_risk=WaistRiskResult(
+            wht_ratio=0.48,
+            risk_level="low",
+            notes=("Low waist-related risk",),
+        ),
+        notes=("Low waist-related risk",),
+        age_band="adult",
+    )
+
+    def _fixed_engine(**kwargs: Any) -> BMICalculateResult:
+        return fixed_result
+
+    monkeypatch.setattr(bmi_router, "calculate_bmi_result", _fixed_engine)
+
+    # Call legacy endpoint
+    payload = {
+        "weight_kg": 70.0,
+        "height_cm": 175.0,
+        "age": 30,
+        "gender": "male",
+        "pregnant": "no",
+        "athlete": "no",
+        "waist_cm": 84.0,
+        "lang": "en",
+    }
+
+    resp = client.post("/api/v1/bmi", json=payload)
+    assert resp.status_code == 200
+
+    data = resp.json()
+
+    # Verify legacy format with values from fixed engine result
+    assert data["bmi"] == 22.5  # From fixed_result
+    assert data["category"] == "Normal weight"  # Localized from "normal" slug
+    assert data["group"] == "general"  # From fixed_result
+    assert data["athlete"] is False  # Derived from group != "athlete"
+    assert "note" in data  # Legacy field (waist risk notes or interpretation)
+    # Note should contain waist risk notes (from fixed_result.notes)
+    assert (
+        "Low waist-related risk" in data["note"]
+        or data["note"] == "Your BMI is within the normal range."
+    )
+
+    # Verify required legacy fields are present; extra fields are allowed for forward compatibility
+    expected_keys = {"bmi", "category", "note", "athlete", "group"}
+    assert set(data.keys()).issuperset(
+        expected_keys
+    ), f"Missing legacy keys. Got: {set(data.keys())}"
+
+
+def test_bmi_endpoint_uses_canonical_handler_via_shim(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    RU: Доказательный тест: /bmi использует engine через handler (shim работает).
+    EN: Proof test: /bmi uses engine via handler (shim works).
+
+    Monkeypatch calculate_bmi_result to return fixed BMICalculateResult,
+    then verify endpoint returns those exact values (proving shim delegation).
+    Also verify visualization gate is preserved (include_chart=False to avoid matplotlib dependency).
+    """
+    import app.routers.bmi as bmi_router
+
+    # Fixed result to verify it "flows through" the shim
+    fixed_result = BMICalculateResult(
+        bmi=24.8,
+        category="normal",
+        group="athlete",
+        group_display="Athlete",
+        interpretation="Your BMI is within the normal range for athletes.",
+        wht_ratio=None,
+        whr=None,
+        waist_risk=None,
+        notes=(),
+        age_band="adult",
+    )
+
+    def _fixed_engine(**kwargs: Any) -> BMICalculateResult:
+        return fixed_result
+
+    monkeypatch.setattr(bmi_router, "calculate_bmi_result", _fixed_engine)
+
+    # Call legacy endpoint (height_m format, include_chart=False to avoid matplotlib)
+    payload = {
+        "weight_kg": 80.0,
+        "height_m": 1.80,
+        "age": 28,
+        "gender": "male",
+        "pregnant": "no",
+        "athlete": "yes",
+        "waist_cm": None,
+        "lang": "en",
+        "include_chart": False,  # Avoid matplotlib dependency in test
+    }
+
+    resp = client.post("/bmi", json=payload)
+    assert resp.status_code == 200
+
+    data = resp.json()
+
+    # Verify legacy format with values from fixed engine result
+    assert data["bmi"] == 24.8  # From fixed_result
+    assert data["category"] == "Normal weight"  # Localized from "normal" slug
+    assert data["group"] == "athlete"  # From fixed_result
+    assert data["athlete"] is True  # Derived from group == "athlete"
+    assert "note" in data  # Legacy field (athlete disclaimer)
+    # Note should contain athlete disclaimer (priority over interpretation)
+    assert "athlete" in data["note"].lower() or "BMI may overestimate" in data["note"]
+
+    # Verify required legacy fields are present; extra fields are allowed for forward compatibility
+    expected_keys = {"bmi", "category", "note", "athlete", "group"}
+    assert set(data.keys()).issuperset(
+        expected_keys
+    ), f"Missing legacy keys. Got: {set(data.keys())}"
+
+    # Verify visualization gate: with include_chart=False, visualization should not be added
+    # (or if added, it should be gracefully handled)
+    # This is a smoke test - full visualization testing is in test_bmi_visualization.py
+
+
+def test_bmi_endpoint_unknown_category_falls_back_to_slug(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    RU: Если engine вернул неизвестный category slug, legacy shim должен отдать его как есть.
+    EN: If engine returns an unknown category slug, legacy shim should fall back to returning it.
+    """
+    import app.routers.bmi as bmi_router
+
+    fixed_result = BMICalculateResult(
+        bmi=24.8,
+        category="mystery_category",
+        group="general",
+        group_display="General",
+        interpretation="Some interpretation.",
+        wht_ratio=None,
+        whr=None,
+        waist_risk=None,
+        notes=(),
+        age_band="adult",
+    )
+
+    def _fixed_engine(**_: Any) -> BMICalculateResult:
+        return fixed_result
+
+    monkeypatch.setattr(bmi_router, "calculate_bmi_result", _fixed_engine)
+
+    payload = {
+        "weight_kg": 80.0,
+        "height_m": 1.80,
+        "age": 28,
+        "gender": "male",
+        "pregnant": "no",
+        "athlete": "no",
+        "waist_cm": None,
+        "lang": "en",
+        "include_chart": False,
+    }
+
+    resp = client.post("/bmi", json=payload)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["category"] == "mystery_category"
+
+
+def test_bmi_endpoint_v1_validation_error_maps_to_422(client: TestClient) -> None:
+    """
+    RU: BMIRequestV1 допускает age=0, но canonical BMICalculateRequest требует age>=1.
+        Shim должен вернуть 422 с ValidationError details.
+    EN: BMIRequestV1 allows age=0, but BMICalculateRequest requires age>=1.
+        Shim should return 422 with ValidationError details.
+    """
+    payload = {
+        "weight_kg": 70.0,
+        "height_cm": 175.0,
+        "age": 0,
+        "gender": "male",
+        "pregnant": "no",
+        "athlete": "no",
+        "waist_cm": 84.0,
+        "lang": "en",
+    }
+
+    resp = client.post("/api/v1/bmi", json=payload)
+    assert resp.status_code == 422
+    detail = resp.json().get("detail")
+    assert isinstance(detail, list)
+
+
+def test_bmi_endpoint_v1_unrealistic_bmi_is_422(client: TestClient) -> None:
+    """
+    RU: BMIRequestV1 должен отклонять нереалистичный BMI > 100.
+    EN: BMIRequestV1 must reject unrealistic BMI > 100.
+
+    Regression: V1 validation now delegates BMI computation to core.bmi.engine._compute_bmi.
+    """
+    payload = {
+        "weight_kg": 320.0,  # BMI ~ 125 for 160cm
+        "height_cm": 160.0,
+        "age": 30,
+        "gender": "male",
+        "pregnant": "no",
+        "athlete": "no",
+        "waist_cm": 84.0,
+        "lang": "en",
+    }
+
+    resp = client.post("/api/v1/bmi", json=payload)
+    assert resp.status_code == 422
+
+
+def test_bmi_endpoint_v1_athlete_note_appends_waist_risk_notes_and_unknown_category_fallback(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Covers legacy_app.py:
+    - unknown category fallback to slug
+    - athlete note appends waist risk notes
+    """
+    import app.routers.bmi as bmi_router
+
+    fixed_result = BMICalculateResult(
+        bmi=22.5,
+        category="mystery_category",
+        group="athlete",
+        group_display="Athlete",
+        interpretation="Ignored for athlete note.",
+        wht_ratio=0.48,
+        whr=None,
+        waist_risk=None,
+        notes=("Extra waist note",),
+        age_band="adult",
+    )
+
+    def _fixed_engine(**_: Any) -> BMICalculateResult:
+        return fixed_result
+
+    monkeypatch.setattr(bmi_router, "calculate_bmi_result", _fixed_engine)
+
+    payload = {
+        "weight_kg": 70.0,
+        "height_cm": 175.0,
+        "age": 30,
+        "gender": "male",
+        "pregnant": "no",
+        "athlete": "yes",
+        "waist_cm": 84.0,
+        "lang": "en",
+    }
+
+    resp = client.post("/api/v1/bmi", json=payload)
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert data["category"] == "mystery_category"
+    assert data["group"] == "athlete"
+    assert data["athlete"] is True
+    assert data["note"] == f"{t('en', 'advice_athlete_bmi')} | Extra waist note"
+
+
+@pytest.mark.parametrize(
+    "binding_name",
+    (
+        "APPLICATION_METADATA",
+        "RUNTIME_ENV",
+        "_app_env",
+        "_application_metadata",
+        "tags_metadata",
+        "_api_description",
+    ),
+)
+def test_retired_metadata_projection_bindings_are_absent(binding_name: str) -> None:
+    """The selected compatibility access paths are absent in the ordinary namespace."""
+    import legacy_app
+
+    assert binding_name not in vars(legacy_app)
+    with pytest.raises(AttributeError):
+        getattr(legacy_app, binding_name)

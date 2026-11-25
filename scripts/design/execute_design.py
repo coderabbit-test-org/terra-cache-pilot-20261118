@@ -1,0 +1,351 @@
+#!/usr/bin/env python3
+"""
+Design Execution Pipeline for PulsePlate.
+
+Executes code-first design instructions through runtime adapters and tracks results.
+
+Usage:
+    python scripts/design/execute_design.py --screen ios.home --validate-only
+    python scripts/design/execute_design.py --screen ios.home --execute --adapter code_native_canvas
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, cast
+
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+
+from scripts.design.contracts import (
+    SUPPORTED_SCREENS,
+    validate_canvas_artifact_contract,
+    validate_instruction_contract,
+)
+from scripts.design.execution_adapters import (
+    available_adapter_names,
+    resolve_execution_adapter,
+)
+from scripts.design.html_preview import HtmlPreviewArtifact, write_html_preview
+
+# Project root for resolving paths
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+PREVIEW_REQUIRED_ADAPTER = "code_native_canvas"
+
+
+def load_instruction(screen_id: str) -> dict[str, Any]:
+    """Load instruction JSON for a screen."""
+    instruction_path = (
+        PROJECT_ROOT / "scripts" / "design" / "instructions" / f"{screen_id.replace('.', '_')}.json"
+    )
+
+    if not instruction_path.exists():
+        raise FileNotFoundError(f"Instruction file not found: {instruction_path}")
+
+    with open(instruction_path, encoding="utf-8") as f:
+        return cast(dict[str, Any], json.load(f))
+
+
+def validate_governance(instruction: dict[str, Any]) -> list[str]:
+    """Validate instruction against governance rules."""
+    errors: list[str] = list(validate_instruction_contract(instruction))
+    checks = instruction.get("governance_checks", [])
+
+    # Token usage check
+    if "verify_token_usage" in checks:
+        bg_token = instruction.get("background_token", "")
+        if not bg_token:
+            errors.append("Missing background_token")
+        elif bg_token.startswith("#"):
+            errors.append(f"Raw hex color used: {bg_token} (use design token)")
+
+    # HPP compliance check
+    if "verify_hpp_compliance" in checks:
+        screen_id = instruction.get("screen_id", "")
+        if screen_id not in SUPPORTED_SCREENS:
+            errors.append(f"Screen {screen_id} not in H+P+Pr scope")
+
+    # CTA registry check
+    if "verify_cta_registry_match" in checks:
+        instructions_list = instruction.get("instructions", [])
+        for inst in instructions_list:
+            if not isinstance(inst, dict):
+                continue
+            if inst.get("type") == "create_button":
+                cta_key = inst.get("cta_key", "")
+                if not cta_key:
+                    errors.append(f"Button {inst.get('name')} missing cta_key")
+
+    return errors
+
+
+def execute_instruction(instruction: dict[str, Any], adapter_name: str) -> dict[str, Any]:
+    """Execute one instruction payload through the configured adapter seam."""
+
+    adapter = resolve_execution_adapter(adapter_name)
+    raw_results = adapter.execute(instruction)
+    if not isinstance(raw_results, dict):
+        raise ValueError(
+            f"Invalid results emitted by {adapter_name}: expected object, "
+            f"got {type(raw_results).__name__}"
+        )
+    results: dict[str, Any] = raw_results
+
+    canvas_artifact = results.get("canvas_artifact")
+    if canvas_artifact is not None and not isinstance(canvas_artifact, dict):
+        raise ValueError(
+            f"Invalid canvas artifact emitted by {adapter_name}: expected object, "
+            f"got {type(canvas_artifact).__name__}"
+        )
+    if adapter_name == "code_native_canvas" and not isinstance(canvas_artifact, dict):
+        raise ValueError(
+            f"Invalid canvas artifact emitted by {adapter_name}: missing artifact payload"
+        )
+    if isinstance(canvas_artifact, dict):
+        canvas_errors = validate_canvas_artifact_contract(canvas_artifact, instruction)
+        if canvas_errors:
+            joined_errors = "; ".join(canvas_errors)
+            raise ValueError(f"Invalid canvas artifact emitted by {adapter_name}: {joined_errors}")
+
+    return results
+
+
+def generate_preview_artifact(
+    screen_id: str,
+    results: dict[str, Any],
+    *,
+    output_path: Path | None = None,
+) -> HtmlPreviewArtifact:
+    """Generate deterministic HTML preview metadata from one code-native result."""
+
+    canvas_artifact = results.get("canvas_artifact")
+    if not isinstance(canvas_artifact, dict):
+        raise ValueError(
+            "HTML preview requires a validated canvas_artifact payload from code_native_canvas"
+        )
+    missing_keys = [
+        key
+        for key in ("interaction_contract", "sections", "nodes", "render_ops")
+        if key not in canvas_artifact
+    ]
+    if missing_keys:
+        raise ValueError(
+            "HTML preview requires a validated canvas_artifact with keys " f"{tuple(missing_keys)}"
+        )
+
+    preview_artifact = write_html_preview(screen_id, canvas_artifact, output_path)
+    results["preview_artifact"] = preview_artifact
+    return preview_artifact
+
+
+def resolve_runtime_adapter(
+    adapter_name: str,
+    *,
+    emit_preview: bool,
+) -> tuple[str, str | None]:
+    """Normalize CLI adapter selection for governed preview execution."""
+
+    if not emit_preview or adapter_name == PREVIEW_REQUIRED_ADAPTER:
+        return adapter_name, None
+
+    if adapter_name == "deterministic_stub":
+        return (
+            PREVIEW_REQUIRED_ADAPTER,
+            "Preview requires code_native_canvas; auto-selecting code_native_canvas "
+            "for preview emission.",
+        )
+
+    raise ValueError(f"HTML preview requires {PREVIEW_REQUIRED_ADAPTER}; got {adapter_name}")
+
+
+def update_manifest(screen_id: str, results: dict[str, Any]) -> None:
+    """Update figma-manifest.json with execution results."""
+    manifest_path = PROJECT_ROOT / "docs" / "design" / "figma-manifest.json"
+
+    if not manifest_path.exists():
+        print(f"Warning: Manifest not found at {manifest_path}")
+        return
+
+    with open(manifest_path, encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    # Add execution results to exports
+    if "exports" not in manifest:
+        manifest["exports"] = []
+
+    # Check if screen already exists in exports
+    existing = next((e for e in manifest["exports"] if e.get("screen_id") == screen_id), None)
+    interaction_contract = results.get("interaction_contract")
+    if interaction_contract is None and isinstance(results.get("canvas_artifact"), dict):
+        interaction_contract = results["canvas_artifact"].get("interaction_contract")
+
+    export_entry = {
+        "screen_id": screen_id,
+        "executed_at": results.get("executed_at"),
+        "status": results.get("status"),
+        "surface": results.get("surface"),
+        "layout_archetype": results.get("layout_archetype"),
+        "layout_pattern": results.get("layout_pattern"),
+        "interaction_contract": interaction_contract,
+        "section_count": results.get("section_count"),
+        "adapter_name": results.get("adapter_name"),
+        "adapter_mode": results.get("adapter_mode"),
+        "simulation_mode": results.get("simulation_mode"),
+        "artifact_type": results.get("artifact_type"),
+        "artifact_version": results.get("artifact_version"),
+        "node_count": len(results.get("created_nodes", [])),
+        "component_count": results.get("component_count"),
+        "nodes": results.get("created_nodes", []),
+        "canvas_artifact": results.get("canvas_artifact"),
+        "preview_artifact": results.get("preview_artifact"),
+    }
+
+    if existing:
+        # Update existing entry
+        idx = manifest["exports"].index(existing)
+        manifest["exports"][idx] = export_entry
+    else:
+        # Add new entry
+        manifest["exports"].append(export_entry)
+
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+
+    print(f"Updated manifest: {manifest_path}")
+
+
+def log_execution(screen_id: str, results: dict[str, Any]) -> None:
+    """Log execution results to audit file."""
+    logs_dir = PROJECT_ROOT / "docs" / "figma" / "execution_logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H-%M-%S")
+    log_path = logs_dir / f"{timestamp}_{screen_id.replace('.', '_')}.json"
+
+    with open(log_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2)
+
+    print(f"Execution log: {log_path}")
+
+
+def main() -> int:
+    """Main entry point."""
+    parser = argparse.ArgumentParser(description="Execute design instructions via runtime adapters")
+    parser.add_argument(
+        "--screen",
+        required=True,
+        help="Screen ID (e.g., ios.home, web.plate)",
+    )
+    parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="Validate instruction only, do not execute",
+    )
+    parser.add_argument(
+        "--execute",
+        action="store_true",
+        help="Execute instruction via the selected adapter (currently simulated)",
+    )
+    parser.add_argument(
+        "--adapter",
+        choices=available_adapter_names(),
+        default="deterministic_stub",
+        help="Execution adapter seam to use",
+    )
+    parser.add_argument(
+        "--update-manifest",
+        action="store_true",
+        default=True,
+        help="Update figma-manifest.json after execution",
+    )
+    parser.add_argument(
+        "--emit-preview",
+        action="store_true",
+        help="Emit deterministic HTML preview for code_native_canvas results",
+    )
+    parser.add_argument(
+        "--preview-output",
+        type=Path,
+        help="Optional HTML preview output path (local-only artifact)",
+    )
+
+    args = parser.parse_args()
+
+    # Load instruction
+    try:
+        instruction = load_instruction(args.screen)
+    except FileNotFoundError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    print(f"Loaded instruction for: {args.screen}")
+    print(f"  Page: {instruction.get('page')}")
+    print(f"  Platform: {instruction.get('platform')}")
+    print(f"  Instructions: {len(instruction.get('instructions', []))}")
+
+    # Validate
+    errors = validate_governance(instruction)
+    if errors:
+        print("\nGovernance validation errors:", file=sys.stderr)
+        for error in errors:
+            print(f"  - {error}", file=sys.stderr)
+        return 1
+
+    print("\nGovernance validation: PASSED")
+
+    if args.validate_only:
+        return 0
+
+    if not args.execute:
+        print("\nUse --execute to run via the selected adapter (currently simulated)")
+        return 0
+
+    try:
+        adapter_name, adapter_notice = resolve_runtime_adapter(
+            args.adapter,
+            emit_preview=args.emit_preview,
+        )
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if adapter_notice:
+        print(f"\n{adapter_notice}")
+
+    # Execute (currently simulated)
+    print("\nExecuting design instructions...")
+    results = execute_instruction(instruction, adapter_name)
+
+    print("\nExecution results:")
+    print(f"  Status: {results.get('status')}")
+    print(f"  Adapter: {results.get('adapter_name')} ({results.get('adapter_mode')})")
+    print(f"  Nodes created: {len(results.get('created_nodes', []))}")
+    print(f"  MCP calls: {len(results.get('mcp_calls', []))}")
+
+    if args.emit_preview:
+        preview_artifact = generate_preview_artifact(
+            args.screen,
+            results,
+            output_path=args.preview_output,
+        )
+        print(f"  HTML preview: {preview_artifact.get('output_path')}")
+
+    # Log execution
+    log_execution(args.screen, results)
+
+    # Update manifest
+    if args.update_manifest:
+        update_manifest(args.screen, results)
+
+    print("\nNote: live external design tools are intentionally optional.")
+    print("Current execution uses local runtime adapter seams.")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

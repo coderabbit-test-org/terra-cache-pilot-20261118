@@ -1,0 +1,980 @@
+"""Tests for API tier validation middleware.
+
+RU: Тесты для промежуточного ПО проверки уровней API.
+EN: Tests for API tier validation middleware.
+"""
+
+import asyncio
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+
+import pytest
+from fastapi import HTTPException
+from starlette.requests import Request
+
+import app.middleware.api_tiers as api_tiers_mod
+from app.services import subscriptions as subscriptions_store
+from app.middleware.api_tiers import (
+    AuthSource,
+    DBLookupResult,
+    DBLookupStatus,
+    CurrentUser,
+    SubscriptionTier,
+    TEST_KEY_PRO,
+    TEST_KEY_VIP,
+    _validate_api_key_tier,
+    derive_subject_id_from_api_key,
+    get_pro_subject_id,
+    get_subscription_tier,
+    require_valid_api_key,
+    require_pro_tier,
+    require_vip_tier,
+)
+from app.security.web_session import WEB_SESSION_COOKIE_NAME, issue_web_session
+from settings import get_runtime_env_name, is_production_like_env
+
+
+@pytest.fixture(autouse=True)
+def clear_environment_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Avoid cross-test bleed from ENVIRONMENT precedence checks."""
+    monkeypatch.delenv("ENVIRONMENT", raising=False)
+
+
+class TestSubscriptionTier:
+    """Test SubscriptionTier enum."""
+
+    def test_tier_values(self) -> None:
+        """Test tier enum has correct values."""
+        assert SubscriptionTier.FREE == "FREE"
+        assert SubscriptionTier.PRO == "PRO"
+        assert SubscriptionTier.VIP == "VIP"
+
+
+class TestValidateAPIKeyTier:
+    """Test _validate_api_key_tier function."""
+
+    def test_vip_key_grants_vip_access(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test VIP key grants VIP access in development."""
+        monkeypatch.setenv("APP_ENV", "local")
+        monkeypatch.setenv("DEBUG", "true")
+        assert _validate_api_key_tier(TEST_KEY_VIP, SubscriptionTier.VIP) is True
+
+    def test_vip_key_grants_pro_access(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test VIP key also grants PRO access (VIP includes PRO)."""
+        monkeypatch.setenv("APP_ENV", "local")
+        monkeypatch.setenv("DEBUG", "true")
+        assert _validate_api_key_tier(TEST_KEY_VIP, SubscriptionTier.PRO) is True
+
+    def test_pro_key_grants_pro_access(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test PRO key grants PRO access in development."""
+        monkeypatch.setenv("APP_ENV", "local")
+        monkeypatch.setenv("DEBUG", "true")
+        assert _validate_api_key_tier(TEST_KEY_PRO, SubscriptionTier.PRO) is True
+
+    def test_pro_key_denies_vip_access(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test PRO key does NOT grant VIP access."""
+        monkeypatch.setenv("APP_ENV", "local")
+        monkeypatch.setenv("DEBUG", "true")
+        assert _validate_api_key_tier(TEST_KEY_PRO, SubscriptionTier.VIP) is False
+
+    def test_anonymous_allowed_in_dev(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test any key accepted when ALLOW_ANONYMOUS_API_KEYS=true in dev."""
+        monkeypatch.setenv("APP_ENV", "local")
+        monkeypatch.setenv("DEBUG", "true")
+        monkeypatch.setenv("ALLOW_ANONYMOUS_API_KEYS", "true")
+        assert _validate_api_key_tier("any_random_key", SubscriptionTier.PRO) is True
+        assert _validate_api_key_tier("any_random_key", SubscriptionTier.VIP) is True
+
+    def test_production_mode_without_db_uses_env_fallback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test production mode falls back to env-based detection when DB is disabled."""
+        monkeypatch.setenv("APP_ENV", "production")
+        monkeypatch.setenv("DEBUG", "false")
+        monkeypatch.setenv("SUBSCRIPTION_DB_ENABLED", "false")
+        monkeypatch.setenv("VIP_API_KEYS", "prod_key")  # pragma: allowlist secret
+        assert _validate_api_key_tier("prod_key", SubscriptionTier.PRO) is True
+        assert _validate_api_key_tier("prod_key", SubscriptionTier.VIP) is True
+
+    def test_production_mode_without_db_resolves_pro_api_keys_csv(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test production env fallback resolves PRO_API_KEYS CSV with whitespace."""
+        monkeypatch.setenv("APP_ENV", "production")
+        monkeypatch.setenv("DEBUG", "false")
+        monkeypatch.setenv("SUBSCRIPTION_DB_ENABLED", "false")
+        monkeypatch.setenv("PRO_API_KEYS", "  pro_key_a , pro_key_b  ")  # pragma: allowlist secret
+        assert _validate_api_key_tier("pro_key_a", SubscriptionTier.PRO) is True
+        assert _validate_api_key_tier("pro_key_b", SubscriptionTier.PRO) is True
+        assert _validate_api_key_tier("pro_key_b", SubscriptionTier.VIP) is False
+
+    def test_production_mode_blocks_test_keys_in_env_fallback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test production env fallback does not accept hardcoded test keys."""
+        monkeypatch.setenv("APP_ENV", "production")
+        monkeypatch.setenv("DEBUG", "false")
+        monkeypatch.setenv("SUBSCRIPTION_DB_ENABLED", "false")
+        assert _validate_api_key_tier(TEST_KEY_PRO, SubscriptionTier.PRO) is False
+        assert _validate_api_key_tier(TEST_KEY_VIP, SubscriptionTier.VIP) is False
+
+    def test_production_db_enabled_uses_db_lookup(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test production mode with DB enabled validates access via DB tier."""
+        monkeypatch.setenv("APP_ENV", "production")
+        monkeypatch.setenv("DEBUG", "false")
+        monkeypatch.setenv("SUBSCRIPTION_DB_ENABLED", "true")
+        monkeypatch.setattr(
+            api_tiers_mod,
+            "_lookup_tier_from_db",
+            lambda _: DBLookupResult(status=DBLookupStatus.HIT, tier=SubscriptionTier.PRO),
+        )
+        assert _validate_api_key_tier("prodtoken", SubscriptionTier.PRO) is True
+        assert _validate_api_key_tier("prodtoken", SubscriptionTier.VIP) is False
+
+    def test_production_db_error_does_not_fallback_to_env_tier(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test DB lookup error path denies access instead of env fallback."""
+        monkeypatch.setenv("APP_ENV", "production")
+        monkeypatch.setenv("DEBUG", "false")
+        monkeypatch.setenv("SUBSCRIPTION_DB_ENABLED", "true")
+        monkeypatch.setenv("VIP_API_KEYS", "env_fallback_key")  # pragma: allowlist secret
+        monkeypatch.setattr(
+            api_tiers_mod,
+            "_lookup_tier_from_db",
+            lambda _: DBLookupResult(status=DBLookupStatus.ERROR),
+        )
+        assert _validate_api_key_tier("env_fallback_key", SubscriptionTier.VIP) is False
+        assert _validate_api_key_tier("unknown_key", SubscriptionTier.PRO) is False
+
+    def test_production_db_invalid_tier_does_not_fallback_to_env(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test DB lookup INVALID_TIER denies access (fail-closed), no env fallback."""
+        monkeypatch.setenv("APP_ENV", "production")
+        monkeypatch.setenv("DEBUG", "false")
+        monkeypatch.setenv("SUBSCRIPTION_DB_ENABLED", "true")
+        monkeypatch.setenv("VIP_API_KEYS", "env_key")  # pragma: allowlist secret
+        monkeypatch.setattr(
+            api_tiers_mod,
+            "_lookup_tier_from_db",
+            lambda _: DBLookupResult(status=DBLookupStatus.INVALID_TIER),
+        )
+        assert _validate_api_key_tier("env_key", SubscriptionTier.VIP) is False
+
+    def test_production_db_miss_does_not_fallback_to_env(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test DB MISS is fail-closed for canonical paid-route authz."""
+        monkeypatch.setenv("APP_ENV", "production")
+        monkeypatch.setenv("DEBUG", "false")
+        monkeypatch.setenv("SUBSCRIPTION_DB_ENABLED", "true")
+        monkeypatch.setenv("PRO_API_KEYS", "miss_then_env_key")  # pragma: allowlist secret
+        monkeypatch.setattr(
+            api_tiers_mod,
+            "_lookup_tier_from_db",
+            lambda _: DBLookupResult(status=DBLookupStatus.MISS),
+        )
+        assert _validate_api_key_tier("miss_then_env_key", SubscriptionTier.PRO) is False
+        assert _validate_api_key_tier("miss_then_env_key", SubscriptionTier.VIP) is False
+
+    def test_production_like_app_env_wins_over_non_production_environment_for_runtime_detection(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Production-like APP_ENV must win over non-production ENVIRONMENT."""
+        monkeypatch.setenv("ENVIRONMENT", "development")
+        monkeypatch.setenv("APP_ENV", "production")
+        monkeypatch.setenv("DEBUG", "true")
+
+        assert get_runtime_env_name() == "production"
+        assert is_production_like_env() is True
+        assert _validate_api_key_tier(TEST_KEY_VIP, SubscriptionTier.VIP) is False
+
+    def test_environment_used_when_app_env_missing_for_runtime_detection(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ENVIRONMENT must be used when APP_ENV is blank."""
+        monkeypatch.setenv("APP_ENV", "   ")
+        monkeypatch.setenv("ENVIRONMENT", "staging")
+        monkeypatch.setenv("DEBUG", "true")
+
+        assert get_runtime_env_name() == "staging"
+        assert is_production_like_env() is True
+        assert _validate_api_key_tier(TEST_KEY_VIP, SubscriptionTier.VIP) is False
+
+    def test_non_production_environment_used_when_app_env_missing_for_runtime_detection(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Non-production ENVIRONMENT must still be returned when APP_ENV is blank."""
+        monkeypatch.setenv("APP_ENV", "   ")
+        monkeypatch.setenv("ENVIRONMENT", "development")
+        monkeypatch.setenv("DEBUG", "true")
+
+        assert get_runtime_env_name() == "development"
+        assert is_production_like_env() is False
+
+    def test_production_like_environment_beats_local_app_env_conflict(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Production-like ENVIRONMENT must fail closed over local APP_ENV conflicts."""
+        monkeypatch.setenv("APP_ENV", "local")
+        monkeypatch.setenv("ENVIRONMENT", "production")
+        monkeypatch.setenv("DEBUG", "true")
+
+        assert get_runtime_env_name() == "production"
+        assert is_production_like_env() is True
+        assert _validate_api_key_tier(TEST_KEY_VIP, SubscriptionTier.VIP) is False
+
+
+class _FakeSession:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _subscription_row(
+    *,
+    tier: str,
+    status: str,
+    source: str = "ios_app_store",
+    expires_at: object = None,
+    activated_at: object = None,
+    created_at: object = None,
+) -> SimpleNamespace:
+    """Build minimal persisted subscription row for api_tiers unit tests."""
+
+    return SimpleNamespace(
+        tier=tier,
+        status=status,
+        source=source,
+        expires_at=expires_at,
+        activated_at=activated_at,
+        created_at=created_at,
+    )
+
+
+def _request_with_cookie(token: str) -> Request:
+    """Build minimal Starlette Request carrying a cookie header."""
+
+    cookie_header = f"{WEB_SESSION_COOKIE_NAME}={token}".encode("utf-8")
+    scope = {
+        "type": "http",
+        "http_version": "1.1",
+        "scheme": "http",
+        "method": "GET",
+        "path": "/",
+        "query_string": b"",
+        "client": ("127.0.0.1", 12345),
+        "server": ("testserver", 80),
+        "headers": [(b"cookie", cookie_header)],
+    }
+    return Request(scope)
+
+
+class TestDBLookupHelpers:
+    """Test low-level DB tier lookup helpers."""
+
+    def test_normalize_utc_datetime_converts_aware_values(self) -> None:
+        """Aware datetimes must normalize to UTC instead of preserving source offset."""
+
+        aware_value = datetime(2026, 3, 11, 15, 30, tzinfo=timezone(timedelta(hours=3)))
+        normalized = api_tiers_mod._normalize_utc_datetime(aware_value)
+        assert normalized == datetime(2026, 3, 11, 12, 30, tzinfo=timezone.utc)
+
+    def test_normalize_utc_datetime_rejects_non_datetime_values(self) -> None:
+        """Malformed persisted expiry values must be treated as invalid state."""
+
+        with pytest.raises(TypeError, match="expires_at must be datetime"):
+            api_tiers_mod._normalize_utc_datetime("2026-01-01")
+
+    def test_tier_allows_access_helper(self) -> None:
+        """Test tier inclusion matrix helper."""
+        assert api_tiers_mod._tier_allows_access(SubscriptionTier.VIP, SubscriptionTier.PRO) is True
+        assert (
+            api_tiers_mod._tier_allows_access(SubscriptionTier.PRO, SubscriptionTier.VIP) is False
+        )
+        assert (
+            api_tiers_mod._tier_allows_access(SubscriptionTier.FREE, SubscriptionTier.FREE) is True
+        )
+
+    def test_parse_tier_value(self) -> None:
+        """Test tier parsing from raw values."""
+        assert api_tiers_mod._parse_tier_value(" vip ") == SubscriptionTier.VIP
+        assert api_tiers_mod._parse_tier_value("PRO") == SubscriptionTier.PRO
+        assert api_tiers_mod._parse_tier_value("unknown") is None
+
+    def test_parse_persisted_helpers_return_none_for_non_string_values(self) -> None:
+        """Test persisted tier/status parsers fail closed on non-string DB values."""
+        assert api_tiers_mod._parse_persisted_subscription_tier(None) is None
+        assert api_tiers_mod._parse_persisted_subscription_status(123) is None
+
+    def test_lookup_tier_from_db_handles_db_exception(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test _lookup_tier_from_db returns DBLookupResult with status ERROR on DB/session exceptions."""
+        import core.db as core_db
+
+        def _boom() -> object:
+            raise RuntimeError("db down")
+
+        monkeypatch.setattr(core_db, "get_session_factory", _boom)
+        result = api_tiers_mod._lookup_tier_from_db("key")
+        assert result.status == DBLookupStatus.ERROR
+        assert result.tier is None
+
+    def test_lookup_tier_from_db_handles_missing_record(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test _lookup_tier_from_db returns DBLookupResult with status MISS when no record is found."""
+        import core.db as core_db
+
+        session = _FakeSession()
+        monkeypatch.setattr(core_db, "get_session_factory", lambda: lambda: session)
+        monkeypatch.setattr(
+            subscriptions_store,
+            "list_subscriptions_for_user",
+            lambda **_kwargs: [],
+        )
+        result = api_tiers_mod._lookup_tier_from_db("key")
+        assert result.status == DBLookupStatus.MISS
+        assert result.tier is None
+        assert session.closed is True
+
+    def test_lookup_tier_from_db_handles_unknown_tier_value(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test _lookup_tier_from_db returns DBLookupResult with status INVALID_TIER for unknown tier values."""
+        import core.db as core_db
+
+        session = _FakeSession()
+        monkeypatch.setattr(core_db, "get_session_factory", lambda: lambda: session)
+        monkeypatch.setattr(
+            subscriptions_store,
+            "list_subscriptions_for_user",
+            lambda **_kwargs: [_subscription_row(tier="not_a_tier", status="active")],
+        )
+        result = api_tiers_mod._lookup_tier_from_db("key")
+        assert result.status == DBLookupStatus.INVALID_TIER
+        assert result.tier is None
+        assert session.closed is True
+
+    def test_lookup_tier_from_db_rejects_invalid_expires_at_type(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Malformed persisted expiry values must fail closed instead of unlocking access."""
+        import core.db as core_db
+
+        session = _FakeSession()
+        monkeypatch.setattr(core_db, "get_session_factory", lambda: lambda: session)
+        monkeypatch.setattr(
+            subscriptions_store,
+            "list_subscriptions_for_user",
+            lambda **_kwargs: [
+                _subscription_row(tier="vip", status="active", expires_at="2026-01-01")
+            ],
+        )
+
+        result = api_tiers_mod._lookup_tier_from_db("key")
+
+        assert result.status == DBLookupStatus.INVALID_TIER
+        assert result.tier is None
+        assert session.closed is True
+
+    def test_compat_paid_expires_at_returns_none_for_non_manual_sources(self) -> None:
+        """Compatibility expiry must not apply outside legacy manual payment sources."""
+
+        subscription = _subscription_row(
+            tier="vip",
+            status="active",
+            source="ios_app_store",
+            expires_at=None,
+            activated_at=datetime.now(timezone.utc),
+        )
+
+        assert (
+            api_tiers_mod._compat_paid_expires_at(
+                subscription,
+                None,
+                now=datetime.now(timezone.utc),
+            )
+            is None
+        )
+
+    def test_compat_paid_expires_at_returns_none_without_created_at(self) -> None:
+        """Legacy compat expiry must fail closed when created_at evidence is missing."""
+
+        subscription = _subscription_row(
+            tier="vip",
+            status="active",
+            source="swift_manual",
+            expires_at=None,
+            activated_at=datetime.now(timezone.utc),
+            created_at=None,
+        )
+
+        assert (
+            api_tiers_mod._compat_paid_expires_at(
+                subscription,
+                None,
+                now=datetime.now(timezone.utc),
+            )
+            is None
+        )
+
+    def test_lookup_tier_from_db_rejects_invalid_legacy_manual_activated_at_type(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Malformed legacy manual activated_at values must fail closed."""
+
+        import core.db as core_db
+
+        session = _FakeSession()
+        monkeypatch.setattr(core_db, "get_session_factory", lambda: (lambda: session))
+        monkeypatch.setattr(
+            subscriptions_store,
+            "list_subscriptions_for_user",
+            lambda **_kwargs: [
+                _subscription_row(
+                    tier="vip",
+                    status="active",
+                    source="swift_manual",
+                    expires_at=None,
+                    activated_at="not-a-datetime",
+                )
+            ],
+        )
+
+        result = api_tiers_mod._lookup_tier_from_db("key")
+
+        assert result.status == DBLookupStatus.INVALID_TIER
+        assert result.tier is None
+        assert session.closed is True
+
+    def test_lookup_tier_from_db_returns_parsed_tier(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test DB lookup returns parsed tier for valid active subscription state."""
+        import core.db as core_db
+
+        session = _FakeSession()
+        monkeypatch.setattr(core_db, "get_session_factory", lambda: lambda: session)
+        monkeypatch.setattr(
+            subscriptions_store,
+            "list_subscriptions_for_user",
+            lambda **_kwargs: [
+                _subscription_row(
+                    tier="vip",
+                    status="active",
+                    expires_at=datetime.now(timezone.utc) + timedelta(days=14),
+                )
+            ],
+        )
+        result = api_tiers_mod._lookup_tier_from_db("key")
+        assert result.status == DBLookupStatus.HIT
+        assert result.tier == SubscriptionTier.VIP
+        assert session.closed is True
+
+    def test_lookup_tier_from_db_returns_free_for_non_active_states(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Persisted non-active subscription rows must deny paid access authoritatively."""
+        import core.db as core_db
+
+        session = _FakeSession()
+        monkeypatch.setattr(core_db, "get_session_factory", lambda: lambda: session)
+        monkeypatch.setattr(
+            subscriptions_store,
+            "list_subscriptions_for_user",
+            lambda **_kwargs: [
+                _subscription_row(tier="vip", status="expired"),
+                _subscription_row(tier="pro", status="cancelled"),
+            ],
+        )
+        result = api_tiers_mod._lookup_tier_from_db("key")
+        assert result.status == DBLookupStatus.HIT
+        assert result.tier == SubscriptionTier.FREE
+        assert session.closed is True
+
+    def test_lookup_tier_from_db_fails_closed_when_rows_mix_valid_and_invalid_state(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Any malformed persisted row must force INVALID_TIER even if another row parses."""
+        import core.db as core_db
+
+        session = _FakeSession()
+        monkeypatch.setattr(core_db, "get_session_factory", lambda: lambda: session)
+        monkeypatch.setattr(
+            subscriptions_store,
+            "list_subscriptions_for_user",
+            lambda **_kwargs: [
+                _subscription_row(
+                    tier="vip",
+                    status="active",
+                    expires_at=datetime.now(timezone.utc) + timedelta(days=14),
+                ),
+                _subscription_row(tier="not_a_tier", status="active"),
+            ],
+        )
+        result = api_tiers_mod._lookup_tier_from_db("key")
+        assert result.status == DBLookupStatus.INVALID_TIER
+        assert result.tier is None
+        assert session.closed is True
+
+    def test_lookup_tier_from_db_defensive_tail_returns_miss(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A truthy-but-empty iterable should hit the defensive MISS tail without crashing."""
+        import core.db as core_db
+
+        class _TruthyEmptySubscriptions:
+            def __bool__(self) -> bool:
+                return True
+
+            def __iter__(self):
+                return iter(())
+
+        session = _FakeSession()
+        monkeypatch.setattr(core_db, "get_session_factory", lambda: lambda: session)
+        monkeypatch.setattr(
+            subscriptions_store,
+            "list_subscriptions_for_user",
+            lambda **_kwargs: _TruthyEmptySubscriptions(),
+        )
+        result = api_tiers_mod._lookup_tier_from_db("key")
+        assert result.status == DBLookupStatus.MISS
+        assert result.tier is None
+        assert session.closed is True
+
+
+class TestRequireProTier:
+    """Test require_pro_tier dependency function (sync, runs in threadpool in FastAPI)."""
+
+    def test_pro_key_accepted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test PRO key is accepted for PRO tier."""
+        monkeypatch.setenv("APP_ENV", "local")
+        monkeypatch.setenv("DEBUG", "true")
+        result = require_pro_tier(x_api_key=TEST_KEY_PRO)
+        assert result == TEST_KEY_PRO
+
+    def test_vip_key_accepted_for_pro(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test VIP key is accepted for PRO tier (VIP includes PRO)."""
+        monkeypatch.setenv("APP_ENV", "local")
+        monkeypatch.setenv("DEBUG", "true")
+        result = require_pro_tier(x_api_key=TEST_KEY_VIP)
+        assert result == TEST_KEY_VIP
+
+    def test_missing_key_raises_401(self) -> None:
+        """Test missing API key raises 401 Unauthorized."""
+        with pytest.raises(HTTPException) as exc_info:
+            require_pro_tier(x_api_key=None)
+        assert exc_info.value.status_code == 401
+        assert "API key required" in exc_info.value.detail
+
+    def test_invalid_key_raises_403(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test invalid API key raises 403 Forbidden."""
+        monkeypatch.setenv("APP_ENV", "local")
+        monkeypatch.setenv("DEBUG", "true")
+        with pytest.raises(HTTPException) as exc_info:
+            require_pro_tier(x_api_key="invalid_key")
+        assert exc_info.value.status_code == 403
+        assert "does not have PRO tier access" in exc_info.value.detail
+
+    def test_cookie_fallback_accepts_valid_pro_cookie(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test missing header falls back to valid PRO cookie."""
+        monkeypatch.setenv("SERVER_SALT", "StrongServerSaltForTests123456789!")
+        issued = issue_web_session(api_key=TEST_KEY_PRO, tier="PRO")
+        request = _request_with_cookie(issued.token)
+
+        result = require_pro_tier(x_api_key=None, request=request)
+        assert result == TEST_KEY_PRO
+        context = api_tiers_mod.get_request_pro_auth_context(request)
+        assert context is not None
+        assert context.source == AuthSource.COOKIE
+        assert context.tier == SubscriptionTier.PRO
+        assert context.session_expires_at_epoch == issued.claims.expires_at_epoch
+
+    def test_header_precedence_rejects_invalid_header_even_with_valid_cookie(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test invalid X-API-Key blocks access even when cookie is valid."""
+        monkeypatch.setenv("SERVER_SALT", "StrongServerSaltForTests123456789!")
+        issued = issue_web_session(api_key=TEST_KEY_PRO, tier="PRO")
+        request = _request_with_cookie(issued.token)
+
+        with pytest.raises(HTTPException) as exc_info:
+            require_pro_tier(x_api_key="invalid_key", request=request)
+        assert exc_info.value.status_code == 403
+
+    def test_empty_header_rejected_even_with_valid_cookie(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test empty X-API-Key header does not fall back to cookie auth."""
+        monkeypatch.setenv("SERVER_SALT", "StrongServerSaltForTests123456789!")
+        issued = issue_web_session(api_key=TEST_KEY_PRO, tier="PRO")
+        request = _request_with_cookie(issued.token)
+
+        with pytest.raises(HTTPException) as exc_info:
+            require_pro_tier(x_api_key="   ", request=request)
+        assert exc_info.value.status_code == 403
+
+    def test_cookie_verifier_runtime_error_fails_closed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test verifier runtime errors do not bypass PRO guard."""
+
+        def raise_runtime_error(_: str) -> None:
+            raise RuntimeError("bad server salt")
+
+        request = _request_with_cookie("signed-cookie-value")
+        monkeypatch.setattr(
+            api_tiers_mod,
+            "verify_web_session",
+            raise_runtime_error,
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            require_pro_tier(x_api_key=None, request=request)
+        assert exc_info.value.status_code == 401
+
+    def test_get_request_pro_auth_context_returns_none_when_missing(self) -> None:
+        """Test helper returns None when request state has no cached context."""
+
+        request = _request_with_cookie("token")
+        assert api_tiers_mod.get_request_pro_auth_context(request) is None
+
+
+class TestRequireValidAPIKey:
+    """Test require_valid_api_key helper for header-authenticated surfaces."""
+
+    def test_free_tier_accepts_valid_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """FREE-tier helper accepts configured keys that resolve through tier logic."""
+        monkeypatch.setenv("APP_ENV", "local")
+        monkeypatch.setenv("DEBUG", "true")
+        dependency = require_valid_api_key()
+
+        result = dependency(x_api_key=TEST_KEY_PRO)
+
+        assert result == TEST_KEY_PRO
+
+    def test_missing_key_raises_401(self) -> None:
+        """Missing API key fails closed for header-authenticated routes."""
+        dependency = require_valid_api_key()
+        with pytest.raises(HTTPException) as exc_info:
+            dependency(x_api_key=None)
+
+        assert exc_info.value.status_code == 401
+        assert "API key required" in exc_info.value.detail
+
+    def test_blank_key_raises_401(self) -> None:
+        """Blank API key header is rejected before tier resolution."""
+        dependency = require_valid_api_key()
+        with pytest.raises(HTTPException) as exc_info:
+            dependency(x_api_key="   ")
+
+        assert exc_info.value.status_code == 401
+        assert "API key required" in exc_info.value.detail
+
+    def test_required_tier_accepts_vip_key_for_pro(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Helper forwards stricter tier requirements to shared resolution logic."""
+        monkeypatch.setenv("APP_ENV", "local")
+        monkeypatch.setenv("DEBUG", "true")
+        dependency = require_valid_api_key(required_tier=SubscriptionTier.PRO)
+
+        result = dependency(x_api_key=TEST_KEY_VIP)
+
+        assert result == TEST_KEY_VIP
+
+    def test_required_tier_rejects_insufficient_access(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Helper fails closed when the key does not satisfy the requested tier."""
+        monkeypatch.setenv("APP_ENV", "local")
+        monkeypatch.setenv("DEBUG", "true")
+        dependency = require_valid_api_key(required_tier=SubscriptionTier.VIP)
+
+        with pytest.raises(HTTPException) as exc_info:
+            dependency(x_api_key=TEST_KEY_PRO)
+
+        assert exc_info.value.status_code == 401
+        assert "VIP tier access" in exc_info.value.detail
+
+    def test_db_lookup_failure_rejects_free_tier_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """DB lookup errors must still fail closed for FREE-tier helper usage."""
+        monkeypatch.setenv("SUBSCRIPTION_DB_ENABLED", "true")
+        monkeypatch.setattr(
+            api_tiers_mod,
+            "_lookup_tier_from_db",
+            lambda _api_key: DBLookupResult(status=DBLookupStatus.ERROR),
+        )
+        dependency = require_valid_api_key()
+
+        with pytest.raises(HTTPException) as exc_info:
+            dependency(x_api_key=TEST_KEY_PRO)
+
+        assert exc_info.value.status_code == 401
+        assert "Invalid API key" in exc_info.value.detail
+
+
+class TestRequireVIPTier:
+    """Test require_vip_tier dependency function (sync, runs in threadpool in FastAPI)."""
+
+    def test_vip_key_accepted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test VIP key is accepted for VIP tier."""
+        monkeypatch.setenv("APP_ENV", "local")
+        monkeypatch.setenv("DEBUG", "true")
+        result = require_vip_tier(x_api_key=TEST_KEY_VIP)
+        assert result == TEST_KEY_VIP
+
+    def test_pro_key_rejected_for_vip(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test PRO key is rejected for VIP tier."""
+        monkeypatch.setenv("APP_ENV", "local")
+        monkeypatch.setenv("DEBUG", "true")
+        with pytest.raises(HTTPException) as exc_info:
+            require_vip_tier(x_api_key=TEST_KEY_PRO)
+        assert exc_info.value.status_code == 403
+        assert "does not have VIP tier access" in exc_info.value.detail
+
+    def test_missing_key_raises_403(self) -> None:
+        """Test missing API key raises 403 Forbidden (VIP = feature-gate)."""
+        with pytest.raises(HTTPException) as exc_info:
+            require_vip_tier(x_api_key=None)
+        assert exc_info.value.status_code == 403
+        assert "VIP access" in exc_info.value.detail or "API key required" in exc_info.value.detail
+
+    def test_invalid_key_raises_403(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test invalid API key raises 403 Forbidden."""
+        monkeypatch.setenv("APP_ENV", "local")
+        monkeypatch.setenv("DEBUG", "true")
+        with pytest.raises(HTTPException) as exc_info:
+            require_vip_tier(x_api_key="invalid_key")
+        assert exc_info.value.status_code == 403
+        assert "Upgrade to VIP" in exc_info.value.detail
+
+    def test_cookie_fallback_accepts_valid_vip_cookie(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test missing header falls back to valid VIP cookie."""
+        monkeypatch.setenv("SERVER_SALT", "StrongServerSaltForTests123456789!")
+        issued = issue_web_session(api_key=TEST_KEY_VIP, tier="VIP")
+        request = _request_with_cookie(issued.token)
+
+        result = require_vip_tier(x_api_key=None, request=request)
+        assert result == TEST_KEY_VIP
+
+    def test_cookie_fallback_rejects_pro_cookie_for_vip(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test VIP guard rejects PRO-tier cookie."""
+        monkeypatch.setenv("SERVER_SALT", "StrongServerSaltForTests123456789!")
+        issued = issue_web_session(api_key=TEST_KEY_PRO, tier="PRO")
+        request = _request_with_cookie(issued.token)
+
+        with pytest.raises(HTTPException) as exc_info:
+            require_vip_tier(x_api_key=None, request=request)
+        assert exc_info.value.status_code == 403
+
+    def test_cookie_fallback_revalidates_current_key_tier(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test cookie auth rechecks current tier instead of trusting embedded claims."""
+        monkeypatch.setenv("SERVER_SALT", "StrongServerSaltForTests123456789!")
+        issued = issue_web_session(api_key=TEST_KEY_PRO, tier="VIP")
+        request = _request_with_cookie(issued.token)
+        monkeypatch.setattr(
+            api_tiers_mod,
+            "_resolve_authorized_api_key_tier",
+            lambda *_args, **_kwargs: SubscriptionTier.PRO,
+        )
+
+        result = require_pro_tier(x_api_key=None, request=request)
+        assert result == TEST_KEY_PRO
+        context = api_tiers_mod.get_request_pro_auth_context(request)
+        assert context is not None
+        assert context.tier == SubscriptionTier.PRO
+
+    def test_cookie_fallback_fails_closed_when_current_key_tier_revoked(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test cookie auth is denied when current tier no longer authorizes access."""
+        monkeypatch.setenv("SERVER_SALT", "StrongServerSaltForTests123456789!")
+        issued = issue_web_session(api_key=TEST_KEY_VIP, tier="VIP")
+        request = _request_with_cookie(issued.token)
+        monkeypatch.setattr(
+            api_tiers_mod,
+            "_resolve_authorized_api_key_tier",
+            lambda *_args, **_kwargs: None,
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            require_vip_tier(x_api_key=None, request=request)
+        assert exc_info.value.status_code == 403
+
+    def test_empty_header_rejected_for_vip_even_with_valid_cookie(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test empty X-API-Key header does not bypass VIP guard via cookie fallback."""
+        monkeypatch.setenv("SERVER_SALT", "StrongServerSaltForTests123456789!")
+        issued = issue_web_session(api_key=TEST_KEY_VIP, tier="VIP")
+        request = _request_with_cookie(issued.token)
+
+        with pytest.raises(HTTPException) as exc_info:
+            require_vip_tier(x_api_key=" ", request=request)
+        assert exc_info.value.status_code == 403
+
+
+class TestGetSubscriptionTier:
+    """Test get_subscription_tier helper function."""
+
+    def test_vip_key_returns_vip_tier(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test VIP key returns VIP tier."""
+        monkeypatch.setenv("APP_ENV", "local")
+        monkeypatch.setenv("DEBUG", "true")
+        assert get_subscription_tier(TEST_KEY_VIP) == SubscriptionTier.VIP
+
+    def test_pro_key_returns_pro_tier(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test PRO key returns PRO tier."""
+        monkeypatch.setenv("APP_ENV", "local")
+        monkeypatch.setenv("DEBUG", "true")
+        assert get_subscription_tier(TEST_KEY_PRO) == SubscriptionTier.PRO
+
+    def test_invalid_key_returns_free_tier(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test invalid key returns FREE tier."""
+        monkeypatch.setenv("APP_ENV", "local")
+        monkeypatch.setenv("DEBUG", "true")
+        assert get_subscription_tier("invalid_key") == SubscriptionTier.FREE
+
+    def test_production_db_disabled_uses_env_detection(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test production mode with DB disabled uses env keys (not test keys)."""
+        monkeypatch.setenv("APP_ENV", "production")
+        monkeypatch.setenv("DEBUG", "false")
+        monkeypatch.setenv("SUBSCRIPTION_DB_ENABLED", "false")
+        monkeypatch.setenv("VIP_API_KEYS", "vip_prod")  # pragma: allowlist secret
+        monkeypatch.setenv(
+            "PRO_API_KEYS", "  pro_prod_a , pro_prod_b  "
+        )  # pragma: allowlist secret
+        assert get_subscription_tier("vip_prod") == SubscriptionTier.VIP
+        assert get_subscription_tier("pro_prod_a") == SubscriptionTier.PRO
+        assert get_subscription_tier("pro_prod_b") == SubscriptionTier.PRO
+        assert get_subscription_tier(TEST_KEY_VIP) == SubscriptionTier.FREE
+        assert get_subscription_tier(TEST_KEY_PRO) == SubscriptionTier.FREE
+
+    def test_production_db_enabled_uses_db_tier(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test get_subscription_tier returns DB tier when available."""
+        monkeypatch.setenv("APP_ENV", "production")
+        monkeypatch.setenv("DEBUG", "false")
+        monkeypatch.setenv("SUBSCRIPTION_DB_ENABLED", "true")
+        monkeypatch.setattr(
+            api_tiers_mod,
+            "_lookup_tier_from_db",
+            lambda _: DBLookupResult(status=DBLookupStatus.HIT, tier=SubscriptionTier.VIP),
+        )
+        assert get_subscription_tier("db_key") == SubscriptionTier.VIP
+
+    def test_production_db_enabled_returns_free_on_db_miss(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test get_subscription_tier is fail-closed on DB MISS in DB-backed mode."""
+        monkeypatch.setenv("APP_ENV", "production")
+        monkeypatch.setenv("DEBUG", "false")
+        monkeypatch.setenv("SUBSCRIPTION_DB_ENABLED", "true")
+        monkeypatch.setenv("VIP_API_KEYS", "env_key")  # pragma: allowlist secret
+        monkeypatch.setattr(
+            api_tiers_mod,
+            "_lookup_tier_from_db",
+            lambda _: DBLookupResult(status=DBLookupStatus.MISS),
+        )
+        assert get_subscription_tier("env_key") == SubscriptionTier.FREE
+        assert get_subscription_tier("unknown_key") == SubscriptionTier.FREE
+
+    def test_production_db_error_returns_free_without_env_fallback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test DB errors are fail-closed for tier inference when DB mode is enabled."""
+        monkeypatch.setenv("APP_ENV", "production")
+        monkeypatch.setenv("DEBUG", "false")
+        monkeypatch.setenv("SUBSCRIPTION_DB_ENABLED", "true")
+        monkeypatch.setenv("VIP_API_KEYS", "env_key")  # pragma: allowlist secret
+        monkeypatch.setattr(
+            api_tiers_mod,
+            "_lookup_tier_from_db",
+            lambda _: DBLookupResult(status=DBLookupStatus.ERROR),
+        )
+        assert get_subscription_tier("env_key") == SubscriptionTier.FREE
+
+
+class TestGetCurrentUser:
+    """Test get_current_user dependency."""
+
+    def test_get_current_user_returns_derived_user(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test get_current_user returns CurrentUser with derived subject_id and api_key."""
+        monkeypatch.setenv("APP_ENV", "local")
+        monkeypatch.setenv("DEBUG", "true")
+        user = asyncio.run(api_tiers_mod.get_current_user(api_key=TEST_KEY_PRO))
+        assert user.api_key == TEST_KEY_PRO
+        assert user.user_id == derive_subject_id_from_api_key(TEST_KEY_PRO)
+
+
+class TestGetProSubjectId:
+    """Test get_pro_subject_id helper."""
+
+    def test_get_pro_subject_id_returns_current_user_id(self) -> None:
+        """Test helper returns subject ID from current user."""
+        current_user = CurrentUser(user_id=123, api_key="test_key")
+        assert asyncio.run(get_pro_subject_id(current_user=current_user)) == 123
+
+
+class TestDeriveSubjectIdFromApiKey:
+    """Tests for derive_subject_id_from_api_key."""
+
+    def test_same_key_is_deterministic(self) -> None:
+        """Test same key produces stable subject IDs."""
+        key = "deterministic-key"
+        assert derive_subject_id_from_api_key(key) == derive_subject_id_from_api_key(key)
+
+    def test_different_keys_are_unique(self) -> None:
+        """Test different keys produce different subject IDs."""
+        first = derive_subject_id_from_api_key("key-one")
+        second = derive_subject_id_from_api_key("key-two")
+        assert first != second
+
+    def test_subject_id_within_positive_postgres_bigint(self) -> None:
+        """Test subject ID stays within the signed PostgreSQL bigint range."""
+        subject_id = derive_subject_id_from_api_key("range-check")
+        assert 1 <= subject_id <= 0x7FFF_FFFF_FFFF_FFFF
+
+
+class TestEnvironmentConfiguration:
+    """Test environment configuration handling."""
+
+    def test_local_env_not_production(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test local environment is not production."""
+        monkeypatch.setenv("APP_ENV", "local")
+        from app.middleware.api_tiers import _is_production_environment
+
+        is_prod, env = _is_production_environment()
+        assert is_prod is False
+        assert env == "local"
+
+    def test_production_env_is_production(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test production environment is detected."""
+        monkeypatch.setenv("APP_ENV", "production")
+        monkeypatch.setenv("DEBUG", "false")
+        from app.middleware.api_tiers import _is_production_environment
+
+        is_prod, env = _is_production_environment()
+        assert is_prod is True
+        assert env == "production"
+
+    def test_staging_env_is_production(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test staging environment is treated as production."""
+        monkeypatch.setenv("APP_ENV", "staging")
+        monkeypatch.setenv("DEBUG", "false")
+        from app.middleware.api_tiers import _is_production_environment
+
+        is_prod, env = _is_production_environment()
+        assert is_prod is True
+        assert env == "staging"
