@@ -8,6 +8,10 @@ language: en-US
 # Path-based instructions
 reviews:
   profile: chill
+  auto_review:
+    enabled: false
+    drafts: false
+    description_keyword: ""
   # Canonical fixed mappings are generated and validated by repo-native gates.
   # Excluding them prevents a reviewer-on-closeout recursion after the final seal.
   path_filters:
@@ -33,3 +37,8 @@ reviews:
       instructions: |
         Ensure tests use descriptive names and follow pytest best practices.
         Maintain 97% test coverage requirement.
+
+
+knowledge_base:
+  code_guidelines:
+    enabled: false
